@@ -36,7 +36,7 @@ agenda/vision_and_plan.md  # широкое видение цифрового с
 Подробности слоя метаданных/графа/поиска — раздел «Слой знаний» ниже.
 
 ## Слой знаний: метаданные, граф, семантический поиск
-Поверх собранных `.md` — слой для кросс-документного анализа (реализован в ветке `feature/knowledge-layer`; проектный план — `pipeline/setup/knowledge_graph_and_metadata_design.md`, gitignored). Всё CPU-only, встроенное, без серверов/JVM/CUDA. Скрипты запускаются ИЗ КОРНЯ: `.venv/bin/python pipeline/scripts/<script>.py`.
+Поверх собранных `.md` — слой для кросс-документного анализа (Фазы 1-4 реализованы, влиты в `main` через PR #1; проектный план и статус — `pipeline/setup/knowledge_graph_and_metadata_design.md`, gitignored). Всё CPU-only, встроенное, без серверов/JVM/CUDA. Скрипты запускаются ИЗ КОРНЯ: `.venv/bin/python pipeline/scripts/<script>.py`.
 
 - **Метаданные** — `schema.py`: pydantic-схема записи `sources.yaml` (id, issuer_type, geo_scope, language, doc_type, authority, topics, g2ai_pattern, типизированные `relations`, `dates`, provenance, status). `render_frontmatter()` порождает frontmatter из записи. `validate_sources.py` — валидатор (структура + принадлежность словарям + уникальность id + ссылочная целостность relations), ненулевой код при ошибках.
 - **Словари** — `pipeline/vocab/vocab_*.yaml` (растут органически); `g2ai_pattern` = переносимый паттерн-решение (ось кросс-странового сравнения), `topics` = тема. `jurisdictions.yaml` (EU/ASEAN) даёт рёбра `member_of`.
