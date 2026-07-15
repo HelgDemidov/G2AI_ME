@@ -1,8 +1,0 @@
-# Dev/CI-инструменты (проверки pipeline/scripts/*.py).
-# Установка: uv pip install -r requirements-dev.txt
-# Проверки:  cd pipeline/scripts && ruff check . && python -m mypy schema.py validate_sources.py && python -m pytest tests/
--r requirements.txt
-mypy==2.3.0
-ruff==0.15.21
-pytest==9.1.1
-types-PyYAML==6.0.12.20260518
