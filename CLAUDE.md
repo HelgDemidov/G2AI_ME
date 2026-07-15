@@ -13,7 +13,7 @@
 intl_xperience/countries/sources.yaml   # реестр первоисточников G2AI-корпуса — единый источник истины (НЕ в git, см. ниже)
 intl_xperience/countries/{iso2}/raw/    # оригиналы документов (PDF), как скачаны с сайтов издателей (НЕ в git)
 intl_xperience/countries/{iso2}/md/     # конвертированные .md с YAML frontmatter (НЕ в git)
-intl_xperience/analysis_lists/small_states_v01.md  # seed-список стран/документов для сбора (черновик, не финальный; трекается в git)
+intl_xperience/source_lists/small_states_v01.md  # seed-список стран/документов для сбора (черновик, не финальный; трекается в git)
 pipeline/scripts/*.py               # код пайплайна (см. «Слой знаний» ниже): pdf_to_markdown (PDF→MD); schema/validate_sources (метаданные); build_graph (граф); chunking/corpus_index (FTS5); embed/vector_store/bge_tokenizer (семантика); ab_eval (A/B); run_pipeline (оркестратор); env
 pipeline/vocab/*.yaml               # контролируемые словари: doc_type/authority/topics/g2ai_pattern + jurisdictions (членство в блоках)
 requirements.txt, requirements-dev.txt, pyproject.toml  # зависимости (runtime/dev) и конфиг инструментов — в КОРНЕ репо
@@ -34,7 +34,7 @@ agenda/vision_and_plan.md  # широкое видение цифрового с
 Подробности слоя метаданных/графа/поиска — раздел «Слой знаний» ниже.
 
 ## Слой знаний: метаданные, граф, семантический поиск
-Поверх собранных `.md` — слой для кросс-документного анализа (Фазы 1-4 реализованы, влиты в `main` через PR #1; проектный план и статус — `pipeline/setup/knowledge_graph_and_metadata_design.md`, gitignored). Всё CPU-only, встроенное, без серверов/JVM/CUDA. Скрипты запускаются ИЗ КОРНЯ: `.venv/bin/python pipeline/scripts/<script>.py`.
+Поверх собранных `.md` — слой для кросс-документного анализа (Фазы 1-4 реализованы, влиты в `main` через PR #1; проектный план и статус — `pipeline/setup/knowledge-graph-metadata/spec.md`, gitignored). Всё CPU-only, встроенное, без серверов/JVM/CUDA. Скрипты запускаются ИЗ КОРНЯ: `.venv/bin/python pipeline/scripts/<script>.py`.
 
 - **Метаданные** — `schema.py`: pydantic-схема записи `sources.yaml` (id, issuer_type, geo_scope, language, doc_type, authority, topics, g2ai_pattern, типизированные `relations`, `dates`, provenance, status). `render_frontmatter()` порождает frontmatter из записи. `validate_sources.py` — валидатор (структура + принадлежность словарям + уникальность id + ссылочная целостность relations), ненулевой код при ошибках.
 - **Словари** — `pipeline/vocab/vocab_*.yaml` (растут органически); `g2ai_pattern` = переносимый паттерн-решение (ось кросс-странового сравнения), `topics` = тема. `jurisdictions.yaml` (EU/ASEAN) даёт рёбра `member_of`.
@@ -59,7 +59,7 @@ agenda/vision_and_plan.md  # широкое видение цифрового с
 - Детектор колонок ловит только ОДИН разрыв (максимум 2 колонки) — 3-колоночная вёрстка не поддержана
 - Заголовки различаются только по РАЗМЕРУ шрифта, не по жирности/цвету — документ с одинаковым кеглем заголовка/тела будет пропущен целиком
 - Диаграммная эвристика — самое слабое место, подобрана под один конкретный флоучарт
-- **Специфический риск для Японии** (в seed-списке `intl_xperience/analysis_lists/small_states_v01.md` есть японская стратегия): `pdfplumber.extract_words()` токенизирует по пробелам — если исходный PDF на японском (CJK, без пробелов между словами), группировка в строки/колонки может не сработать; проверить наличие англоязычной версии до прогона.
+- **Специфический риск для Японии** (в seed-списке `intl_xperience/source_lists/small_states_v01.md` есть японская стратегия): `pdfplumber.extract_words()` токенизирует по пробелам — если исходный PDF на японском (CJK, без пробелов между словами), группировка в строки/колонки может не сработать; проверить наличие англоязычной версии до прогона.
 
 **Практика на каждый новый документ:** тот же выборочный аудит, что делался для Сингапура — сверка списка заголовков, проверка таблиц на дубли/фрагментацию, чтение хотя бы одного «сложного» (многоколоночного/с диаграммой) участка целиком. Не доверять результату вслепую.
 
