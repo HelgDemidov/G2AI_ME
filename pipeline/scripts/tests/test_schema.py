@@ -13,13 +13,19 @@ from schema import (
     Axis,
     CandidateRecord,
     ConnectorKind,
+    DiscoveryProvenance,
     Fidelity,
+    GeoScope,
+    IssuerType,
+    Relevance,
     Rights,
     Sensitivity,
     SourceRecord,
+    Status,
     TargetFit,
     load_candidates,
     load_vocab,
+    promote_candidate,
     render_frontmatter,
 )
 
@@ -277,6 +283,85 @@ def test_load_candidates_empty(tmp_path: Path) -> None:
     path = tmp_path / "candidates.yaml"
     path.write_text("# пусто\n", encoding="utf-8")
     assert load_candidates(path) == []
+
+
+def _relevance() -> Relevance:
+    return Relevance.model_validate(
+        {
+            "target_fit": "primary",
+            "axis": "agentic_g2ai",
+            "assessed_stage": "triage",
+            "rationale": "ok",
+            "assessed_date": "2026-07-15",
+        }
+    )
+
+
+def test_promote_candidate_success() -> None:
+    data = valid_candidate()
+    data.update(
+        title="Doc",
+        issuer="Gov",
+        language="en",
+        source_url="https://ex.org/d.pdf",
+        doc_date="2026-03-01",
+        rights="cc-by",
+        sensitivity="confidential",
+    )
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="ae-cabinet-agentic-2026",
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="framework",
+        authority="soft_law",
+        relevance=_relevance(),
+    )
+    assert isinstance(rec, SourceRecord)
+    assert rec.id == "ae-cabinet-agentic-2026"
+    assert rec.status == Status.pending  # дефолт промоушена
+    assert rec.source_url == "https://ex.org/d.pdf"
+    assert rec.dates.published is not None
+    assert rec.rights == Rights.cc_by  # перенесён с кандидата
+    assert rec.sensitivity == Sensitivity.confidential
+    assert rec.relevance is not None and rec.relevance.target_fit == TargetFit.primary
+    assert rec.discovery is not None
+    assert rec.discovery.connector_id == "agora"
+    assert rec.discovery.source_ref == cand.source_ref
+
+
+def test_promote_candidate_missing_source_url_raises() -> None:
+    cand = CandidateRecord.model_validate(
+        {**valid_candidate(), "title": "Doc", "issuer": "Gov", "language": "en"}  # без source_url
+    )
+    with pytest.raises(ValueError, match="source_url"):
+        promote_candidate(
+            cand,
+            id="x-y-2026",
+            issuer_type=IssuerType.government,
+            geo_scope=GeoScope.national,
+            doc_type="framework",
+            authority="soft_law",
+            relevance=_relevance(),
+        )
+
+
+def test_discovery_provenance_default_merged_from() -> None:
+    dp = DiscoveryProvenance.model_validate(
+        {
+            "connector_id": "agora",
+            "connector_kind": "registry",
+            "source_ref": "ref",
+            "retrieved_at": "2026-07-15",
+        }
+    )
+    assert dp.merged_from == []
+
+
+def test_source_record_discovery_default_none() -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.discovery is None
 
 
 def test_load_real_vocab_nonempty() -> None:

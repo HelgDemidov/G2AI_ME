@@ -187,6 +187,22 @@ class Relevance(BaseModel):
     assessed_date: _dt.date
 
 
+class DiscoveryProvenance(BaseModel):
+    """Провенанс добычи, сохранённый на промоушене кандидата в ``SourceRecord``.
+
+    End-to-end аудит: каким коннектором/запросом найден документ. ``merged_from`` —
+    id-ы коннекторов при мульти-источном merge (discovery/architecture.md §4.4).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_id: str = Field(min_length=1)
+    connector_kind: ConnectorKind
+    source_ref: str = Field(min_length=1)
+    retrieved_at: _dt.date
+    merged_from: list[str] = Field(default_factory=list)
+
+
 class SourceRecord(BaseModel):
     """Одна запись реестра первоисточников (один документ корпуса)."""
 
@@ -230,6 +246,7 @@ class SourceRecord(BaseModel):
     retrieved_snapshot_date: _dt.date | None = None
     sensitivity: Sensitivity = Sensitivity.normal
     rights: Rights = Rights.unknown
+    discovery: DiscoveryProvenance | None = None  # провенанс добычи, сохранён при промоушене
     # --- пайплайн ---
     status: Status
     translation_status: TranslationStatus = TranslationStatus.not_started
@@ -301,6 +318,71 @@ def load_candidates(candidates_path: Path) -> list[CandidateRecord]:
     if not isinstance(raw, list):
         raise ValueError(f"{candidates_path}: верхний уровень должен быть списком кандидатов")
     return [CandidateRecord.model_validate(item) for item in raw]
+
+
+def promote_candidate(
+    cand: CandidateRecord,
+    *,
+    id: str,
+    issuer_type: IssuerType,
+    geo_scope: GeoScope,
+    doc_type: str,
+    authority: str,
+    relevance: Relevance,
+    status: Status = Status.pending,
+    merged_from: list[str] | None = None,
+) -> SourceRecord:
+    """Промоутнуть кандидата в строгий ``SourceRecord`` (конверсия типа между хранилищами).
+
+    Издательские/классификационные решения (``id``/``issuer_type``/``geo_scope``/
+    ``doc_type``/``authority``) и вердикт ``relevance`` — аргументы (решение триажа),
+    не выводятся из кандидата. Обязательные для ``SourceRecord`` поля, которых у
+    кандидата может не быть (``title``/``issuer``/``language``/``source_url``), берутся
+    из кандидата и обязаны присутствовать — иначе ``ValueError`` (неполного кандидата
+    промоутить нельзя). Провенанс добычи сохраняется в ``discovery``.
+    """
+    title, issuer, language, source_url = cand.title, cand.issuer, cand.language, cand.source_url
+    missing = [
+        name
+        for name, val in (
+            ("title", title),
+            ("issuer", issuer),
+            ("language", language),
+            ("source_url", source_url),
+        )
+        if val is None
+    ]
+    if missing:
+        raise ValueError(
+            f"кандидат ({cand.connector_id}/{cand.source_ref}): "
+            f"нельзя промоутить без полей: {', '.join(missing)}"
+        )
+    assert title is not None and issuer is not None
+    assert language is not None and source_url is not None
+
+    return SourceRecord(
+        id=id,
+        title=title,
+        issuer=issuer,
+        issuer_type=issuer_type,
+        geo_scope=geo_scope,
+        language=language,
+        dates=Dates(published=cand.doc_date),
+        doc_type=doc_type,
+        authority=authority,
+        source_url=source_url,
+        rights=cand.rights or Rights.unknown,
+        sensitivity=cand.sensitivity or Sensitivity.normal,
+        relevance=relevance,
+        discovery=DiscoveryProvenance(
+            connector_id=cand.connector_id,
+            connector_kind=cand.connector_kind,
+            source_ref=cand.source_ref,
+            retrieved_at=cand.retrieved_at,
+            merged_from=merged_from or [],
+        ),
+        status=status,
+    )
 
 
 def load_vocab(name: str, vocab_dir: Path = VOCAB_DIR) -> set[str]:
