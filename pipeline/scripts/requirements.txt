@@ -1,5 +1,5 @@
-pdfplumber==0.11.10
-
-# dev-инструменты (проверка scripts/*.py)
-mypy==2.3.0
-ruff==0.15.21
+# Runtime-зависимости пайплайна G2AI-корпуса.
+# Установка: uv pip install -r requirements.txt
+pdfplumber==0.11.10   # PDF -> Markdown (pdf_to_markdown.py)
+pydantic==2.13.4      # схема метаданных sources.yaml (schema.py)
+PyYAML==6.0.3         # чтение/запись sources.yaml и словарей vocab/
