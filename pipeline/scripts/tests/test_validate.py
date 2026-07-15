@@ -64,6 +64,13 @@ def test_structural_error_reported(tmp_path: Path) -> None:
     assert any("запись #0" in e and "id" in e for e in errors)
 
 
+def test_missing_relevance_rejected(tmp_path: Path) -> None:
+    rec = valid_record()
+    del rec["relevance"]
+    errors = validate_sources(_write(tmp_path, [rec]), VOCAB_DIR)
+    assert any("relevance" in e for e in errors)
+
+
 def test_top_level_not_list(tmp_path: Path) -> None:
     path = tmp_path / "sources.yaml"
     path.write_text("foo: bar\n", encoding="utf-8")

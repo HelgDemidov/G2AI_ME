@@ -1,12 +1,33 @@
 """Тесты pydantic-схемы записи sources.yaml и рендера frontmatter."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from schema import AcquisitionMethod, Fidelity, Sensitivity, SourceRecord, load_vocab, render_frontmatter
+from schema import (
+    AcquisitionMethod,
+    AssessedStage,
+    Axis,
+    CandidateRecord,
+    ConnectorKind,
+    DiscoveryProvenance,
+    Fidelity,
+    GeoScope,
+    IssuerType,
+    Relevance,
+    Rights,
+    Sensitivity,
+    SourceRecord,
+    Status,
+    TargetFit,
+    load_candidates,
+    load_vocab,
+    promote_candidate,
+    render_frontmatter,
+)
 
 
 def valid_record() -> dict[str, Any]:
@@ -26,6 +47,13 @@ def valid_record() -> dict[str, Any]:
         "topics": ["ai-governance", "agentic-ai"],
         "g2ai_pattern": ["agent-governance-framework"],
         "source_url": "https://example.org/doc.pdf",
+        "relevance": {
+            "target_fit": "primary",
+            "axis": "agentic_g2ai",
+            "assessed_stage": "confirmed",
+            "rationale": "эталонный агентный G2AI-документ",
+            "assessed_date": "2026-07-15",
+        },
         "status": "verified",
     }
 
@@ -59,6 +87,7 @@ def test_extra_field_forbidden() -> None:
         ("fidelity", "trustme"),            # вне enum Fidelity
         ("sensitivity", "top_secret"),       # вне enum Sensitivity
         ("official_alt_url", "ftp://x/y"),   # не http(s)
+        ("rights", "gpl"),                   # вне enum Rights
     ],
 )
 def test_bad_field_rejected(field: str, bad: str) -> None:
@@ -108,6 +137,231 @@ def test_acquisition_fields_parse() -> None:
     assert rec.fidelity == Fidelity.archived_snapshot
     assert rec.sensitivity == Sensitivity.confidential
     assert rec.official_alt_url == "https://example.org/alt.pdf"
+
+
+def test_rights_default() -> None:
+    """Обратная совместимость: запись без rights дефолтит unknown."""
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.rights == Rights.unknown
+
+
+def test_rights_parse() -> None:
+    data = valid_record()
+    data["rights"] = "cc-by"
+    rec = SourceRecord.model_validate(data)
+    assert rec.rights == Rights.cc_by
+
+
+def test_relevance_parse() -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.relevance is not None
+    assert rec.relevance.target_fit == TargetFit.primary
+    assert rec.relevance.axis == Axis.agentic_g2ai
+    assert rec.relevance.assessed_stage == AssessedStage.confirmed
+
+
+def test_relevance_default_none() -> None:
+    """Обратная совместимость: запись без relevance парсится (Optional на pydantic-уровне)."""
+    data = valid_record()
+    del data["relevance"]
+    rec = SourceRecord.model_validate(data)
+    assert rec.relevance is None
+    assert rec.in_force is None
+
+
+@pytest.mark.parametrize("drop", ["rationale", "assessed_date"])
+def test_relevance_missing_required_rejected(drop: str) -> None:
+    data = valid_record()
+    del data["relevance"][drop]
+    with pytest.raises(ValidationError):
+        SourceRecord.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [("target_fit", "core"), ("axis", "economy"), ("assessed_stage", "final")],
+)
+def test_relevance_bad_enum_rejected(field: str, bad: str) -> None:
+    data = valid_record()
+    data["relevance"][field] = bad
+    with pytest.raises(ValidationError):
+        SourceRecord.model_validate(data)
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_in_force_parse(value: bool | None) -> None:
+    data = valid_record()
+    data["in_force"] = value
+    rec = SourceRecord.model_validate(data)
+    assert rec.in_force is value
+
+
+def test_triage_config_wellformed() -> None:
+    """pipeline/config/triage.yaml — валидный YAML с целочисленным frontier_year."""
+    import yaml as _yaml
+
+    from schema import VOCAB_DIR
+
+    config_path = VOCAB_DIR.parent / "config" / "triage.yaml"
+    data = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+    assert isinstance(data["frontier_year"], int)
+
+
+def valid_candidate() -> dict[str, Any]:
+    """Минимально валидный CandidateRecord (только обязательные поля добычи)."""
+    return {
+        "connector_id": "agora",
+        "connector_kind": "registry",
+        "retrieved_at": "2026-07-15",
+        "source_ref": "zenodo:10.5281/zenodo.13883066#row-42",
+        "raw_hash": "deadbeef",
+    }
+
+
+def test_candidate_minimal() -> None:
+    cand = CandidateRecord.model_validate(valid_candidate())
+    assert cand.connector_kind == ConnectorKind.registry
+    assert cand.source_url is None  # best-effort библиография опускаема
+    assert cand.native_tags == []
+
+
+def test_candidate_permissive_extra_allowed() -> None:
+    data = valid_candidate()
+    data["some_connector_specific_field"] = {"nested": 1}
+    cand = CandidateRecord.model_validate(data)  # extra="allow" не падает
+    assert cand.connector_id == "agora"
+
+
+def test_candidate_full_bibliography() -> None:
+    data = valid_candidate()
+    data.update(
+        title="X",
+        issuer="Y",
+        source_url="https://example.org/a.pdf",
+        language="en",
+        rights="cc-by",
+        sensitivity="confidential",
+        native_tags=["risk", "governance"],
+    )
+    cand = CandidateRecord.model_validate(data)
+    assert cand.source_url == "https://example.org/a.pdf"
+    assert cand.rights == Rights.cc_by
+    assert cand.sensitivity == Sensitivity.confidential
+    assert cand.native_tags == ["risk", "governance"]
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [("connector_kind", "spider"), ("source_url", "ftp://x/y"), ("rights", "gpl")],
+)
+def test_candidate_bad_field_rejected(field: str, bad: str) -> None:
+    data = valid_candidate()
+    data[field] = bad
+    with pytest.raises(ValidationError):
+        CandidateRecord.model_validate(data)
+
+
+def test_candidate_missing_required_rejected() -> None:
+    data = valid_candidate()
+    del data["connector_id"]
+    with pytest.raises(ValidationError):
+        CandidateRecord.model_validate(data)
+
+
+def test_load_candidates(tmp_path: Path) -> None:
+    import yaml as _yaml
+
+    path = tmp_path / "candidates.yaml"
+    path.write_text(_yaml.safe_dump([valid_candidate()], allow_unicode=True), encoding="utf-8")
+    cands = load_candidates(path)
+    assert len(cands) == 1
+    assert cands[0].connector_id == "agora"
+
+
+def test_load_candidates_empty(tmp_path: Path) -> None:
+    path = tmp_path / "candidates.yaml"
+    path.write_text("# пусто\n", encoding="utf-8")
+    assert load_candidates(path) == []
+
+
+def _relevance() -> Relevance:
+    return Relevance.model_validate(
+        {
+            "target_fit": "primary",
+            "axis": "agentic_g2ai",
+            "assessed_stage": "triage",
+            "rationale": "ok",
+            "assessed_date": "2026-07-15",
+        }
+    )
+
+
+def test_promote_candidate_success() -> None:
+    data = valid_candidate()
+    data.update(
+        title="Doc",
+        issuer="Gov",
+        language="en",
+        source_url="https://ex.org/d.pdf",
+        doc_date="2026-03-01",
+        rights="cc-by",
+        sensitivity="confidential",
+    )
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="ae-cabinet-agentic-2026",
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="framework",
+        authority="soft_law",
+        relevance=_relevance(),
+    )
+    assert isinstance(rec, SourceRecord)
+    assert rec.id == "ae-cabinet-agentic-2026"
+    assert rec.status == Status.pending  # дефолт промоушена
+    assert rec.source_url == "https://ex.org/d.pdf"
+    assert rec.dates.published is not None
+    assert rec.rights == Rights.cc_by  # перенесён с кандидата
+    assert rec.sensitivity == Sensitivity.confidential
+    assert rec.relevance is not None and rec.relevance.target_fit == TargetFit.primary
+    assert rec.discovery is not None
+    assert rec.discovery.connector_id == "agora"
+    assert rec.discovery.source_ref == cand.source_ref
+
+
+def test_promote_candidate_missing_source_url_raises() -> None:
+    cand = CandidateRecord.model_validate(
+        {**valid_candidate(), "title": "Doc", "issuer": "Gov", "language": "en"}  # без source_url
+    )
+    with pytest.raises(ValueError, match="source_url"):
+        promote_candidate(
+            cand,
+            id="x-y-2026",
+            issuer_type=IssuerType.government,
+            geo_scope=GeoScope.national,
+            doc_type="framework",
+            authority="soft_law",
+            relevance=_relevance(),
+        )
+
+
+def test_discovery_provenance_default_merged_from() -> None:
+    dp = DiscoveryProvenance.model_validate(
+        {
+            "connector_id": "agora",
+            "connector_kind": "registry",
+            "source_ref": "ref",
+            "retrieved_at": "2026-07-15",
+        }
+    )
+    assert dp.merged_from == []
+
+
+def test_source_record_discovery_default_none() -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.discovery is None
 
 
 def test_load_real_vocab_nonempty() -> None:
