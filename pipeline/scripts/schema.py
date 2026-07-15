@@ -134,6 +134,17 @@ class SourceRecord(BaseModel):
     notes: str | None = None
 
 
+def load_records(sources_path: Path) -> list[SourceRecord]:
+    """Загрузить и структурно провалидировать записи реестра (raises на битой структуре).
+
+    Полную валидацию (словари, уникальность id, relations) делает validate_sources.py.
+    """
+    raw: Any = yaml.safe_load(sources_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError(f"{sources_path}: верхний уровень должен быть списком записей")
+    return [SourceRecord.model_validate(item) for item in raw]
+
+
 def load_vocab(name: str, vocab_dir: Path = VOCAB_DIR) -> set[str]:
     """Множество допустимых терминов из ``pipeline/vocab/vocab_<name>.yaml``.
 

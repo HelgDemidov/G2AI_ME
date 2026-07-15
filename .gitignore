@@ -9,6 +9,9 @@ __pycache__/
 # Локальные ML-модели (эмбеддинги и т.п.) — тяжёлые, качаются отдельно, не в git
 /pipeline/models/
 
+# Производные индексы (SQLite FTS5/векторы) — пересобираются из корпуса, не в git
+/pipeline/index/
+
 # OS / editor
 .DS_Store
 

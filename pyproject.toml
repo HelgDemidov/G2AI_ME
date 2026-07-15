@@ -9,9 +9,9 @@ strict = true
 mypy_path = "pipeline/scripts"
 explicit_package_bases = true
 
-# networkx не поставляет полноценные типы -> не флагать как «нет стабов».
+# networkx/tokenizers не поставляют полноценные типы -> не флагать как «нет стабов».
 [[tool.mypy.overrides]]
-module = ["networkx.*"]
+module = ["networkx.*", "tokenizers.*"]
 ignore_missing_imports = true
 
 [tool.ruff]

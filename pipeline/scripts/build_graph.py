@@ -25,7 +25,7 @@ from typing import Any
 import networkx as nx
 import yaml
 
-from schema import SourceRecord
+from schema import SourceRecord, load_records
 from validate_sources import DEFAULT_SOURCES, validate_sources
 
 JURISDICTIONS_PATH = Path(__file__).resolve().parent.parent / "vocab" / "jurisdictions.yaml"
@@ -54,14 +54,6 @@ def _country_node(iso2: str) -> str:
 
 def _bloc_node(key: str) -> str:
     return f"bloc:{key}"
-
-
-def load_records(sources_path: Path) -> list[SourceRecord]:
-    """Структурно-валидные записи реестра (raises на битой структуре)."""
-    raw: Any = yaml.safe_load(sources_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        raise ValueError(f"{sources_path}: верхний уровень должен быть списком записей")
-    return [SourceRecord.model_validate(item) for item in raw]
 
 
 def load_jurisdictions(path: Path = JURISDICTIONS_PATH) -> dict[str, dict[str, Any]]:
