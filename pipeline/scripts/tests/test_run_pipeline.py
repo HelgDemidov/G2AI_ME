@@ -7,8 +7,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from acquisition import AcquisitionOutcome, ClassifiedResponse
 from schema import SourceRecord, render_frontmatter
-from run_pipeline import Stage, _compose_md, _do_frontmatter, needed_stages, process_docs
+from run_pipeline import Stage, _compose_md, _do_download, _do_frontmatter, needed_stages, process_docs
 from test_schema import valid_record
 
 
@@ -83,7 +84,9 @@ def test_do_frontmatter_syncs_and_idempotent(tmp_path: Path) -> None:
 def test_dry_run_no_side_effects(tmp_path: Path) -> None:
     rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
     results, changed = process_docs(
-        [rec], tmp_path, force=False, dry_run=True, no_download=False, pause=0
+        [rec], tmp_path,
+        sources_path=tmp_path / "sources.yaml",  # dry-run -> никогда не открывается
+        force=False, dry_run=True, no_download=False, pause=0,
     )
     assert changed is False
     assert results[0].done == [Stage.download, Stage.convert, Stage.frontmatter]
@@ -98,13 +101,39 @@ def test_failure_isolation(tmp_path: Path) -> None:
     (tmp_path / "md/b.md").write_text(_compose_md(b, ""), encoding="utf-8")  # b актуален
 
     results, changed = process_docs(
-        [a, b], tmp_path, force=False, dry_run=False, no_download=True, pause=0
+        [a, b], tmp_path,
+        sources_path=tmp_path / "sources.yaml",  # --no-download -> a падает до открытия файла
+        force=False, dry_run=False, no_download=True, pause=0,
     )
     ra = next(r for r in results if r.doc_id == "a-doc-2026")
     rb = next(r for r in results if r.doc_id == "b-doc-2026")
     assert ra.error is not None and "download" in ra.error  # a упал, но не оборвал батч
     assert rb.up_to_date is True
     assert changed is False
+
+
+def test_do_download_persists_acquisition_state(tmp_path: Path, monkeypatch: Any) -> None:
+    """Сквозная проверка проводки: _do_download -> run_ladder -> persist_acquisition_state."""
+    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
+    sources_path = tmp_path / "sources.yaml"
+    sources_path.write_text(f"# header comment\n\n- id: {rec.id}\n  status: pending\n", encoding="utf-8")
+
+    ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
+
+    def fake_fetch(url: str, dest: Path, *, user_agent: str, timeout: int = 30) -> ClassifiedResponse:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"%PDF-1.4 fake content")
+        return ok
+
+    monkeypatch.setattr("acquisition.fetch_and_classify", fake_fetch)
+
+    _do_download(rec, tmp_path, sources_path=sources_path, pause=0)
+
+    assert (tmp_path / "raw/d.pdf").read_bytes() == b"%PDF-1.4 fake content"
+    content = sources_path.read_text(encoding="utf-8")
+    assert "acquisition_method: direct" in content
+    assert "fidelity: live" in content
+    assert "# header comment" in content  # комментарий не потерян сквозным вызовом
 
 
 def test_render_frontmatter_used_in_compose(tmp_path: Path) -> None:

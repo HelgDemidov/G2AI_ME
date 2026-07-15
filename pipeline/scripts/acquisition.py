@@ -7,11 +7,15 @@ that calls into it, same separation as ``build_graph.py``/``corpus_index.py``.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Any
+
+from ruamel.yaml import YAML
 
 import schema
 
@@ -214,3 +218,61 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
                 )
             raise AcquisitionBlocked(rec.source_url, f"{rung.value} blocked ({classified.reason})")
         raise AcquisitionDead(rec.source_url, f"{rung.value} confirmed dead ({classified.reason})")
+
+
+# --- persisting acquisition state back to sources.yaml (round-trip-safe) ---
+def persist_acquisition_state(
+    sources_path: Path,
+    record_id: str,
+    *,
+    acquisition_method: schema.AcquisitionMethod,
+    fidelity: schema.Fidelity,
+    checked: _dt.date,
+    retrieved_snapshot_date: _dt.date | None = None,
+) -> dict[str, tuple[Any, Any]]:
+    """Point-patch acquisition_method/acquisition_checked/fidelity(/retrieved_snapshot_date)
+    for one record in ``sources.yaml``, leaving everything else in the file byte-identical.
+
+    Uses ``ruamel.yaml`` round-trip mode, NOT plain PyYAML: a naive
+    load-then-``yaml.safe_dump`` would silently drop the file's top comment
+    header and reformat multi-line ``summary``/``notes`` fields (PyYAML's data
+    model has no concept of comments or original scalar style). Atomic write
+    (tmp -> rename), same pattern as the ``.md`` frontmatter sync.
+
+    Returns ``{field: (old_value, new_value)}`` for fields that actually
+    changed — empty dict if nothing needed updating (caller uses this to
+    print a summary rather than writing silently; see spec §"Доработки
+    оркестратора").
+    """
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    with sources_path.open("r", encoding="utf-8") as fh:
+        data = yaml.load(fh)
+
+    record = next((item for item in data if item.get("id") == record_id), None)
+    if record is None:
+        raise ValueError(f"запись '{record_id}' не найдена в {sources_path}")
+
+    patch: dict[str, Any] = {
+        "acquisition_method": acquisition_method.value,
+        "acquisition_checked": checked,
+        "fidelity": fidelity.value,
+    }
+    if retrieved_snapshot_date is not None:
+        patch["retrieved_snapshot_date"] = retrieved_snapshot_date
+
+    changed: dict[str, tuple[Any, Any]] = {}
+    for key, new_value in patch.items():
+        old_value = record.get(key)
+        if old_value != new_value:
+            changed[key] = (old_value, new_value)
+            record[key] = new_value
+
+    if not changed:
+        return changed
+
+    tmp = sources_path.with_name(sources_path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        yaml.dump(data, fh)
+    tmp.replace(sources_path)
+    return changed

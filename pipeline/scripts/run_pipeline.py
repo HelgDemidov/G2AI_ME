@@ -22,6 +22,7 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import hashlib
 import logging
 import shutil
@@ -117,13 +118,17 @@ def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) 
 
 
 # --- исполнители стадий (side-effect, атомарная запись) ---
-def _do_download(rec: schema.SourceRecord, root: Path, *, pause: float) -> None:
+def _do_download(rec: schema.SourceRecord, root: Path, *, sources_path: Path, pause: float) -> None:
     """Скачивание через acquisition-лестницу (direct -> official_alt; см. acquisition.py).
 
     Не резюмируется между попытками (без ``curl -C -``): переключение лестницы
     между разными URL на один и тот же файл сделало бы резюм небезопасным
     (докачка "не с того" ответа), а лестница и так не кеширует известный блок
     между прогонами (§5 спека) — каждая попытка полная и честная.
+
+    После успеха точечно обновляет ``acquisition_method``/``acquisition_checked``/
+    ``fidelity`` в ``sources.yaml`` (round-trip-safe, см. ``persist_acquisition_state``)
+    и печатает сводку правок — не молча (решение 2026-07-15, см. спек).
     """
     raw = _raw_file(rec, root)
     if raw is None:
@@ -138,6 +143,13 @@ def _do_download(rec: schema.SourceRecord, root: Path, *, pause: float) -> None:
     if rec.sha256 and _sha256(part) != rec.sha256:
         raise RuntimeError(f"sha256 не совпал (ожидался {rec.sha256[:12]}…)")
     part.replace(raw)
+    changed = acquisition.persist_acquisition_state(
+        sources_path, rec.id,
+        acquisition_method=result.method, fidelity=result.fidelity, checked=_dt.date.today(),
+    )
+    if changed:
+        summary = ", ".join(f"{k}: {old!r} -> {new!r}" for k, (old, new) in changed.items())
+        logger.info("  sources.yaml обновлён (%s): %s", rec.id, summary)
     logger.info("  добыто %s: метод=%s fidelity=%s", rec.id, result.method.value, result.fidelity.value)
     if pause > 0:
         time.sleep(pause)
@@ -178,6 +190,7 @@ def process_docs(
     records: list[schema.SourceRecord],
     root: Path,
     *,
+    sources_path: Path,
     force: bool,
     dry_run: bool,
     no_download: bool,
@@ -201,7 +214,7 @@ def process_docs(
                     if no_download:
                         raise RuntimeError("нужен download, но задан --no-download (скачайте raw вручную)")
                     if not dry_run:
-                        _do_download(rec, root, pause=pause)
+                        _do_download(rec, root, sources_path=sources_path, pause=pause)
                 elif stage is Stage.convert:
                     if not dry_run:
                         _do_convert(rec, root)
@@ -293,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
 
     results, changed = process_docs(
         records, REPO_ROOT,
+        sources_path=args.sources,
         force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
     )
 
