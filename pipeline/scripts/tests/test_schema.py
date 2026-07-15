@@ -6,7 +6,15 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from schema import AcquisitionMethod, Fidelity, Sensitivity, SourceRecord, load_vocab, render_frontmatter
+from schema import (
+    AcquisitionMethod,
+    Fidelity,
+    Rights,
+    Sensitivity,
+    SourceRecord,
+    load_vocab,
+    render_frontmatter,
+)
 
 
 def valid_record() -> dict[str, Any]:
@@ -59,6 +67,7 @@ def test_extra_field_forbidden() -> None:
         ("fidelity", "trustme"),            # вне enum Fidelity
         ("sensitivity", "top_secret"),       # вне enum Sensitivity
         ("official_alt_url", "ftp://x/y"),   # не http(s)
+        ("rights", "gpl"),                   # вне enum Rights
     ],
 )
 def test_bad_field_rejected(field: str, bad: str) -> None:
@@ -108,6 +117,19 @@ def test_acquisition_fields_parse() -> None:
     assert rec.fidelity == Fidelity.archived_snapshot
     assert rec.sensitivity == Sensitivity.confidential
     assert rec.official_alt_url == "https://example.org/alt.pdf"
+
+
+def test_rights_default() -> None:
+    """Обратная совместимость: запись без rights дефолтит unknown."""
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.rights == Rights.unknown
+
+
+def test_rights_parse() -> None:
+    data = valid_record()
+    data["rights"] = "cc-by"
+    rec = SourceRecord.model_validate(data)
+    assert rec.rights == Rights.cc_by
 
 
 def test_load_real_vocab_nonempty() -> None:

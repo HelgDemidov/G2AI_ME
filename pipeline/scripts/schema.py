@@ -89,6 +89,23 @@ class Sensitivity(str, Enum):
     confidential = "confidential"
 
 
+class Rights(str, Enum):
+    """Режим прав на переиздание документа (закрытое множество).
+
+    Захватывается best-effort DISCOVERY-коннектором, финализируется на Стадии 1
+    триажа (см. ``source-relevance-triage``). Forward-looking метаданные для будущей
+    публикации итогового пакета; шиппнутую acquisition-лестницу НЕ гейтит
+    (та гейтится по ``sensitivity``).
+    """
+
+    ogl = "ogl"
+    cc_by = "cc-by"
+    public_domain = "public_domain"
+    crown = "crown"
+    unknown = "unknown"
+    all_rights_reserved = "all_rights_reserved"
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -163,6 +180,7 @@ class SourceRecord(BaseModel):
     fidelity: Fidelity | None = None
     retrieved_snapshot_date: _dt.date | None = None
     sensitivity: Sensitivity = Sensitivity.normal
+    rights: Rights = Rights.unknown
     # --- пайплайн ---
     status: Status
     translation_status: TranslationStatus = TranslationStatus.not_started
