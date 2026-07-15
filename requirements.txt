@@ -3,3 +3,4 @@
 pdfplumber==0.11.10   # PDF -> Markdown (pdf_to_markdown.py)
 pydantic==2.13.4      # схема метаданных sources.yaml (schema.py)
 PyYAML==6.0.3         # чтение/запись sources.yaml и словарей vocab/
+networkx==3.6.1       # гетерогенный граф знаний (build_graph.py)

@@ -1,0 +1,12 @@
+# Членство юрисдикций в региональных блоках — для рёбер member_of в графе знаний.
+# Блок -> метка + список стран-членов (ISO 3166-1 alpha-2, строчными).
+# Узлы-блоки и рёбра member_of создаются ТОЛЬКО для стран, реально встретившихся
+# в корпусе (чтобы граф не разрастался пустыми узлами). Растёт по мере надобности.
+blocs:
+  eu:
+    label: "European Union"
+    members: [at, be, bg, hr, cy, cz, dk, ee, fi, fr, de, gr, hu, ie, it,
+              lv, lt, lu, mt, nl, pl, pt, ro, sk, si, es, se]
+  asean:
+    label: "ASEAN"
+    members: [bn, kh, id, la, my, mm, ph, sg, th, vn]

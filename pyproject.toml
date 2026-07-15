@@ -9,6 +9,11 @@ strict = true
 mypy_path = "pipeline/scripts"
 explicit_package_bases = true
 
+# networkx не поставляет полноценные типы -> не флагать как «нет стабов».
+[[tool.mypy.overrides]]
+module = ["networkx.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 target-version = "py312"
 
