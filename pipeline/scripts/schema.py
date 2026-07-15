@@ -128,6 +128,18 @@ class AssessedStage(str, Enum):
     confirmed = "confirmed"
 
 
+class ConnectorKind(str, Enum):
+    """Архетип discovery-коннектора, породившего кандидата (discovery/architecture.md §3).
+
+    Общий стабильный enum: определяется здесь (розетка триажа), импортируется discovery-core.
+    """
+
+    registry = "registry"
+    outlet_watcher = "outlet_watcher"
+    directed_search = "directed_search"
+    manual = "manual"
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -224,6 +236,47 @@ class SourceRecord(BaseModel):
     notes: str | None = None
 
 
+class CandidateRecord(BaseModel):
+    """Кандидат-источник из DISCOVERY (живёт в candidates.yaml, до допуска в реестр).
+
+    Лёгкий пермиссивный (``extra="allow"``) upstream-кузен ``SourceRecord``: данные
+    коннекторов разнородны и неполны. Не несёт ``relevance`` (discovery не оценивает)
+    и не требует ``id`` (присваивается при промоушене). Контракт-розетка между
+    DISCOVERY (writer) и триажем (reader); см. source-relevance-triage §3.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # провенанс добычи (обязательно)
+    connector_id: str = Field(min_length=1)
+    connector_kind: ConnectorKind
+    retrieved_at: _dt.date
+    source_ref: str = Field(min_length=1)
+    raw_hash: str = Field(min_length=1)
+    # best-effort библиография (Optional — данные upstream неполны)
+    title: str | None = None
+    issuer: str | None = None
+    jurisdiction: str | None = None
+    source_url: str | None = Field(default=None, pattern=r"^https?://")
+    doc_date: _dt.date | None = None
+    reported_status: str | None = None
+    language: str | None = None
+    rights: Rights | None = None  # best-effort от коннектора; финализирует триаж
+    sensitivity: Sensitivity | None = None  # best-effort; несётся в acquisition-гейт
+    # passthrough-обогащение источника (Optional)
+    native_summary: str | None = None
+    native_id: str | None = None
+    native_tags: list[str] = Field(default_factory=list)
+    # дешёвый pre-signal (НЕ вердикт — target_fit присваивает только триаж)
+    matched_query: str | None = None
+    matched_vocab_tags: list[str] = Field(default_factory=list)
+    # dedup-ключи (заполняет discovery)
+    normalized_url: str | None = None
+    content_hash: str | None = None
+    # причина отказа (если триаж отклонил — кандидат остаётся в candidates.yaml)
+    rejected_reason: str | None = None
+
+
 def load_records(sources_path: Path) -> list[SourceRecord]:
     """Загрузить и структурно провалидировать записи реестра (raises на битой структуре).
 
@@ -233,6 +286,21 @@ def load_records(sources_path: Path) -> list[SourceRecord]:
     if not isinstance(raw, list):
         raise ValueError(f"{sources_path}: верхний уровень должен быть списком записей")
     return [SourceRecord.model_validate(item) for item in raw]
+
+
+def load_candidates(candidates_path: Path) -> list[CandidateRecord]:
+    """Загрузить и структурно провалидировать кандидатов ``candidates.yaml``.
+
+    Слой кандидатов — отдельный файл (по умолчанию рядом с sources.yaml), наполняется
+    DISCOVERY-коннекторами; триаж читает и промоутит допущенных (см. ``promote_candidate``).
+    Пустой/новый файл -> пустой список.
+    """
+    raw: Any = yaml.safe_load(candidates_path.read_text(encoding="utf-8"))
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"{candidates_path}: верхний уровень должен быть списком кандидатов")
+    return [CandidateRecord.model_validate(item) for item in raw]
 
 
 def load_vocab(name: str, vocab_dir: Path = VOCAB_DIR) -> set[str]:

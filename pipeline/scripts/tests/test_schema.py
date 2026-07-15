@@ -1,6 +1,7 @@
 """Тесты pydantic-схемы записи sources.yaml и рендера frontmatter."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -10,11 +11,14 @@ from schema import (
     AcquisitionMethod,
     AssessedStage,
     Axis,
+    CandidateRecord,
+    ConnectorKind,
     Fidelity,
     Rights,
     Sensitivity,
     SourceRecord,
     TargetFit,
+    load_candidates,
     load_vocab,
     render_frontmatter,
 )
@@ -196,6 +200,83 @@ def test_triage_config_wellformed() -> None:
     data = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert isinstance(data, dict)
     assert isinstance(data["frontier_year"], int)
+
+
+def valid_candidate() -> dict[str, Any]:
+    """Минимально валидный CandidateRecord (только обязательные поля добычи)."""
+    return {
+        "connector_id": "agora",
+        "connector_kind": "registry",
+        "retrieved_at": "2026-07-15",
+        "source_ref": "zenodo:10.5281/zenodo.13883066#row-42",
+        "raw_hash": "deadbeef",
+    }
+
+
+def test_candidate_minimal() -> None:
+    cand = CandidateRecord.model_validate(valid_candidate())
+    assert cand.connector_kind == ConnectorKind.registry
+    assert cand.source_url is None  # best-effort библиография опускаема
+    assert cand.native_tags == []
+
+
+def test_candidate_permissive_extra_allowed() -> None:
+    data = valid_candidate()
+    data["some_connector_specific_field"] = {"nested": 1}
+    cand = CandidateRecord.model_validate(data)  # extra="allow" не падает
+    assert cand.connector_id == "agora"
+
+
+def test_candidate_full_bibliography() -> None:
+    data = valid_candidate()
+    data.update(
+        title="X",
+        issuer="Y",
+        source_url="https://example.org/a.pdf",
+        language="en",
+        rights="cc-by",
+        sensitivity="confidential",
+        native_tags=["risk", "governance"],
+    )
+    cand = CandidateRecord.model_validate(data)
+    assert cand.source_url == "https://example.org/a.pdf"
+    assert cand.rights == Rights.cc_by
+    assert cand.sensitivity == Sensitivity.confidential
+    assert cand.native_tags == ["risk", "governance"]
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [("connector_kind", "spider"), ("source_url", "ftp://x/y"), ("rights", "gpl")],
+)
+def test_candidate_bad_field_rejected(field: str, bad: str) -> None:
+    data = valid_candidate()
+    data[field] = bad
+    with pytest.raises(ValidationError):
+        CandidateRecord.model_validate(data)
+
+
+def test_candidate_missing_required_rejected() -> None:
+    data = valid_candidate()
+    del data["connector_id"]
+    with pytest.raises(ValidationError):
+        CandidateRecord.model_validate(data)
+
+
+def test_load_candidates(tmp_path: Path) -> None:
+    import yaml as _yaml
+
+    path = tmp_path / "candidates.yaml"
+    path.write_text(_yaml.safe_dump([valid_candidate()], allow_unicode=True), encoding="utf-8")
+    cands = load_candidates(path)
+    assert len(cands) == 1
+    assert cands[0].connector_id == "agora"
+
+
+def test_load_candidates_empty(tmp_path: Path) -> None:
+    path = tmp_path / "candidates.yaml"
+    path.write_text("# пусто\n", encoding="utf-8")
+    assert load_candidates(path) == []
 
 
 def test_load_real_vocab_nonempty() -> None:
