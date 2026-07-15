@@ -13,12 +13,15 @@ from acquisition import (
     AcquisitionBlocked,
     AcquisitionDead,
     AcquisitionOutcome,
+    ArchiveUnavailable,
     ClassifiedResponse,
     ManualAcquisitionConflict,
     ManualAcquisitionTimeout,
     acquire_manually,
     classify_response,
     fetch_and_classify,
+    fetch_from_archive,
+    find_wayback_snapshot,
     next_rung,
     persist_acquisition_state,
     run_ladder,
@@ -448,3 +451,71 @@ def test_acquire_manually_opens_browser_and_ingests(tmp_path: Path, monkeypatch:
     assert result.fidelity == schema.Fidelity.manual
     assert dest.exists()
     assert captured_cmd[0] == ["xdg-open", rec.source_url]
+
+
+# --- archive fallback через Wayback CDX (§8 спека) ---
+
+class _FakeCompletedProcess:
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+
+
+def test_find_wayback_snapshot_picks_freshest(monkeypatch: Any) -> None:
+    # CDX сортирует по timestamp по возрастанию -- последняя строка самая свежая.
+    cdx_output = (
+        "ae,gov,ai)/doc.pdf 20210802061657 https://ai.gov.ae/doc.pdf application/pdf 200 AAA 961300\n"
+        "ae,gov,ai)/doc.pdf 20220806004506 https://ai.gov.ae/doc.pdf application/pdf 200 BBB 8693182\n"
+    )
+
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
+        return _FakeCompletedProcess(cdx_output)
+
+    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    snapshot = find_wayback_snapshot("https://ai.gov.ae/doc.pdf")
+    assert snapshot is not None
+    assert snapshot.timestamp == "20220806004506"
+    assert snapshot.snapshot_url == "https://web.archive.org/web/20220806004506id_/https://ai.gov.ae/doc.pdf"
+
+
+def test_find_wayback_snapshot_none_when_empty(monkeypatch: Any) -> None:
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
+        return _FakeCompletedProcess("")
+
+    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    assert find_wayback_snapshot("https://example.org/gone.pdf") is None
+
+
+def test_fetch_from_archive_success(tmp_path: Path, monkeypatch: Any) -> None:
+    cdx_output = "urlkey 20220806004506 https://example.org/doc.pdf application/pdf 200 X 123\n"
+    monkeypatch.setattr(
+        "acquisition.subprocess.run",
+        lambda cmd, check, capture_output, text: _FakeCompletedProcess(cdx_output),
+    )
+    ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
+    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([ok]))
+
+    result = fetch_from_archive(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")
+
+    assert result.method == ARCHIVE
+    assert result.fidelity == schema.Fidelity.archived_snapshot
+    assert result.retrieved_snapshot_date == dt.date(2022, 8, 6)
+
+
+def test_fetch_from_archive_raises_when_no_snapshot(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "acquisition.subprocess.run", lambda cmd, check, capture_output, text: _FakeCompletedProcess("")
+    )
+    with pytest.raises(ArchiveUnavailable):
+        fetch_from_archive(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")
+
+
+def test_fetch_from_archive_raises_when_snapshot_invalid(tmp_path: Path, monkeypatch: Any) -> None:
+    cdx_output = "urlkey 20220806004506 https://example.org/doc.pdf application/pdf 200 X 123\n"
+    monkeypatch.setattr(
+        "acquisition.subprocess.run",
+        lambda cmd, check, capture_output, text: _FakeCompletedProcess(cdx_output),
+    )
+    blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
+    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    with pytest.raises(ArchiveUnavailable):
+        fetch_from_archive(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")

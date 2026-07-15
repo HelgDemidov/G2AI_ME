@@ -161,12 +161,18 @@ def _do_download(
         logger.info("  %s: %s", rec.id, exc)
         logger.info("  открываю в браузере и жду файл (папка: %s)…", watch_dir or acquisition.default_watch_dir())
         result = acquisition.acquire_manually(rec, part, watch_dir=watch_dir)
+    except acquisition.AcquisitionDead as exc:
+        # Архив автоматический — в отличие от manual, не требует --only/присутствия человека.
+        logger.info("  %s: %s", rec.id, exc)
+        logger.info("  ищу снимок в Wayback…")
+        result = acquisition.fetch_from_archive(rec, part, user_agent=USER_AGENT)
     if rec.sha256 and _sha256(part) != rec.sha256:
         raise RuntimeError(f"sha256 не совпал (ожидался {rec.sha256[:12]}…)")
     part.replace(raw)
     changed = acquisition.persist_acquisition_state(
         sources_path, rec.id,
         acquisition_method=result.method, fidelity=result.fidelity, checked=_dt.date.today(),
+        retrieved_snapshot_date=result.retrieved_snapshot_date,
     )
     if changed:
         summary = ", ".join(f"{k}: {old!r} -> {new!r}" for k, (old, new) in changed.items())
