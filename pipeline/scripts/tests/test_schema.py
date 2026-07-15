@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from schema import SourceRecord, load_vocab, render_frontmatter
+from schema import AcquisitionMethod, Fidelity, Sensitivity, SourceRecord, load_vocab, render_frontmatter
 
 
 def valid_record() -> dict[str, Any]:
@@ -55,6 +55,10 @@ def test_extra_field_forbidden() -> None:
         ("issuer_type", "ministry"),   # вне enum
         ("status", "done"),            # вне enum Status
         ("source_url", "ftp://x/y"),   # не http(s)
+        ("acquisition_method", "torrent"),  # вне enum AcquisitionMethod
+        ("fidelity", "trustme"),            # вне enum Fidelity
+        ("sensitivity", "top_secret"),       # вне enum Sensitivity
+        ("official_alt_url", "ftp://x/y"),   # не http(s)
     ],
 )
 def test_bad_field_rejected(field: str, bad: str) -> None:
@@ -78,6 +82,32 @@ def test_render_frontmatter() -> None:
     assert fm.rstrip().endswith("---")
     assert "id: sg-imda-mgf-agentic-2026" in fm
     assert "published: '2026-05-20'" in fm or "published: 2026-05-20" in fm
+
+
+def test_acquisition_fields_default() -> None:
+    """Обратная совместимость: запись без новых полей (как реальная запись SG) парсится."""
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.acquisition_method is None
+    assert rec.acquisition_checked is None
+    assert rec.fidelity is None
+    assert rec.retrieved_snapshot_date is None
+    assert rec.official_alt_url is None
+    assert rec.sensitivity == Sensitivity.normal
+
+
+def test_acquisition_fields_parse() -> None:
+    data = valid_record()
+    data["acquisition_method"] = "manual"
+    data["acquisition_checked"] = "2026-07-15"
+    data["fidelity"] = "archived_snapshot"
+    data["retrieved_snapshot_date"] = "2026-01-24"
+    data["official_alt_url"] = "https://example.org/alt.pdf"
+    data["sensitivity"] = "confidential"
+    rec = SourceRecord.model_validate(data)
+    assert rec.acquisition_method == AcquisitionMethod.manual
+    assert rec.fidelity == Fidelity.archived_snapshot
+    assert rec.sensitivity == Sensitivity.confidential
+    assert rec.official_alt_url == "https://example.org/alt.pdf"
 
 
 def test_load_real_vocab_nonempty() -> None:

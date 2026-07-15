@@ -60,6 +60,35 @@ class TranslationStatus(str, Enum):
     done = "done"
 
 
+class AcquisitionMethod(str, Enum):
+    """Последний-известный канал добычи байтов.
+
+    Подсказка, не жёсткий конфиг: оркестратор всё равно идёт по лестнице
+    ``direct -> official_alt -> manual -> archive`` (см. ``source-acquisition-ladder/spec.md``).
+    """
+
+    direct = "direct"
+    official_alt = "official_alt"
+    manual = "manual"
+    archive = "archive"
+
+
+class Fidelity(str, Enum):
+    """Честность добытых байтов относительно официального источника."""
+
+    live = "live"
+    rehost = "rehost"
+    manual = "manual"
+    archived_snapshot = "archived_snapshot"
+
+
+class Sensitivity(str, Enum):
+    """Чувствительность документа. Гейтит acquisition-лестницу: confidential -> archive недоступен."""
+
+    normal = "normal"
+    confidential = "confidential"
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -124,10 +153,16 @@ class SourceRecord(BaseModel):
     tech_basis: str | None = None
     # --- провенанс ---
     source_url: str = Field(pattern=r"^https?://")
+    official_alt_url: str | None = Field(default=None, pattern=r"^https?://")
     press_release_url: str | None = Field(default=None, pattern=r"^https?://")
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     raw_path: str | None = None
     md_path: str | None = None
+    acquisition_method: AcquisitionMethod | None = None
+    acquisition_checked: _dt.date | None = None
+    fidelity: Fidelity | None = None
+    retrieved_snapshot_date: _dt.date | None = None
+    sensitivity: Sensitivity = Sensitivity.normal
     # --- пайплайн ---
     status: Status
     translation_status: TranslationStatus = TranslationStatus.not_started
