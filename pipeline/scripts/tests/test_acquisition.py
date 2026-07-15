@@ -14,13 +14,29 @@ from acquisition import (
     AcquisitionDead,
     AcquisitionOutcome,
     ClassifiedResponse,
+    ManualAcquisitionConflict,
+    ManualAcquisitionTimeout,
+    acquire_manually,
     classify_response,
     fetch_and_classify,
     next_rung,
     persist_acquisition_state,
     run_ladder,
+    watch_and_ingest,
+    _looks_like_candidate_pdf,
 )
 from test_schema import valid_record
+
+# Минимальный PDF без точных xref-офсетов — pdfminer (движок pdfplumber) его
+# восстанавливает через фолбэк-скан по "obj"; проверено эмпирически перед тестами.
+MINIMAL_PDF = (
+    b"%PDF-1.4\n"
+    b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n"
+    b"trailer<</Size 4/Root 1 0 R>>\n"
+    b"%%EOF\n"
+)
 
 REAL_PDF_BODY = b"%PDF-1.6\n" + b"x" * 4000  # больше MIN_EXPECTED_PDF_SIZE
 
@@ -320,3 +336,115 @@ def test_persist_acquisition_state_atomic_on_dump_failure(tmp_path: Path, monkey
     # Главная гарантия атомарности: исходный файл не тронут при сбое сериализации
     # (возможный осиротевший .tmp — тот же паттерн, что у _do_convert/_do_frontmatter).
     assert sources_path.read_text(encoding="utf-8") == original
+
+
+# --- ручной watch-folder путь (§6 спека) ---
+
+def test_looks_like_candidate_pdf_accepts_valid(tmp_path: Path) -> None:
+    p = tmp_path / "real.pdf"
+    p.write_bytes(MINIMAL_PDF)
+    ok, reason = _looks_like_candidate_pdf(p)
+    assert ok is True
+    assert "стр" in reason
+
+
+def test_looks_like_candidate_pdf_rejects_non_pdf(tmp_path: Path) -> None:
+    p = tmp_path / "not_a_pdf.txt"
+    p.write_bytes(b"hello world, this is definitely not a PDF")
+    ok, reason = _looks_like_candidate_pdf(p)
+    assert ok is False
+    assert "%PDF" in reason
+
+
+def test_looks_like_candidate_pdf_rejects_corrupt(tmp_path: Path) -> None:
+    p = tmp_path / "corrupt.pdf"
+    p.write_bytes(b"%PDF-1.4\ngarbage garbage garbage, no real structure at all")
+    ok, reason = _looks_like_candidate_pdf(p)
+    assert ok is False
+
+
+def test_watch_and_ingest_picks_up_preexisting_file(tmp_path: Path) -> None:
+    """Резюмируемость: файл уже лежит в папке ДО первого вызова — первая же
+    итерация его находит, отдельного "начального скана" не требуется."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "real.pdf").write_bytes(MINIMAL_PDF)
+    dest = tmp_path / "dest.pdf"
+
+    result = watch_and_ingest(dest, watch_dir=watch_dir, now=lambda: 0.0, sleep=lambda s: None, timeout=1.0)
+
+    assert result == dest
+    assert dest.read_bytes() == MINIMAL_PDF
+    assert not (watch_dir / "real.pdf").exists()  # перенесён, не скопирован
+
+
+def test_watch_and_ingest_ignores_invalid_files(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "not_a_pdf.txt").write_bytes(b"hello world, not a pdf at all")
+    (watch_dir / "real.pdf").write_bytes(MINIMAL_PDF)
+    dest = tmp_path / "dest.pdf"
+
+    result = watch_and_ingest(dest, watch_dir=watch_dir, now=lambda: 0.0, sleep=lambda s: None, timeout=1.0)
+
+    assert result == dest
+    assert (watch_dir / "not_a_pdf.txt").exists()  # мусор не тронут, не принят как кандидат
+
+
+def test_watch_and_ingest_conflict_raises_and_moves_nothing(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "a.pdf").write_bytes(MINIMAL_PDF)
+    (watch_dir / "b.pdf").write_bytes(MINIMAL_PDF)
+    dest = tmp_path / "dest.pdf"
+
+    with pytest.raises(ManualAcquisitionConflict):
+        watch_and_ingest(dest, watch_dir=watch_dir, now=lambda: 0.0, sleep=lambda s: None, timeout=1.0)
+
+    assert not dest.exists()
+    assert (watch_dir / "a.pdf").exists()
+    assert (watch_dir / "b.pdf").exists()  # ни один не угадан/перенесён
+
+
+def test_watch_and_ingest_timeout_is_deterministic_no_real_sleep(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()  # пусто — ничего не появится
+    clock = {"t": 0.0}
+    sleep_calls: list[float] = []
+
+    def fake_now() -> float:
+        return clock["t"]
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock["t"] += seconds
+
+    with pytest.raises(ManualAcquisitionTimeout):
+        watch_and_ingest(
+            tmp_path / "dest.pdf", watch_dir=watch_dir,
+            now=fake_now, sleep=fake_sleep, poll_interval=1.0, timeout=5.0,
+        )
+    assert len(sleep_calls) == 5  # 5 "секунд" дедлайна — без единого реального time.sleep
+
+
+def test_acquire_manually_opens_browser_and_ingests(tmp_path: Path, monkeypatch: Any) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "real.pdf").write_bytes(MINIMAL_PDF)  # уже лежит — резюмируемость
+
+    captured_cmd: list[list[str]] = []
+
+    def fake_run(cmd: list[str], check: bool = False) -> Any:  # noqa: FBT002 — сигнатура subprocess.run
+        captured_cmd.append(cmd)
+        return None
+
+    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+
+    rec = _rec()
+    dest = tmp_path / "dest.pdf"
+    result = acquire_manually(rec, dest, watch_dir=watch_dir, timeout=1.0)
+
+    assert result.method == MANUAL
+    assert result.fidelity == schema.Fidelity.manual
+    assert dest.exists()
+    assert captured_cmd[0] == ["xdg-open", rec.source_url]

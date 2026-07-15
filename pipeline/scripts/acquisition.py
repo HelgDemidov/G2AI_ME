@@ -10,11 +10,14 @@ from __future__ import annotations
 import datetime as _dt
 import subprocess
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import pdfplumber
 from ruamel.yaml import YAML
 
 import schema
@@ -55,6 +58,14 @@ class AcquisitionDead(RuntimeError):
         self.url = url
         self.reason = reason
         super().__init__(f"archive acquisition needed for {url}: {reason}")
+
+
+class ManualAcquisitionTimeout(RuntimeError):
+    """No valid, unambiguous candidate appeared in the watch window before the deadline."""
+
+
+class ManualAcquisitionConflict(RuntimeError):
+    """More than one valid candidate appeared in the watch window — not guessing which is right."""
 
 
 # Challenge pages we've observed (ai.gov.ae/Cloudflare) are small HTML, well under this.
@@ -276,3 +287,106 @@ def persist_acquisition_state(
         yaml.dump(data, fh)
     tmp.replace(sources_path)
     return changed
+
+
+# --- manual watch-folder ingestion (§6 of the spec) ---
+DEFAULT_MANUAL_TIMEOUT_SECONDS = 300.0  # разумный запас на клик + докачку одного PDF
+DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+
+
+def default_watch_dir() -> Path:
+    """Системная папка загрузок пользователя, через ``xdg-user-dir DOWNLOAD``
+    (не хардкодить строку — локаль-зависима, см. §6: на этой машине она кириллическая).
+    """
+    try:
+        result = subprocess.run(
+            ["xdg-user-dir", "DOWNLOAD"], capture_output=True, text=True, check=True
+        )
+        resolved = result.stdout.strip()
+        if resolved:
+            return Path(resolved)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return Path.home() / "Downloads"  # разумный fallback без xdg-user-dir
+
+
+def _looks_like_candidate_pdf(path: Path) -> tuple[bool, str]:
+    """Дешёвая магия сначала (не читаем весь файл ради больших не-PDF в папке
+    загрузок), pdfplumber — только если магия совпала. Возвращает (валиден, причина).
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(8)
+    except OSError as exc:
+        return False, f"не удалось прочитать: {exc}"
+    if not head.startswith(b"%PDF"):
+        return False, "не PDF (нет магии %PDF)"
+    try:
+        with pdfplumber.open(path) as pdf:
+            n_pages = len(pdf.pages)
+    except Exception as exc:  # noqa: BLE001 — битый/недописанный PDF, не наш кандидат (пока)
+        return False, f"PDF повреждён или ещё не дописан: {exc}"
+    if n_pages < 1:
+        return False, "0 страниц"
+    return True, f"{n_pages} стр."
+
+
+def watch_and_ingest(
+    dest: Path,
+    *,
+    watch_dir: Path,
+    now: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    timeout: float = DEFAULT_MANUAL_TIMEOUT_SECONDS,
+) -> Path:
+    """Следить за ``watch_dir`` до появления ОДНОГО валидного PDF-кандидата, перенести
+    его в ``dest``. Первая же итерация — это и есть начальное сканирование уже
+    лежащих файлов (резюмируемость после прерванного прогона — §6), отдельного
+    "initial scan" шага не требуется по построению.
+
+    НЕ кеширует отказы кандидатов между итерациями: недописанный браузером файл
+    должен быть перепроверен на следующем цикле, а не забыт навсегда. Батч
+    (>1 валидных кандидатов одновременно) не разрешается угадыванием — конфликт.
+
+    ``now``/``sleep`` инжектируемы ради детерминированных тестов (без реального sleep).
+    """
+    deadline = now() + timeout
+    while True:
+        candidates = [
+            path
+            for path in sorted(watch_dir.iterdir())
+            if path.is_file() and _looks_like_candidate_pdf(path)[0]
+        ]
+        if len(candidates) > 1:
+            names = ", ".join(p.name for p in candidates)
+            raise ManualAcquisitionConflict(
+                f"{len(candidates)} валидных кандидата одновременно в {watch_dir}: {names} — разрешите вручную"
+            )
+        if len(candidates) == 1:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            candidates[0].replace(dest)
+            return dest
+        if now() >= deadline:
+            raise ManualAcquisitionTimeout(f"не дождался файла в {watch_dir} за {timeout:.0f}с")
+        sleep(poll_interval)
+
+
+def acquire_manually(
+    rec: schema.SourceRecord,
+    dest: Path,
+    *,
+    watch_dir: Path | None = None,
+    timeout: float = DEFAULT_MANUAL_TIMEOUT_SECONDS,
+) -> LadderResult:
+    """1-клик путь: открыть ``rec.source_url`` в браузере пользователя, дождаться
+    файла в watch-папке, перенести в ``dest``. Сбой ``xdg-open`` не фатален —
+    URL уже напечатан вызывающей стороной, пользователь может кликнуть сам.
+    """
+    subprocess.run(["xdg-open", rec.source_url], check=False)
+    watch_and_ingest(dest, watch_dir=watch_dir or default_watch_dir(), timeout=timeout)
+    return LadderResult(
+        schema.AcquisitionMethod.manual,
+        schema.Fidelity.manual,
+        ClassifiedResponse(AcquisitionOutcome.ok, None, "manual acquisition via watch-folder"),
+    )

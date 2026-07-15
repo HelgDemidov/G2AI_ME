@@ -118,13 +118,27 @@ def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) 
 
 
 # --- исполнители стадий (side-effect, атомарная запись) ---
-def _do_download(rec: schema.SourceRecord, root: Path, *, sources_path: Path, pause: float) -> None:
+def _do_download(
+    rec: schema.SourceRecord,
+    root: Path,
+    *,
+    sources_path: Path,
+    pause: float,
+    interactive: bool = False,
+    watch_dir: Path | None = None,
+) -> None:
     """Скачивание через acquisition-лестницу (direct -> official_alt; см. acquisition.py).
 
     Не резюмируется между попытками (без ``curl -C -``): переключение лестницы
     между разными URL на один и тот же файл сделало бы резюм небезопасным
     (докачка "не с того" ответа), а лестница и так не кеширует известный блок
     между прогонами (§5 спека) — каждая попытка полная и честная.
+
+    ``interactive`` (=есть ``--only``, решение №2 при реализации спека): если
+    лестница упирается в блок, единственный документ в прогоне — живая сессия
+    с пользователем, поэтому запускаем синхронный 1-клик watch-folder путь.
+    В батч-прогоне (``interactive=False``) блок просто репортится как отказ
+    документа — батч не прерывается (существующее поведение, ничего не меняли).
 
     После успеха точечно обновляет ``acquisition_method``/``acquisition_checked``/
     ``fidelity`` в ``sources.yaml`` (round-trip-safe, см. ``persist_acquisition_state``)
@@ -139,7 +153,14 @@ def _do_download(rec: schema.SourceRecord, root: Path, *, sources_path: Path, pa
         raise RuntimeError("curl не найден в PATH")
     raw.parent.mkdir(parents=True, exist_ok=True)
     part = raw.parent / (raw.name + ".part")  # атомарный (rename) staging-файл
-    result = acquisition.run_ladder(rec, part, user_agent=USER_AGENT)
+    try:
+        result = acquisition.run_ladder(rec, part, user_agent=USER_AGENT)
+    except acquisition.AcquisitionBlocked as exc:
+        if not interactive:
+            raise
+        logger.info("  %s: %s", rec.id, exc)
+        logger.info("  открываю в браузере и жду файл (папка: %s)…", watch_dir or acquisition.default_watch_dir())
+        result = acquisition.acquire_manually(rec, part, watch_dir=watch_dir)
     if rec.sha256 and _sha256(part) != rec.sha256:
         raise RuntimeError(f"sha256 не совпал (ожидался {rec.sha256[:12]}…)")
     part.replace(raw)
@@ -195,8 +216,15 @@ def process_docs(
     dry_run: bool,
     no_download: bool,
     pause: float,
+    interactive: bool = False,
+    watch_dir: Path | None = None,
 ) -> tuple[list[DocResult], bool]:
-    """Прогнать документы по стадиям. Возвращает результаты и флаг «что-то изменилось»."""
+    """Прогнать документы по стадиям. Возвращает результаты и флаг «что-то изменилось».
+
+    ``interactive`` включает синхронный 1-клик watch-folder путь для manual-блоков
+    (осмысленно только для одно-документных прогонов — ``main()`` включает его
+    именно тогда, когда задан ``--only``).
+    """
     results: list[DocResult] = []
     changed = False
     for rec in records:
@@ -214,7 +242,10 @@ def process_docs(
                     if no_download:
                         raise RuntimeError("нужен download, но задан --no-download (скачайте raw вручную)")
                     if not dry_run:
-                        _do_download(rec, root, sources_path=sources_path, pause=pause)
+                        _do_download(
+                            rec, root, sources_path=sources_path, pause=pause,
+                            interactive=interactive, watch_dir=watch_dir,
+                        )
                 elif stage is Stage.convert:
                     if not dry_run:
                         _do_convert(rec, root)
@@ -281,6 +312,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--embed", action="store_true", help="также пересобрать векторы (медленно)")
     parser.add_argument("--graphml", type=Path, default=None, help="экспортировать граф в GraphML")
     parser.add_argument("--pause", type=float, default=1.0, help="пауза между скачиваниями, сек")
+    parser.add_argument(
+        "--watch-dir", type=Path, default=None,
+        help="папка для ручного (manual) watch-folder пути; по умолчанию — системная папка загрузок",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -304,10 +339,13 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("документ с id %r не найден", args.only)
             return 2
 
+    # Синхронный manual watch-folder путь — только осмыслен для одно-документного
+    # прогона (--only): пользователь реально сидит и ждёт клика (§6 спека, решение №2).
     results, changed = process_docs(
         records, REPO_ROOT,
         sources_path=args.sources,
         force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
+        interactive=bool(args.only), watch_dir=args.watch_dir,
     )
 
     # корпусный индекс: пересобираем, если что-то изменилось / нет БД / --force
