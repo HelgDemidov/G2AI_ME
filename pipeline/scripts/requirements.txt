@@ -1,5 +1,0 @@
-pdfplumber==0.11.10
-
-# dev-инструменты (проверка scripts/*.py)
-mypy==2.3.0
-ruff==0.15.21

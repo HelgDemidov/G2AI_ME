@@ -1,0 +1,25 @@
+# Конфигурация dev-инструментов G2AI-пайплайна.
+# Код живёт в pipeline/scripts/; инструменты запускаются ИЗ КОРНЯ репозитория.
+# pythonpath/mypy_path подставляют pipeline/scripts в путь поиска модулей,
+# поэтому sibling-импорты (`from schema import ...`) резолвятся без conftest-хаков.
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+strict = true
+mypy_path = "pipeline/scripts"
+explicit_package_bases = true
+
+# networkx/tokenizers/onnxruntime не поставляют полноценные типы -> не флагать как «нет стабов».
+[[tool.mypy.overrides]]
+module = ["networkx.*", "tokenizers.*", "onnxruntime.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.pytest.ini_options]
+pythonpath = ["pipeline/scripts"]
+testpaths = ["pipeline/scripts/tests"]
+markers = [
+    "model: тест требует локально скачанную модель bge-m3 (в CI пропускается: -m 'not model')",
+]

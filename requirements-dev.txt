@@ -1,0 +1,11 @@
+# Dev/CI-инструменты (проверки pipeline/scripts/*.py).
+# Установка:  uv pip install -r requirements-dev.txt
+# Проверки (ИЗ КОРНЯ репозитория; конфиг — pyproject.toml):
+#   .venv/bin/ruff check pipeline/scripts
+#   .venv/bin/python -m mypy pipeline/scripts/schema.py pipeline/scripts/validate_sources.py
+#   .venv/bin/python -m pytest
+-r requirements.txt
+mypy==2.3.0
+ruff==0.15.21
+pytest==9.1.1
+types-PyYAML==6.0.12.20260518
