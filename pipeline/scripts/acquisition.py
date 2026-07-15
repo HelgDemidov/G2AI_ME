@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pdfplumber
 from ruamel.yaml import YAML
@@ -193,6 +194,7 @@ class LadderResult:
     method: schema.AcquisitionMethod
     fidelity: schema.Fidelity
     classified: ClassifiedResponse
+    retrieved_snapshot_date: _dt.date | None = None  # заполняется только archive-путём
 
 
 def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> LadderResult:
@@ -389,4 +391,65 @@ def acquire_manually(
         schema.AcquisitionMethod.manual,
         schema.Fidelity.manual,
         ClassifiedResponse(AcquisitionOutcome.ok, None, "manual acquisition via watch-folder"),
+    )
+
+
+# --- archive fallback via Wayback CDX (§8 of the spec — only for confirmed-dead URLs) ---
+WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
+
+
+class ArchiveUnavailable(RuntimeError):
+    """No usable Wayback snapshot exists for source_url — the document is genuinely gone,
+    not just from the official host. A real, reportable terminal outcome (§8: the last
+    rung of the ladder), not a bug.
+    """
+
+
+@dataclass
+class ArchiveSnapshot:
+    timestamp: str  # YYYYMMDDHHMMSS (Wayback's format)
+    snapshot_url: str  # .../web/<timestamp>id_/<original> — "id_" = raw bytes, no Wayback toolbar
+
+
+def find_wayback_snapshot(original_url: str, *, timeout: int = 30) -> ArchiveSnapshot | None:
+    """CDX lookup for the freshest 200/application-pdf snapshot of ``original_url``.
+
+    Returns ``None`` if none found. CDX sorts by timestamp ascending, so the
+    last line is the freshest snapshot — a closer match to the document's
+    final official content than an old one (still not a fidelity guarantee,
+    see spec §7 — the record's ``fidelity`` is set to ``archived_snapshot``,
+    never ``live``, regardless).
+    """
+    query = (
+        f"{WAYBACK_CDX_URL}?url={quote(original_url, safe='')}"
+        "&output=text&filter=statuscode:200&filter=mimetype:application/pdf&limit=20"
+    )
+    result = subprocess.run(
+        ["curl", "-sS", "--connect-timeout", str(timeout), query],
+        check=True, capture_output=True, text=True,
+    )
+    lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    # CDX text format: <urlkey> <timestamp> <original> <mimetype> <statuscode> <digest> <length>
+    timestamp = lines[-1].split()[1]
+    return ArchiveSnapshot(timestamp, f"https://web.archive.org/web/{timestamp}id_/{original_url}")
+
+
+def fetch_from_archive(rec: schema.SourceRecord, dest: Path, *, user_agent: str, timeout: int = 30) -> LadderResult:
+    """Last rung of the ladder: only ever reached for a confirmed-dead source_url
+    (never for a block — see §2/§9; sensitivity=confidential never reaches here,
+    ``next_rung`` routes those to manual instead).
+    """
+    snapshot = find_wayback_snapshot(rec.source_url, timeout=timeout)
+    if snapshot is None:
+        raise ArchiveUnavailable(f"нет снимка Wayback для {rec.source_url}")
+    classified = fetch_and_classify(snapshot.snapshot_url, dest, user_agent=user_agent, timeout=timeout)
+    if classified.outcome is not AcquisitionOutcome.ok:
+        raise ArchiveUnavailable(
+            f"снимок {snapshot.snapshot_url} не является валидным PDF: {classified.reason}"
+        )
+    snapshot_date = _dt.datetime.strptime(snapshot.timestamp[:8], "%Y%m%d").date()
+    return LadderResult(
+        schema.AcquisitionMethod.archive, schema.Fidelity.archived_snapshot, classified, snapshot_date
     )
