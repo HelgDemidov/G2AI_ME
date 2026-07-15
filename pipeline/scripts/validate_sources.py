@@ -2,7 +2,9 @@
 
 Проверяет: (1) структуру каждой записи через pydantic-схему; (2) принадлежность
 ``doc_type``/``authority``/``topics``/``g2ai_pattern`` контролируемым словарям;
-(3) уникальность ``id``; (4) ссылочную целостность ``relations`` (цель — существующий id).
+(3) уникальность ``id``; (4) ссылочную целостность ``relations`` (цель — существующий id);
+(5) наличие ``relevance`` (все записи sources.yaml — допущенные триажем; см.
+source-relevance-triage).
 
 Возвращает ненулевой код при ошибках — пригодно для pre-commit и CI.
 Запуск::
@@ -64,6 +66,12 @@ def validate_sources(sources_path: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
         for pattern in rec.g2ai_pattern:
             if pattern not in vocabs["g2ai_pattern"]:
                 errors.append(f"запись '{rec.id}': g2ai_pattern '{pattern}' вне словаря")
+
+        if rec.relevance is None:
+            errors.append(
+                f"запись '{rec.id}': отсутствует relevance "
+                "(обязателен для допущенной записи sources.yaml — прошла триаж)"
+            )
 
         records.append(rec)
 
