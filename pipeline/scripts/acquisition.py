@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import schema
+
 
 class AcquisitionOutcome(str, Enum):
     """Result of classifying a single download attempt."""
@@ -30,11 +32,25 @@ class ClassifiedResponse:
 
 
 class AcquisitionBlocked(RuntimeError):
-    """A direct/official_alt attempt hit a WAF/challenge signature (see §3 of the spec)."""
+    """The ladder's automatic rungs (direct/official_alt) are exhausted by a WAF
+    block (see §3/§4 of the spec) — manual acquisition is needed.
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        self.url = url
+        self.reason = reason
+        super().__init__(f"manual acquisition needed for {url}: {reason}")
 
 
 class AcquisitionDead(RuntimeError):
-    """A direct/official_alt attempt confirmed the URL no longer resolves (404/410)."""
+    """``source_url`` is confirmed gone (404/410) — archive fallback is needed,
+    or manual if the record is ``sensitivity: confidential`` (§9, archive unavailable).
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        self.url = url
+        self.reason = reason
+        super().__init__(f"archive acquisition needed for {url}: {reason}")
 
 
 # Challenge pages we've observed (ai.gov.ae/Cloudflare) are small HTML, well under this.
@@ -122,3 +138,79 @@ def fetch_and_classify(
         return classify_response(body, headers_text)
     finally:
         headers_path.unlink(missing_ok=True)
+
+
+# --- ladder routing (§2/§4/§9 of the spec) ---
+_FIDELITY_BY_AUTOMATIC_RUNG = {
+    schema.AcquisitionMethod.direct: schema.Fidelity.live,
+    schema.AcquisitionMethod.official_alt: schema.Fidelity.rehost,
+}
+
+
+def next_rung(
+    outcome: AcquisitionOutcome,
+    rung: schema.AcquisitionMethod,
+    *,
+    has_official_alt: bool,
+    sensitivity: schema.Sensitivity,
+) -> schema.AcquisitionMethod | None:
+    """Given the outcome of attempting ``rung``, decide the next ladder rung.
+
+    Returns ``None`` if ``rung`` succeeded. See spec §2 (block -> manual is
+    terminal for "alive but blocked"; dead -> archive is terminal for "gone"),
+    §4 (official_alt is a block-bypass tried once, right after direct), and
+    §9 (confidential records never reach archive, even when dead).
+    """
+    if outcome is AcquisitionOutcome.ok:
+        return None
+    if outcome is AcquisitionOutcome.dead:
+        if sensitivity is schema.Sensitivity.confidential:
+            return schema.AcquisitionMethod.manual
+        return schema.AcquisitionMethod.archive
+    # blocked
+    if rung is schema.AcquisitionMethod.direct and has_official_alt:
+        return schema.AcquisitionMethod.official_alt
+    return schema.AcquisitionMethod.manual
+
+
+@dataclass
+class LadderResult:
+    method: schema.AcquisitionMethod
+    fidelity: schema.Fidelity
+    classified: ClassifiedResponse
+
+
+def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> LadderResult:
+    """Automatic portion of the ladder: try ``direct``, then ``official_alt`` once
+    if blocked and available. Always starts fresh from ``direct`` — the ladder
+    deliberately does not cache "known blocked" across runs in this version
+    (§5: WAF state can flip either way; curl's own ``--retry`` already avoids
+    hammering a *transient* failure, and a block/dead classification is a
+    single-shot signal, not something curl retries internally).
+
+    Raises ``AcquisitionBlocked`` when manual acquisition is needed, or
+    ``AcquisitionDead`` when archive fallback is needed. Does not itself
+    perform manual/archive acquisition or persist anything to ``sources.yaml``
+    — those are the caller's job (see run_pipeline.py and commits 4/5/6).
+    """
+    has_alt = bool(rec.official_alt_url)
+    rung = schema.AcquisitionMethod.direct
+    classified = fetch_and_classify(rec.source_url, dest, user_agent=user_agent)
+
+    while True:
+        nxt = next_rung(classified.outcome, rung, has_official_alt=has_alt, sensitivity=rec.sensitivity)
+        if nxt is None:
+            return LadderResult(rung, _FIDELITY_BY_AUTOMATIC_RUNG[rung], classified)
+        if nxt is schema.AcquisitionMethod.official_alt:
+            assert rec.official_alt_url is not None  # has_alt guarantees this
+            rung = nxt
+            classified = fetch_and_classify(rec.official_alt_url, dest, user_agent=user_agent)
+            continue
+        if nxt is schema.AcquisitionMethod.manual:
+            if classified.outcome is AcquisitionOutcome.dead:
+                raise AcquisitionBlocked(
+                    rec.source_url,
+                    f"{rung.value} confirmed dead ({classified.reason}) but sensitivity=confidential — archive unavailable",
+                )
+            raise AcquisitionBlocked(rec.source_url, f"{rung.value} blocked ({classified.reason})")
+        raise AcquisitionDead(rec.source_url, f"{rung.value} confirmed dead ({classified.reason})")

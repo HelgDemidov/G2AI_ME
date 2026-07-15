@@ -25,12 +25,12 @@ import argparse
 import hashlib
 import logging
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+import acquisition
 import build_graph
 import corpus_index
 import schema
@@ -118,24 +118,27 @@ def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) 
 
 # --- исполнители стадий (side-effect, атомарная запись) ---
 def _do_download(rec: schema.SourceRecord, root: Path, *, pause: float) -> None:
+    """Скачивание через acquisition-лестницу (direct -> official_alt; см. acquisition.py).
+
+    Не резюмируется между попытками (без ``curl -C -``): переключение лестницы
+    между разными URL на один и тот же файл сделало бы резюм небезопасным
+    (докачка "не с того" ответа), а лестница и так не кеширует известный блок
+    между прогонами (§5 спека) — каждая попытка полная и честная.
+    """
     raw = _raw_file(rec, root)
     if raw is None:
         raise RuntimeError("нет raw_path в записи")
     if not rec.source_url:
         raise RuntimeError("нет source_url для скачивания")
-    curl = shutil.which("curl")
-    if curl is None:
+    if shutil.which("curl") is None:
         raise RuntimeError("curl не найден в PATH")
     raw.parent.mkdir(parents=True, exist_ok=True)
-    part = raw.parent / (raw.name + ".part")  # докачиваемый (curl -C -) и атомарный (rename)
-    cmd = [
-        curl, "-fL", "--retry", "3", "--retry-delay", "2", "-C", "-",
-        "--connect-timeout", "30", "-A", USER_AGENT, "-o", str(part), rec.source_url,
-    ]
-    subprocess.run(cmd, check=True)
+    part = raw.parent / (raw.name + ".part")  # атомарный (rename) staging-файл
+    result = acquisition.run_ladder(rec, part, user_agent=USER_AGENT)
     if rec.sha256 and _sha256(part) != rec.sha256:
         raise RuntimeError(f"sha256 не совпал (ожидался {rec.sha256[:12]}…)")
     part.replace(raw)
+    logger.info("  добыто %s: метод=%s fidelity=%s", rec.id, result.method.value, result.fidelity.value)
     if pause > 0:
         time.sleep(pause)
 
