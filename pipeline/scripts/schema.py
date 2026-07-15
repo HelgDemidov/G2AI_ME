@@ -106,6 +106,28 @@ class Rights(str, Enum):
     all_rights_reserved = "all_rights_reserved"
 
 
+class TargetFit(str, Enum):
+    """Тир целевого соответствия документа оси анализа (source-relevance-triage §2.2)."""
+
+    primary = "primary"
+    context = "context"
+    background = "background"
+
+
+class Axis(str, Enum):
+    """Ось оценки target_fit (§2.3): узкая агентная vs широкий цифровой суверенитет."""
+
+    agentic_g2ai = "agentic_g2ai"
+    digital_sovereignty = "digital_sovereignty"
+
+
+class AssessedStage(str, Enum):
+    """Докуда дошла оценка: дешёвый триаж по метаданным vs подтверждение по тексту."""
+
+    triage = "triage"
+    confirmed = "confirmed"
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -141,6 +163,18 @@ class Dates(BaseModel):
     last_checked: _dt.date | None = None  # свежесть: когда последний раз перепроверяли источник
 
 
+class Relevance(BaseModel):
+    """Вердикт триажа релевантности (source-relevance-triage). Присваивает ТОЛЬКО триаж."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_fit: TargetFit
+    axis: Axis
+    assessed_stage: AssessedStage
+    rationale: str = Field(min_length=1)
+    assessed_date: _dt.date
+
+
 class SourceRecord(BaseModel):
     """Одна запись реестра первоисточников (один документ корпуса)."""
 
@@ -168,6 +202,9 @@ class SourceRecord(BaseModel):
     # --- аналитика ---
     summary: str | None = None
     tech_basis: str | None = None
+    # --- релевантность/актуальность (source-relevance-triage) ---
+    relevance: Relevance | None = None  # обязательность в sources.yaml — правило validate_sources
+    in_force: bool | None = None  # действует ли «живой» документ (взвешивание свежести)
     # --- провенанс ---
     source_url: str = Field(pattern=r"^https?://")
     official_alt_url: str | None = Field(default=None, pattern=r"^https?://")

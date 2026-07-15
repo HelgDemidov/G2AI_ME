@@ -8,10 +8,13 @@ from pydantic import ValidationError
 
 from schema import (
     AcquisitionMethod,
+    AssessedStage,
+    Axis,
     Fidelity,
     Rights,
     Sensitivity,
     SourceRecord,
+    TargetFit,
     load_vocab,
     render_frontmatter,
 )
@@ -34,6 +37,13 @@ def valid_record() -> dict[str, Any]:
         "topics": ["ai-governance", "agentic-ai"],
         "g2ai_pattern": ["agent-governance-framework"],
         "source_url": "https://example.org/doc.pdf",
+        "relevance": {
+            "target_fit": "primary",
+            "axis": "agentic_g2ai",
+            "assessed_stage": "confirmed",
+            "rationale": "эталонный агентный G2AI-документ",
+            "assessed_date": "2026-07-15",
+        },
         "status": "verified",
     }
 
@@ -130,6 +140,62 @@ def test_rights_parse() -> None:
     data["rights"] = "cc-by"
     rec = SourceRecord.model_validate(data)
     assert rec.rights == Rights.cc_by
+
+
+def test_relevance_parse() -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.relevance is not None
+    assert rec.relevance.target_fit == TargetFit.primary
+    assert rec.relevance.axis == Axis.agentic_g2ai
+    assert rec.relevance.assessed_stage == AssessedStage.confirmed
+
+
+def test_relevance_default_none() -> None:
+    """Обратная совместимость: запись без relevance парсится (Optional на pydantic-уровне)."""
+    data = valid_record()
+    del data["relevance"]
+    rec = SourceRecord.model_validate(data)
+    assert rec.relevance is None
+    assert rec.in_force is None
+
+
+@pytest.mark.parametrize("drop", ["rationale", "assessed_date"])
+def test_relevance_missing_required_rejected(drop: str) -> None:
+    data = valid_record()
+    del data["relevance"][drop]
+    with pytest.raises(ValidationError):
+        SourceRecord.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [("target_fit", "core"), ("axis", "economy"), ("assessed_stage", "final")],
+)
+def test_relevance_bad_enum_rejected(field: str, bad: str) -> None:
+    data = valid_record()
+    data["relevance"][field] = bad
+    with pytest.raises(ValidationError):
+        SourceRecord.model_validate(data)
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_in_force_parse(value: bool | None) -> None:
+    data = valid_record()
+    data["in_force"] = value
+    rec = SourceRecord.model_validate(data)
+    assert rec.in_force is value
+
+
+def test_triage_config_wellformed() -> None:
+    """pipeline/config/triage.yaml — валидный YAML с целочисленным frontier_year."""
+    import yaml as _yaml
+
+    from schema import VOCAB_DIR
+
+    config_path = VOCAB_DIR.parent / "config" / "triage.yaml"
+    data = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+    assert isinstance(data["frontier_year"], int)
 
 
 def test_load_real_vocab_nonempty() -> None:
