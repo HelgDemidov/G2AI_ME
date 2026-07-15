@@ -1,0 +1,20 @@
+# Python
+pipeline/scripts/.venv/
+pipeline/scripts/__pycache__/
+pipeline/scripts/.mypy_cache/
+pipeline/scripts/.ruff_cache/
+*.pyc
+
+# Локальные ML-модели (эмбеддинги и т.п.) — тяжёлые, качаются отдельно, не в git
+/pipeline/models/
+
+# OS / editor
+.DS_Store
+
+# Не публикуемые в этом репо материалы
+/intl_xperience/countries/
+/agenda/vision_and_plan.md
+# внутренняя кухня: проектные анализы и планы, локально
+/pipeline/setup/
+# внутренняя кухня: кастомные команды/настройки Claude Code, локально
+/.claude/
