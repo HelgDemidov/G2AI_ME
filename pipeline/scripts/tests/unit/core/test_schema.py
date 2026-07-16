@@ -22,6 +22,7 @@ from core.schema import (
     Relevance,
     Rights,
     Sensitivity,
+    SourceFormat,
     SourceRecord,
     TargetFit,
     Track,
@@ -113,6 +114,26 @@ def test_curated_provenance_fields() -> None:
     rec2 = SourceRecord.model_validate(data)
     assert rec2.official_alt_url == "https://example.org/alt.pdf"
     assert rec2.sensitivity == Sensitivity.confidential
+
+
+def test_source_format_default_pdf() -> None:
+    """Обратная совместимость: существующие meta.yaml без source_format остаются валидными."""
+    rec = SourceRecord.model_validate(valid_record())
+    assert rec.source_format == SourceFormat.pdf
+
+
+def test_source_format_html_parse() -> None:
+    data = valid_record()
+    data["source_format"] = "html"
+    rec = SourceRecord.model_validate(data)
+    assert rec.source_format == SourceFormat.html
+
+
+def test_source_format_bad_rejected() -> None:
+    data = valid_record()
+    data["source_format"] = "docx"  # ещё не в enum
+    with pytest.raises(ValidationError):
+        SourceRecord.model_validate(data)
 
 
 def test_rights_default() -> None:
@@ -304,6 +325,26 @@ def test_promote_candidate_success() -> None:
     assert rec.rights == Rights.cc_by  # перенесён с кандидата
     assert rec.sensitivity == Sensitivity.confidential
     assert rec.relevance is not None and rec.relevance.target_fit == TargetFit.primary
+    assert rec.source_format == SourceFormat.pdf  # дефолт, если не передан явно
+
+
+def test_promote_candidate_source_format_passthrough() -> None:
+    data = valid_candidate()
+    data.update(title="Doc", issuer="EU", language="en", source_url="https://ex.org/d.html")
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="eu-doc-2024",
+        entity_id="eu",
+        track=Track.intl_xperience,
+        issuer_type=IssuerType.igo,
+        geo_scope=GeoScope.regional,
+        doc_type="legislation",
+        authority="binding_law",
+        relevance=_relevance(),
+        source_format=SourceFormat.html,
+    )
+    assert rec.source_format == SourceFormat.html
 
 
 def test_promote_candidate_missing_source_url_raises() -> None:

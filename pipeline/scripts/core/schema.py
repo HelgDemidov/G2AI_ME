@@ -60,6 +60,14 @@ class Track(str, Enum):
     montenegro = "montenegro"
 
 
+class SourceFormat(str, Enum):
+    """Формат первоисточника: диктует расширение ``raw.*``, классификацию добычи и конвертер
+    (чартер ``convert/architecture.md`` §3.2)."""
+
+    pdf = "pdf"
+    html = "html"
+
+
 class TranslationStatus(str, Enum):
     """Статус перевода (RU/ME — вторая фаза)."""
 
@@ -248,6 +256,7 @@ class SourceRecord(BaseModel):
     authority: str = Field(min_length=1)     # словарь — validate_sources.py
     source_url: str = Field(pattern=r"^https?://")            # официальный первоисточник
     official_alt_url: str | None = Field(default=None, pattern=r"^https?://")  # вход ладдера
+    source_format: SourceFormat = SourceFormat.pdf  # расширение raw.*, классификация добычи, конвертер
     sensitivity: Sensitivity = Sensitivity.normal            # гейтит archive-ступень ладдера
     rights: Rights = Rights.unknown
     # --- аналитика (минимум, контент — EN) ---
@@ -415,6 +424,7 @@ def promote_candidate(
     doc_type: str,
     authority: str,
     relevance: Relevance,
+    source_format: SourceFormat = SourceFormat.pdf,
 ) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
@@ -457,6 +467,7 @@ def promote_candidate(
         doc_type=doc_type,
         authority=authority,
         source_url=source_url,
+        source_format=source_format,
         rights=cand.rights or Rights.unknown,
         sensitivity=cand.sensitivity or Sensitivity.normal,
         relevance=relevance,
