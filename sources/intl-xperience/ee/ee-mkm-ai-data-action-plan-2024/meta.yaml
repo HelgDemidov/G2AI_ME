@@ -1,0 +1,36 @@
+# Курируемая запись документа (corpus-layout-v2). Человек — источник истины.
+# Операционное состояние — .state.yaml (локально); оригинал — raw.pdf; конвертация — doc.md.
+id: ee-mkm-ai-data-action-plan-2024
+entity_id: ee
+track: intl-xperience
+title: Tehisintellekti tegevuskava 2024–2026
+issuer: Majandus- ja Kommunikatsiooniministeerium
+issuer_type: government
+geo_scope: national
+language: et
+dates:
+  published: 2024-02-08
+doc_type: national_strategy
+authority: soft_law
+source_url: https://www.mkm.ee/media/10157/download
+sensitivity: normal
+rights: unknown
+topics:
+  - ai-governance
+  - data-governance
+  - public-sector-ai
+  - language-technology
+g2ai_pattern: []
+summary: >-
+  Estonia's national AI and data action plan 2024-2026 (Ministry of Economic
+  Affairs and Communications): AI adoption across the public sector and economy,
+  data governance, language technology, and EU alignment.
+relevance:
+  target_fit: context
+  axis: digital_sovereignty
+  assessed_stage: triage
+  rationale: >-
+    Pre-frontier (2024) national AI/data adoption plan; context on the
+    digital_sovereignty axis (X-Road / data governance / language tech), not
+    agentic-primary (freshness signal: 2024 < frontier_year 2025).
+  assessed_date: 2026-07-15
