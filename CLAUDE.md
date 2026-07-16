@@ -15,7 +15,16 @@ sources/{track}/{entity}/{doc-id}/      # ПАПКА-НА-ДОКУМЕНТ (corp
 #   └─ raw.pdf / doc.md / .state.yaml — оригинал / конвертация / операц.состояние (sha256/acquisition); НЕ в git
 sources/candidates.yaml             # слой кандидатов (CandidateRecord) ДО допуска триажем (НЕ в git)
 sources/temporary/small_states_v01.md  # seed-список (сырой вход discovery-manual, не источник истины; локально, НЕ трекается — под deny-default /sources/**)
-pipeline/scripts/*.py               # код пайплайна (см. «Слой знаний» ниже): pdf_to_markdown (PDF→MD); schema/validate_sources (метаданные); build_graph (граф); chunking/corpus_index (FTS5); embed/vector_store/bge_tokenizer (семантика); ab_eval (A/B); acquisition (WAF-лестница добычи); run_pipeline (оркестратор); fsio (единая staging/atomic-write политика, PR #6/#8); env
+pipeline/scripts/                   # код пайплайна СЛОЕВЫМИ ПОДПАКЕТАМИ (repo-layout, 2026-07-16; см. «Слой знаний» ниже):
+#   ├─ core/     — schema/validate_sources (метаданные), fsio (staging/atomic-write), env (REPO_ROOT/.env)
+#   ├─ acquire/  — acquisition (WAF-лестница добычи)
+#   ├─ convert/  — pdf_to_markdown (PDF→MD; сюда же лягут converters/pdf_graphics из convert-спеков)
+#   ├─ index/    — chunking/corpus_index (FTS5), embed/vector_store/bge_tokenizer (семантика), ab_eval (A/B)
+#   ├─ graph/    — build_graph (граф)
+#   ├─ run_pipeline.py — оркестратор (верхний уровень, сшивает слои)
+#   ├─ validate_sources.py, corpus_index.py, vector_store.py, ab_eval.py, build_graph.py, pdf_to_markdown.py
+#   │    — тонкие CLI-ШИМЫ для обратной совместимости команд (НЕ импортировать: библиотека — в пакетах)
+#   └─ tests/    — unit/<слой>/ (герметичные) + integration/ (@model/@corpus/@ocr — внешние ресурсы) + support.py (общие фабрики)
 pipeline/vocab/*.yaml               # контролируемые словари: doc_type/authority/topics/g2ai_pattern + jurisdictions (членство в блоках)
 pipeline/config/triage.yaml         # тюнинг-параметры триажа релевантности (frontier_year); ТРЕКАЕТСЯ, правится вручную
 requirements.txt, requirements-dev.txt, pyproject.toml  # зависимости (runtime/dev) и конфиг инструментов — в КОРНЕ репо
@@ -25,7 +34,7 @@ agenda/vision_and_plan.md  # широкое видение цифрового с
 ```
 **`.gitignore` под `/sources/` — deny-by-default:** игнорируется всё (документы `raw.*`/`doc.md`/`.state.yaml`, `candidates.yaml`), КРОМЕ `meta.yaml` — курируемая мета (библиография/аналитика, не тела документов) версионируется в git, а сами документы (потенциально авторское право, см. «Статус» ниже) остаются локально. `agenda/vision_and_plan.md` и `pipeline/setup/` — тоже gitignored.
 
-`.venv/` в КОРНЕ репо — локальный venv через `uv` (в `.gitignore`, не коммитится; venv непереносим — не копировать, а пересоздавать: `uv venv .venv && uv pip install -r requirements-dev.txt`; классический `source .venv/bin/activate` у uv-venv может не работать — вызывать бинарники как `.venv/bin/…`). Конфиг инструментов — `pyproject.toml` (mypy/ruff/pytest; `pythonpath`/`mypy_path` указывают на `pipeline/scripts`, поэтому проверки запускаются ИЗ КОРНЯ, кеши тоже оседают в корне). Проверки перед коммитом изменений в `pipeline/scripts/*.py` (из корня, те же, что в CI): `.venv/bin/ruff check pipeline/scripts && .venv/bin/python -m mypy pipeline/scripts/*.py && .venv/bin/python -m pytest && .venv/bin/python pipeline/scripts/validate_sources.py` (в CI — `pytest -m "not model"`, т.к. модели там нет; `validate_sources.py` — 4-й шаг CI с PR #5).
+`.venv/` в КОРНЕ репо — локальный venv через `uv` (в `.gitignore`, не коммитится; venv непереносим — не копировать, а пересоздавать: `uv venv .venv && uv pip install -r requirements-dev.txt`; классический `source .venv/bin/activate` у uv-venv может не работать — вызывать бинарники как `.venv/bin/…`). Конфиг инструментов — `pyproject.toml` (mypy/ruff/pytest; `pythonpath`/`mypy_path` указывают на `pipeline/scripts`, поэтому проверки запускаются ИЗ КОРНЯ, кеши тоже оседают в корне). Проверки перед коммитом изменений в коде пайплайна (из корня, те же, что в CI): `.venv/bin/ruff check pipeline/scripts && .venv/bin/python -m mypy pipeline/scripts && .venv/bin/python -m pytest && .venv/bin/python pipeline/scripts/validate_sources.py` (в CI — `pytest -m "not model"`, т.к. модели там нет; `validate_sources.py` — 4-й шаг CI с PR #5). mypy — РЕКУРСИВНО по каталогу (с repo-layout 2026-07-16 проверяются и подпакеты, и тесты; прежний file-glob `pipeline/scripts/*.py` тесты не видел вовсе).
 
 ## Пайплайн сбора документов
 1. **Discovery + триаж релевантности (ДО добычи)** — WebSearch: найти реальный документ/издателя/дату (seed-список `small_states_v01.md` НЕнадёжен — реальные кейсы: фиктивные заголовки ОАЭ и Эстонии) и оценить релевантность. Кандидат заводится в `sources/candidates.yaml` (`CandidateRecord`); допущенный триажем промоутится в курируемый `meta.yaml` папки-документа через `schema.promote_candidate()`. НЕ WebFetch для тела документа — прогоняет через маленькую модель, не verbatim; годится только для метаданных.
@@ -50,7 +59,7 @@ agenda/vision_and_plan.md  # широкое видение цифрового с
 
 Модель bge-m3 (~543 МБ) качается отдельно в `pipeline/models/bge-m3-onnx-int8/` (int8 ONNX, команды — в проектном плане). Тесты, зависящие от модели, помечены `@pytest.mark.model` и в CI пропускаются (`-m "not model"`). Векторы разных моделей несравнимы — на корпусе живёт одна модель за раз.
 
-## `pipeline/scripts/pdf_to_markdown.py` — как устроен и его реальные ограничения
+## `pipeline/scripts/convert/pdf_to_markdown.py` — как устроен и его реальные ограничения
 Полностью автоматический конвертер PDF→Markdown на `pdfplumber` (MIT, pure Python, CPU-only, ~70MB venv — сознательно НЕ marker-pdf/datalab-to, см. ниже почему). Механизмы:
 - **Восстановление порядка чтения в многоколоночной вёрстке** — geometric gap-анализ по bounding-box словам (проекция покрытия по x, поиск устойчивого по высоте разрыва в центральной трети страницы), а не regex-эвристика поверх готового текста.
 - **Иерархия заголовков** — по кластерам font-size конкретного документа (пересчитывается заново для каждого PDF из его собственной гистограммы), НЕ по regex на нумерации "1.1.1" — работает и для документов без явной нумерации разделов.

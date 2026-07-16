@@ -11,11 +11,11 @@ from typing import Any
 
 import pytest
 
-import acquisition
-import corpus_index
-import schema
-from acquisition import AcquisitionOutcome, ClassifiedResponse
-import fsio
+from acquire import acquisition
+from index import corpus_index
+from core import schema
+from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
+from core import fsio
 from run_pipeline import (
     Stage,
     _adopt_untracked_raw,
@@ -30,8 +30,8 @@ from run_pipeline import (
     process_docs,
     rebuild_index,
 )
-from schema import SourceRecord, render_frontmatter
-from test_schema import valid_record, write_doc
+from core.schema import SourceRecord, render_frontmatter
+from tests.support import valid_record, write_doc
 
 
 def make(**over: Any) -> SourceRecord:
@@ -199,7 +199,7 @@ def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
         dest.write_bytes(b"%PDF-1.4 fake content")
         return ok
 
-    monkeypatch.setattr("acquisition.fetch_and_classify", fake_fetch)
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", fake_fetch)
 
     _do_download(rec, tmp_path, pause=0)
 
@@ -221,7 +221,7 @@ def test_do_download_cleans_staging_on_batch_block(tmp_path: Path, monkeypatch: 
         dest.write_bytes(b"<html>Attention Required</html>")  # как реальный curl -o на challenge
         raise acquisition.AcquisitionBlocked(rec_.source_url, "direct blocked (WAF challenge)")
 
-    monkeypatch.setattr("acquisition.run_ladder", fake_run_ladder)
+    monkeypatch.setattr("acquire.acquisition.run_ladder", fake_run_ladder)
 
     with pytest.raises(acquisition.AcquisitionBlocked):
         _do_download(rec, tmp_path, pause=0, interactive=False)
@@ -245,7 +245,7 @@ def test_do_download_replaces_prior_raw_of_different_ext(tmp_path: Path, monkeyp
         dest.write_bytes(b"%PDF-1.4 fake content")
         return ok
 
-    monkeypatch.setattr("acquisition.fetch_and_classify", fake_fetch)
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", fake_fetch)
 
     _do_download(rec, tmp_path, pause=0)
 
@@ -352,7 +352,7 @@ def test_needs_index_rebuild_true_when_force(tmp_path: Path) -> None:
 
 def test_rebuild_index_writes_fingerprint_on_success(tmp_path: Path, monkeypatch: Any) -> None:
     _corpus_doc(tmp_path)
-    monkeypatch.setattr("bge_tokenizer.token_counter", lambda: (lambda text: len(text.split())))
+    monkeypatch.setattr("index.bge_tokenizer.token_counter", lambda: (lambda text: len(text.split())))
 
     db = tmp_path / "c.db"
     status = rebuild_index(tmp_path, db, embed=False)
@@ -374,7 +374,7 @@ def test_rebuild_index_without_model_does_not_touch_existing_fingerprint(
     def fake_token_counter() -> Any:
         raise FileNotFoundError("bge-m3 не найден (тест)")
 
-    monkeypatch.setattr("bge_tokenizer.token_counter", fake_token_counter)
+    monkeypatch.setattr("index.bge_tokenizer.token_counter", fake_token_counter)
 
     db = tmp_path / "c.db"
     conn = corpus_index.create_db(db)

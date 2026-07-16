@@ -33,16 +33,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-import acquisition
-import build_graph
-import corpus_index
-import fsio
-import schema
-import validate_sources
-import vector_store
-from chunking import strip_frontmatter
-from embed import get_embedder
-from pdf_to_markdown import convert as pdf_convert
+from acquire import acquisition
+from graph import build_graph
+from index import corpus_index
+from core import fsio
+from core import schema
+from core import validate_sources
+from index import vector_store
+from index.chunking import strip_frontmatter
+from index.embed import get_embedder
+from convert.pdf_to_markdown import convert as pdf_convert
 
 logger = logging.getLogger("run_pipeline")
 
@@ -343,7 +343,7 @@ def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, force: bool
     намеренно НЕ трогает индекс: следующий прогон (когда модель появится) честно
     доиндексирует по нетронутому отпечатку — самовосстановление по построению.
     """
-    from bge_tokenizer import EMBED_MAX_TOKENS, token_counter  # ленивый импорт: модель-зависимо
+    from index.bge_tokenizer import EMBED_MAX_TOKENS, token_counter  # ленивый импорт: модель-зависимо
 
     try:
         counter = token_counter()

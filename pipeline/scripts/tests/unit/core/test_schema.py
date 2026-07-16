@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from schema import (
+from tests.support import valid_record, write_doc
+
+from core.schema import (
     AcquisitionMethod,
     AssessedStage,
     Axis,
@@ -36,56 +38,6 @@ from schema import (
     render_frontmatter,
     save_state,
 )
-
-
-def valid_record() -> dict[str, Any]:
-    """Минимально валидная запись (термины — из реальных словарей pipeline/vocab/)."""
-    return {
-        "id": "sg-imda-mgf-agentic-2026",
-        "entity_id": "sg",
-        "track": "intl-xperience",
-        "title": "Model AI Governance Framework for Agentic AI",
-        "issuer": "Infocomm Media Development Authority (IMDA)",
-        "issuer_type": "government",
-        "geo_scope": "national",
-        "language": "en",
-        "dates": {"published": "2026-05-20", "retrieved": "2026-07-15"},
-        "doc_type": "framework",
-        "authority": "soft_law",
-        "topics": ["ai-governance", "agentic-ai"],
-        "g2ai_pattern": ["agent-governance-framework"],
-        "source_url": "https://example.org/doc.pdf",
-        "relevance": {
-            "target_fit": "primary",
-            "axis": "agentic_g2ai",
-            "assessed_stage": "confirmed",
-            "rationale": "эталонный агентный G2AI-документ",
-            "assessed_date": "2026-07-15",
-        },
-    }
-
-
-def write_doc(
-    root: Path,
-    rec: dict[str, Any],
-    *,
-    raw: bytes | None = None,
-    md: str | None = None,
-    state: dict[str, Any] | None = None,
-) -> Path:
-    """Создать папку-документ sources/<track>/<entity>/<id>/ + meta.yaml (+ raw.pdf/doc.md/.state.yaml)."""
-    import yaml as _yaml
-
-    d = root / rec["track"] / rec["entity_id"] / rec["id"]
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "meta.yaml").write_text(_yaml.safe_dump(rec, allow_unicode=True), encoding="utf-8")
-    if raw is not None:
-        (d / "raw.pdf").write_bytes(raw)
-    if md is not None:
-        (d / "doc.md").write_text(md, encoding="utf-8")
-    if state is not None:
-        (d / ".state.yaml").write_text(_yaml.safe_dump(state, allow_unicode=True), encoding="utf-8")
-    return d
 
 
 def test_valid_record_parses() -> None:
@@ -224,7 +176,7 @@ def test_triage_config_wellformed() -> None:
     """pipeline/config/triage.yaml — валидный YAML с целочисленным frontier_year."""
     import yaml as _yaml
 
-    from schema import VOCAB_DIR
+    from core.schema import VOCAB_DIR
 
     config_path = VOCAB_DIR.parent / "config" / "triage.yaml"
     data = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -416,7 +368,7 @@ def test_save_load_state_roundtrip(tmp_path: Path) -> None:
 
 def test_save_state_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any) -> None:
     """Мигрировано на fsio.atomic_write_text — единая staging-политика."""
-    import fsio
+    from core import fsio
 
     calls: list[Path] = []
     real = fsio.atomic_write_text
@@ -425,7 +377,7 @@ def test_save_state_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any) -> 
         calls.append(target)
         real(target, text)
 
-    monkeypatch.setattr("schema.fsio.atomic_write_text", spy)
+    monkeypatch.setattr("core.schema.fsio.atomic_write_text", spy)
     path = tmp_path / ".state.yaml"
     save_state(path, OperationalState(sha256="a" * 64))
     assert calls == [path]

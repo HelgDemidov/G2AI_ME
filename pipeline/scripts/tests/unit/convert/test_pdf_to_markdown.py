@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from pdf_to_markdown import Word, compute_doc_stats, convert
+from convert.pdf_to_markdown import Word, compute_doc_stats, convert
 
 
 def test_compute_doc_stats_uses_own_height_per_page_for_boilerplate_band() -> None:
@@ -51,6 +51,6 @@ class _FakeEmptyPdf:
 
 
 def test_convert_raises_on_pdf_without_pages(monkeypatch: Any, tmp_path: Path) -> None:
-    monkeypatch.setattr("pdf_to_markdown.pdfplumber.open", lambda path: _FakeEmptyPdf())
+    monkeypatch.setattr("convert.pdf_to_markdown.pdfplumber.open", lambda path: _FakeEmptyPdf())
     with pytest.raises(RuntimeError, match="без страниц"):
         convert(str(tmp_path / "in.pdf"), str(tmp_path / "out.md"))

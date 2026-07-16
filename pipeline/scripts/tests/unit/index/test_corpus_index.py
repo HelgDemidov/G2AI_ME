@@ -10,9 +10,9 @@ from typing import Any
 
 import pytest
 
-import corpus_index
-from chunking import Chunk
-from corpus_index import (
+from index import corpus_index
+from index.chunking import Chunk
+from index.corpus_index import (
     SCHEMA_VERSION,
     _cmd_search,
     content_hash,
@@ -27,7 +27,7 @@ from corpus_index import (
     sanitize_fts_query,
     write_meta,
 )
-from test_schema import valid_record, write_doc
+from tests.support import valid_record, write_doc
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="sqlite собран без FTS5")
 

@@ -20,7 +20,7 @@ from typing import Any, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from bge_tokenizer import EMBED_MAX_TOKENS, MODEL_DIR, TOKENIZER_JSON, load_tokenizer
+from index.bge_tokenizer import EMBED_MAX_TOKENS, MODEL_DIR, TOKENIZER_JSON, load_tokenizer
 
 FloatArray = NDArray[np.float32]
 

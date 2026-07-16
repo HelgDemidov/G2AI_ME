@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-import schema
-from acquisition import (
+from core import schema
+from acquire.acquisition import (
     AcquisitionBlocked,
     AcquisitionDead,
     AcquisitionOutcome,
@@ -28,7 +28,7 @@ from acquisition import (
     watch_and_ingest,
     _looks_like_candidate_pdf,
 )
-from test_schema import valid_record
+from tests.support import valid_record
 
 # Минимальный PDF без точных xref-офсетов — pdfminer (движок pdfplumber) его
 # восстанавливает через фолбэк-скан по "obj"; проверено эмпирически перед тестами.
@@ -173,7 +173,7 @@ def test_fetch_and_classify_omits_dash_f_and_captures_headers(
         Path(cmd[o_index + 1]).write_bytes(CLOUDFLARE_BLOCK_BODY)
         return _FakeProc(returncode=0)
 
-    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
     dest = tmp_path / "doc.pdf"
     result = fetch_and_classify("https://ai.gov.ae/doc.pdf", dest, user_agent="test-ua")
 
@@ -192,7 +192,7 @@ def test_fetch_and_classify_includes_max_time(tmp_path: Path, monkeypatch: Any) 
         Path(cmd[cmd.index("-o") + 1]).write_bytes(REAL_PDF_BODY)
         return _FakeProc(returncode=0)
 
-    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
     fetch_and_classify(
         "https://example.org/doc.pdf", tmp_path / "doc.pdf", user_agent="test-ua", total_timeout=123
     )
@@ -207,7 +207,7 @@ def test_fetch_and_classify_curl_unreachable_is_dead(
     """Сетевой отказ curl (не удалось разрешить/подключиться) — классифицируется как
     dead, а не бросает исключение: самый типичный «мёртвый URL» (снесённый домен)
     должен доходить до archive-ступени лестницы, а не ронять документ на download."""
-    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check: _FakeProc(returncode=code))
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", lambda cmd, check: _FakeProc(returncode=code))
     result = fetch_and_classify("https://gone.example/doc.pdf", tmp_path / "doc.pdf", user_agent="ua")
     assert result.outcome == AcquisitionOutcome.dead
     assert str(code) in result.reason
@@ -216,7 +216,7 @@ def test_fetch_and_classify_curl_unreachable_is_dead(
 def test_fetch_and_classify_curl_other_failure_raises(tmp_path: Path, monkeypatch: Any) -> None:
     """Иной ненулевой код (28 — таймаут после исчерпанных --retry, и прочее) — не
     классификация, а отказ вызова: не притворяемся, что знаем, мёртв URL или нет."""
-    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check: _FakeProc(returncode=28))
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", lambda cmd, check: _FakeProc(returncode=28))
     with pytest.raises(RuntimeError):
         fetch_and_classify("https://slow.example/doc.pdf", tmp_path / "doc.pdf", user_agent="ua")
 
@@ -273,7 +273,7 @@ def _rec(**over: Any) -> schema.SourceRecord:
 
 def test_run_ladder_direct_ok(tmp_path: Path, monkeypatch: Any) -> None:
     ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([ok]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([ok]))
     result = run_ladder(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")
     assert result.method == DIRECT
     assert result.fidelity == schema.Fidelity.live
@@ -281,7 +281,7 @@ def test_run_ladder_direct_ok(tmp_path: Path, monkeypatch: Any) -> None:
 
 def test_run_ladder_blocked_no_alt_raises_blocked(tmp_path: Path, monkeypatch: Any) -> None:
     blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
     with pytest.raises(AcquisitionBlocked):
         run_ladder(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")  # official_alt_url не задан
 
@@ -289,7 +289,7 @@ def test_run_ladder_blocked_no_alt_raises_blocked(tmp_path: Path, monkeypatch: A
 def test_run_ladder_blocked_falls_through_to_official_alt(tmp_path: Path, monkeypatch: Any) -> None:
     blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
     ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([blocked, ok]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked, ok]))
     rec = _rec(official_alt_url="https://example.org/alt.pdf")
     result = run_ladder(rec, tmp_path / "doc.pdf", user_agent="test-ua")
     assert result.method == OFFICIAL_ALT
@@ -298,7 +298,7 @@ def test_run_ladder_blocked_falls_through_to_official_alt(tmp_path: Path, monkey
 
 def test_run_ladder_blocked_on_official_alt_raises_blocked(tmp_path: Path, monkeypatch: Any) -> None:
     blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([blocked, blocked]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked, blocked]))
     rec = _rec(official_alt_url="https://example.org/alt.pdf")
     with pytest.raises(AcquisitionBlocked):
         run_ladder(rec, tmp_path / "doc.pdf", user_agent="test-ua")
@@ -306,14 +306,14 @@ def test_run_ladder_blocked_on_official_alt_raises_blocked(tmp_path: Path, monke
 
 def test_run_ladder_dead_normal_raises_dead(tmp_path: Path, monkeypatch: Any) -> None:
     dead = ClassifiedResponse(AcquisitionOutcome.dead, 404, "HTTP 404")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([dead]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([dead]))
     with pytest.raises(AcquisitionDead):
         run_ladder(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")  # sensitivity=normal (дефолт)
 
 
 def test_run_ladder_dead_confidential_raises_blocked_not_dead(tmp_path: Path, monkeypatch: Any) -> None:
     dead = ClassifiedResponse(AcquisitionOutcome.dead, 404, "HTTP 404")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([dead]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([dead]))
     rec = _rec(sensitivity="confidential")
     with pytest.raises(AcquisitionBlocked) as exc_info:
         run_ladder(rec, tmp_path / "doc.pdf", user_agent="test-ua")
@@ -500,7 +500,7 @@ def test_watch_and_ingest_memoizes_inspection_across_polls(tmp_path: Path, monke
         calls["n"] += 1
         return real_inspect(path)
 
-    monkeypatch.setattr("acquisition._looks_like_candidate_pdf", counting_inspect)
+    monkeypatch.setattr("acquire.acquisition._looks_like_candidate_pdf", counting_inspect)
 
     rec = _rec(title="Model AI Governance Framework for Agentic AI")
     clock = {"t": 0.0}
@@ -521,9 +521,9 @@ def test_acquire_manually_default_dir_uses_title_matcher(tmp_path: Path, monkeyp
         captured["matcher"] = matcher
         return dest
 
-    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check=False: None)
-    monkeypatch.setattr("acquisition.default_watch_dir", lambda: tmp_path / "downloads")
-    monkeypatch.setattr("acquisition.watch_and_ingest", fake_watch_and_ingest)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", lambda cmd, check=False: None)
+    monkeypatch.setattr("acquire.acquisition.default_watch_dir", lambda: tmp_path / "downloads")
+    monkeypatch.setattr("acquire.acquisition.watch_and_ingest", fake_watch_and_ingest)
 
     acquire_manually(_rec(), tmp_path / "dest.pdf")  # watch_dir не передан -> дефолтная папка
 
@@ -538,8 +538,8 @@ def test_acquire_manually_explicit_watch_dir_disables_matcher(tmp_path: Path, mo
         captured["matcher"] = matcher
         return dest
 
-    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check=False: None)
-    monkeypatch.setattr("acquisition.watch_and_ingest", fake_watch_and_ingest)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", lambda cmd, check=False: None)
+    monkeypatch.setattr("acquire.acquisition.watch_and_ingest", fake_watch_and_ingest)
 
     acquire_manually(_rec(), tmp_path / "dest.pdf", watch_dir=tmp_path / "custom")
 
@@ -557,7 +557,7 @@ def test_acquire_manually_opens_browser_and_ingests(tmp_path: Path, monkeypatch:
         captured_cmd.append(cmd)
         return None
 
-    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
 
     rec = _rec()
     dest = tmp_path / "dest.pdf"
@@ -586,7 +586,7 @@ def test_find_wayback_snapshot_picks_freshest(monkeypatch: Any) -> None:
     def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
         return _FakeCompletedProcess(cdx_output)
 
-    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
     snapshot = find_wayback_snapshot("https://ai.gov.ae/doc.pdf")
     assert snapshot is not None
     assert snapshot.timestamp == "20220806004506"
@@ -602,7 +602,7 @@ def test_find_wayback_snapshot_query_uses_negative_limit_and_max_time(monkeypatc
         captured.extend(cmd)
         return _FakeCompletedProcess("")
 
-    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
     find_wayback_snapshot("https://ai.gov.ae/doc.pdf")
 
     query = captured[-1]
@@ -615,7 +615,7 @@ def test_find_wayback_snapshot_malformed_line_returns_none(monkeypatch: Any) -> 
     """Строка без второго поля (timestamp) — не наш формат, трактуем как «снимка
     нет», а не IndexError."""
     monkeypatch.setattr(
-        "acquisition.subprocess.run",
+        "acquire.acquisition.subprocess.run",
         lambda cmd, check, capture_output, text: _FakeCompletedProcess("garbage-single-token\n"),
     )
     assert find_wayback_snapshot("https://example.org/doc.pdf") is None
@@ -625,18 +625,18 @@ def test_find_wayback_snapshot_none_when_empty(monkeypatch: Any) -> None:
     def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
         return _FakeCompletedProcess("")
 
-    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
     assert find_wayback_snapshot("https://example.org/gone.pdf") is None
 
 
 def test_fetch_from_archive_success(tmp_path: Path, monkeypatch: Any) -> None:
     cdx_output = "urlkey 20220806004506 https://example.org/doc.pdf application/pdf 200 X 123\n"
     monkeypatch.setattr(
-        "acquisition.subprocess.run",
+        "acquire.acquisition.subprocess.run",
         lambda cmd, check, capture_output, text: _FakeCompletedProcess(cdx_output),
     )
     ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([ok]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([ok]))
 
     result = fetch_from_archive(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")
 
@@ -647,7 +647,7 @@ def test_fetch_from_archive_success(tmp_path: Path, monkeypatch: Any) -> None:
 
 def test_fetch_from_archive_raises_when_no_snapshot(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setattr(
-        "acquisition.subprocess.run", lambda cmd, check, capture_output, text: _FakeCompletedProcess("")
+        "acquire.acquisition.subprocess.run", lambda cmd, check, capture_output, text: _FakeCompletedProcess("")
     )
     with pytest.raises(ArchiveUnavailable):
         fetch_from_archive(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")
@@ -656,10 +656,10 @@ def test_fetch_from_archive_raises_when_no_snapshot(tmp_path: Path, monkeypatch:
 def test_fetch_from_archive_raises_when_snapshot_invalid(tmp_path: Path, monkeypatch: Any) -> None:
     cdx_output = "urlkey 20220806004506 https://example.org/doc.pdf application/pdf 200 X 123\n"
     monkeypatch.setattr(
-        "acquisition.subprocess.run",
+        "acquire.acquisition.subprocess.run",
         lambda cmd, check, capture_output, text: _FakeCompletedProcess(cdx_output),
     )
     blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
-    monkeypatch.setattr("acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
     with pytest.raises(ArchiveUnavailable):
         fetch_from_archive(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")

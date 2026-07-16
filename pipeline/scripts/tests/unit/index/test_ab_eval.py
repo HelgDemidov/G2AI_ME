@@ -1,7 +1,7 @@
 """Тесты логики A/B-харнесса (hit@k) — без модели/сети, CI-safe."""
 from __future__ import annotations
 
-from ab_eval import CONTROL_QUERIES, hit_at_k
+from index.ab_eval import CONTROL_QUERIES, hit_at_k
 
 
 def test_hit_in_top1() -> None:

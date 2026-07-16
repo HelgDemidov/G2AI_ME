@@ -5,9 +5,9 @@ from pathlib import Path
 
 import yaml
 
-from schema import VOCAB_DIR
-from test_schema import valid_record, write_doc
-from validate_sources import validate_sources
+from core.schema import VOCAB_DIR
+from tests.support import valid_record, write_doc
+from core.validate_sources import validate_sources
 
 
 def _errors(root: Path, vocab_dir: Path = VOCAB_DIR) -> list[str]:
