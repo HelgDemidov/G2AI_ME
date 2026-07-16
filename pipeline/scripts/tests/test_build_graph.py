@@ -45,7 +45,7 @@ def test_doc_concept_edges() -> None:
 
 def test_shared_pattern_cluster() -> None:
     a = make()
-    b = make(id="eu-ec-ai-act-2024", country="Germany", country_iso2="de")
+    b = make(id="eu-ec-ai-act-2024", entity_id="de")
     graph = build_graph([a, b], JUR)
     docs = docs_by_pattern(graph, "agent-governance-framework")
     assert set(docs) == {"doc:sg-imda-mgf-agentic-2026", "doc:eu-ec-ai-act-2024"}

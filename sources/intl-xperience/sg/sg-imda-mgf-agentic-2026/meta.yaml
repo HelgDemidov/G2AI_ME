@@ -1,0 +1,41 @@
+# Курируемая запись документа (corpus-layout-v2). Человек — источник истины.
+# Операционное состояние — .state.yaml (локально); оригинал — raw.pdf; конвертация — doc.md.
+id: sg-imda-mgf-agentic-2026
+entity_id: sg
+track: intl-xperience
+title: Model AI Governance Framework for Agentic AI
+issuer: Infocomm Media Development Authority (IMDA)
+issuer_type: government
+geo_scope: national
+language: en
+dates:
+  published: 2026-05-20
+  updated: 2026-06-05
+  retrieved: 2026-07-15
+  last_checked: 2026-07-15
+doc_type: framework
+authority: soft_law
+source_url: https://www.imda.gov.sg/-/media/imda/files/about/emerging-tech-and-research/artificial-intelligence/mgf-for-agentic-ai.pdf
+sensitivity: normal
+rights: unknown
+topics:
+  - ai-governance
+  - agentic-ai
+  - agent-safety
+  - tool-use
+  - human-oversight
+  - risk-management
+g2ai_pattern:
+  - agent-governance-framework
+  - tool-call-verification
+  - human-accountability
+summary: >-
+  Model framework for governing agentic AI: risk assessment and mitigation at
+  input, meaningful human accountability, technical controls and agent testing,
+  and end-user responsibility.
+relevance:
+  target_fit: primary
+  axis: agentic_g2ai
+  assessed_stage: confirmed
+  rationale: IMDA Model AI Governance Framework for Agentic AI — reference agentic G2AI document.
+  assessed_date: 2026-07-15

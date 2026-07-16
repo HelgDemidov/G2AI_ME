@@ -1,15 +1,17 @@
 """Тесты оркестратора: реконсиляция стадий, синк frontmatter, dry-run, изоляция отказов.
 
 Всё CI-safe — без сети (download), pdfplumber (convert) и модели (index).
+Раскладка — папка-документ (corpus-layout-v2): пути выводятся из <root>/<track>/<entity>/<id>/.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
+import schema
 from acquisition import AcquisitionOutcome, ClassifiedResponse
-from schema import SourceRecord, render_frontmatter
 from run_pipeline import Stage, _compose_md, _do_download, _do_frontmatter, needed_stages, process_docs
+from schema import SourceRecord, render_frontmatter
 from test_schema import valid_record
 
 
@@ -19,91 +21,90 @@ def make(**over: Any) -> SourceRecord:
     return SourceRecord.model_validate(data)
 
 
-def _touch(path: Path, content: bytes = b"x") -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-    return path
+def _place(
+    rec: SourceRecord,
+    root: Path,
+    *,
+    raw: bytes | None = None,
+    md: str | None = None,
+    state: dict[str, Any] | None = None,
+) -> None:
+    """Разложить raw.pdf/doc.md/.state.yaml в выведенную папку-документ."""
+    import yaml as _yaml
+
+    d = schema.doc_dir(rec, root)
+    d.mkdir(parents=True, exist_ok=True)
+    if raw is not None:
+        (d / "raw.pdf").write_bytes(raw)
+    if md is not None:
+        (d / "doc.md").write_text(md, encoding="utf-8")
+    if state is not None:
+        (d / ".state.yaml").write_text(_yaml.safe_dump(state, allow_unicode=True), encoding="utf-8")
 
 
 def test_needs_all_when_nothing_exists(tmp_path: Path) -> None:
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
-    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
+    assert needed_stages(make(), tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
 
 
 def test_needs_convert_when_md_missing(tmp_path: Path) -> None:
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")  # sha256 не задан
-    _touch(tmp_path / "raw/d.pdf")
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")  # raw есть, sha неизвестен -> download не нужен
     assert needed_stages(rec, tmp_path) == [Stage.convert, Stage.frontmatter]
 
 
 def test_sha256_mismatch_triggers_download(tmp_path: Path) -> None:
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md", sha256="0" * 64)
-    _touch(tmp_path / "raw/d.pdf")  # содержимое не совпадёт с sha256
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", state={"sha256": "0" * 64})  # sha не совпадёт с содержимым
     assert Stage.download in needed_stages(rec, tmp_path)
 
 
 def test_up_to_date_no_stages(tmp_path: Path) -> None:
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
-    _touch(tmp_path / "raw/d.pdf")
-    md = tmp_path / "md/d.md"
-    md.parent.mkdir(parents=True, exist_ok=True)
-    md.write_text(_compose_md(rec, ""), encoding="utf-8")  # синхронный frontmatter
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))  # синхронный frontmatter, sha неизвестен
     assert needed_stages(rec, tmp_path) == []
 
 
 def test_force_redoes_all(tmp_path: Path) -> None:
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
-    _touch(tmp_path / "raw/d.pdf")
-    md = tmp_path / "md/d.md"
-    md.parent.mkdir(parents=True, exist_ok=True)
-    md.write_text(_compose_md(rec, ""), encoding="utf-8")
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))
     assert needed_stages(rec, tmp_path, force=True) == [Stage.download, Stage.convert, Stage.frontmatter]
 
 
 def test_frontmatter_drift_detected(tmp_path: Path) -> None:
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
-    _touch(tmp_path / "raw/d.pdf")
-    md = tmp_path / "md/d.md"
-    md.parent.mkdir(parents=True, exist_ok=True)
-    md.write_text("---\nid: stale-old\n---\n\nBody.\n", encoding="utf-8")  # frontmatter разошёлся
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", md="---\nid: stale-old\n---\n\nBody.\n")
     assert needed_stages(rec, tmp_path) == [Stage.frontmatter]
 
 
 def test_do_frontmatter_syncs_and_idempotent(tmp_path: Path) -> None:
-    rec = make(md_path="md/d.md")
-    md = tmp_path / "md/d.md"
-    md.parent.mkdir(parents=True, exist_ok=True)
-    md.write_text("Body only, no frontmatter.\n", encoding="utf-8")
+    rec = make()
+    _place(rec, tmp_path, md="Body only, no frontmatter.\n")
     assert _do_frontmatter(rec, tmp_path) is True
-    content = md.read_text(encoding="utf-8")
+    content = schema.md_file(rec, tmp_path).read_text(encoding="utf-8")
     assert content.startswith("---\n")
     assert "Body only" in content
     assert _do_frontmatter(rec, tmp_path) is False  # второй раз — уже синхронно
 
 
 def test_dry_run_no_side_effects(tmp_path: Path) -> None:
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
+    rec = make()
     results, changed = process_docs(
         [rec], tmp_path,
-        sources_path=tmp_path / "sources.yaml",  # dry-run -> никогда не открывается
         force=False, dry_run=True, no_download=False, pause=0,
     )
     assert changed is False
     assert results[0].done == [Stage.download, Stage.convert, Stage.frontmatter]
-    assert not (tmp_path / "raw/d.pdf").exists()  # ничего не создано
+    assert not schema.doc_dir(rec, tmp_path).exists()  # ничего не создано
 
 
 def test_failure_isolation(tmp_path: Path) -> None:
-    a = make(id="a-doc-2026", raw_path="raw/a.pdf", md_path="md/a.md")  # нужен download
-    b = make(id="b-doc-2026", raw_path="raw/b.pdf", md_path="md/b.md")
-    _touch(tmp_path / "raw/b.pdf")
-    (tmp_path / "md/b.md").parent.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "md/b.md").write_text(_compose_md(b, ""), encoding="utf-8")  # b актуален
+    a = make(id="a-doc-2026", entity_id="aa")  # нужен download
+    b = make(id="b-doc-2026", entity_id="bb")
+    _place(b, tmp_path, raw=b"pdf", md=_compose_md(b, ""))  # b актуален
 
     results, changed = process_docs(
         [a, b], tmp_path,
-        sources_path=tmp_path / "sources.yaml",  # --no-download -> a падает до открытия файла
-        force=False, dry_run=False, no_download=True, pause=0,
+        force=False, dry_run=False, no_download=True, pause=0,  # a падает на download
     )
     ra = next(r for r in results if r.doc_id == "a-doc-2026")
     rb = next(r for r in results if r.doc_id == "b-doc-2026")
@@ -112,12 +113,9 @@ def test_failure_isolation(tmp_path: Path) -> None:
     assert changed is False
 
 
-def test_do_download_persists_acquisition_state(tmp_path: Path, monkeypatch: Any) -> None:
-    """Сквозная проверка проводки: _do_download -> run_ladder -> persist_acquisition_state."""
-    rec = make(raw_path="raw/d.pdf", md_path="md/d.md")
-    sources_path = tmp_path / "sources.yaml"
-    sources_path.write_text(f"# header comment\n\n- id: {rec.id}\n  status: pending\n", encoding="utf-8")
-
+def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
+    """Сквозная проводка: _do_download -> run_ladder -> запись .state.yaml (не sources.yaml)."""
+    rec = make()
     ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
 
     def fake_fetch(url: str, dest: Path, *, user_agent: str, timeout: int = 30) -> ClassifiedResponse:
@@ -127,17 +125,17 @@ def test_do_download_persists_acquisition_state(tmp_path: Path, monkeypatch: Any
 
     monkeypatch.setattr("acquisition.fetch_and_classify", fake_fetch)
 
-    _do_download(rec, tmp_path, sources_path=sources_path, pause=0)
+    _do_download(rec, tmp_path, pause=0)
 
-    assert (tmp_path / "raw/d.pdf").read_bytes() == b"%PDF-1.4 fake content"
-    content = sources_path.read_text(encoding="utf-8")
-    assert "acquisition_method: direct" in content
-    assert "fidelity: live" in content
-    assert "# header comment" in content  # комментарий не потерян сквозным вызовом
+    assert (schema.doc_dir(rec, tmp_path) / "raw.pdf").read_bytes() == b"%PDF-1.4 fake content"
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_method is not None and st.acquisition_method.value == "direct"
+    assert st.fidelity is not None and st.fidelity.value == "live"
+    assert st.sha256 is not None
 
 
 def test_render_frontmatter_used_in_compose(tmp_path: Path) -> None:
-    rec = make(md_path="md/d.md")
+    rec = make()
     composed = _compose_md(rec, "old body")
     assert composed.startswith(render_frontmatter(rec))
     assert composed.rstrip().endswith("old body")

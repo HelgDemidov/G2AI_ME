@@ -25,7 +25,7 @@ from typing import Any
 import networkx as nx
 import yaml
 
-from schema import SourceRecord, load_records
+from schema import GeoScope, SourceRecord, load_records
 from validate_sources import DEFAULT_SOURCES, validate_sources
 
 JURISDICTIONS_PATH = Path(__file__).resolve().parent.parent / "vocab" / "jurisdictions.yaml"
@@ -94,8 +94,7 @@ def build_graph(
             doc_type=rec.doc_type,
             authority=rec.authority,
             language=rec.language,
-            status=rec.status.value,
-            country=rec.country or "",
+            entity=rec.entity_id,
             issuer=rec.issuer,
         )
         issuer = _issuer_node(rec.issuer)
@@ -112,11 +111,11 @@ def build_graph(
             ensure(node, "topic", topic)
             graph.add_edge(doc, node, etype="about")
 
-        if rec.country_iso2:
-            iso2 = rec.country_iso2.lower()
+        if rec.geo_scope is GeoScope.national:
+            iso2 = rec.entity_id.lower()  # для наций entity_id == iso2 (даёт членство в блоках)
             countries_seen.add(iso2)
             node = _country_node(iso2)
-            ensure(node, "jurisdiction", rec.country or iso2, jlevel="country")
+            ensure(node, "jurisdiction", iso2.upper(), jlevel="country")
             graph.add_edge(doc, node, etype="applies_to")
 
     # member_of: страна -> блок (только для стран, встретившихся в корпусе)

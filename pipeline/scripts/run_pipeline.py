@@ -43,7 +43,6 @@ from pdf_to_markdown import convert as pdf_convert
 
 logger = logging.getLogger("run_pipeline")
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 # Браузероподобный UA: WAF-ы гос. сайтов часто блокируют не-браузерные UA (см. CLAUDE.md).
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -65,15 +64,7 @@ class DocResult:
     error: str | None = None
 
 
-# --- пути и хеши ---
-def _raw_file(rec: schema.SourceRecord, root: Path) -> Path | None:
-    return root / rec.raw_path if rec.raw_path else None
-
-
-def _md_file(rec: schema.SourceRecord, root: Path) -> Path | None:
-    return root / rec.md_path if rec.md_path else None
-
-
+# --- пути и хеши (пути выводятся из папки-документа: schema.raw_file/md_file/state_file) ---
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -90,29 +81,29 @@ def _compose_md(rec: schema.SourceRecord, current_md: str) -> str:
 
 
 def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) -> list[Stage]:
-    """Какие стадии нужны документу по фактическому состоянию ФС."""
+    """Какие стадии нужны документу по фактическому состоянию ФС (пути выводятся из папки)."""
     stages: list[Stage] = []
-    raw = _raw_file(rec, root)
-    md = _md_file(rec, root)
+    raw = schema.raw_file(rec, root)          # существующий raw.* или None
+    md = schema.md_file(rec, root)            # doc.md (путь; может не существовать)
+    known_sha = schema.load_state(schema.state_file(rec, root)).sha256
 
-    if raw is not None:
-        if force or not raw.exists():
-            stages.append(Stage.download)
-        elif rec.sha256 and _sha256(raw) != rec.sha256:
-            stages.append(Stage.download)  # файл повреждён/изменился
+    if force or raw is None:
+        stages.append(Stage.download)
+    elif known_sha and _sha256(raw) != known_sha:
+        stages.append(Stage.download)         # файл повреждён/изменился vs записанный sha
 
-    if md is not None:
-        stale = raw is not None and raw.exists() and md.exists() and raw.stat().st_mtime > md.stat().st_mtime
-        if force or Stage.download in stages or not md.exists() or stale:
-            stages.append(Stage.convert)
+    stale = False
+    if raw is not None and raw.exists() and md.exists():
+        stale = raw.stat().st_mtime > md.stat().st_mtime
+    if force or Stage.download in stages or not md.exists() or stale:
+        stages.append(Stage.convert)
 
-    if md is not None:
-        if Stage.convert in stages:
-            stages.append(Stage.frontmatter)
-        elif md.exists():
-            current = md.read_text(encoding="utf-8")
-            if _compose_md(rec, current) != current:
-                stages.append(Stage.frontmatter)  # frontmatter разошёлся с реестром
+    if Stage.convert in stages:
+        stages.append(Stage.frontmatter)
+    elif md.exists():
+        current = md.read_text(encoding="utf-8")
+        if _compose_md(rec, current) != current:
+            stages.append(Stage.frontmatter)  # frontmatter разошёлся с реестром
 
     return stages
 
@@ -122,35 +113,27 @@ def _do_download(
     rec: schema.SourceRecord,
     root: Path,
     *,
-    sources_path: Path,
     pause: float,
     interactive: bool = False,
     watch_dir: Path | None = None,
 ) -> None:
     """Скачивание через acquisition-лестницу (direct -> official_alt; см. acquisition.py).
 
-    Не резюмируется между попытками (без ``curl -C -``): переключение лестницы
-    между разными URL на один и тот же файл сделало бы резюм небезопасным
-    (докачка "не с того" ответа), а лестница и так не кеширует известный блок
-    между прогонами (§5 спека) — каждая попытка полная и честная.
+    Цель — ``<doc_dir>/raw.pdf`` (корпус — PDF; HTML/OCR-путь — будущее, бэклог #4).
+    Не резюмируется между попытками (без ``curl -C -``); лестница не кеширует блок.
 
-    ``interactive`` (=есть ``--only``, решение №2 при реализации спека): если
-    лестница упирается в блок, единственный документ в прогоне — живая сессия
-    с пользователем, поэтому запускаем синхронный 1-клик watch-folder путь.
-    В батч-прогоне (``interactive=False``) блок просто репортится как отказ
-    документа — батч не прерывается (существующее поведение, ничего не меняли).
+    ``interactive`` (=есть ``--only``): при блоке ЖИВОГО документа — синхронный 1-клик
+    watch-folder путь. В батче (``interactive=False``) блок репортится как отказ
+    документа (батч не прерывается). Мёртвый URL -> archive (автоматически, оба режима).
 
-    После успеха точечно обновляет ``acquisition_method``/``acquisition_checked``/
-    ``fidelity`` в ``sources.yaml`` (round-trip-safe, см. ``persist_acquisition_state``)
-    и печатает сводку правок — не молча (решение 2026-07-15, см. спек).
+    После успеха пишет операционное состояние (sha256/acquisition_method/fidelity/
+    checked) в ``.state.yaml`` (машиннописаный sidecar, corpus-layout-v2).
     """
-    raw = _raw_file(rec, root)
-    if raw is None:
-        raise RuntimeError("нет raw_path в записи")
     if not rec.source_url:
         raise RuntimeError("нет source_url для скачивания")
     if shutil.which("curl") is None:
         raise RuntimeError("curl не найден в PATH")
+    raw = schema.doc_dir(rec, root) / "raw.pdf"
     raw.parent.mkdir(parents=True, exist_ok=True)
     part = raw.parent / (raw.name + ".part")  # атомарный (rename) staging-файл
     try:
@@ -162,33 +145,28 @@ def _do_download(
         logger.info("  открываю в браузере и жду файл (папка: %s)…", watch_dir or acquisition.default_watch_dir())
         result = acquisition.acquire_manually(rec, part, watch_dir=watch_dir)
     except acquisition.AcquisitionDead as exc:
-        # Архив автоматический — в отличие от manual, не требует --only/присутствия человека.
         logger.info("  %s: %s", rec.id, exc)
         logger.info("  ищу снимок в Wayback…")
         result = acquisition.fetch_from_archive(rec, part, user_agent=USER_AGENT)
-    if rec.sha256 and _sha256(part) != rec.sha256:
-        raise RuntimeError(f"sha256 не совпал (ожидался {rec.sha256[:12]}…)")
     part.replace(raw)
-    changed = acquisition.persist_acquisition_state(
-        sources_path, rec.id,
-        acquisition_method=result.method, fidelity=result.fidelity, checked=_dt.date.today(),
-        retrieved_snapshot_date=result.retrieved_snapshot_date,
-    )
-    if changed:
-        summary = ", ".join(f"{k}: {old!r} -> {new!r}" for k, (old, new) in changed.items())
-        logger.info("  sources.yaml обновлён (%s): %s", rec.id, summary)
-    logger.info("  добыто %s: метод=%s fidelity=%s", rec.id, result.method.value, result.fidelity.value)
+    state_path = schema.state_file(rec, root)
+    state = schema.load_state(state_path)
+    state.sha256 = _sha256(raw)
+    state.acquisition_method = result.method
+    state.fidelity = result.fidelity
+    state.acquisition_checked = _dt.date.today()
+    state.retrieved_snapshot_date = result.retrieved_snapshot_date
+    schema.save_state(state_path, state)
+    logger.info("  добыто %s: метод=%s fidelity=%s (.state.yaml обновлён)", rec.id, result.method.value, result.fidelity.value)
     if pause > 0:
         time.sleep(pause)
 
 
 def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
-    raw = _raw_file(rec, root)
-    md = _md_file(rec, root)
+    raw = schema.raw_file(rec, root)
+    md = schema.md_file(rec, root)
     if raw is None or not raw.exists():
         raise RuntimeError("нет raw-файла для конвертации")
-    if md is None:
-        raise RuntimeError("нет md_path в записи")
     md.parent.mkdir(parents=True, exist_ok=True)
     tmp = md.parent / (md.name + ".tmp")
     pdf_convert(str(raw), str(tmp))
@@ -198,10 +176,10 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
 
 
 def _do_frontmatter(rec: schema.SourceRecord, root: Path) -> bool:
-    """Синхронизировать frontmatter .md с реестром. Возвращает True, если файл изменён."""
-    md = _md_file(rec, root)
-    if md is None or not md.exists():
-        raise RuntimeError("нет .md для синхронизации frontmatter")
+    """Синхронизировать frontmatter doc.md с реестром. Возвращает True, если файл изменён."""
+    md = schema.md_file(rec, root)
+    if not md.exists():
+        raise RuntimeError("нет doc.md для синхронизации frontmatter")
     current = md.read_text(encoding="utf-8")
     desired = _compose_md(rec, current)
     if desired == current:
@@ -217,7 +195,6 @@ def process_docs(
     records: list[schema.SourceRecord],
     root: Path,
     *,
-    sources_path: Path,
     force: bool,
     dry_run: bool,
     no_download: bool,
@@ -249,7 +226,7 @@ def process_docs(
                         raise RuntimeError("нужен download, но задан --no-download (скачайте raw вручную)")
                     if not dry_run:
                         _do_download(
-                            rec, root, sources_path=sources_path, pause=pause,
+                            rec, root, pause=pause,
                             interactive=interactive, watch_dir=watch_dir,
                         )
                 elif stage is Stage.convert:
@@ -326,11 +303,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    if not args.sources.exists():
-        logger.error("файл не найден: %s", args.sources)
-        return 2
-
-    # quality-gate: реестр обязан быть валиден
+    # quality-gate: реестр обязан быть валиден (пустой/несуществующий корень — валиден)
     errors = validate_sources.validate_sources(args.sources)
     if errors:
         logger.error("реестр невалиден (%d) — исправьте перед прогоном:", len(errors))
@@ -348,8 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     # Синхронный manual watch-folder путь — только осмыслен для одно-документного
     # прогона (--only): пользователь реально сидит и ждёт клика (§6 спека, решение №2).
     results, changed = process_docs(
-        records, REPO_ROOT,
-        sources_path=args.sources,
+        records, args.sources,
         force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
         interactive=bool(args.only), watch_dir=args.watch_dir,
     )

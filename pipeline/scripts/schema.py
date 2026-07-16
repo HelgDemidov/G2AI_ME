@@ -20,6 +20,8 @@ VOCAB_DIR = Path(__file__).resolve().parent.parent / "vocab"
 
 # Внутренний id: kebab-slug минимум из двух сегментов, напр. ``sg-imda-mgf-agentic-2026``.
 ID_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)+$"
+# Слаг сущности (== папка под track): lowercase-kebab, допускает один сегмент (ee, oecd, anthropic).
+ENTITY_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 
 
 class IssuerType(str, Enum):
@@ -43,13 +45,11 @@ class GeoScope(str, Enum):
     global_ = "global"  # 'global' — ключевое слово Python, отсюда суффикс
 
 
-class Status(str, Enum):
-    """Статус записи в пайплайне."""
+class Track(str, Enum):
+    """Верхний аналитический раскол корпуса (== верхняя папка под ``sources/``; corpus-layout-v2)."""
 
-    pending = "pending"
-    downloaded = "downloaded"
-    converted = "converted"
-    verified = "verified"
+    intl_xperience = "intl-xperience"
+    montenegro = "montenegro"
 
 
 class TranslationStatus(str, Enum):
@@ -187,70 +187,57 @@ class Relevance(BaseModel):
     assessed_date: _dt.date
 
 
-class DiscoveryProvenance(BaseModel):
-    """Провенанс добычи, сохранённый на промоушене кандидата в ``SourceRecord``.
+class OperationalState(BaseModel):
+    """Производное/операционное состояние документа — sidecar ``.state.yaml`` (corpus-layout-v2).
 
-    End-to-end аудит: каким коннектором/запросом найден документ. ``merged_from`` —
-    id-ы коннекторов при мульти-источном merge (discovery/architecture.md §4.4).
+    Машиннописаное (пайплайн/ладдер), отдельно от курируемого ``meta.yaml``: целостность,
+    канал добычи, статус процессов. Отсутствующий файл == пустое состояние (свежий документ).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    connector_id: str = Field(min_length=1)
-    connector_kind: ConnectorKind
-    source_ref: str = Field(min_length=1)
-    retrieved_at: _dt.date
-    merged_from: list[str] = Field(default_factory=list)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    acquisition_method: AcquisitionMethod | None = None
+    acquisition_checked: _dt.date | None = None
+    fidelity: Fidelity | None = None
+    retrieved_snapshot_date: _dt.date | None = None
+    translation_status: TranslationStatus = TranslationStatus.not_started
 
 
 class SourceRecord(BaseModel):
-    """Одна запись реестра первоисточников (один документ корпуса)."""
+    """Курируемая запись документа (``meta.yaml``, corpus-layout-v2) — человек-источник истины.
+
+    Операционное состояние (sha256/acquisition/…) — в ``OperationalState`` (``.state.yaml``);
+    провенанс добычи — в ``CandidateRecord`` (``candidates.yaml``); пути выводятся из папки.
+    Только Dublin-Core-библиография + минимум аналитики (topics/g2ai_pattern/summary/relevance).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     # --- идентичность ---
     id: str = Field(pattern=ID_PATTERN)
-    # --- библиография ---
+    entity_id: str = Field(pattern=ENTITY_PATTERN)  # слаг сущности (== папка); для наций == iso2
+    track: Track  # верхний раскол корпуса (== верхняя папка)
+    # --- библиография (Dublin Core) ---
     title: str = Field(min_length=1)
     issuer: str = Field(min_length=1)
     issuer_type: IssuerType
-    country: str | None = None
-    country_iso2: str | None = Field(default=None, pattern=r"^[a-z]{2}$")
     geo_scope: GeoScope
     language: str = Field(pattern=r"^[a-z]{2}$")  # ISO 639-1
     dates: Dates = Field(default_factory=Dates)
-    doc_version: str | None = None
-    # --- классификация (принадлежность словарям проверяет validate_sources.py) ---
-    doc_type: str = Field(min_length=1)
-    authority: str = Field(min_length=1)
-    topics: list[str] = Field(default_factory=list)
-    g2ai_pattern: list[str] = Field(default_factory=list)
-    # --- связи (рёбра графа) ---
-    relations: list[Relation] = Field(default_factory=list)
-    # --- аналитика ---
-    summary: str | None = None
-    tech_basis: str | None = None
-    # --- релевантность/актуальность (source-relevance-triage) ---
-    relevance: Relevance | None = None  # обязательность в sources.yaml — правило validate_sources
-    in_force: bool | None = None  # действует ли «живой» документ (взвешивание свежести)
-    # --- провенанс ---
-    source_url: str = Field(pattern=r"^https?://")
-    official_alt_url: str | None = Field(default=None, pattern=r"^https?://")
-    press_release_url: str | None = Field(default=None, pattern=r"^https?://")
-    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    raw_path: str | None = None
-    md_path: str | None = None
-    acquisition_method: AcquisitionMethod | None = None
-    acquisition_checked: _dt.date | None = None
-    fidelity: Fidelity | None = None
-    retrieved_snapshot_date: _dt.date | None = None
-    sensitivity: Sensitivity = Sensitivity.normal
+    doc_type: str = Field(min_length=1)      # словарь — validate_sources.py
+    authority: str = Field(min_length=1)     # словарь — validate_sources.py
+    source_url: str = Field(pattern=r"^https?://")            # официальный первоисточник
+    official_alt_url: str | None = Field(default=None, pattern=r"^https?://")  # вход ладдера
+    sensitivity: Sensitivity = Sensitivity.normal            # гейтит archive-ступень ладдера
     rights: Rights = Rights.unknown
-    discovery: DiscoveryProvenance | None = None  # провенанс добычи, сохранён при промоушене
-    # --- пайплайн ---
-    status: Status
-    translation_status: TranslationStatus = TranslationStatus.not_started
-    notes: str | None = None
+    # --- аналитика (минимум, контент — EN) ---
+    topics: list[str] = Field(default_factory=list)          # словарь
+    g2ai_pattern: list[str] = Field(default_factory=list)    # словарь; только матрично-релевантные
+    summary: str | None = None                               # 2–3 предложения, EN
+    relations: list[Relation] = Field(default_factory=list)
+    relevance: Relevance | None = None       # вердикт триажа; обязателен — правило validate_sources
+    in_force: bool | None = None             # действует ли «живой» документ (взвешивание свежести)
 
 
 class CandidateRecord(BaseModel):
@@ -294,15 +281,55 @@ class CandidateRecord(BaseModel):
     rejected_reason: str | None = None
 
 
-def load_records(sources_path: Path) -> list[SourceRecord]:
-    """Загрузить и структурно провалидировать записи реестра (raises на битой структуре).
+def doc_dir(rec: SourceRecord, root: Path) -> Path:
+    """Папка документа: ``<root>/<track>/<entity_id>/<id>/`` (corpus-layout-v2)."""
+    return root / rec.track.value / rec.entity_id / rec.id
 
-    Полную валидацию (словари, уникальность id, relations) делает validate_sources.py.
+
+def raw_file(rec: SourceRecord, root: Path) -> Path | None:
+    """Оригинал документа: ``raw.*`` в папке (ext глобится). Несколько raw.* -> ошибка."""
+    matches = sorted(doc_dir(rec, root).glob("raw.*"))
+    if len(matches) > 1:
+        names = ", ".join(p.name for p in matches)
+        raise ValueError(f"{rec.id}: несколько raw.* в папке ({names})")
+    return matches[0] if matches else None
+
+
+def md_file(rec: SourceRecord, root: Path) -> Path:
+    """Конвертация: ``<doc_dir>/doc.md``."""
+    return doc_dir(rec, root) / "doc.md"
+
+
+def state_file(rec: SourceRecord, root: Path) -> Path:
+    """Операционный sidecar: ``<doc_dir>/.state.yaml``."""
+    return doc_dir(rec, root) / ".state.yaml"
+
+
+def load_records(sources_root: Path) -> list[SourceRecord]:
+    """Собрать записи корпуса обходом дерева ``sources/**/meta.yaml`` (строго, raises).
+
+    Инварианты: имя папки документа == ``id``; папка сущности == ``entity_id``; верхняя ==
+    ``track``; глобальная уникальность ``id``. Порядок — по ``id`` (детерминизм).
+    Полную семантику (словари, relevance, relations) проверяет validate_sources.py.
     """
-    raw: Any = yaml.safe_load(sources_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        raise ValueError(f"{sources_path}: верхний уровень должен быть списком записей")
-    return [SourceRecord.model_validate(item) for item in raw]
+    records: list[SourceRecord] = []
+    seen: set[str] = set()
+    for meta_path in sorted(sources_root.rglob("meta.yaml")):
+        raw: Any = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+        rec = SourceRecord.model_validate(raw)
+        doc, entity, track = meta_path.parent, meta_path.parent.parent, meta_path.parent.parent.parent
+        if doc.name != rec.id:
+            raise ValueError(f"{meta_path}: папка '{doc.name}' != id '{rec.id}'")
+        if entity.name != rec.entity_id:
+            raise ValueError(f"{meta_path}: папка сущности '{entity.name}' != entity_id '{rec.entity_id}'")
+        if track.name != rec.track.value:
+            raise ValueError(f"{meta_path}: верхняя папка '{track.name}' != track '{rec.track.value}'")
+        if rec.id in seen:
+            raise ValueError(f"дубль id '{rec.id}' ({meta_path})")
+        seen.add(rec.id)
+        records.append(rec)
+    records.sort(key=lambda r: r.id)
+    return records
 
 
 def load_candidates(candidates_path: Path) -> list[CandidateRecord]:
@@ -320,26 +347,45 @@ def load_candidates(candidates_path: Path) -> list[CandidateRecord]:
     return [CandidateRecord.model_validate(item) for item in raw]
 
 
+def load_state(state_path: Path) -> OperationalState:
+    """Загрузить операционное состояние ``.state.yaml`` (отсутствует/пуст -> пустое состояние)."""
+    if not state_path.exists():
+        return OperationalState()
+    raw: Any = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    if raw is None:
+        return OperationalState()
+    return OperationalState.model_validate(raw)
+
+
+def save_state(state_path: Path, state: OperationalState) -> None:
+    """Атомарно записать операционное состояние (машиннописаный файл, plain YAML + tmp->rename)."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = state.model_dump(mode="json", exclude_none=True)
+    tmp = state_path.parent / (state_path.name + ".tmp")
+    tmp.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp.replace(state_path)
+
+
 def promote_candidate(
     cand: CandidateRecord,
     *,
     id: str,
+    entity_id: str,
+    track: Track,
     issuer_type: IssuerType,
     geo_scope: GeoScope,
     doc_type: str,
     authority: str,
     relevance: Relevance,
-    status: Status = Status.pending,
-    merged_from: list[str] | None = None,
 ) -> SourceRecord:
-    """Промоутнуть кандидата в строгий ``SourceRecord`` (конверсия типа между хранилищами).
+    """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
-    Издательские/классификационные решения (``id``/``issuer_type``/``geo_scope``/
-    ``doc_type``/``authority``) и вердикт ``relevance`` — аргументы (решение триажа),
-    не выводятся из кандидата. Обязательные для ``SourceRecord`` поля, которых у
-    кандидата может не быть (``title``/``issuer``/``language``/``source_url``), берутся
-    из кандидата и обязаны присутствовать — иначе ``ValueError`` (неполного кандидата
-    промоутить нельзя). Провенанс добычи сохраняется в ``discovery``.
+    Издательские/классификационные решения (``id``/``entity_id``/``track``/``issuer_type``/
+    ``geo_scope``/``doc_type``/``authority``) и вердикт ``relevance`` — аргументы (решение
+    триажа), не выводятся из кандидата. Обязательные поля, которых у кандидата может не быть
+    (``title``/``issuer``/``language``/``source_url``), берутся из кандидата и обязаны
+    присутствовать — иначе ``ValueError``. Провенанс добычи остаётся в ``candidates.yaml``
+    (в ``meta.yaml`` НЕ копируется — corpus-layout-v2).
     """
     title, issuer, language, source_url = cand.title, cand.issuer, cand.language, cand.source_url
     missing = [
@@ -362,6 +408,8 @@ def promote_candidate(
 
     return SourceRecord(
         id=id,
+        entity_id=entity_id,
+        track=track,
         title=title,
         issuer=issuer,
         issuer_type=issuer_type,
@@ -374,14 +422,6 @@ def promote_candidate(
         rights=cand.rights or Rights.unknown,
         sensitivity=cand.sensitivity or Sensitivity.normal,
         relevance=relevance,
-        discovery=DiscoveryProvenance(
-            connector_id=cand.connector_id,
-            connector_kind=cand.connector_kind,
-            source_ref=cand.source_ref,
-            retrieved_at=cand.retrieved_at,
-            merged_from=merged_from or [],
-        ),
-        status=status,
     )
 
 
@@ -406,7 +446,7 @@ def render_frontmatter(rec: SourceRecord) -> str:
     fields: dict[str, Any] = {
         "id": rec.id,
         "title": rec.title,
-        "country": rec.country,
+        "entity_id": rec.entity_id,
         "issuer": rec.issuer,
         "issuer_type": rec.issuer_type.value,
         "doc_type": rec.doc_type,
@@ -416,7 +456,6 @@ def render_frontmatter(rec: SourceRecord) -> str:
         "source_url": rec.source_url,
         "g2ai_pattern": rec.g2ai_pattern,
         "topics": rec.topics,
-        "translation_status": rec.translation_status.value,
     }
     present = {k: v for k, v in fields.items() if v not in (None, [], "")}
     body = yaml.safe_dump(present, allow_unicode=True, sort_keys=False)

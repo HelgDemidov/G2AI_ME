@@ -16,7 +16,7 @@ from pathlib import Path
 
 from bge_tokenizer import token_counter
 from chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
-from schema import load_records
+from schema import load_records, md_file
 from validate_sources import DEFAULT_SOURCES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -90,20 +90,18 @@ def fts_search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[Se
 
 
 def chunks_from_corpus(
-    sources_path: Path,
+    sources_root: Path,
     count_tokens: TokenCounter,
     max_tokens: int = 512,
 ) -> list[Chunk]:
-    """Собрать канонические чанки всех .md-файлов корпуса (по md_path из реестра)."""
+    """Собрать канонические чанки всех doc.md корпуса (пути выводятся из папки-документа)."""
     chunks: list[Chunk] = []
-    for rec in load_records(sources_path):
-        if not rec.md_path:
+    for rec in load_records(sources_root):
+        md = md_file(rec, sources_root)
+        if not md.exists():
+            print(f"  пропуск {rec.id}: нет файла {md}", file=sys.stderr)
             continue
-        md_file = REPO_ROOT / rec.md_path
-        if not md_file.exists():
-            print(f"  пропуск {rec.id}: нет файла {md_file}", file=sys.stderr)
-            continue
-        text = strip_frontmatter(md_file.read_text(encoding="utf-8"))
+        text = strip_frontmatter(md.read_text(encoding="utf-8"))
         chunks.extend(chunk_text(text, count_tokens, max_tokens, doc_id=rec.id))
     return chunks
 
