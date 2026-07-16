@@ -84,16 +84,27 @@ def _compose_md(rec: schema.SourceRecord, current_md: str) -> str:
 
 
 def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) -> list[Stage]:
-    """Какие стадии нужны документу по фактическому состоянию ФС (пути выводятся из папки)."""
+    """Какие стадии нужны документу по фактическому состоянию ФС (пути выводятся из папки).
+
+    Целостность raw — дешёвым stat-guard'ом: sha256 пересчитывается (полное чтение
+    файла) ТОЛЬКО если ``size``/``mtime_ns`` разошлись с записанными в
+    ``.state.yaml`` — иначе на КАЖДОМ прогоне читались бы гигабайты raw ради «делать
+    нечего». Честная оговорка: guard доверяет mtime — подмена файла с подделкой
+    mtime+size его обойдёт, но это уже модель угроз, не защита от случайной порчи;
+    ``--force`` всегда пересчитывает.
+    """
     stages: list[Stage] = []
     raw = schema.raw_file(rec, root)          # существующий raw.* или None
     md = schema.md_file(rec, root)            # doc.md (путь; может не существовать)
-    known_sha = schema.load_state(schema.state_file(rec, root)).sha256
+    state = schema.load_state(schema.state_file(rec, root))
 
     if force or raw is None:
         stages.append(Stage.download)
-    elif known_sha and _sha256(raw) != known_sha:
-        stages.append(Stage.download)         # файл повреждён/изменился vs записанный sha
+    elif state.sha256:
+        st = raw.stat()
+        stat_matches = st.st_size == state.raw_size and st.st_mtime_ns == state.raw_mtime_ns
+        if not stat_matches and _sha256(raw) != state.sha256:
+            stages.append(Stage.download)     # файл повреждён/изменился vs записанный sha
 
     stale = False
     if raw is not None and raw.exists() and md.exists():
@@ -109,6 +120,41 @@ def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) 
             stages.append(Stage.frontmatter)  # frontmatter разошёлся с реестром
 
     return stages
+
+
+def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
+    """Обеспечить, что существующий raw отслеживается sha256 + stat-guard'ом
+    (``raw_size``/``raw_mtime_ns``). Покрывает два случая:
+
+    (а) raw добыт вручную (``--no-download``) — единственный писатель sha был у
+    ``_do_download``; без усыновления повреждение такого файла оставалось бы
+    невидимым навсегда.
+    (б) ``.state.yaml`` старого формата (sha есть, guard-полей ещё нет —
+    добавлены этим спеком): бэкфиллит их, но ТОЛЬКО если текущее содержимое
+    подтверждённо совпадает с уже записанным sha (одноразовая верификация при
+    миграции) — иначе рассинхрон/порча тихо получили бы «благословение» без
+    проверки, и guard начал бы доверять непроверенному файлу навсегда.
+
+    Идемпотентно. ``acquisition_method``/``fidelity`` не трогает — канал добычи
+    неизвестен изначально, человек фиксирует его сам при желании.
+    """
+    raw = schema.raw_file(rec, root)
+    if raw is None:
+        return
+    state_path = schema.state_file(rec, root)
+    state = schema.load_state(state_path)
+    st = raw.stat()
+    if state.sha256 is None:
+        state.sha256 = _sha256(raw)
+        state.raw_size = st.st_size
+        state.raw_mtime_ns = st.st_mtime_ns
+        schema.save_state(state_path, state)
+        logger.info("  %s: усыновлён ручной raw, sha зафиксирован", rec.id)
+    elif state.raw_size is None or state.raw_mtime_ns is None:
+        if _sha256(raw) == state.sha256:
+            state.raw_size = st.st_size
+            state.raw_mtime_ns = st.st_mtime_ns
+            schema.save_state(state_path, state)
 
 
 # --- исполнители стадий (side-effect, атомарная запись) ---
@@ -171,7 +217,10 @@ def _do_download(
         # при любом исключении (в т.ч. пробрасываемом AcquisitionBlocked) убирает огрызок
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
+    st = raw.stat()
     state.sha256 = _sha256(raw)
+    state.raw_size = st.st_size
+    state.raw_mtime_ns = st.st_mtime_ns
     state.acquisition_method = result.method
     state.fidelity = result.fidelity
     state.acquisition_checked = _dt.date.today()
@@ -228,10 +277,14 @@ def process_docs(
     (осмысленно только для одно-документных прогонов — ``main()`` включает его
     именно тогда, когда задан ``--only``).
 
-    Изоляция отказа охватывает и ПЛАНИРОВАНИЕ (staging-чистку + ``needed_stages``),
-    не только исполнение стадий: битый ``.state.yaml`` или папка с несколькими
-    ``raw.*`` (``schema.raw_file`` кидает ``ValueError``) роняют только этот
-    документ, а не весь батч.
+    Изоляция отказа охватывает и ПЛАНИРОВАНИЕ (staging-чистку + усыновление
+    неотслеженного raw + ``needed_stages``), не только исполнение стадий: битый
+    ``.state.yaml`` или папка с несколькими ``raw.*`` (``schema.raw_file`` кидает
+    ``ValueError``) роняют только этот документ, а не весь батч.
+
+    Усыновление (``_adopt_untracked_raw``) пропускается при ``dry_run`` — оно
+    ПИШЕТ ``.state.yaml`` (посчитанный sha256), а dry-run обязан быть no-op;
+    staging-чистка (garbage, не значимое состояние) выполняется в обоих режимах.
 
     Не отслеживает «что-то изменилось» (раньше — in-run флаг ``changed``):
     решение о пересборке индекса теперь реконсилируется по ``corpus_index.
@@ -243,6 +296,8 @@ def process_docs(
         res = DocResult(rec.id)
         try:
             fsio.cleanup_staging(schema.doc_dir(rec, root))  # останки упавшего прогона — самовосстановление
+            if not dry_run:  # усыновление ПИШЕТ .state.yaml — dry-run обязан быть no-op
+                _adopt_untracked_raw(rec, root)  # ручной/старого формата raw — под контролем целостности
             stages = needed_stages(rec, root, force=force)
         except Exception as exc:  # noqa: BLE001 — изоляция отказа документа (планирование)
             res.error = f"planning: {exc}"

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +17,13 @@ import schema
 from acquisition import AcquisitionOutcome, ClassifiedResponse
 from run_pipeline import (
     Stage,
+    _adopt_untracked_raw,
     _compose_md,
     _do_download,
     _do_frontmatter,
     _needs_index_rebuild,
     _read_index_fingerprint,
+    _sha256,
     needed_stages,
     process_docs,
     rebuild_index,
@@ -108,6 +111,15 @@ def test_dry_run_no_side_effects(tmp_path: Path) -> None:
     )
     assert results[0].done == [Stage.download, Stage.convert, Stage.frontmatter]
     assert not schema.doc_dir(rec, tmp_path).exists()  # ничего не создано
+
+
+def test_dry_run_does_not_adopt_untracked_raw(tmp_path: Path) -> None:
+    """--dry-run обязан быть no-op: усыновление (запись .state.yaml с посчитанным
+    sha) не должно происходить, даже если есть неотслеженный raw."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))  # актуален, sha не отслежен
+    process_docs([rec], tmp_path, force=False, dry_run=True, no_download=False, pause=0)
+    assert not schema.state_file(rec, tmp_path).exists()
 
 
 def test_failure_isolation(tmp_path: Path) -> None:
@@ -320,3 +332,121 @@ def test_rebuild_index_without_model_does_not_touch_existing_fingerprint(
 
     assert "пропущен" in status
     assert _read_index_fingerprint(db) == "old-fingerprint"
+
+
+# --- усыновление sha ручных raw + stat-guard пересчёта ---
+
+
+def test_adopt_untracked_raw_no_state_backfills_sha_and_stat(tmp_path: Path) -> None:
+    rec = make()
+    content = b"manually placed pdf content"
+    _place(rec, tmp_path, raw=content)
+
+    _adopt_untracked_raw(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.sha256 == hashlib.sha256(content).hexdigest()
+    assert state.raw_size == len(content)
+    assert state.raw_mtime_ns is not None
+
+
+def test_adopt_untracked_raw_no_raw_is_noop(tmp_path: Path) -> None:
+    rec = make()  # папка документа не создана вовсе
+    _adopt_untracked_raw(rec, tmp_path)  # не должно бросать
+    assert schema.load_state(schema.state_file(rec, tmp_path)) == schema.OperationalState()
+
+
+def test_adopt_untracked_raw_idempotent(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+    _adopt_untracked_raw(rec, tmp_path)
+    state1 = schema.load_state(schema.state_file(rec, tmp_path))
+    _adopt_untracked_raw(rec, tmp_path)  # повторно — уже отслежен, ничего не меняет
+    state2 = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state1 == state2
+
+
+def test_adopt_untracked_raw_backfills_old_state_when_sha_still_matches(tmp_path: Path) -> None:
+    """.state.yaml старого формата (sha есть, guard-полей нет) — бэкфилл, если
+    содержимое подтверждённо совпадает с уже записанным sha."""
+    rec = make()
+    content = b"stable content since before this feature"
+    _place(rec, tmp_path, raw=content, state={"sha256": hashlib.sha256(content).hexdigest()})
+
+    _adopt_untracked_raw(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.raw_size == len(content)
+    assert state.raw_mtime_ns is not None
+
+
+def test_adopt_untracked_raw_does_not_backfill_when_sha_mismatches(tmp_path: Path) -> None:
+    """Старый .state.yaml с sha, НЕ совпадающим с текущим содержимым (файл разошёлся
+    ДО того, как эта фича появилась) — guard-поля не бэкфиллятся вслепую; needed_stages
+    сама поймает расхождение и запланирует download."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"actual content", state={"sha256": "0" * 64})
+
+    _adopt_untracked_raw(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.sha256 == "0" * 64  # не тронут — не наше дело исправлять чужой sha
+    assert state.raw_size is None
+    assert state.raw_mtime_ns is None
+    assert Stage.download in needed_stages(rec, tmp_path)  # расхождение всё равно поймано
+
+
+def test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))  # актуален
+    _adopt_untracked_raw(rec, tmp_path)  # заполняет guard-поля
+
+    calls = {"n": 0}
+    real_sha256 = _sha256
+
+    def counting_sha256(path: Path) -> str:
+        calls["n"] += 1
+        return real_sha256(path)
+
+    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+
+    assert needed_stages(rec, tmp_path) == []
+    assert calls["n"] == 0  # stat совпал — полное чтение файла не потребовалось
+
+
+def test_needed_stages_stat_guard_recomputes_when_mtime_changed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))
+    _adopt_untracked_raw(rec, tmp_path)
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.touch()  # тот же контент, новый mtime -> guard не совпадёт
+
+    calls = {"n": 0}
+    real_sha256 = _sha256
+
+    def counting_sha256(path: Path) -> str:
+        calls["n"] += 1
+        return real_sha256(path)
+
+    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+
+    needed_stages(rec, tmp_path)
+    assert calls["n"] == 1  # stat разошёлся -> честно перечитан
+
+
+def test_corrupted_raw_after_adoption_triggers_download(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"original content", md=_compose_md(rec, ""))
+    _adopt_untracked_raw(rec, tmp_path)
+    assert needed_stages(rec, tmp_path) == []  # усыновлён, актуален
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.write_bytes(b"corrupted, different content, different size")
+
+    assert Stage.download in needed_stages(rec, tmp_path)
