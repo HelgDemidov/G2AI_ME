@@ -205,7 +205,7 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
 
     Raises ``AcquisitionBlocked`` when manual acquisition is needed, or
     ``AcquisitionDead`` when archive fallback is needed. Does not itself
-    perform manual/archive acquisition or persist anything to ``sources.yaml``
+    perform manual/archive acquisition or persist any state (``.state.yaml``)
     — those are the caller's job (see run_pipeline.py and commits 4/5/6).
     """
     has_alt = bool(rec.official_alt_url)

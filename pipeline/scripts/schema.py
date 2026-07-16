@@ -1,4 +1,4 @@
-"""Схема метаданных записей ``sources.yaml`` (G2AI-корпус) + рендер frontmatter.
+"""Схема метаданных записей корпуса (``meta.yaml``, corpus-layout-v2) + рендер frontmatter.
 
 Структурная валидация — pydantic (типы, форматы, обязательность, стабильные enum).
 Проверка принадлежности контролируемым словарям (doc_type / authority / topics /
@@ -335,7 +335,7 @@ def load_records(sources_root: Path) -> list[SourceRecord]:
 def load_candidates(candidates_path: Path) -> list[CandidateRecord]:
     """Загрузить и структурно провалидировать кандидатов ``candidates.yaml``.
 
-    Слой кандидатов — отдельный файл (по умолчанию рядом с sources.yaml), наполняется
+    Слой кандидатов — отдельный файл (``sources/candidates.yaml``), наполняется
     DISCOVERY-коннекторами; триаж читает и промоутит допущенных (см. ``promote_candidate``).
     Пустой/новый файл -> пустой список.
     """

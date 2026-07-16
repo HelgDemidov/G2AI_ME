@@ -1,15 +1,16 @@
-"""Валидатор реестра ``sources.yaml`` G2AI-корпуса.
+"""Валидатор корпуса G2AI — дерево ``sources/**/meta.yaml`` (corpus-layout-v2).
 
 Проверяет: (1) структуру каждой записи через pydantic-схему; (2) принадлежность
 ``doc_type``/``authority``/``topics``/``g2ai_pattern`` контролируемым словарям;
 (3) уникальность ``id``; (4) ссылочную целостность ``relations`` (цель — существующий id);
-(5) наличие ``relevance`` (все записи sources.yaml — допущенные триажем; см.
-source-relevance-triage).
+(5) наличие ``relevance`` (каждая запись корпуса — допущенная триажем; см.
+source-relevance-triage); (6) инварианты папок (папка документа == ``id``,
+папка сущности == ``entity_id``, верхняя == ``track``).
 
 Возвращает ненулевой код при ошибках — пригодно для pre-commit и CI.
 Запуск::
 
-    python3 validate_sources.py [путь_к_sources.yaml]
+    python3 validate_sources.py [корень_sources]
 """
 from __future__ import annotations
 
@@ -97,7 +98,7 @@ def validate_sources(sources_root: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Валидация реестра sources.yaml G2AI-корпуса")
+    parser = argparse.ArgumentParser(description="Валидация корпуса G2AI (sources/**/meta.yaml)")
     parser.add_argument(
         "sources",
         nargs="?",

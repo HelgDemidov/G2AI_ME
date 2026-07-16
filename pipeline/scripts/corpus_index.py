@@ -4,7 +4,8 @@
   chunks(chunk_id, doc_id, chunk_index, text, n_tokens)
   chunks_fts — внешне-контентная FTS5 над chunks.text, tokenize=unicode61 (многоязычно).
 
-CLI: собрать индекс из .md-файлов корпуса (пути и id — из sources.yaml) и/или искать.
+CLI: собрать индекс из ``doc.md`` корпуса (записи — обход ``sources/**/meta.yaml``,
+пути выводятся из папок-документов) и/или искать.
 """
 from __future__ import annotations
 

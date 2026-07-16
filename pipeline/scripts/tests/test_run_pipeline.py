@@ -114,7 +114,7 @@ def test_failure_isolation(tmp_path: Path) -> None:
 
 
 def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
-    """Сквозная проводка: _do_download -> run_ladder -> запись .state.yaml (не sources.yaml)."""
+    """Сквозная проводка: _do_download -> run_ladder -> запись .state.yaml (не meta.yaml)."""
     rec = make()
     ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
 

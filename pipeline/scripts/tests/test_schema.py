@@ -1,4 +1,4 @@
-"""Тесты pydantic-схемы записи sources.yaml и рендера frontmatter."""
+"""Тесты pydantic-схем корпуса (meta.yaml / .state.yaml / candidates.yaml) и рендера frontmatter."""
 from __future__ import annotations
 
 from pathlib import Path
