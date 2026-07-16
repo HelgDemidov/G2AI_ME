@@ -428,6 +428,34 @@ def test_find_wayback_snapshot_picks_freshest(monkeypatch: Any) -> None:
     assert snapshot.snapshot_url == "https://web.archive.org/web/20220806004506id_/https://ai.gov.ae/doc.pdf"
 
 
+def test_find_wayback_snapshot_query_uses_negative_limit_and_max_time(monkeypatch: Any) -> None:
+    """limit=-5 запрашивает у CDX-сервера ПОСЛЕДНИЕ N результатов напрямую — без
+    знака limit=20 отдал бы 20 СТАРЕЙШИХ (CDX сортирует по возрастанию)."""
+    captured: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
+        captured.extend(cmd)
+        return _FakeCompletedProcess("")
+
+    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    find_wayback_snapshot("https://ai.gov.ae/doc.pdf")
+
+    query = captured[-1]
+    assert "limit=-5" in query
+    assert "limit=20" not in query
+    assert "--max-time" in captured
+
+
+def test_find_wayback_snapshot_malformed_line_returns_none(monkeypatch: Any) -> None:
+    """Строка без второго поля (timestamp) — не наш формат, трактуем как «снимка
+    нет», а не IndexError."""
+    monkeypatch.setattr(
+        "acquisition.subprocess.run",
+        lambda cmd, check, capture_output, text: _FakeCompletedProcess("garbage-single-token\n"),
+    )
+    assert find_wayback_snapshot("https://example.org/doc.pdf") is None
+
+
 def test_find_wayback_snapshot_none_when_empty(monkeypatch: Any) -> None:
     def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
         return _FakeCompletedProcess("")

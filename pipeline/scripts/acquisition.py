@@ -380,25 +380,31 @@ class ArchiveSnapshot:
 def find_wayback_snapshot(original_url: str, *, timeout: int = 30) -> ArchiveSnapshot | None:
     """CDX lookup for the freshest 200/application-pdf snapshot of ``original_url``.
 
-    Returns ``None`` if none found. CDX sorts by timestamp ascending, so the
-    last line is the freshest snapshot — a closer match to the document's
-    final official content than an old one (still not a fidelity guarantee,
-    see spec §7 — the record's ``fidelity`` is set to ``archived_snapshot``,
-    never ``live``, regardless).
+    Returns ``None`` if none found. ``limit=-N`` asks the CDX server for the
+    LAST N results directly (verified against the official CDX server README,
+    2026-07-16: "Set limit=-N to return the last N results"). A plain
+    ``limit=20`` (no sign) instead returns the FIRST 20 — CDX sorts ascending
+    by timestamp, so for a URL with more than 20 matching snapshots that
+    silently picked a stale one instead of the freshest (still not a fidelity
+    guarantee either way, see spec §7 — the record's ``fidelity`` is set to
+    ``archived_snapshot``, never ``live``, regardless).
     """
     query = (
         f"{WAYBACK_CDX_URL}?url={quote(original_url, safe='')}"
-        "&output=text&filter=statuscode:200&filter=mimetype:application/pdf&limit=20"
+        "&output=text&filter=statuscode:200&filter=mimetype:application/pdf&limit=-5"
     )
     result = subprocess.run(
-        ["curl", "-sS", "--connect-timeout", str(timeout), query],
+        ["curl", "-sS", "--connect-timeout", str(timeout), "--max-time", str(timeout), query],
         check=True, capture_output=True, text=True,
     )
     lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     if not lines:
         return None
     # CDX text format: <urlkey> <timestamp> <original> <mimetype> <statuscode> <digest> <length>
-    timestamp = lines[-1].split()[1]
+    fields = lines[-1].split()
+    if len(fields) < 2:
+        return None  # неразбираемая строка — трактуем как «снимка нет», не IndexError
+    timestamp = fields[1]
     return ArchiveSnapshot(timestamp, f"https://web.archive.org/web/{timestamp}id_/{original_url}")
 
 
