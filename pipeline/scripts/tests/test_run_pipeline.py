@@ -355,10 +355,12 @@ def test_rebuild_index_writes_fingerprint_on_success(tmp_path: Path, monkeypatch
     monkeypatch.setattr("bge_tokenizer.token_counter", lambda: (lambda text: len(text.split())))
 
     db = tmp_path / "c.db"
-    status = rebuild_index(tmp_path, db, embed=False, fingerprint="fp-123")
+    status = rebuild_index(tmp_path, db, embed=False)
 
-    assert "FTS" in status
-    assert _read_index_fingerprint(db) == "fp-123"
+    assert "чанков" in status
+    # отпечаток, записанный пересборкой, обязан совпасть со свежепосчитанным —
+    # иначе следующий прогон не смог бы честно no-op'нуть по гейту.
+    assert _read_index_fingerprint(db) == corpus_index.corpus_fingerprint(tmp_path)
 
 
 def test_rebuild_index_without_model_does_not_touch_existing_fingerprint(
@@ -380,7 +382,7 @@ def test_rebuild_index_without_model_does_not_touch_existing_fingerprint(
     conn.commit()
     conn.close()
 
-    status = rebuild_index(tmp_path, db, embed=False, fingerprint="new-fingerprint")
+    status = rebuild_index(tmp_path, db, embed=False)
 
     assert "пропущен" in status
     assert _read_index_fingerprint(db) == "old-fingerprint"

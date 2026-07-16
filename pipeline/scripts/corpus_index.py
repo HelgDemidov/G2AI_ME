@@ -100,23 +100,35 @@ def write_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _doc_fingerprint(md: Path) -> str:
+    """Per-doc отпечаток ``doc.md`` (только ``stat``): ``"<size>:<mtime_ns>"``.
+    Единица инкрементальной переиндексации — хранится в ``doc_state``."""
+    st = md.stat()
+    return f"{st.st_size}:{st.st_mtime_ns}"
+
+
+def _fingerprint_from_parts(parts: list[str]) -> str:
+    """sha256 отсортированных строк — общий хэш для ``corpus_fingerprint`` и его
+    инкрементального пересчёта (``index_corpus_incremental``): формат обязан
+    совпадать, поэтому считается ОДНОЙ функцией."""
+    return hashlib.sha256("\n".join(sorted(parts)).encode("utf-8")).hexdigest()
+
+
 def corpus_fingerprint(sources_root: Path) -> str:
     """Дешёвый (только ``stat``, без чтения содержимого) отпечаток состояния корпуса:
     sha256 отсортированных ``"<id>:<size>:<mtime_ns>"`` по всем СУЩЕСТВУЮЩИМ ``doc.md``.
 
     Документы без ``doc.md`` не входят — их появление (после конвертации) меняет
     отпечаток и триггерит пересборку индекса. На ~200 документах — ~200 ``stat()``,
-    миллисекунды (см. spec index-consistency §2: content-hash дороже и появится
-    на уровне ЧАНКОВ в index-incremental, где окупается).
+    миллисекунды. Остаётся быстрым глобальным гейтом «есть ли работа вообще»
+    (реконсиляция run_pipeline); тонкую per-doc инкрементальность даёт ``doc_state``.
     """
-    parts: list[str] = []
-    for rec in load_records(sources_root):
-        md = md_file(rec, sources_root)
-        if not md.exists():
-            continue
-        st = md.stat()
-        parts.append(f"{rec.id}:{st.st_size}:{st.st_mtime_ns}")
-    return hashlib.sha256("\n".join(sorted(parts)).encode("utf-8")).hexdigest()
+    parts = [
+        f"{rec.id}:{_doc_fingerprint(md)}"
+        for rec in load_records(sources_root)
+        if (md := md_file(rec, sources_root)).exists()
+    ]
+    return _fingerprint_from_parts(parts)
 
 
 @dataclass(frozen=True)
@@ -217,6 +229,134 @@ def index_chunks(
     conn.commit()
 
 
+def _delete_doc_chunks(conn: sqlite3.Connection, doc_id: str) -> None:
+    """Удалить чанки документа из ``chunks`` И из внешне-контентного FTS-индекса.
+
+    FTS5 external content не самосинхронизируется (триггеров нет): удаление строки —
+    ТОЛЬКО через ``INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', …)``
+    с ТЕМ ЖЕ текстом, что был проиндексирован, иначе в индексе остаются висячие
+    постинги (верифицировано по sqlite.org/fts5). Текст берём прямо из ``chunks`` — он
+    побайтово совпадает со вставленным (``_insert_doc_chunks`` пишет FTS тем же
+    ``c.text``). Порядок принципиален: FTS-delete КАЖДОЙ строки ДО ``DELETE FROM
+    chunks`` — после удаления строки её текст для delete уже не прочитать.
+    """
+    old = conn.execute("SELECT chunk_id, text FROM chunks WHERE doc_id = ?", (doc_id,)).fetchall()
+    for chunk_id, text in old:
+        conn.execute(
+            "INSERT INTO chunks_fts (chunks_fts, rowid, text) VALUES ('delete', ?, ?)",
+            (chunk_id, text),
+        )
+    conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+
+
+def _insert_doc_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
+    """Вставить чанки документа в ``chunks`` + вручную синхронизировать FTS.
+    ``chunk_id`` присваивается rowid'ом при INSERT — берём ``lastrowid`` и пишем в FTS
+    ТОТ ЖЕ текст (инвариант для последующего ``_delete_doc_chunks``)."""
+    for c in chunks:
+        cur = conn.execute(
+            "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text)),
+        )
+        conn.execute("INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)", (cur.lastrowid, c.text))
+
+
+def _rebuild_doc_state(conn: sqlite3.Connection, sources_root: Path) -> None:
+    """Переписать ``doc_state`` под текущий корпус (после полного rebuild): иначе
+    следующий инкремент счёл бы все документы «изменившимися» (пустой doc_state) и
+    пере-чанковал бы весь корпус повторно."""
+    conn.execute("DELETE FROM doc_state")
+    conn.executemany(
+        "INSERT INTO doc_state (doc_id, fingerprint) VALUES (?, ?)",
+        [
+            (rec.id, _doc_fingerprint(md))
+            for rec in load_records(sources_root)
+            if (md := md_file(rec, sources_root)).exists()
+        ],
+    )
+    conn.commit()
+
+
+def index_corpus_incremental(
+    conn: sqlite3.Connection,
+    sources_root: Path,
+    count_tokens: TokenCounter,
+    max_tokens: int,
+) -> tuple[int, int]:
+    """Инкрементальная переиндексация: пере-чанкуются (дорогая bge-токенизация) и
+    пере-индексируются в FTS ТОЛЬКО документы, чей ``doc.md`` изменился (fingerprint
+    разошёлся с ``doc_state``) или исчез из корпуса. Возвращает ``(изменено, удалено)``.
+
+    Одна транзакция на прогон (``with conn``): краш откатывает к консистентному
+    прошлому поколению — ``doc_state`` не обгоняет ``chunks``. DDL/миграция здесь
+    ОТСУТСТВУЮТ (они в ``create_db``): питоновский ``sqlite3`` неявно коммитит на DDL
+    и порвал бы атомарность. ``corpus_fingerprint``/``chunk_max_tokens`` пишутся той
+    же транзакцией — глобальный гейт реконсиляции остаётся согласован с чанками.
+    """
+    current: dict[str, tuple[str, Path]] = {}
+    for rec in load_records(sources_root):
+        md = md_file(rec, sources_root)
+        if md.exists():
+            current[rec.id] = (_doc_fingerprint(md), md)
+    stored = {
+        str(r[0]): str(r[1])
+        for r in conn.execute("SELECT doc_id, fingerprint FROM doc_state").fetchall()
+    }
+
+    changed = [doc_id for doc_id, (fp, _) in current.items() if stored.get(doc_id) != fp]
+    vanished = [doc_id for doc_id in stored if doc_id not in current]
+    corpus_fp = _fingerprint_from_parts([f"{d}:{fp}" for d, (fp, _) in current.items()])
+
+    with conn:  # атомарно: либо всё новое поколение, либо ничего
+        for doc_id in (*changed, *vanished):
+            _delete_doc_chunks(conn, doc_id)
+        for doc_id in changed:
+            fp, md = current[doc_id]
+            text = strip_frontmatter(md.read_text(encoding="utf-8"))
+            _insert_doc_chunks(conn, chunk_text(text, count_tokens, max_tokens, doc_id=doc_id))
+            conn.execute(
+                "INSERT INTO doc_state (doc_id, fingerprint) VALUES (?, ?) "
+                "ON CONFLICT(doc_id) DO UPDATE SET fingerprint = excluded.fingerprint",
+                (doc_id, fp),
+            )
+        for doc_id in vanished:
+            conn.execute("DELETE FROM doc_state WHERE doc_id = ?", (doc_id,))
+        write_meta(conn, "corpus_fingerprint", corpus_fp)
+        write_meta(conn, "chunk_max_tokens", str(max_tokens))
+    return len(changed), len(vanished)
+
+
+def index_corpus(
+    conn: sqlite3.Connection,
+    sources_root: Path,
+    count_tokens: TokenCounter,
+    max_tokens: int,
+    *,
+    force: bool = False,
+) -> str:
+    """Единая точка индексации. Полный rebuild (эталонный ``index_chunks`` +
+    ``_rebuild_doc_state``) при ``force`` или смене ``chunk_max_tokens`` (границы
+    чанков изменились → пере-чанковать весь корпус); иначе — инкремент. Свежая/только
+    что мигрированная БД (пустой ``doc_state``) строится инкрементальным путём: все
+    документы «изменились», FTS чист — висячих постингов нет. Возвращает статус."""
+    stored_max = read_meta(conn, "chunk_max_tokens")
+    full = force or (stored_max is not None and int(stored_max) != max_tokens)
+    if full:
+        chunks = chunks_from_corpus(sources_root, count_tokens, max_tokens)
+        index_chunks(
+            conn, chunks,
+            corpus_fingerprint=corpus_fingerprint(sources_root),
+            chunk_max_tokens=max_tokens,
+        )
+        _rebuild_doc_state(conn, sources_root)
+        return f"полная пересборка: {len(chunks)} чанков"
+    changed, vanished = index_corpus_incremental(conn, sources_root, count_tokens, max_tokens)
+    row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+    total = int(row[0]) if row else 0
+    return f"инкремент: изменено {changed}, удалено {vanished}; всего {total} чанков"
+
+
 def sanitize_fts_query(q: str) -> str:
     """Безопасно превратить произвольную пользовательскую строку в FTS5 MATCH-запрос.
 
@@ -269,16 +409,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
     if not fts5_available():
         print("SQLite без поддержки FTS5 — индекс не построить", file=sys.stderr)
         return 3
-    chunks = chunks_from_corpus(args.sources, token_counter(), args.max_tokens)
     conn = create_db(args.db)
-    index_chunks(
-        conn, chunks,
-        corpus_fingerprint=corpus_fingerprint(args.sources),
-        chunk_max_tokens=args.max_tokens,
-    )
-    n_docs = len({c.doc_id for c in chunks})
-    print(f"Проиндексировано: {len(chunks)} чанков из {n_docs} документов -> {args.db}")
+    status = index_corpus(conn, args.sources, token_counter(), args.max_tokens, force=args.force)
     conn.close()
+    print(f"{status} -> {args.db}")
     return 0
 
 
@@ -308,9 +442,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"путь к БД ({DEFAULT_DB})")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_build = sub.add_parser("build", help="построить индекс из .md корпуса")
+    p_build = sub.add_parser("build", help="построить/обновить индекс из .md корпуса (инкрементально)")
     p_build.add_argument("sources", nargs="?", type=Path, default=DEFAULT_SOURCES)
     p_build.add_argument("--max-tokens", type=int, default=EMBED_MAX_TOKENS)
+    p_build.add_argument(
+        "--force", action="store_true",
+        help="полная пересборка вместо инкремента по изменённым doc.md",
+    )
     p_build.set_defaults(func=_cmd_build)
 
     p_search = sub.add_parser("search", help="полнотекстовый поиск")

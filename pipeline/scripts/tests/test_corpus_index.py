@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import corpus_index
 from chunking import Chunk
 from corpus_index import (
     SCHEMA_VERSION,
@@ -19,6 +21,8 @@ from corpus_index import (
     fts5_available,
     fts_search,
     index_chunks,
+    index_corpus,
+    index_corpus_incremental,
     read_meta,
     sanitize_fts_query,
     write_meta,
@@ -319,4 +323,173 @@ def test_migration_then_index_works(tmp_path: Path) -> None:
     index_chunks(conn, sample_chunks())
     hits = fts_search(conn, "governance")
     assert len(hits) == 1
+    conn.close()
+
+
+# --- инкрементальная переиндексация по doc-fingerprint (spec index-incremental §2) ---
+
+# Тела из абзацев по 2 слова: с MAX=3 каждый документ даёт несколько чанков —
+# упражняем многочанковый delete/insert и последовательность chunk_index.
+_MAX = 3
+_A_BODY = "alpha governance\n\nframework oversight\n\ntesting agents"
+_B_BODY = "beta monitoring\n\npermission tooling\n\nhuman review"
+
+
+def _fake_counter(text: str) -> int:
+    return len(text.split())
+
+
+def _doc(root: Path, doc_id: str, entity: str, body: str) -> Path:
+    return _write_corpus_doc(root, id=doc_id, entity_id=entity, md=body)
+
+
+def _chunk_rows(conn: sqlite3.Connection) -> list[tuple[str, int, str]]:
+    return sorted(
+        (str(r[0]), int(r[1]), str(r[2]))
+        for r in conn.execute("SELECT doc_id, chunk_index, text FROM chunks").fetchall()
+    )
+
+
+def _chunk_ids_of(conn: sqlite3.Connection, doc_id: str) -> set[int]:
+    return {int(r[0]) for r in conn.execute("SELECT chunk_id FROM chunks WHERE doc_id=?", (doc_id,))}
+
+
+def _fts_docs(conn: sqlite3.Connection, term: str) -> set[tuple[str, int]]:
+    return {(h.doc_id, h.chunk_index) for h in fts_search(conn, term)}
+
+
+def test_initial_index_builds_all_docs(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    _doc(root, "doc-beta-2026", "be", _B_BODY)
+    conn = create_db(tmp_path / "c.db")
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    assert (changed, vanished) == (2, 0)
+    assert _fts_docs(conn, "governance") == {("doc-alpha-2026", 0)}
+    assert _fts_docs(conn, "monitoring") == {("doc-beta-2026", 0)}
+    conn.close()
+
+
+def test_incremental_touches_only_changed_doc(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    dir_a = _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    _doc(root, "doc-beta-2026", "be", _B_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    b_ids_before = _chunk_ids_of(conn, "doc-beta-2026")
+
+    (dir_a / "doc.md").write_text("alpha rewritten\n\nbrand new body", encoding="utf-8")
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (1, 0)
+    assert _chunk_ids_of(conn, "doc-beta-2026") == b_ids_before  # B не тронут
+    assert _fts_docs(conn, "rewritten") == {("doc-alpha-2026", 0)}  # новый текст A ищется
+    assert _fts_docs(conn, "governance") == set()  # старый текст A выметен из FTS
+    assert _fts_docs(conn, "monitoring") == {("doc-beta-2026", 0)}  # B по-прежнему ищется
+    conn.close()
+
+
+def test_incremental_noop_when_unchanged(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    _doc(root, "doc-beta-2026", "be", _B_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    rows_before = _chunk_rows(conn)
+    a_ids, b_ids = _chunk_ids_of(conn, "doc-alpha-2026"), _chunk_ids_of(conn, "doc-beta-2026")
+
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (0, 0)
+    assert _chunk_rows(conn) == rows_before
+    assert _chunk_ids_of(conn, "doc-alpha-2026") == a_ids  # chunk_id не перевыдан
+    assert _chunk_ids_of(conn, "doc-beta-2026") == b_ids
+    conn.close()
+
+
+def test_incremental_adds_new_doc(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    a_ids = _chunk_ids_of(conn, "doc-alpha-2026")
+
+    _doc(root, "doc-beta-2026", "be", _B_BODY)
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (1, 0)
+    assert _chunk_ids_of(conn, "doc-alpha-2026") == a_ids  # A не тронут
+    assert _fts_docs(conn, "monitoring") == {("doc-beta-2026", 0)}
+    conn.close()
+
+
+def test_incremental_purges_removed_doc(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    dir_b = _doc(root, "doc-beta-2026", "be", _B_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    assert _fts_docs(conn, "monitoring") == {("doc-beta-2026", 0)}
+
+    shutil.rmtree(dir_b)  # документ исчез из корпуса
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (0, 1)
+    assert _chunk_ids_of(conn, "doc-beta-2026") == set()  # чанки B ушли
+    assert _fts_docs(conn, "monitoring") == set()  # и FTS-строки B ушли (не висячие постинги)
+    assert conn.execute("SELECT COUNT(*) FROM doc_state WHERE doc_id=?", ("doc-beta-2026",)).fetchone()[0] == 0
+    assert _fts_docs(conn, "governance") == {("doc-alpha-2026", 0)}  # A цел
+    conn.close()
+
+
+def test_incremental_series_equals_full_rebuild(tmp_path: Path) -> None:
+    """GOLDEN-оракул (spec §Тестовое покрытие): набор (doc_id, chunk_index, text) и
+    FTS-выдача после СЕРИИ инкрементов == после полного --force rebuild того же
+    финального корпуса. Ловит любой десинк ручного external-content delete/insert."""
+    root = tmp_path / "src"
+    dir_a = _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    dir_b = _doc(root, "doc-beta-2026", "be", _B_BODY)
+
+    conn_inc = create_db(tmp_path / "inc.db")
+    index_corpus(conn_inc, root, _fake_counter, _MAX)                       # начальная
+    (dir_a / "doc.md").write_text("alpha edited\n\nnew alpha lines\n\ntail", encoding="utf-8")
+    index_corpus(conn_inc, root, _fake_counter, _MAX)                       # правка A
+    _doc(root, "doc-gamma-2026", "ga", "gamma novel\n\nwords appended")     # +C
+    index_corpus(conn_inc, root, _fake_counter, _MAX)
+    shutil.rmtree(dir_b)                                                    # -B
+    index_corpus(conn_inc, root, _fake_counter, _MAX)
+
+    conn_full = create_db(tmp_path / "full.db")
+    index_corpus(conn_full, root, _fake_counter, _MAX, force=True)          # эталон
+
+    assert _chunk_rows(conn_inc) == _chunk_rows(conn_full)
+    for term in ("alpha", "edited", "gamma", "novel", "governance", "monitoring"):
+        assert _fts_docs(conn_inc, term) == _fts_docs(conn_full, term), term
+    conn_inc.close()
+    conn_full.close()
+
+
+def test_incremental_rolls_back_on_failure(tmp_path: Path, monkeypatch: Any) -> None:
+    """Транзакционность: сбой посреди инкремента (мок insert) откатывает ВСЁ —
+    doc_state не обгоняет chunks, БД остаётся на прошлом поколении."""
+    root = tmp_path / "src"
+    dir_a = _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    dir_b = _doc(root, "doc-beta-2026", "be", _B_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    rows_before = _chunk_rows(conn)
+    fp_before = read_meta(conn, "corpus_fingerprint")
+
+    (dir_a / "doc.md").write_text("alpha changed one\n\ntwo three", encoding="utf-8")
+    (dir_b / "doc.md").write_text("beta changed four\n\nfive six", encoding="utf-8")
+
+    def boom(_conn: sqlite3.Connection, _chunks: list[Chunk]) -> None:
+        raise RuntimeError("искусственный сбой посреди инкремента")
+
+    monkeypatch.setattr(corpus_index, "_insert_doc_chunks", boom)
+    with pytest.raises(RuntimeError):
+        index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert _chunk_rows(conn) == rows_before           # чанки не изменились
+    assert read_meta(conn, "corpus_fingerprint") == fp_before  # отпечаток не обогнал
     conn.close()
