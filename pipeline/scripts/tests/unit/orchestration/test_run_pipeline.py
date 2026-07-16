@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from acquire import acquisition
+from convert import converters
 from index import corpus_index
 from core import schema
 from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
@@ -77,21 +78,46 @@ def test_sha256_mismatch_triggers_download(tmp_path: Path) -> None:
     assert Stage.download in needed_stages(rec, tmp_path)
 
 
+def _stamp_converter_state(rec: SourceRecord, root: Path) -> None:
+    """Дописать converter_name/version (текущий реестр) в УЖЕ существующее .state.yaml,
+    сохранив прочие поля (sha256/raw_size/…) — для тестов, где состояние уже подготовлено
+    _adopt_untracked_raw и фокус не на версионировании конвертера."""
+    state_path = schema.state_file(rec, root)
+    state = schema.load_state(state_path)
+    conv = converters._CONVERTERS["pdf"]
+    state.converter_name, state.converter_version = conv.name, conv.version
+    schema.save_state(state_path, state)
+
+
+def _current_converter_state() -> dict[str, str]:
+    """Состояние с converter_name/version, ТЕКУЩИМИ у реального реестра pdf — изолирует
+    тесты, не посвящённые версионированию конвертера, от converter_changed в needed_stages
+    (иначе легаси-состояние без этих полей само по себе требовало бы Stage.convert, см.
+    отдельные test_needed_stages_*_converter_* ниже, которые как раз это и проверяют)."""
+    conv = converters._CONVERTERS["pdf"]
+    return {"converter_name": conv.name, "converter_version": conv.version}
+
+
 def test_up_to_date_no_stages(tmp_path: Path) -> None:
     rec = make()
-    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))  # синхронный frontmatter, sha неизвестен
+    _place(  # синхронный frontmatter, sha неизвестен, конвертер актуален
+        rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""), state=_current_converter_state()
+    )
     assert needed_stages(rec, tmp_path) == []
 
 
 def test_force_redoes_all(tmp_path: Path) -> None:
     rec = make()
-    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))
+    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""), state=_current_converter_state())
     assert needed_stages(rec, tmp_path, force=True) == [Stage.download, Stage.convert, Stage.frontmatter]
 
 
 def test_frontmatter_drift_detected(tmp_path: Path) -> None:
     rec = make()
-    _place(rec, tmp_path, raw=b"pdf", md="---\nid: stale-old\n---\n\nBody.\n")
+    _place(
+        rec, tmp_path, raw=b"pdf", md="---\nid: stale-old\n---\n\nBody.\n",
+        state=_current_converter_state(),
+    )
     assert needed_stages(rec, tmp_path) == [Stage.frontmatter]
 
 
@@ -122,6 +148,11 @@ def test_do_frontmatter_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any)
     assert calls == [schema.md_file(rec, tmp_path)]
 
 
+def _fake_converter(fn: Any, *, name: str = "pdf", version: str = "test") -> Any:
+    """Подменить реестр реестра одним fake-конвертером: fn(raw, out, language) -> None."""
+    return converters.Converter(name, version, fn)
+
+
 def test_do_convert_staging_uses_dot_prefix_on_failure(tmp_path: Path, monkeypatch: Any) -> None:
     """_do_convert мигрирован на fsio.staging_path — при отказе конвертации огрызок
     остаётся под dot-префиксным именем (совместимым с fsio.cleanup_staging), не
@@ -129,10 +160,10 @@ def test_do_convert_staging_uses_dot_prefix_on_failure(tmp_path: Path, monkeypat
     rec = make()
     _place(rec, tmp_path, raw=b"pdf")
 
-    def fake_convert(src: str, dst: str) -> None:
-        Path(dst).write_bytes(b"")  # пустой вывод -> _do_convert бросит RuntimeError
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_bytes(b"")  # пустой вывод -> _do_convert бросит RuntimeError
 
-    monkeypatch.setattr("run_pipeline.pdf_convert", fake_convert)
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
 
     with pytest.raises(RuntimeError, match="пустой файл"):
         _do_convert(rec, tmp_path)
@@ -145,14 +176,91 @@ def test_do_convert_success_leaves_no_staging(tmp_path: Path, monkeypatch: Any) 
     rec = make()
     _place(rec, tmp_path, raw=b"pdf")
 
-    def fake_convert(src: str, dst: str) -> None:
-        Path(dst).write_text("converted body", encoding="utf-8")
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("converted body", encoding="utf-8")
 
-    monkeypatch.setattr("run_pipeline.pdf_convert", fake_convert)
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
     _do_convert(rec, tmp_path)
 
     assert schema.md_file(rec, tmp_path).read_text(encoding="utf-8") == "converted body"
     assert list(schema.doc_dir(rec, tmp_path).glob(".*.part")) == []
+
+
+def test_do_convert_writes_converter_name_and_version_to_state(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("body", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert, version="7"))
+    _do_convert(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert (state.converter_name, state.converter_version) == ("pdf", "7")
+
+
+def test_do_convert_passes_record_language_to_converter(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make(language="et")
+    _place(rec, tmp_path, raw=b"pdf")
+    seen: list[str | None] = []
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        seen.append(language)
+        dst.write_text("body", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    _do_convert(rec, tmp_path)
+
+    assert seen == ["et"]
+
+
+def test_do_convert_unsupported_format_raises(tmp_path: Path) -> None:
+    rec = make()
+    d = schema.doc_dir(rec, tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "raw.xyz").write_bytes(b"data")
+    with pytest.raises(converters.UnsupportedFormat):
+        _do_convert(rec, tmp_path)
+
+
+# --- needed_stages: converter_changed (реконсиляция реконверсии) ---
+
+
+def test_needed_stages_replans_convert_when_converter_version_changed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    rec = make()
+    _place(
+        rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""),
+        state={"converter_name": "pdf", "converter_version": "0"},
+    )
+    monkeypatch.setitem(
+        converters._CONVERTERS, "pdf", _fake_converter(lambda raw, out, lang: None, version="1")
+    )
+    assert needed_stages(rec, tmp_path) == [Stage.convert, Stage.frontmatter]
+
+
+def test_needed_stages_no_convert_when_converter_version_matches(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    rec = make()
+    _place(
+        rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""),
+        state={"converter_name": "pdf", "converter_version": "1"},
+    )
+    monkeypatch.setitem(
+        converters._CONVERTERS, "pdf", _fake_converter(lambda raw, out, lang: None, version="1")
+    )
+    assert needed_stages(rec, tmp_path) == []
+
+
+def test_needed_stages_legacy_state_without_converter_fields_replans_convert(tmp_path: Path) -> None:
+    """.state.yaml без converter_name/version (легаси) -> mismatch с None -> одноразовая
+    реконверсия на первом прогоне после мерджа спека (см. spec §3)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))  # без state вовсе
+    assert needed_stages(rec, tmp_path) == [Stage.convert, Stage.frontmatter]
 
 
 def test_dry_run_no_side_effects(tmp_path: Path) -> None:
@@ -177,7 +285,9 @@ def test_dry_run_does_not_adopt_untracked_raw(tmp_path: Path) -> None:
 def test_failure_isolation(tmp_path: Path) -> None:
     a = make(id="a-doc-2026", entity_id="aa")  # нужен download
     b = make(id="b-doc-2026", entity_id="bb")
-    _place(b, tmp_path, raw=b"pdf", md=_compose_md(b, ""))  # b актуален
+    _place(  # b актуален (вкл. версию конвертера — иначе понадобился бы реальный _do_convert)
+        b, tmp_path, raw=b"pdf", md=_compose_md(b, ""), state=_current_converter_state()
+    )
 
     results = process_docs(
         [a, b], tmp_path,
@@ -256,7 +366,9 @@ def test_do_download_replaces_prior_raw_of_different_ext(tmp_path: Path, monkeyp
 def test_process_docs_cleans_stale_staging_before_planning(tmp_path: Path) -> None:
     """Реконсиляционная чистка (§1d): останки упавшего прогона убираются сами."""
     rec = make()
-    _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))  # актуален
+    _place(  # актуален (вкл. версию конвертера)
+        rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""), state=_current_converter_state()
+    )
     doc_dir = schema.doc_dir(rec, tmp_path)
     (doc_dir / ".raw.pdf.part").write_bytes(b"stale leftover")
 
@@ -279,7 +391,9 @@ def test_planning_failure_isolated_from_batch(tmp_path: Path) -> None:
     (broken_dir / "raw.html").write_bytes(b"html")  # два raw.* -> ValueError у raw_file
 
     ok = make(id="ok-doc-2026", entity_id="oo")
-    _place(ok, tmp_path, raw=b"pdf", md=_compose_md(ok, ""))  # актуален
+    _place(  # актуален (вкл. версию конвертера)
+        ok, tmp_path, raw=b"pdf", md=_compose_md(ok, ""), state=_current_converter_state()
+    )
 
     results = process_docs(
         [broken, ok], tmp_path, force=False, dry_run=False, no_download=False, pause=0
@@ -456,6 +570,7 @@ def test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged(
     rec = make()
     _place(rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""))  # актуален
     _adopt_untracked_raw(rec, tmp_path)  # заполняет guard-поля
+    _stamp_converter_state(rec, tmp_path)  # + converter-поля, сохраняя guard-поля
 
     calls = {"n": 0}
     real_sha256 = _sha256
@@ -497,6 +612,7 @@ def test_corrupted_raw_after_adoption_triggers_download(tmp_path: Path) -> None:
     rec = make()
     _place(rec, tmp_path, raw=b"original content", md=_compose_md(rec, ""))
     _adopt_untracked_raw(rec, tmp_path)
+    _stamp_converter_state(rec, tmp_path)
     assert needed_stages(rec, tmp_path) == []  # усыновлён, актуален
 
     raw = schema.raw_file(rec, tmp_path)
