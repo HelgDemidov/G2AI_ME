@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "bge-m3-onnx-int8"
+MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "bge-m3-onnx-int8"
 TOKENIZER_JSON = MODEL_DIR / "tokenizer.json"
 
 # Единый бюджет чанка/эмбеддинга корпуса. Модельный контекст bge-m3 — 8192

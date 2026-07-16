@@ -32,7 +32,8 @@ jobs:
         run: ruff check pipeline/scripts
 
       - name: Mypy (strict)
-        run: python -m mypy pipeline/scripts/*.py
+        # рекурсивно по каталогу: подпакеты слоёв + тесты (file-glob *.py их не видел)
+        run: python -m mypy pipeline/scripts
 
       - name: Pytest (без модель-зависимых)
         run: python -m pytest -m "not model"

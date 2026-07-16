@@ -1,9 +1,9 @@
 """Тесты логики чанковки (счётчик токенов = число слов, без модели — CI-safe)."""
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
 
-from chunking import _hard_split, chunk_text, strip_frontmatter
+from index.chunking import _hard_split, chunk_text, strip_frontmatter
 
 
 def wc(text: str) -> int:
@@ -68,7 +68,7 @@ def test_indices_are_sequential() -> None:
 # --- _hard_split: перф (O(n), не O(n²)) и корректность при "лгущей" per-word оценке ---
 
 
-def _counting(counter: Any) -> tuple[Any, dict[str, int]]:
+def _counting(counter: Callable[[str], int]) -> tuple[Callable[[str], int], dict[str, int]]:
     calls = {"n": 0}
 
     def wrapped(text: str) -> int:

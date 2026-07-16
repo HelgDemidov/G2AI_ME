@@ -7,8 +7,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from bge_tokenizer import TOKENIZER_JSON
-from embed import DEFAULT_ONNX, OnnxBgeEmbedder
+from index.bge_tokenizer import TOKENIZER_JSON
+from index.embed import DEFAULT_ONNX, OnnxBgeEmbedder
 
 pytestmark = [
     pytest.mark.model,

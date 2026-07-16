@@ -13,11 +13,11 @@ from typing import Any
 import numpy as np
 import pytest
 
-from bge_tokenizer import EMBED_MAX_TOKENS
-from chunking import Chunk
-from corpus_index import create_db, fts5_available, index_chunks
-from embed import l2_normalize
-from vector_store import (
+from index.bge_tokenizer import EMBED_MAX_TOKENS
+from index.chunking import Chunk
+from index.corpus_index import create_db, fts5_available, index_chunks
+from index.embed import l2_normalize
+from index.vector_store import (
     _cmd_embed,
     check_chunk_budget,
     chunk_hashes,
@@ -215,7 +215,7 @@ def test_cmd_embed_reports_budget_error_without_calling_embedder(
     def fail_if_called(backend: str, model: str | None) -> Any:
         raise AssertionError("эмбеддер не должен вызываться — гейт обязан отсечь раньше")
 
-    monkeypatch.setattr("vector_store._make_embedder", fail_if_called)
+    monkeypatch.setattr("index.vector_store._make_embedder", fail_if_called)
 
     args = argparse.Namespace(db=db, backend="bge", model=None)
     assert _cmd_embed(args) == 2

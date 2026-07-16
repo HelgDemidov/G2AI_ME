@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fsio import atomic_write_text, cleanup_staging, staging_path
+from core.fsio import atomic_write_text, cleanup_staging, staging_path
 
 
 def test_staging_path_is_dot_prefixed(tmp_path: Path) -> None:

@@ -15,11 +15,11 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-import fsio
-from env import REPO_ROOT
+from core import fsio
+from core.env import REPO_ROOT
 
 # Каталог контролируемых словарей: pipeline/vocab/ (sibling каталога scripts/).
-VOCAB_DIR = Path(__file__).resolve().parent.parent / "vocab"
+VOCAB_DIR = Path(__file__).resolve().parents[2] / "vocab"
 # Корень дерева папок-документов (corpus-layout-v2). Единственный источник —
 # env.REPO_ROOT; потребители (run_pipeline/corpus_index/build_graph) импортируют
 # отсюда, не из validate_sources — зависимость «инструмент → валидатор ради

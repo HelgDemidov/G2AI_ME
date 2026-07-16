@@ -6,7 +6,7 @@ from typing import Any
 
 import networkx as nx
 
-from build_graph import (
+from graph.build_graph import (
     build_graph,
     docs_by_pattern,
     docs_in_bloc,
@@ -16,8 +16,8 @@ from build_graph import (
     main,
     summary,
 )
-from schema import SourceRecord
-from test_schema import valid_record
+from core.schema import SourceRecord
+from tests.support import valid_record
 
 JUR: dict[str, dict[str, Any]] = {"asean": {"label": "ASEAN", "members": {"sg", "th"}}}
 

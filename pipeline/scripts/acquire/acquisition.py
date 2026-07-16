@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 import pdfplumber
 
-import schema
+from core import schema
 
 
 class AcquisitionOutcome(str, Enum):
