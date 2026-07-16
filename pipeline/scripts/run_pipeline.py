@@ -43,7 +43,6 @@ from pdf_to_markdown import convert as pdf_convert
 
 logger = logging.getLogger("run_pipeline")
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 # Браузероподобный UA: WAF-ы гос. сайтов часто блокируют не-браузерные UA (см. CLAUDE.md).
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

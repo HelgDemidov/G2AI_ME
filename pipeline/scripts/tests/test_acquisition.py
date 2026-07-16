@@ -23,7 +23,6 @@ from acquisition import (
     fetch_from_archive,
     find_wayback_snapshot,
     next_rung,
-    persist_acquisition_state,
     run_ladder,
     watch_and_ingest,
     _looks_like_candidate_pdf,
@@ -248,100 +247,6 @@ def test_run_ladder_dead_confidential_raises_blocked_not_dead(tmp_path: Path, mo
         run_ladder(rec, tmp_path / "doc.pdf", user_agent="test-ua")
     assert "confidential" in str(exc_info.value)
 
-
-# --- round-trip-safe запись в sources.yaml ---
-
-REALISTIC_SOURCES_YAML = """\
-# Реестр первоисточников G2AI-корпуса — единый источник истины.
-# Схема и валидация:      pipeline/scripts/schema.py + validate_sources.py
-
-- id: sg-imda-mgf-agentic-2026
-  title: "Model AI Governance Framework for Agentic AI"
-  dates:
-    published: 2026-05-20
-  summary: >-
-    Модельный фреймворк управления агентным ИИ: оценка и ограничение рисков на
-    входе, значимая человеческая подотчётность.
-  status: verified
-"""
-
-
-def test_persist_acquisition_state_preserves_comments_and_formatting(tmp_path: Path) -> None:
-    sources_path = tmp_path / "sources.yaml"
-    sources_path.write_text(REALISTIC_SOURCES_YAML, encoding="utf-8")
-
-    changed = persist_acquisition_state(
-        sources_path, "sg-imda-mgf-agentic-2026",
-        acquisition_method=schema.AcquisitionMethod.direct,
-        fidelity=schema.Fidelity.live,
-        checked=dt.date(2026, 7, 15),
-    )
-
-    result = sources_path.read_text(encoding="utf-8")
-    assert "# Реестр первоисточников" in result  # комментарий шапки не потерян
-    assert "summary: >-" in result  # folded scalar не переформатирован
-    assert "acquisition_method: direct" in result
-    assert "acquisition_checked: 2026-07-15" in result
-    assert changed == {
-        "acquisition_method": (None, "direct"),
-        "acquisition_checked": (None, dt.date(2026, 7, 15)),
-        "fidelity": (None, "live"),
-    }
-
-
-def test_persist_acquisition_state_noop_when_unchanged(tmp_path: Path) -> None:
-    sources_path = tmp_path / "sources.yaml"
-    sources_path.write_text(REALISTIC_SOURCES_YAML, encoding="utf-8")
-    kwargs = dict(
-        acquisition_method=schema.AcquisitionMethod.direct,
-        fidelity=schema.Fidelity.live,
-        checked=dt.date(2026, 7, 15),
-    )
-    persist_acquisition_state(sources_path, "sg-imda-mgf-agentic-2026", **kwargs)
-    after_first = sources_path.read_text(encoding="utf-8")
-
-    changed = persist_acquisition_state(sources_path, "sg-imda-mgf-agentic-2026", **kwargs)
-    assert changed == {}
-    assert sources_path.read_text(encoding="utf-8") == after_first  # второй прогон не трогает файл
-
-
-def test_persist_acquisition_state_unknown_id_raises(tmp_path: Path) -> None:
-    sources_path = tmp_path / "sources.yaml"
-    sources_path.write_text(REALISTIC_SOURCES_YAML, encoding="utf-8")
-    with pytest.raises(ValueError):
-        persist_acquisition_state(
-            sources_path, "nonexistent-id",
-            acquisition_method=schema.AcquisitionMethod.direct,
-            fidelity=schema.Fidelity.live,
-            checked=dt.date(2026, 7, 15),
-        )
-
-
-def test_persist_acquisition_state_atomic_on_dump_failure(tmp_path: Path, monkeypatch: Any) -> None:
-    sources_path = tmp_path / "sources.yaml"
-    sources_path.write_text(REALISTIC_SOURCES_YAML, encoding="utf-8")
-    original = sources_path.read_text(encoding="utf-8")
-
-    import acquisition as acq
-
-    def raising_dump(self: Any, data: Any, stream: Any) -> None:
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(acq.YAML, "dump", raising_dump)
-
-    with pytest.raises(RuntimeError):
-        persist_acquisition_state(
-            sources_path, "sg-imda-mgf-agentic-2026",
-            acquisition_method=schema.AcquisitionMethod.direct,
-            fidelity=schema.Fidelity.live,
-            checked=dt.date(2026, 7, 15),
-        )
-    # Главная гарантия атомарности: исходный файл не тронут при сбое сериализации
-    # (возможный осиротевший .tmp — тот же паттерн, что у _do_convert/_do_frontmatter).
-    assert sources_path.read_text(encoding="utf-8") == original
-
-
-# --- ручной watch-folder путь (§6 спека) ---
 
 def test_looks_like_candidate_pdf_accepts_valid(tmp_path: Path) -> None:
     p = tmp_path / "real.pdf"

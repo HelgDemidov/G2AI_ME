@@ -52,15 +52,6 @@ class Track(str, Enum):
     montenegro = "montenegro"
 
 
-class Status(str, Enum):
-    """Статус записи в пайплайне."""
-
-    pending = "pending"
-    downloaded = "downloaded"
-    converted = "converted"
-    verified = "verified"
-
-
 class TranslationStatus(str, Enum):
     """Статус перевода (RU/ME — вторая фаза)."""
 
