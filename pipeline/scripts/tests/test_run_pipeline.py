@@ -196,6 +196,30 @@ def test_process_docs_cleans_stale_staging_before_planning(tmp_path: Path) -> No
     assert changed is False
 
 
+def test_planning_failure_isolated_from_batch(tmp_path: Path) -> None:
+    """Папка с двумя raw.* ломает планирование ОДНОГО документа (ValueError у
+    raw_file), но не рвёт батч — вопреки прежнему поведению, где needed_stages()
+    вызывался вне per-doc try и такая папка убивала весь прогон."""
+    broken = make(id="broken-doc-2026", entity_id="bb")
+    broken_dir = schema.doc_dir(broken, tmp_path)
+    broken_dir.mkdir(parents=True, exist_ok=True)
+    (broken_dir / "raw.pdf").write_bytes(b"pdf")
+    (broken_dir / "raw.html").write_bytes(b"html")  # два raw.* -> ValueError у raw_file
+
+    ok = make(id="ok-doc-2026", entity_id="oo")
+    _place(ok, tmp_path, raw=b"pdf", md=_compose_md(ok, ""))  # актуален
+
+    results, changed = process_docs(
+        [broken, ok], tmp_path, force=False, dry_run=False, no_download=False, pause=0
+    )
+
+    r_broken = next(r for r in results if r.doc_id == "broken-doc-2026")
+    r_ok = next(r for r in results if r.doc_id == "ok-doc-2026")
+    assert r_broken.error is not None and r_broken.error.startswith("planning:")
+    assert r_ok.up_to_date is True  # батч не оборван
+    assert changed is False
+
+
 def test_render_frontmatter_used_in_compose(tmp_path: Path) -> None:
     rec = make()
     composed = _compose_md(rec, "old body")

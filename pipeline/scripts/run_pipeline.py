@@ -226,13 +226,24 @@ def process_docs(
     ``interactive`` включает синхронный 1-клик watch-folder путь для manual-блоков
     (осмысленно только для одно-документных прогонов — ``main()`` включает его
     именно тогда, когда задан ``--only``).
+
+    Изоляция отказа охватывает и ПЛАНИРОВАНИЕ (staging-чистку + ``needed_stages``),
+    не только исполнение стадий: битый ``.state.yaml`` или папка с несколькими
+    ``raw.*`` (``schema.raw_file`` кидает ``ValueError``) роняют только этот
+    документ, а не весь батч.
     """
     results: list[DocResult] = []
     changed = False
     for rec in records:
         res = DocResult(rec.id)
-        fsio.cleanup_staging(schema.doc_dir(rec, root))  # останки упавшего прогона — самовосстановление
-        stages = needed_stages(rec, root, force=force)
+        try:
+            fsio.cleanup_staging(schema.doc_dir(rec, root))  # останки упавшего прогона — самовосстановление
+            stages = needed_stages(rec, root, force=force)
+        except Exception as exc:  # noqa: BLE001 — изоляция отказа документа (планирование)
+            res.error = f"planning: {exc}"
+            logger.error("  ✗ %s: %s", rec.id, res.error)
+            results.append(res)
+            continue
         if not stages:
             res.up_to_date = True
             logger.info("• %s: актуально", rec.id)
