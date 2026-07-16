@@ -196,22 +196,6 @@ class Relevance(BaseModel):
     assessed_date: _dt.date
 
 
-class DiscoveryProvenance(BaseModel):
-    """Провенанс добычи, сохранённый на промоушене кандидата в ``SourceRecord``.
-
-    End-to-end аудит: каким коннектором/запросом найден документ. ``merged_from`` —
-    id-ы коннекторов при мульти-источном merge (discovery/architecture.md §4.4).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    connector_id: str = Field(min_length=1)
-    connector_kind: ConnectorKind
-    source_ref: str = Field(min_length=1)
-    retrieved_at: _dt.date
-    merged_from: list[str] = Field(default_factory=list)
-
-
 class OperationalState(BaseModel):
     """Производное/операционное состояние документа — sidecar ``.state.yaml`` (corpus-layout-v2).
 
@@ -230,7 +214,12 @@ class OperationalState(BaseModel):
 
 
 class SourceRecord(BaseModel):
-    """Одна запись реестра первоисточников (один документ корпуса)."""
+    """Курируемая запись документа (``meta.yaml``, corpus-layout-v2) — человек-источник истины.
+
+    Операционное состояние (sha256/acquisition/…) — в ``OperationalState`` (``.state.yaml``);
+    провенанс добычи — в ``CandidateRecord`` (``candidates.yaml``); пути выводятся из папки.
+    Только Dublin-Core-библиография + минимум аналитики (topics/g2ai_pattern/summary/relevance).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -238,47 +227,26 @@ class SourceRecord(BaseModel):
     id: str = Field(pattern=ID_PATTERN)
     entity_id: str = Field(pattern=ENTITY_PATTERN)  # слаг сущности (== папка); для наций == iso2
     track: Track  # верхний раскол корпуса (== верхняя папка)
-    # --- библиография ---
+    # --- библиография (Dublin Core) ---
     title: str = Field(min_length=1)
     issuer: str = Field(min_length=1)
     issuer_type: IssuerType
-    country: str | None = None
-    country_iso2: str | None = Field(default=None, pattern=r"^[a-z]{2}$")
     geo_scope: GeoScope
     language: str = Field(pattern=r"^[a-z]{2}$")  # ISO 639-1
     dates: Dates = Field(default_factory=Dates)
-    doc_version: str | None = None
-    # --- классификация (принадлежность словарям проверяет validate_sources.py) ---
-    doc_type: str = Field(min_length=1)
-    authority: str = Field(min_length=1)
-    topics: list[str] = Field(default_factory=list)
-    g2ai_pattern: list[str] = Field(default_factory=list)
-    # --- связи (рёбра графа) ---
-    relations: list[Relation] = Field(default_factory=list)
-    # --- аналитика ---
-    summary: str | None = None
-    tech_basis: str | None = None
-    # --- релевантность/актуальность (source-relevance-triage) ---
-    relevance: Relevance | None = None  # обязательность в sources.yaml — правило validate_sources
-    in_force: bool | None = None  # действует ли «живой» документ (взвешивание свежести)
-    # --- провенанс ---
-    source_url: str = Field(pattern=r"^https?://")
-    official_alt_url: str | None = Field(default=None, pattern=r"^https?://")
-    press_release_url: str | None = Field(default=None, pattern=r"^https?://")
-    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    raw_path: str | None = None
-    md_path: str | None = None
-    acquisition_method: AcquisitionMethod | None = None
-    acquisition_checked: _dt.date | None = None
-    fidelity: Fidelity | None = None
-    retrieved_snapshot_date: _dt.date | None = None
-    sensitivity: Sensitivity = Sensitivity.normal
+    doc_type: str = Field(min_length=1)      # словарь — validate_sources.py
+    authority: str = Field(min_length=1)     # словарь — validate_sources.py
+    source_url: str = Field(pattern=r"^https?://")            # официальный первоисточник
+    official_alt_url: str | None = Field(default=None, pattern=r"^https?://")  # вход ладдера
+    sensitivity: Sensitivity = Sensitivity.normal            # гейтит archive-ступень ладдера
     rights: Rights = Rights.unknown
-    discovery: DiscoveryProvenance | None = None  # провенанс добычи, сохранён при промоушене
-    # --- пайплайн ---
-    status: Status
-    translation_status: TranslationStatus = TranslationStatus.not_started
-    notes: str | None = None
+    # --- аналитика (минимум, контент — EN) ---
+    topics: list[str] = Field(default_factory=list)          # словарь
+    g2ai_pattern: list[str] = Field(default_factory=list)    # словарь; только матрично-релевантные
+    summary: str | None = None                               # 2–3 предложения, EN
+    relations: list[Relation] = Field(default_factory=list)
+    relevance: Relevance | None = None       # вердикт триажа; обязателен — правило validate_sources
+    in_force: bool | None = None             # действует ли «живой» документ (взвешивание свежести)
 
 
 class CandidateRecord(BaseModel):
@@ -418,17 +386,15 @@ def promote_candidate(
     doc_type: str,
     authority: str,
     relevance: Relevance,
-    status: Status = Status.pending,
-    merged_from: list[str] | None = None,
 ) -> SourceRecord:
-    """Промоутнуть кандидата в строгий ``SourceRecord`` (конверсия типа между хранилищами).
+    """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
-    Издательские/классификационные решения (``id``/``issuer_type``/``geo_scope``/
-    ``doc_type``/``authority``) и вердикт ``relevance`` — аргументы (решение триажа),
-    не выводятся из кандидата. Обязательные для ``SourceRecord`` поля, которых у
-    кандидата может не быть (``title``/``issuer``/``language``/``source_url``), берутся
-    из кандидата и обязаны присутствовать — иначе ``ValueError`` (неполного кандидата
-    промоутить нельзя). Провенанс добычи сохраняется в ``discovery``.
+    Издательские/классификационные решения (``id``/``entity_id``/``track``/``issuer_type``/
+    ``geo_scope``/``doc_type``/``authority``) и вердикт ``relevance`` — аргументы (решение
+    триажа), не выводятся из кандидата. Обязательные поля, которых у кандидата может не быть
+    (``title``/``issuer``/``language``/``source_url``), берутся из кандидата и обязаны
+    присутствовать — иначе ``ValueError``. Провенанс добычи остаётся в ``candidates.yaml``
+    (в ``meta.yaml`` НЕ копируется — corpus-layout-v2).
     """
     title, issuer, language, source_url = cand.title, cand.issuer, cand.language, cand.source_url
     missing = [
@@ -465,14 +431,6 @@ def promote_candidate(
         rights=cand.rights or Rights.unknown,
         sensitivity=cand.sensitivity or Sensitivity.normal,
         relevance=relevance,
-        discovery=DiscoveryProvenance(
-            connector_id=cand.connector_id,
-            connector_kind=cand.connector_kind,
-            source_ref=cand.source_ref,
-            retrieved_at=cand.retrieved_at,
-            merged_from=merged_from or [],
-        ),
-        status=status,
     )
 
 
@@ -497,7 +455,7 @@ def render_frontmatter(rec: SourceRecord) -> str:
     fields: dict[str, Any] = {
         "id": rec.id,
         "title": rec.title,
-        "country": rec.country,
+        "entity_id": rec.entity_id,
         "issuer": rec.issuer,
         "issuer_type": rec.issuer_type.value,
         "doc_type": rec.doc_type,
@@ -507,7 +465,6 @@ def render_frontmatter(rec: SourceRecord) -> str:
         "source_url": rec.source_url,
         "g2ai_pattern": rec.g2ai_pattern,
         "topics": rec.topics,
-        "translation_status": rec.translation_status.value,
     }
     present = {k: v for k, v in fields.items() if v not in (None, [], "")}
     body = yaml.safe_dump(present, allow_unicode=True, sort_keys=False)

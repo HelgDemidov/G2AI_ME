@@ -13,7 +13,6 @@ from schema import (
     Axis,
     CandidateRecord,
     ConnectorKind,
-    DiscoveryProvenance,
     Fidelity,
     GeoScope,
     IssuerType,
@@ -22,7 +21,6 @@ from schema import (
     Rights,
     Sensitivity,
     SourceRecord,
-    Status,
     TargetFit,
     Track,
     TranslationStatus,
@@ -44,8 +42,6 @@ def valid_record() -> dict[str, Any]:
         "title": "Model AI Governance Framework for Agentic AI",
         "issuer": "Infocomm Media Development Authority (IMDA)",
         "issuer_type": "government",
-        "country": "Singapore",
-        "country_iso2": "sg",
         "geo_scope": "national",
         "language": "en",
         "dates": {"published": "2026-05-20", "retrieved": "2026-07-15"},
@@ -61,7 +57,6 @@ def valid_record() -> dict[str, Any]:
             "rationale": "эталонный агентный G2AI-документ",
             "assessed_date": "2026-07-15",
         },
-        "status": "verified",
     }
 
 
@@ -91,8 +86,8 @@ def write_doc(
 def test_valid_record_parses() -> None:
     rec = SourceRecord.model_validate(valid_record())
     assert rec.id == "sg-imda-mgf-agentic-2026"
+    assert rec.entity_id == "sg" and rec.track.value == "intl-xperience"
     assert rec.dates.published is not None
-    assert rec.translation_status.value == "not_started"  # значение по умолчанию
 
 
 def test_extra_field_forbidden() -> None:
@@ -107,14 +102,9 @@ def test_extra_field_forbidden() -> None:
     [
         ("id", "SG_Bad_ID"),          # не kebab-slug
         ("id", "singleword"),          # один сегмент
-        ("country_iso2", "SGP"),       # не 2 строчные буквы
         ("language", "eng"),           # не ISO 639-1
-        ("sha256", "xyz"),             # не 64 hex
         ("issuer_type", "ministry"),   # вне enum
-        ("status", "done"),            # вне enum Status
         ("source_url", "ftp://x/y"),   # не http(s)
-        ("acquisition_method", "torrent"),  # вне enum AcquisitionMethod
-        ("fidelity", "trustme"),            # вне enum Fidelity
         ("sensitivity", "top_secret"),       # вне enum Sensitivity
         ("official_alt_url", "ftp://x/y"),   # не http(s)
         ("rights", "gpl"),                   # вне enum Rights
@@ -143,30 +133,18 @@ def test_render_frontmatter() -> None:
     assert "published: '2026-05-20'" in fm or "published: 2026-05-20" in fm
 
 
-def test_acquisition_fields_default() -> None:
-    """Обратная совместимость: запись без новых полей (как реальная запись SG) парсится."""
+def test_curated_provenance_fields() -> None:
+    """Оставшиеся в meta.yaml provenance-поля: official_alt_url/sensitivity/rights (acquisition -> .state.yaml)."""
     rec = SourceRecord.model_validate(valid_record())
-    assert rec.acquisition_method is None
-    assert rec.acquisition_checked is None
-    assert rec.fidelity is None
-    assert rec.retrieved_snapshot_date is None
     assert rec.official_alt_url is None
     assert rec.sensitivity == Sensitivity.normal
-
-
-def test_acquisition_fields_parse() -> None:
+    assert rec.rights == Rights.unknown
     data = valid_record()
-    data["acquisition_method"] = "manual"
-    data["acquisition_checked"] = "2026-07-15"
-    data["fidelity"] = "archived_snapshot"
-    data["retrieved_snapshot_date"] = "2026-01-24"
     data["official_alt_url"] = "https://example.org/alt.pdf"
     data["sensitivity"] = "confidential"
-    rec = SourceRecord.model_validate(data)
-    assert rec.acquisition_method == AcquisitionMethod.manual
-    assert rec.fidelity == Fidelity.archived_snapshot
-    assert rec.sensitivity == Sensitivity.confidential
-    assert rec.official_alt_url == "https://example.org/alt.pdf"
+    rec2 = SourceRecord.model_validate(data)
+    assert rec2.official_alt_url == "https://example.org/alt.pdf"
+    assert rec2.sensitivity == Sensitivity.confidential
 
 
 def test_rights_default() -> None:
@@ -352,15 +330,12 @@ def test_promote_candidate_success() -> None:
     )
     assert isinstance(rec, SourceRecord)
     assert rec.id == "ae-cabinet-agentic-2026"
-    assert rec.status == Status.pending  # дефолт промоушена
+    assert rec.entity_id == "ae" and rec.track == Track.intl_xperience
     assert rec.source_url == "https://ex.org/d.pdf"
     assert rec.dates.published is not None
     assert rec.rights == Rights.cc_by  # перенесён с кандидата
     assert rec.sensitivity == Sensitivity.confidential
     assert rec.relevance is not None and rec.relevance.target_fit == TargetFit.primary
-    assert rec.discovery is not None
-    assert rec.discovery.connector_id == "agora"
-    assert rec.discovery.source_ref == cand.source_ref
 
 
 def test_promote_candidate_missing_source_url_raises() -> None:
@@ -379,23 +354,6 @@ def test_promote_candidate_missing_source_url_raises() -> None:
             authority="soft_law",
             relevance=_relevance(),
         )
-
-
-def test_discovery_provenance_default_merged_from() -> None:
-    dp = DiscoveryProvenance.model_validate(
-        {
-            "connector_id": "agora",
-            "connector_kind": "registry",
-            "source_ref": "ref",
-            "retrieved_at": "2026-07-15",
-        }
-    )
-    assert dp.merged_from == []
-
-
-def test_source_record_discovery_default_none() -> None:
-    rec = SourceRecord.model_validate(valid_record())
-    assert rec.discovery is None
 
 
 def test_operational_state_default() -> None:
