@@ -36,3 +36,6 @@ jobs:
 
       - name: Pytest (без модель-зависимых)
         run: python -m pytest -m "not model"
+
+      - name: Validate corpus registry (sources/**/meta.yaml)
+        run: python pipeline/scripts/validate_sources.py
