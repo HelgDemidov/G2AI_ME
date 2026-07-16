@@ -90,6 +90,15 @@ def test_valid_record_parses() -> None:
     assert rec.dates.published is not None
 
 
+@pytest.mark.parametrize("code", ["en", "cnr"])
+def test_language_accepts_iso_639_1_and_639_3(code: str) -> None:
+    """639-1 (2 буквы, 'en') и 639-3 там, где 639-1 нет (черногорский 'cnr') — оба валидны."""
+    data = valid_record()
+    data["language"] = code
+    rec = SourceRecord.model_validate(data)
+    assert rec.language == code
+
+
 def test_extra_field_forbidden() -> None:
     data = valid_record()
     data["unknown_field"] = "x"
@@ -102,7 +111,9 @@ def test_extra_field_forbidden() -> None:
     [
         ("id", "SG_Bad_ID"),          # не kebab-slug
         ("id", "singleword"),          # один сегмент
-        ("language", "eng"),           # не ISO 639-1
+        ("language", "x"),             # короче 2 букв
+        ("language", "engl"),          # длиннее 3 букв
+        ("language", "CNR"),           # не lowercase
         ("issuer_type", "ministry"),   # вне enum
         ("source_url", "ftp://x/y"),   # не http(s)
         ("sensitivity", "top_secret"),       # вне enum Sensitivity

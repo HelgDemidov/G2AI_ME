@@ -63,7 +63,7 @@ def test_valid_relation_between_records(tmp_path: Path) -> None:
 
 def test_structural_error_reported(tmp_path: Path) -> None:
     rec = valid_record()
-    rec["language"] = "eng"  # не ISO 639-1
+    rec["language"] = "english"  # не проходит ни ISO 639-1, ни 639-3 по форме
     write_doc(tmp_path, rec)
     assert any("language" in e for e in validate_sources(tmp_path, VOCAB_DIR))
 
