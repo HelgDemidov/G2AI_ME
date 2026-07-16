@@ -18,7 +18,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from bge_tokenizer import token_counter
+from bge_tokenizer import EMBED_MAX_TOKENS, token_counter
 from chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
 from schema import load_records, md_file
 from validate_sources import DEFAULT_SOURCES
@@ -118,7 +118,11 @@ def create_db(db_path: Path) -> sqlite3.Connection:
 
 
 def index_chunks(
-    conn: sqlite3.Connection, chunks: list[Chunk], *, corpus_fingerprint: str | None = None
+    conn: sqlite3.Connection,
+    chunks: list[Chunk],
+    *,
+    corpus_fingerprint: str | None = None,
+    chunk_max_tokens: int | None = None,
 ) -> None:
     """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно).
 
@@ -129,11 +133,14 @@ def index_chunks(
     (``index-incremental``, там векторы перестанут гибнуть вовсе);
     ``vector_store.ensure_schema`` пересоздаст её при следующем ``embed-corpus``.
 
-    ``corpus_fingerprint``, если передан, пишется в ``index_meta`` АТОМАРНО с
-    чанками — в одном ``conn.commit()``. На этом полагается реконсиляция
-    пересборки в ``run_pipeline``: крах между шагами оставляет старый (или
-    отсутствующий) отпечаток, следующий прогон честно пересоберёт —
-    самовосстановление по построению, без отдельного флага/статуса.
+    ``corpus_fingerprint``/``chunk_max_tokens``, если переданы, пишутся в
+    ``index_meta`` АТОМАРНО с чанками — в одном ``conn.commit()``. На этом
+    полагается реконсиляция пересборки в ``run_pipeline``: крах между шагами
+    оставляет старый (или отсутствующий) отпечаток, следующий прогон честно
+    пересоберёт — самовосстановление по построению, без отдельного флага/статуса.
+    ``chunk_max_tokens`` — бюджет, с которым собраны чанки; ``vector_store``
+    сверяет его с лимитом эмбеддера перед ``embed-corpus`` (см. spec
+    index-consistency §6: инвариант «чанк целиком видим обоим поискам»).
     """
     conn.execute("DROP TABLE IF EXISTS vectors")
     conn.execute(_META_SCHEMA)  # defensive — index_meta может не существовать без create_db
@@ -146,6 +153,8 @@ def index_chunks(
     conn.execute("INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild')")
     if corpus_fingerprint is not None:
         write_meta(conn, "corpus_fingerprint", corpus_fingerprint)
+    if chunk_max_tokens is not None:
+        write_meta(conn, "chunk_max_tokens", str(chunk_max_tokens))
     conn.commit()
 
 
@@ -183,7 +192,7 @@ def fts_search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[Se
 def chunks_from_corpus(
     sources_root: Path,
     count_tokens: TokenCounter,
-    max_tokens: int = 512,
+    max_tokens: int = EMBED_MAX_TOKENS,
 ) -> list[Chunk]:
     """Собрать канонические чанки всех doc.md корпуса (пути выводятся из папки-документа)."""
     chunks: list[Chunk] = []
@@ -203,7 +212,11 @@ def _cmd_build(args: argparse.Namespace) -> int:
         return 3
     chunks = chunks_from_corpus(args.sources, token_counter(), args.max_tokens)
     conn = create_db(args.db)
-    index_chunks(conn, chunks, corpus_fingerprint=corpus_fingerprint(args.sources))
+    index_chunks(
+        conn, chunks,
+        corpus_fingerprint=corpus_fingerprint(args.sources),
+        chunk_max_tokens=args.max_tokens,
+    )
     n_docs = len({c.doc_id for c in chunks})
     print(f"Проиндексировано: {len(chunks)} чанков из {n_docs} документов -> {args.db}")
     conn.close()
@@ -238,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_build = sub.add_parser("build", help="построить индекс из .md корпуса")
     p_build.add_argument("sources", nargs="?", type=Path, default=DEFAULT_SOURCES)
-    p_build.add_argument("--max-tokens", type=int, default=512)
+    p_build.add_argument("--max-tokens", type=int, default=EMBED_MAX_TOKENS)
     p_build.set_defaults(func=_cmd_build)
 
     p_search = sub.add_parser("search", help="полнотекстовый поиск")

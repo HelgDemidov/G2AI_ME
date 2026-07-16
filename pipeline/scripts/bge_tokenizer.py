@@ -13,6 +13,13 @@ from typing import Any
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "bge-m3-onnx-int8"
 TOKENIZER_JSON = MODEL_DIR / "tokenizer.json"
 
+# Единый бюджет чанка/эмбеддинга корпуса. Модельный контекст bge-m3 — 8192
+# токена, но наш бюджет — 512: внимание растёт квадратично, целый документ на
+# 8192 на 2-ядерном CPU взорвался бы по памяти/времени (см. spec
+# knowledge-graph-metadata §2). Единственный источник этого числа — chunking,
+# corpus_index (CLI-дефолт) и embed.OnnxBgeEmbedder читают ЕГО, не хардкодят своё.
+EMBED_MAX_TOKENS = 512
+
 
 def load_tokenizer(path: Path = TOKENIZER_JSON) -> Any:
     """Загрузить fast-токенизатор bge-m3 из tokenizer.json."""

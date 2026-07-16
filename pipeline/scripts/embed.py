@@ -20,7 +20,7 @@ from typing import Any, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from bge_tokenizer import MODEL_DIR, TOKENIZER_JSON, load_tokenizer
+from bge_tokenizer import EMBED_MAX_TOKENS, MODEL_DIR, TOKENIZER_JSON, load_tokenizer
 
 FloatArray = NDArray[np.float32]
 
@@ -54,7 +54,7 @@ class OnnxBgeEmbedder:
         self,
         model_path: Path = DEFAULT_ONNX,
         tokenizer_path: Path = TOKENIZER_JSON,
-        max_tokens: int = 512,
+        max_tokens: int = EMBED_MAX_TOKENS,
         batch_size: int = 16,
     ) -> None:
         import onnxruntime as ort

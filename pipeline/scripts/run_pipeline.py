@@ -345,15 +345,17 @@ def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, fingerprint
     ``corpus_index.index_chunks``. Ветка «нет токенизатора» намеренно НЕ пишет
     fingerprint: следующий прогон (когда модель появится) честно доиндексирует.
     """
-    from bge_tokenizer import token_counter  # ленивый импорт: модель-зависимо
+    from bge_tokenizer import EMBED_MAX_TOKENS, token_counter  # ленивый импорт: модель-зависимо
 
     try:
         counter = token_counter()
     except FileNotFoundError as exc:
         return f"пропущен (нет токенизатора bge-m3: {exc})"
-    chunks = corpus_index.chunks_from_corpus(sources_path, counter)
+    chunks = corpus_index.chunks_from_corpus(sources_path, counter, EMBED_MAX_TOKENS)
     conn = corpus_index.create_db(db_path)
-    corpus_index.index_chunks(conn, chunks, corpus_fingerprint=fingerprint)
+    corpus_index.index_chunks(
+        conn, chunks, corpus_fingerprint=fingerprint, chunk_max_tokens=EMBED_MAX_TOKENS
+    )
     conn.close()
     status = f"FTS: {len(chunks)} чанков"
     if embed:
