@@ -214,3 +214,248 @@ def region_guards_ok(elements: list[Element], words: list[Any], page_area: float
     if total_chars / len(elements) > REGION_MAX_CHARS_PER_ELEMENT:
         return False
     return True
+
+
+# --- классификация (грид/sequence), region-hash, Region, detect_regions ---
+
+GRID_SNAP_PT = 3.0          # допуск защёлкивания краёв rect'ов в колонки/строки
+GRID_MAX_COLS = 6
+GRID_MAX_ROWS = 12
+GRID_MIN_OCCUPANCY = 0.9    # доля заполненных ячеек грида
+SEQ_MIN_BOXES = 3
+SEQ_MAX_BOXES = 8
+SEQ_AXIS_OVERLAP = 0.5      # мин. доля перекрытия по поперечной оси (от меньшей стороны)
+_LINE_TOP_TOLERANCE = 2.5   # тот же допуск, что pdf_to_markdown.LINE_TOP_TOLERANCE
+
+
+@dataclass
+class Region:
+    """Классифицированный регион: reconstructed (grid/sequence) несёт
+    cells/items, opaque — только слова (Labels маркера рендерятся из них).
+    ``id`` — стабильный короткий hash (region_id) для машинной адресации
+    (VLM-шов чартера §4.3; вычисляется для ЛЮБОГО региона, не только opaque —
+    полезно для аудита/отладки, дёшево)."""
+
+    bbox: BBox
+    elements: list[Element]
+    words: list[Any]
+    kind: str  # "grid" | "sequence" | "opaque"
+    id: str
+    cells: list[list[str]] | None = None
+    items: list[str] | None = None
+
+
+def _line_texts(words: list[Any]) -> list[str]:
+    """Группирует слова региона в строки читательского порядка (top, затем x0).
+    Общий примитив для текста ячейки грида / подписи sequence-элемента / Labels
+    opaque-маркера — самодостаточен (без импорта pdf_to_markdown.group_into_lines,
+    никакой циклической зависимости, design rationale WordLike-Protocol)."""
+    if not words:
+        return []
+    ordered = sorted(words, key=lambda w: (w.top, w.x0))
+    lines: list[list[Any]] = []
+    for w in ordered:
+        if lines and abs(w.top - lines[-1][-1].top) <= _LINE_TOP_TOLERANCE:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    return [" ".join(x.text for x in sorted(line, key=lambda w: w.x0)) for line in lines]
+
+
+def _join_reading_order(words: list[Any]) -> str:
+    return " ".join(_line_texts(words))
+
+
+def _cluster_1d(values: list[float], tol: float) -> list[float]:
+    """1D-кластеризация с допуском: соседние (после сортировки) значения ближе
+    ``tol`` схлопываются в группу; представитель группы — среднее."""
+    if not values:
+        return []
+    vals = sorted(values)
+    groups: list[list[float]] = [[vals[0]]]
+    for v in vals[1:]:
+        if v - groups[-1][-1] <= tol:
+            groups[-1].append(v)
+        else:
+            groups.append([v])
+    return [sum(g) / len(g) for g in groups]
+
+
+def _nearest_index(value: float, representatives: list[float]) -> int:
+    return min(range(len(representatives)), key=lambda i: abs(representatives[i] - value))
+
+
+def try_grid(elements: list[Element], words: list[Any]) -> list[list[str]] | None:
+    """Грид-предикат (§1.1): rect'ы защёлкиваются в колонки/строки по x0/top
+    (допуск ``GRID_SNAP_PT``), 2..GRID_MAX_COLS x 2..GRID_MAX_ROWS, ни один rect
+    не делит ячейку с другим, заполненность >= GRID_MIN_OCCUPANCY. Любое
+    нарушение -> None — фабрикация «почти грида» запрещена."""
+    rects = [e for e in elements if e.kind == "rect"]
+    if not rects:
+        return None
+    cols = _cluster_1d([r.x0 for r in rects], GRID_SNAP_PT)
+    rows = _cluster_1d([r.top for r in rects], GRID_SNAP_PT)
+    if not (2 <= len(cols) <= GRID_MAX_COLS and 2 <= len(rows) <= GRID_MAX_ROWS):
+        return None
+
+    cell_map: dict[tuple[int, int], Element] = {}
+    for r in rects:
+        key = (_nearest_index(r.top, rows), _nearest_index(r.x0, cols))
+        if key in cell_map:
+            return None  # два rect в одной ячейке — не чистый грид
+        cell_map[key] = r
+
+    if len(rects) < GRID_MIN_OCCUPANCY * len(rows) * len(cols):
+        return None
+
+    cells: list[list[str]] = []
+    for row_idx in range(len(rows)):
+        row_cells: list[str] = []
+        for col_idx in range(len(cols)):
+            rect = cell_map.get((row_idx, col_idx))
+            row_cells.append("" if rect is None else _join_reading_order(region_words(words, _bbox(rect))))
+        cells.append(row_cells)
+    return cells
+
+
+def _vertical_overlap(a: Element, b: Element) -> float:
+    return max(0.0, min(a.bottom, b.bottom) - max(a.top, b.top))
+
+
+def _horizontal_overlap(a: Element, b: Element) -> float:
+    return max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
+
+
+def _bbox_overlap(a: Element, b: Element) -> bool:
+    return a.x0 < b.x1 and b.x0 < a.x1 and a.top < b.bottom and b.top < a.bottom
+
+
+def _axis_chain_ok(rects: list[Element], overlap: Any, size: Any) -> bool:
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            min_size = min(size(rects[i]), size(rects[j]))
+            if min_size <= 0 or overlap(rects[i], rects[j]) < SEQ_AXIS_OVERLAP * min_size:
+                return False
+    return True
+
+
+def try_sequence(elements: list[Element], words: list[Any]) -> list[str] | None:
+    """Sequence-предикат (§1.2): SEQ_MIN_BOXES..SEQ_MAX_BOXES непересекающихся
+    rect'ов на одной оси (все пары перекрываются по поперечной оси на
+    >= SEQ_AXIS_OVERLAP от меньшей стороны) -> упорядоченные подписи. Направление
+    потока/стрелки НЕ угадывается (чартер §4.2) — только один линейный порядок
+    (по x0 для горизонтальной цепи, по top для вертикальной)."""
+    rects = [e for e in elements if e.kind == "rect"]
+    if not (SEQ_MIN_BOXES <= len(rects) <= SEQ_MAX_BOXES):
+        return None
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            if _bbox_overlap(rects[i], rects[j]):
+                return None
+
+    if _axis_chain_ok(rects, _vertical_overlap, lambda r: r.bottom - r.top):
+        ordered = sorted(rects, key=lambda r: r.x0)
+    elif _axis_chain_ok(rects, _horizontal_overlap, lambda r: r.x1 - r.x0):
+        ordered = sorted(rects, key=lambda r: r.top)
+    else:
+        return None
+
+    return [_join_reading_order(region_words(words, _bbox(r))) for r in ordered]
+
+
+def region_hash(page: int, bbox: BBox, texts: list[str]) -> str:
+    """sha256(page|округлённый_bbox|отсортированные_тексты) — контракт VLM-шва
+    (чартер §4.3): детерминирован, НЕ зависит от рендера пикселей (рендер
+    нестабилен между версиями pdfium). Округление до 1pt — стабильность против
+    float-шума; сортировка текстов — независимость от порядка извлечения."""
+    payload = (
+        f"{page}|{round(bbox[0])},{round(bbox[1])},{round(bbox[2])},{round(bbox[3])}|"
+        + "\x1f".join(sorted(t.strip() for t in texts if t.strip()))
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def region_id(page: int, bbox: BBox, texts: list[str]) -> str:
+    return region_hash(page, bbox, texts)[:12]
+
+
+def detect_regions(
+    page: int,
+    elements: list[Element],
+    words: list[Any],
+    page_width: float,
+    page_height: float,
+    table_bboxes: list[BBox],
+) -> tuple[list[Region], list[Any]]:
+    """Главный конвейер §1: intake (искл. уже забранные таблицами) -> dedupe ->
+    filter -> cluster -> guards -> классификация (грид/sequence/opaque).
+    ``page`` — 1-based номер страницы (входит в region_hash). Регионы, не
+    прошедшие guard'ы, распускаются — их слова просто не изымаются из ``words``."""
+    page_area = page_width * page_height
+    candidates = [e for e in elements if not _element_center_in_any_bbox(e, table_bboxes)]
+    candidates = dedupe_elements(candidates)
+    candidates = filter_elements(candidates, page_area)
+
+    regions: list[Region] = []
+    consumed: set[int] = set()
+    for cluster in cluster_elements(candidates):
+        bbox = union_bbox(cluster)
+        r_words = region_words(words, bbox)
+        if not region_guards_ok(cluster, r_words, page_area):
+            continue
+        rid = region_id(page, bbox, _line_texts(r_words))
+        cells = try_grid(cluster, r_words)
+        if cells is not None:
+            regions.append(Region(bbox, cluster, r_words, "grid", rid, cells=cells))
+        else:
+            items = try_sequence(cluster, r_words)
+            if items is not None:
+                regions.append(Region(bbox, cluster, r_words, "sequence", rid, items=items))
+            else:
+                regions.append(Region(bbox, cluster, r_words, "opaque", rid))
+        consumed.update(id(w) for w in r_words)
+
+    remaining = [w for w in words if id(w) not in consumed]
+    return regions, remaining
+
+
+def render_region_block(region: Region, page: int) -> str:
+    """Точный маркер-грамматика §2. Грид/sequence несут общий заголовок
+    «Reconstructed infographic»; opaque — честный «structure not reconstructed»
+    с сохранёнными подписями (порядок чтения не гарантирован)."""
+    if region.kind == "grid":
+        assert region.cells is not None
+        return _render_grid(region.cells, page, region.id)
+    if region.kind == "sequence":
+        assert region.items is not None
+        return _render_sequence(region.items, page, region.id)
+    return _render_opaque(region.words, page, region.id)
+
+
+def _render_grid(cells: list[list[str]], page: int, rid: str) -> str:
+    if not cells:
+        return f"> [Reconstructed infographic, p. {page}, region {rid}]"
+    header, *body = cells
+    lines = [
+        f"> [Reconstructed infographic, p. {page}, region {rid}]",
+        "",
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * len(header)) + " |",
+    ]
+    for row in body:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def _render_sequence(items: list[str], page: int, rid: str) -> str:
+    lines = [f"> [Reconstructed infographic, p. {page}, region {rid}]", ""]
+    lines.extend(f"{i}. {text}" for i, text in enumerate(items, start=1))
+    return "\n".join(lines)
+
+
+def _render_opaque(words: list[Any], page: int, rid: str) -> str:
+    labels = "; ".join(_line_texts(words))
+    return (
+        f"> [Figure, p. {page}, region {rid} — structure not reconstructed]\n"
+        f"> Labels (reading order not guaranteed): {labels}"
+    )

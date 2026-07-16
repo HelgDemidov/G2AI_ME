@@ -7,11 +7,18 @@ from typing import Any
 
 from convert.pdf_graphics import (
     Element,
+    Region,
     cluster_elements,
     dedupe_elements,
+    detect_regions,
     filter_elements,
     region_guards_ok,
+    region_hash,
+    region_id,
     region_words,
+    render_region_block,
+    try_grid,
+    try_sequence,
     union_bbox,
 )
 
@@ -151,3 +158,228 @@ def test_guards_accept_plausible_swot_region() -> None:
     ]
     words = [_Word("Strength", x0=10.0, x1=60.0, top=10.0, bottom=20.0)]
     assert region_guards_ok(elements, words, PAGE_AREA) is True
+
+
+# --- try_grid: 2x2 SWOT-подобная матрица (§1.1) ---
+
+
+def _swot_2x2() -> tuple[list[Element], list[_Word]]:
+    elements = [
+        _rect(0.0, 0.0, 100.0, 100.0),      # (row0, col0)
+        _rect(110.0, 0.0, 210.0, 100.0),    # (row0, col1)
+        _rect(0.0, 110.0, 100.0, 210.0),    # (row1, col0)
+        _rect(110.0, 110.0, 210.0, 210.0),  # (row1, col1)
+    ]
+    words = [
+        _Word("Strength", x0=10.0, x1=60.0, top=10.0, bottom=20.0),
+        _Word("Weakness", x0=120.0, x1=170.0, top=10.0, bottom=20.0),
+        _Word("Opportunity", x0=10.0, x1=60.0, top=120.0, bottom=130.0),
+        _Word("Threat", x0=120.0, x1=170.0, top=120.0, bottom=130.0),
+    ]
+    return elements, words
+
+
+def test_try_grid_reconstructs_2x2_matrix_with_correct_cell_text() -> None:
+    elements, words = _swot_2x2()
+    assert try_grid(elements, words) == [["Strength", "Weakness"], ["Opportunity", "Threat"]]
+
+
+def test_try_grid_empty_cell_renders_as_empty_string() -> None:
+    elements, words = _swot_2x2()
+    words = words[:3]  # без слова в (row1,col1) — ячейка должна остаться ""
+    cells = try_grid(elements, words)
+    assert cells is not None
+    assert cells[1][1] == ""
+
+
+def test_try_grid_none_when_occupancy_below_threshold() -> None:
+    """3 из 4 ячеек 2x2 — заполненность 75% < GRID_MIN_OCCUPANCY (90%) -> None
+    («дырка» в матрице — не почти-грид, честный отказ)."""
+    elements, words = _swot_2x2()
+    assert try_grid(elements[:3], words) is None
+
+
+def test_try_grid_none_when_too_many_columns() -> None:
+    """7 колонок > GRID_MAX_COLS (6) -> None."""
+    elements = [
+        _rect(col * 110.0, row * 110.0, col * 110.0 + 100.0, row * 110.0 + 100.0)
+        for row in range(2) for col in range(7)
+    ]
+    assert try_grid(elements, []) is None
+
+
+def test_try_grid_none_when_two_rects_share_a_cell() -> None:
+    """Пятый rect попадает в ту же ячейку (row0,col0), что и первый -> None
+    (грид не фабрикуется при коллизии). x0/top=1.0 — внутри GRID_SNAP_PT (3pt)
+    от кластера "0", поэтому схлопывается в ТУ ЖЕ колонку/строку, а не в новую."""
+    elements, words = _swot_2x2()
+    collision = _rect(1.0, 1.0, 90.0, 90.0)
+    assert try_grid([*elements, collision], words) is None
+
+
+def test_try_grid_none_without_any_rects() -> None:
+    curve = Element("curve", 0.0, 0.0, 50.0, 50.0)
+    assert try_grid([curve, curve, curve], []) is None
+
+
+# --- try_sequence: одноосевая последовательность боксов (§1.2) ---
+
+
+def test_try_sequence_horizontal_chain_orders_by_x0() -> None:
+    elements = [
+        _rect(100.0, 0.0, 140.0, 40.0), _rect(0.0, 0.0, 40.0, 40.0),  # намеренно не по порядку
+        _rect(150.0, 0.0, 190.0, 40.0), _rect(50.0, 0.0, 90.0, 40.0),
+    ]
+    words = [
+        _Word("Build", x0=105.0, x1=135.0, top=15.0, bottom=25.0),
+        _Word("Discover", x0=5.0, x1=35.0, top=15.0, bottom=25.0),
+        _Word("Launch", x0=155.0, x1=185.0, top=15.0, bottom=25.0),
+        _Word("Design", x0=55.0, x1=85.0, top=15.0, bottom=25.0),
+    ]
+    assert try_sequence(elements, words) == ["Discover", "Design", "Build", "Launch"]
+
+
+def test_try_sequence_vertical_chain_orders_by_top() -> None:
+    elements = [
+        _rect(0.0, 100.0, 100.0, 140.0), _rect(0.0, 0.0, 100.0, 40.0),
+        _rect(0.0, 50.0, 100.0, 90.0),
+    ]
+    words = [
+        _Word("Third", x0=10.0, x1=40.0, top=110.0, bottom=120.0),
+        _Word("First", x0=10.0, x1=40.0, top=10.0, bottom=20.0),
+        _Word("Second", x0=10.0, x1=40.0, top=60.0, bottom=70.0),
+    ]
+    assert try_sequence(elements, words) == ["First", "Second", "Third"]
+
+
+def test_try_sequence_none_when_boxes_overlap() -> None:
+    elements = [
+        _rect(0.0, 0.0, 50.0, 40.0), _rect(30.0, 0.0, 80.0, 40.0),  # пересекаются по x
+        _rect(100.0, 0.0, 140.0, 40.0),
+    ]
+    assert try_sequence(elements, []) is None
+
+
+def test_try_sequence_none_when_too_few_boxes() -> None:
+    elements = [_rect(0.0, 0.0, 40.0, 40.0), _rect(50.0, 0.0, 90.0, 40.0)]  # 2 < SEQ_MIN_BOXES
+    assert try_sequence(elements, []) is None
+
+
+def test_try_sequence_none_when_axis_overlap_insufficient() -> None:
+    """Боксы не пересекаются, но и не выровнены ни по одной оси (диагональная
+    россыпь) — ни горизонтальная, ни вертикальная цепь не набирают перекрытие."""
+    elements = [
+        _rect(0.0, 0.0, 40.0, 40.0),
+        _rect(60.0, 60.0, 100.0, 100.0),
+        _rect(120.0, 120.0, 160.0, 160.0),
+    ]
+    assert try_sequence(elements, []) is None
+
+
+# --- region_hash / region_id: детерминизм VLM-шва (чартер §4.3) ---
+
+
+def test_region_hash_stable_to_text_order_and_subpixel_noise() -> None:
+    a = region_hash(1, (10.3, 20.2, 50.1, 60.4), ["alpha", "beta"])
+    b = region_hash(1, (10.4, 20.1, 50.4, 60.2), ["beta", "alpha"])
+    assert a == b
+
+
+def test_region_hash_differs_by_page() -> None:
+    assert region_hash(1, (0.0, 0.0, 10.0, 10.0), ["x"]) != region_hash(2, (0.0, 0.0, 10.0, 10.0), ["x"])
+
+
+def test_region_id_is_12_char_prefix_of_hash() -> None:
+    h = region_hash(3, (0.0, 0.0, 10.0, 10.0), ["x"])
+    assert region_id(3, (0.0, 0.0, 10.0, 10.0), ["x"]) == h[:12]
+
+
+# --- render_region_block: точная грамматика маркеров (§2) ---
+
+
+def test_render_grid_block_matches_grammar() -> None:
+    region = Region(
+        bbox=(0.0, 0.0, 210.0, 210.0), elements=[], words=[],
+        kind="grid", id="abc123def456",
+        cells=[["Strength", "Weakness"], ["Opportunity", "Threat"]],
+    )
+    expected = (
+        "> [Reconstructed infographic, p. 5, region abc123def456]\n"
+        "\n"
+        "| Strength | Weakness |\n"
+        "| --- | --- |\n"
+        "| Opportunity | Threat |"
+    )
+    assert render_region_block(region, page=5) == expected
+
+
+def test_render_sequence_block_matches_grammar() -> None:
+    region = Region(
+        bbox=(0.0, 0.0, 190.0, 40.0), elements=[], words=[],
+        kind="sequence", id="seq000111222", items=["Discover", "Design", "Build"],
+    )
+    expected = (
+        "> [Reconstructed infographic, p. 3, region seq000111222]\n"
+        "\n"
+        "1. Discover\n"
+        "2. Design\n"
+        "3. Build"
+    )
+    assert render_region_block(region, page=3) == expected
+
+
+def test_render_opaque_block_matches_grammar() -> None:
+    words = [
+        _Word("Node A", x0=10.0, x1=50.0, top=10.0, bottom=20.0),
+        _Word("Node B", x0=10.0, x1=50.0, top=60.0, bottom=70.0),
+    ]
+    region = Region(
+        bbox=(0.0, 0.0, 100.0, 100.0), elements=[], words=words,
+        kind="opaque", id="opq333444555",
+    )
+    expected = (
+        "> [Figure, p. 6, region opq333444555 — structure not reconstructed]\n"
+        "> Labels (reading order not guaranteed): Node A; Node B"
+    )
+    assert render_region_block(region, page=6) == expected
+
+
+# --- detect_regions: сквозной конвейер (guards + классификация + изъятие слов) ---
+
+
+def test_detect_regions_end_to_end_grid_removes_words_from_prose() -> None:
+    elements, words = _swot_2x2()
+    prose_word = _Word("unrelated prose", x0=300.0, x1=400.0, top=300.0, bottom=310.0)
+    regions, remaining = detect_regions(
+        page=1, elements=elements, words=[*words, prose_word],
+        page_width=PAGE_W, page_height=PAGE_H, table_bboxes=[],
+    )
+    assert len(regions) == 1
+    assert regions[0].kind == "grid"
+    assert remaining == [prose_word]  # слова региона изъяты, посторонняя проза осталась
+
+
+def test_detect_regions_dissolved_cluster_keeps_words_in_prose() -> None:
+    """Кластер из 2 элементов (< REGION_MIN_ELEMENTS) — регион не создаётся,
+    его слова НЕ изымаются из words."""
+    elements = [_rect(0.0, 0.0, 50.0, 20.0), _rect(0.0, 25.0, 50.0, 45.0)]
+    word = _Word("callout text", x0=5.0, x1=45.0, top=5.0, bottom=15.0)
+    regions, remaining = detect_regions(
+        page=1, elements=elements, words=[word],
+        page_width=PAGE_W, page_height=PAGE_H, table_bboxes=[],
+    )
+    assert regions == []
+    assert remaining == [word]
+
+
+def test_detect_regions_excludes_elements_inside_table_bbox() -> None:
+    """Элементы внутри уже забранной таблицы не участвуют в детекции регионов
+    (приоритет у get_real_tables — интейк-шаг §1)."""
+    elements, words = _swot_2x2()
+    table_bbox = (0.0, 0.0, 210.0, 210.0)  # накрывает весь SWOT-кластер
+    regions, remaining = detect_regions(
+        page=1, elements=elements, words=words,
+        page_width=PAGE_W, page_height=PAGE_H, table_bboxes=[table_bbox],
+    )
+    assert regions == []
+    assert remaining == words
