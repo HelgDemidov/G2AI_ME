@@ -333,15 +333,15 @@ def process_docs(
     return results
 
 
-def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, fingerprint: str) -> str:
-    """Пересобрать корпусный индекс: FTS5 (всегда) + векторы (если embed). Требует
-    токенизатор bge-m3.
+def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, force: bool = False) -> str:
+    """Пересобрать корпусный индекс: FTS5 (инкрементально по изменённым ``doc.md``,
+    либо полностью при ``force``) + векторы (если embed). Требует токенизатор bge-m3.
 
-    ``fingerprint`` — заранее посчитанный ``corpus_index.corpus_fingerprint``
-    (считается ВЫЗЫВАЮЩЕЙ стороной ПОСЛЕ ``process_docs``, т.к. конвертация меняет
-    mtime ``doc.md``); пишется в ``index_meta`` атомарно с чанками — см.
-    ``corpus_index.index_chunks``. Ветка «нет токенизатора» намеренно НЕ пишет
-    fingerprint: следующий прогон (когда модель появится) честно доиндексирует.
+    ``corpus_fingerprint``/``chunk_max_tokens`` пишутся в ``index_meta`` атомарно с
+    чанками (см. ``corpus_index.index_corpus`` / ``index_chunks``) — реконсиляция
+    пересборки в ``main`` полагается на этот отпечаток. Ветка «нет токенизатора»
+    намеренно НЕ трогает индекс: следующий прогон (когда модель появится) честно
+    доиндексирует по нетронутому отпечатку — самовосстановление по построению.
     """
     from bge_tokenizer import EMBED_MAX_TOKENS, token_counter  # ленивый импорт: модель-зависимо
 
@@ -349,20 +349,18 @@ def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, fingerprint
         counter = token_counter()
     except FileNotFoundError as exc:
         return f"пропущен (нет токенизатора bge-m3: {exc})"
-    chunks = corpus_index.chunks_from_corpus(sources_path, counter, EMBED_MAX_TOKENS)
     conn = corpus_index.create_db(db_path)
-    corpus_index.index_chunks(
-        conn, chunks, corpus_fingerprint=fingerprint, chunk_max_tokens=EMBED_MAX_TOKENS
-    )
+    status = corpus_index.index_corpus(conn, sources_path, counter, EMBED_MAX_TOKENS, force=force)
     conn.close()
-    status = f"FTS: {len(chunks)} чанков"
     if embed:
         embedder = get_embedder("bge")
         conn = sqlite3.connect(db_path)
-        ids, texts = vector_store.chunk_texts(conn)
-        vector_store.store_vectors(conn, ids, embedder.embed(texts), embedder.name)
+        hashes, texts = vector_store.chunk_hashes(conn, not_embedded_for=embedder.name)
+        if hashes:  # эмбеддим только НОВЫЕ хэши (правка 1 документа != пере-embed всего корпуса)
+            vector_store.store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
+        removed = vector_store.gc_vectors(conn, embedder.name)
         conn.close()
-        status += f"; векторы: {len(ids)} ({embedder.name})"
+        status += f"; векторы: +{len(hashes)} ({embedder.name}), GC {removed}"
     return status
 
 
@@ -380,9 +378,10 @@ def _read_index_fingerprint(db_path: Path) -> str | None:
 
 
 def _needs_index_rebuild(sources_path: Path, db_path: Path, *, force: bool) -> tuple[bool, str]:
-    """Решить, нужна ли пересборка индекса (реконсиляция по fingerprint, а не по
-    in-run флагу), и вернуть уже посчитанный текущий fingerprint — чтобы вызывающая
-    сторона передала его в ``rebuild_index`` без повторного пересчёта."""
+    """Решить, нужна ли пересборка индекса (реконсиляция по глобальному fingerprint,
+    а не по in-run флагу), и вернуть посчитанный текущий отпечаток. Отпечаток —
+    быстрый гейт «есть ли работа вообще»; саму пересборку (полную или инкрементальную
+    по ``doc_state``) и запись нового отпечатка делает ``rebuild_index``/``index_corpus``."""
     current_fp = corpus_index.corpus_fingerprint(sources_path)
     stored_fp = _read_index_fingerprint(db_path)
     return (force or stored_fp != current_fp), current_fp
@@ -449,11 +448,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         logger.info("Индекс: dry-run, не трогаем")
     else:
-        needs_rebuild, current_fp = _needs_index_rebuild(args.sources, args.db, force=args.force)
+        needs_rebuild, _ = _needs_index_rebuild(args.sources, args.db, force=args.force)
         if needs_rebuild:
             logger.info(
                 "Индекс: %s",
-                rebuild_index(args.sources, args.db, embed=args.embed, fingerprint=current_fp),
+                rebuild_index(args.sources, args.db, embed=args.embed, force=args.force),
             )
         else:
             logger.info("Индекс: актуален (fingerprint совпадает)")

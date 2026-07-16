@@ -1,4 +1,8 @@
-"""Тесты векторного хранилища и брутфорс-косинуса (синтетические векторы, без модели)."""
+"""Тесты векторного хранилища и брутфорс-косинуса (синтетические векторы, без модели).
+
+Ключ вектора — content_hash чанка (spec index-incremental §3): пере-чанковка не
+осиротит неизменившиеся векторы, вектор не может указать на чужой текст; эмбеддинг
+инкрементален (только новые хэши), осиротевшие чистит gc_vectors."""
 from __future__ import annotations
 
 import argparse
@@ -11,25 +15,23 @@ import pytest
 
 from bge_tokenizer import EMBED_MAX_TOKENS
 from chunking import Chunk
-from corpus_index import create_db, fts5_available, index_chunks, read_meta, write_meta
+from corpus_index import create_db, fts5_available, index_chunks
 from embed import l2_normalize
 from vector_store import (
-    VectorsStaleError,
     _cmd_embed,
     check_chunk_budget,
-    chunk_texts,
+    chunk_hashes,
+    gc_vectors,
     load_vectors,
     semantic_search,
     store_vectors,
+    unembedded_count,
 )
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="sqlite без FTS5")
 
-FP = "test-corpus-fingerprint"  # фиксированный fingerprint для тестовых БД — store_vectors
-# и semantic_search сверяют его между собой, а не пересчитывают из реального корпуса.
 
-
-def _setup(tmp_path: Path) -> tuple[sqlite3.Connection, list[int]]:
+def _setup(tmp_path: Path) -> sqlite3.Connection:
     conn = create_db(tmp_path / "c.db")
     index_chunks(
         conn,
@@ -38,76 +40,141 @@ def _setup(tmp_path: Path) -> tuple[sqlite3.Connection, list[int]]:
             Chunk("doc-a", 1, "second", 1),
             Chunk("doc-b", 0, "third", 1),
         ],
-        corpus_fingerprint=FP,
     )
-    ids, _ = chunk_texts(conn)
-    return conn, ids
+    return conn
+
+
+def _vec_count(conn: sqlite3.Connection, model: str) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM vectors WHERE model=?", (model,)).fetchone()[0])
+
+
+# --- store / load: ключ content_hash ---
 
 
 def test_store_and_load(tmp_path: Path) -> None:
-    conn, ids = _setup(tmp_path)
-    store_vectors(conn, ids, l2_normalize(np.eye(3, dtype=np.float32)), "m")
-    got_ids, mat = load_vectors(conn, "m")
-    assert got_ids == ids
+    conn = _setup(tmp_path)
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes, l2_normalize(np.eye(3, dtype=np.float32)), "m")
+    got, mat = load_vectors(conn, "m")
+    assert set(got) == set(hashes)
     assert mat.shape == (3, 3)
 
 
-def test_semantic_search_nearest(tmp_path: Path) -> None:
-    conn, ids = _setup(tmp_path)
-    store_vectors(conn, ids, l2_normalize(np.eye(3, dtype=np.float32)), "m")
-    query = np.array([0.9, 0.1, 0.0], dtype=np.float32)  # ближе всего к первому чанку
-    hits = semantic_search(conn, query, "m", top_k=3)
-    assert hits[0].chunk_id == ids[0]
-    assert hits[0].doc_id == "doc-a"
-    assert hits[0].chunk_index == 0
-    assert hits[0].score >= hits[1].score >= hits[2].score
-
-
-def test_reembed_replaces(tmp_path: Path) -> None:
-    conn, ids = _setup(tmp_path)
+def test_reembed_upserts_not_duplicates(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    hashes, _ = chunk_hashes(conn)
     vecs = l2_normalize(np.ones((3, 3), dtype=np.float32))
-    store_vectors(conn, ids, vecs, "m")
-    store_vectors(conn, ids, vecs, "m")  # повторно — не дублируется (PK)
-    got_ids, _ = load_vectors(conn, "m")
-    assert got_ids == ids
+    store_vectors(conn, hashes, vecs, "m")
+    store_vectors(conn, hashes, vecs, "m")  # повторно — upsert по (content_hash, model)
+    assert _vec_count(conn, "m") == 3
 
 
-def test_absent_model_raises_vectors_stale(tmp_path: Path) -> None:
-    """Модель, которую никогда не эмбеддили, — тот же честный отказ, что у
-    устаревших векторов (spec index-consistency §3: «расхождение ИЛИ отсутствие»)."""
-    conn, _ = _setup(tmp_path)
-    with pytest.raises(VectorsStaleError):
-        semantic_search(conn, np.zeros(3, dtype=np.float32), "absent", 5)
+def test_semantic_search_nearest(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    hashes, texts = chunk_hashes(conn)
+    vecs = l2_normalize(np.eye(len(hashes), dtype=np.float32))
+    store_vectors(conn, hashes, vecs, "m")
+    ti = texts.index("second")  # целимся в конкретный текст, не в позицию хэша
+    hits = semantic_search(conn, vecs[ti], "m", top_k=len(hashes))
+    assert hits[0].text == "second"
+    assert hits[0].doc_id == "doc-a"
+    assert hits[0].chunk_index == 1
+    assert hits[0].score >= hits[-1].score
 
 
-def test_semantic_search_raises_when_fingerprint_mismatches(tmp_path: Path) -> None:
-    conn, ids = _setup(tmp_path)
-    store_vectors(conn, ids, l2_normalize(np.eye(3, dtype=np.float32)), "m")
-    write_meta(conn, "corpus_fingerprint", "different-fingerprint-now")  # корпус «изменился»
+def test_semantic_search_empty_when_no_vectors(tmp_path: Path) -> None:
+    """Ни одного вектора модели → пустая выдача (не исключение): устаревших/неверных
+    результатов не бывает по построению, отсутствие репортит CLI."""
+    conn = _setup(tmp_path)
+    assert semantic_search(conn, np.zeros(3, dtype=np.float32), "m", 5) == []
+
+
+# --- boilerplate: общий хэш двух документов = один вектор, оба чанка находимы ---
+
+
+def test_shared_hash_one_vector_both_chunks_found(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [
+            Chunk("doc-a", 0, "boilerplate", 1),  # тот же текст…
+            Chunk("doc-b", 0, "boilerplate", 1),  # …в другом документе
+            Chunk("doc-b", 1, "unique", 1),
+        ],
+    )
+    hashes, texts = chunk_hashes(conn)
+    assert len(hashes) == 2  # дубль схлопнут: boilerplate + unique
+    store_vectors(conn, hashes, l2_normalize(np.eye(2, dtype=np.float32)), "m")
+    assert _vec_count(conn, "m") == 2  # один вектор на общий хэш, не два
+
+    bi = texts.index("boilerplate")
+    hits = semantic_search(conn, l2_normalize(np.eye(2, dtype=np.float32))[bi], "m", top_k=2)
+    boiler = {(h.doc_id, h.chunk_index) for h in hits if h.text == "boilerplate"}
+    assert boiler == {("doc-a", 0), ("doc-b", 0)}  # score роздан обоим носителям хэша
+
+
+# --- инкрементальный отбор: только новые хэши ---
+
+
+def test_chunk_hashes_pending_excludes_embedded(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    all_hashes, _ = chunk_hashes(conn)
+    assert len(all_hashes) == 3
+    store_vectors(conn, all_hashes[:2], l2_normalize(np.eye(2, dtype=np.float32)), "m")
+
+    pending, _ = chunk_hashes(conn, not_embedded_for="m")
+    assert set(pending) == {all_hashes[2]}  # только ещё не заэмбедженный
+    other, _ = chunk_hashes(conn, not_embedded_for="other")
+    assert set(other) == set(all_hashes)  # другая модель — всё заново
+
+
+def test_chunk_hashes_pending_when_vectors_table_absent(tmp_path: Path) -> None:
+    """Первый embed: таблицы vectors ещё нет — pending-отбор не должен падать
+    (регресс real-run: подзапрос по vectors ронял `no such table`)."""
+    conn = _setup(tmp_path)  # чанки есть, ни одного store_vectors → таблицы vectors нет
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='vectors'"
+    ).fetchone() is None
+    pending, _ = chunk_hashes(conn, not_embedded_for="m")
+    all_hashes, _ = chunk_hashes(conn)
+    assert set(pending) == set(all_hashes)  # ничего не заэмбеддено — все pending
+
+
+def test_unembedded_count(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    assert unembedded_count(conn, "m") == 3
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes[:1], l2_normalize(np.eye(1, dtype=np.float32)), "m")
+    assert unembedded_count(conn, "m") == 2
+
+
+# --- GC осиротевших векторов ---
+
+
+def test_gc_removes_orphaned_vectors(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes, l2_normalize(np.eye(3, dtype=np.float32)), "m")
+    orphan = hashes[0]
+    conn.execute("DELETE FROM chunks WHERE content_hash=?", (orphan,))  # текст исчез из корпуса
     conn.commit()
-    with pytest.raises(VectorsStaleError):
-        semantic_search(conn, np.zeros(3, dtype=np.float32), "m", 5)
+
+    removed = gc_vectors(conn, "m")
+    assert removed == 1
+    remaining, _ = load_vectors(conn, "m")
+    assert orphan not in remaining
+    assert len(remaining) == 2
 
 
-def test_semantic_search_raises_when_no_corpus_fingerprint_at_all(tmp_path: Path) -> None:
-    """БД без единого записанного corpus_fingerprint — свежесть векторов неизвестна,
-    безопаснее отказать, чем молча доверять."""
-    conn = create_db(tmp_path / "no-fp.db")
-    index_chunks(conn, [Chunk("doc-a", 0, "first", 1)])  # без corpus_fingerprint
-    ids, _ = chunk_texts(conn)
-    store_vectors(conn, ids, l2_normalize(np.eye(1, dtype=np.float32)), "m")
-    assert read_meta(conn, "corpus_fingerprint") is None
-    with pytest.raises(VectorsStaleError):
-        semantic_search(conn, np.zeros(1, dtype=np.float32), "m", 5)
+def test_gc_keeps_vectors_still_referenced(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes, l2_normalize(np.eye(3, dtype=np.float32)), "m")
+    assert gc_vectors(conn, "m") == 0  # все хэши ещё в chunks
+    assert _vec_count(conn, "m") == 3
 
 
-def test_store_vectors_stamps_fingerprint_matching_corpus(tmp_path: Path) -> None:
-    conn, ids = _setup(tmp_path)
-    store_vectors(conn, ids, l2_normalize(np.eye(3, dtype=np.float32)), "m")
-    assert read_meta(conn, "vectors_fingerprint:m") == FP
-
-
-# --- check_chunk_budget: инвариант «чанк целиком видим обоим поискам» ---
+# --- check_chunk_budget: инвариант «чанк целиком видим обоим поискам» (index-consistency §6) ---
 
 
 def test_check_chunk_budget_passes_when_within_limit(tmp_path: Path) -> None:
@@ -131,12 +198,9 @@ def test_check_chunk_budget_raises_when_exceeds_limit(tmp_path: Path) -> None:
 
 def test_store_vectors_raises_when_chunk_budget_exceeded(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
-    index_chunks(
-        conn, [Chunk("doc-a", 0, "x", 1)],
-        corpus_fingerprint=FP, chunk_max_tokens=EMBED_MAX_TOKENS * 2,
-    )
+    index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
     with pytest.raises(ValueError):
-        store_vectors(conn, [1], l2_normalize(np.eye(1, dtype=np.float32)), "m")
+        store_vectors(conn, ["deadbeef"], l2_normalize(np.eye(1, dtype=np.float32)), "m")
 
 
 def test_cmd_embed_reports_budget_error_without_calling_embedder(
@@ -145,10 +209,7 @@ def test_cmd_embed_reports_budget_error_without_calling_embedder(
     """Гейт срабатывает ДО дорогого embedder.embed() — не тратить минуты ONNX впустую."""
     db = tmp_path / "c.db"
     conn = create_db(db)
-    index_chunks(
-        conn, [Chunk("doc-a", 0, "x", 1)],
-        corpus_fingerprint=FP, chunk_max_tokens=EMBED_MAX_TOKENS * 2,
-    )
+    index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
     conn.close()
 
     def fail_if_called(backend: str, model: str | None) -> Any:
