@@ -128,14 +128,30 @@ def classify_response(
     return ClassifiedResponse(AcquisitionOutcome.blocked, status, "unexpected content (not a valid PDF)")
 
 
+# curl exit codes (stable across decades): 6 = couldn't resolve host, 7 = failed
+# to connect. Both mean "this URL is unreachable" — the same terminal signal as
+# a confirmed-dead HTTP status, so the ladder should treat them identically.
+_CURL_UNREACHABLE_CODES = (6, 7)
+
+
 def fetch_and_classify(
-    url: str, dest: Path, *, user_agent: str, timeout: int = 30
+    url: str, dest: Path, *, user_agent: str, timeout: int = 30, total_timeout: int = 300
 ) -> ClassifiedResponse:
     """Single download attempt (no ladder stepping — that's the caller's job).
 
     Deliberately omits ``-f``: a hard HTTP error (403/404) must still land its
     status/body so ``classify_response`` can tell a block apart from a dead URL —
     with ``-f`` curl discards the response before we ever see it.
+
+    A network-level curl failure (exit 6/7 — DNS/connect unreachable) is
+    classified as ``dead`` directly: this is the single most common shape of
+    "the URL is gone" (a decommissioned government domain), and without this
+    check it would raise instead of routing to the archive rung. Offline-vs-
+    dead-domain is not disambiguated here — see design rationale in the spec:
+    the archive rung's own curl call fails the same way, so the worst case is
+    one wasted archive attempt, not silent corruption. ``--max-time`` bounds
+    the whole transfer (``--connect-timeout`` alone doesn't cap a stalled
+    transfer on a slow LTE link).
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix="acq-headers-", suffix=".txt", delete=False) as tmp:
@@ -143,10 +159,20 @@ def fetch_and_classify(
     try:
         cmd = [
             "curl", "-sSL", "--retry", "3", "--retry-delay", "2",
-            "--connect-timeout", str(timeout), "-A", user_agent,
+            "--connect-timeout", str(timeout), "--max-time", str(total_timeout),
+            "-A", user_agent,
             "-D", str(headers_path), "-o", str(dest), url,
         ]
-        subprocess.run(cmd, check=True)
+        proc = subprocess.run(cmd, check=False)
+        if proc.returncode in _CURL_UNREACHABLE_CODES:
+            return ClassifiedResponse(
+                AcquisitionOutcome.dead, None,
+                f"curl exit {proc.returncode}: host unreachable (DNS/connect)",
+            )
+        if proc.returncode != 0:
+            # 28 = timeout after --retry already exhausted transients; anything
+            # else is an unexpected curl failure — not a classification, a bug/env issue.
+            raise RuntimeError(f"curl failed (exit {proc.returncode}) for {url}")
         headers_text = headers_path.read_text(encoding="utf-8", errors="replace")
         body = dest.read_bytes() if dest.exists() else b""
         return classify_response(body, headers_text)

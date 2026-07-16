@@ -124,6 +124,13 @@ def test_classify_redirect_keeps_only_final_hop_status_and_headers() -> None:
     assert result.outcome == AcquisitionOutcome.blocked
 
 
+class _FakeProc:
+    """Минимальная подмена ``subprocess.CompletedProcess`` — только ``returncode``."""
+
+    def __init__(self, returncode: int = 0) -> None:
+        self.returncode = returncode
+
+
 def test_fetch_and_classify_omits_dash_f_and_captures_headers(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -132,12 +139,13 @@ def test_fetch_and_classify_omits_dash_f_and_captures_headers(
     """
     captured_cmd: list[str] = []
 
-    def fake_run(cmd: list[str], check: bool) -> None:  # noqa: FBT001 — сигнатура subprocess.run
+    def fake_run(cmd: list[str], check: bool) -> _FakeProc:  # noqa: FBT001 — сигнатура subprocess.run
         captured_cmd.extend(cmd)
         d_index = cmd.index("-D")
         o_index = cmd.index("-o")
         Path(cmd[d_index + 1]).write_text(CLOUDFLARE_BLOCK_HEADERS, encoding="utf-8")
         Path(cmd[o_index + 1]).write_bytes(CLOUDFLARE_BLOCK_BODY)
+        return _FakeProc(returncode=0)
 
     monkeypatch.setattr("acquisition.subprocess.run", fake_run)
     dest = tmp_path / "doc.pdf"
@@ -147,6 +155,44 @@ def test_fetch_and_classify_omits_dash_f_and_captures_headers(
     assert "-D" in captured_cmd
     assert result.outcome == AcquisitionOutcome.blocked
     assert result.http_status == 403
+
+
+def test_fetch_and_classify_includes_max_time(tmp_path: Path, monkeypatch: Any) -> None:
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool) -> _FakeProc:  # noqa: FBT001
+        captured_cmd.extend(cmd)
+        Path(cmd[cmd.index("-D") + 1]).write_text(OK_HEADERS, encoding="utf-8")
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(REAL_PDF_BODY)
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr("acquisition.subprocess.run", fake_run)
+    fetch_and_classify(
+        "https://example.org/doc.pdf", tmp_path / "doc.pdf", user_agent="test-ua", total_timeout=123
+    )
+    assert "--max-time" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--max-time") + 1] == "123"
+
+
+@pytest.mark.parametrize("code", [6, 7])
+def test_fetch_and_classify_curl_unreachable_is_dead(
+    tmp_path: Path, monkeypatch: Any, code: int
+) -> None:
+    """Сетевой отказ curl (не удалось разрешить/подключиться) — классифицируется как
+    dead, а не бросает исключение: самый типичный «мёртвый URL» (снесённый домен)
+    должен доходить до archive-ступени лестницы, а не ронять документ на download."""
+    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check: _FakeProc(returncode=code))
+    result = fetch_and_classify("https://gone.example/doc.pdf", tmp_path / "doc.pdf", user_agent="ua")
+    assert result.outcome == AcquisitionOutcome.dead
+    assert str(code) in result.reason
+
+
+def test_fetch_and_classify_curl_other_failure_raises(tmp_path: Path, monkeypatch: Any) -> None:
+    """Иной ненулевой код (28 — таймаут после исчерпанных --retry, и прочее) — не
+    классификация, а отказ вызова: не притворяемся, что знаем, мёртв URL или нет."""
+    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check: _FakeProc(returncode=28))
+    with pytest.raises(RuntimeError):
+        fetch_and_classify("https://slow.example/doc.pdf", tmp_path / "doc.pdf", user_agent="ua")
 
 
 # --- маршрутизация лестницы (§2/§4/§9 спека) ---
