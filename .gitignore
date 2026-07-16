@@ -9,6 +9,10 @@ __pycache__/
 .pytest_cache/
 *.pyc
 
+# Coverage (pytest-cov) — производный отчёт, пересобирается каждым прогоном
+.coverage
+htmlcov/
+
 # Локальные ML-модели (эмбеддинги и т.п.) — тяжёлые, качаются отдельно, не в git
 /pipeline/models/
 

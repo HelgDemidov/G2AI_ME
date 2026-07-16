@@ -24,3 +24,30 @@ markers = [
     "model: тест требует локально скачанную модель bge-m3 (в CI пропускается: -m 'not model')",
     "corpus: тест требует локальный корпус sources/ (в CI пропускается: -m 'not corpus')",
 ]
+
+[tool.coverage.run]
+source = ["pipeline/scripts"]
+# тесты (самопокрывающиеся) и CLI-шимы (repo-layout, PR #10 — 8-строчные
+# `from X import main`, никогда не исполняются под pytest, реальный код — в
+# пакетах) искажали бы Cover% в обе стороны, если бы считались.
+omit = [
+    "pipeline/scripts/tests/*",
+    "pipeline/scripts/ab_eval.py",
+    "pipeline/scripts/build_graph.py",
+    "pipeline/scripts/corpus_index.py",
+    "pipeline/scripts/pdf_to_markdown.py",
+    "pipeline/scripts/validate_sources.py",
+    "pipeline/scripts/vector_store.py",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    "if __name__ == .__main__.:",
+]
+# Честный текущий бейзлайн (измерено 2026-07-16, только тесты пакета unit/): 73%.
+# Модули с системно низким покрытием — не пробел в тестах, а зависимость от
+# внешних ресурсов, недоступных CI (модель bge-m3 — embed.py/bge_tokenizer.py/
+# ab_eval.py; известный геометрический пробел pdf_to_markdown.py — адресуется
+# спеком convert-graphics). Порог — гейт РЕГРЕССИИ (несколько % запаса ниже
+# бейзлайна), не целевой показатель; поднимать вручную по мере роста покрытия.
+fail_under = 70

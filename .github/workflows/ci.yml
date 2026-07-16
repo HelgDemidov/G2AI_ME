@@ -1,7 +1,10 @@
 name: CI
 
 # Проверки качества кода пайплайна G2AI на push в main/feature-ветки и на PR в main.
-# Модель-зависимые тесты (@model, требуют bge-m3 543 МБ) в CI пропускаются: -m "not model".
+# 4 независимых параллельных джоба (single-responsibility, чёткая атрибуция отказа):
+# quality (ruff+mypy+pip-audit) / test-unit (+coverage) / test-integration / validate-corpus.
+# Модель- и корпус-зависимые тесты (@model — bge-m3 543 МБ; @corpus — локальный sources/,
+# raw.pdf/doc.md не в git) в CI недостижимы: -m "not model and not corpus" везде.
 on:
   push:
     branches: [main, "feature/**"]
@@ -9,7 +12,12 @@ on:
     branches: [main]
 
 jobs:
-  checks:
+  # ---------------------------------------------------------------------------
+  # Статический анализ: линт, типы, аудит зависимостей на известные CVE.
+  # Не трогает sources/ и не запускает pytest — самый быстрый и дешёвый джоб.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Code quality (ruff + mypy + pip-audit)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,8 +43,103 @@ jobs:
         # рекурсивно по каталогу: подпакеты слоёв + тесты (file-glob *.py их не видел)
         run: python -m mypy pipeline/scripts
 
-      - name: Pytest (без модель- и корпус-зависимых)
-        run: python -m pytest -m "not model and not corpus"
+      - name: Audit Python dependencies
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt -r requirements-dev.txt
+
+  # ---------------------------------------------------------------------------
+  # Юнит-тесты (pipeline/scripts/tests/unit/) + coverage-гейт. Герметичны —
+  # без сети/модели/локального корпуса, зеркалят слоевую структуру pipeline/scripts/.
+  # ---------------------------------------------------------------------------
+  test-unit:
+    name: Unit tests + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Pytest unit + coverage
+        # Порог — в pyproject.toml ([tool.coverage.report].fail_under), явный --cov-fail-under
+        # здесь дублирует его для гарантии кода возврата (fail_under в конфиге сам по себе
+        # не влияет на exit pytest без CLI-флага — проверено эмпирически 2026-07-16).
+        run: >
+          python -m pytest pipeline/scripts/tests/unit -m "not model and not corpus"
+          --cov --cov-report=term-missing --cov-fail-under=70
+
+  # ---------------------------------------------------------------------------
+  # Интеграционные тесты (pipeline/scripts/tests/integration/) — @model/@corpus,
+  # оба недостижимы в CI (нет модели bge-m3, sources/ без raw.pdf/doc.md — не в
+  # git). Полностью отфильтрованный прогон -> pytest exit 5 ("no tests ran"),
+  # это ОЖИДАЕМО здесь и не признак поломки — явно отличаем от реальных отказов.
+  # Джоб — задел: как только появится CI-safe интеграционный тест (без внешних
+  # тяжёлых ресурсов), начнёт реально что-то запускать без правок этого файла.
+  # ---------------------------------------------------------------------------
+  test-integration:
+    name: Integration tests (CI-safe subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Pytest integration (exit 5 = ничего CI-safe не собралось, это ок)
+        run: |
+          set +e
+          python -m pytest pipeline/scripts/tests/integration -m "not model and not corpus" -v
+          code=$?
+          if [ "$code" -eq 5 ]; then
+            echo "0 CI-safe интеграционных тестов (всё требует model/corpus) — ожидаемо, не отказ."
+            exit 0
+          fi
+          exit $code
+
+  # ---------------------------------------------------------------------------
+  # Валидация курируемого реестра корпуса (sources/**/meta.yaml — трекается в
+  # git, в отличие от raw.pdf/doc.md). Не pytest — отдельный по природе гейт.
+  # ---------------------------------------------------------------------------
+  validate-corpus:
+    name: Validate corpus registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Validate corpus registry (sources/**/meta.yaml)
         run: python pipeline/scripts/validate_sources.py

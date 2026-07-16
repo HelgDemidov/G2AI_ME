@@ -1,11 +1,13 @@
-# Dev/CI-инструменты (проверки pipeline/scripts/*.py).
+# Dev/CI-инструменты (проверки pipeline/scripts/).
 # Установка:  uv pip install -r requirements-dev.txt
-# Проверки (ИЗ КОРНЯ репозитория; конфиг — pyproject.toml):
+# Проверки (ИЗ КОРНЯ репозитория; конфиг — pyproject.toml), те же, что в CI (.github/workflows/ci.yml):
 #   .venv/bin/ruff check pipeline/scripts
-#   .venv/bin/python -m mypy pipeline/scripts/schema.py pipeline/scripts/validate_sources.py
-#   .venv/bin/python -m pytest
+#   .venv/bin/python -m mypy pipeline/scripts
+#   .venv/bin/python -m pytest -m "not model and not corpus" --cov --cov-report=term-missing
+#   .venv/bin/python pipeline/scripts/validate_sources.py
 -r requirements.txt
 mypy==2.3.0
 ruff==0.15.21
 pytest==9.1.1
+pytest-cov==7.1.0
 types-PyYAML==6.0.12.20260518
