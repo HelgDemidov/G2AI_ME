@@ -298,6 +298,11 @@ def raw_file(rec: SourceRecord, root: Path) -> Path | None:
     return matches[0] if matches else None
 
 
+def raw_target(rec: SourceRecord, root: Path, ext: str = "pdf") -> Path:
+    """Путь для НОВОГО оригинала (пишущий близнец ``raw_file``): ``<doc_dir>/raw.<ext>``."""
+    return doc_dir(rec, root) / f"raw.{ext}"
+
+
 def md_file(rec: SourceRecord, root: Path) -> Path:
     """Конвертация: ``<doc_dir>/doc.md``."""
     return doc_dir(rec, root) / "doc.md"

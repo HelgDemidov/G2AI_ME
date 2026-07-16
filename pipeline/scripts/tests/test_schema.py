@@ -24,10 +24,13 @@ from schema import (
     TargetFit,
     Track,
     TranslationStatus,
+    doc_dir,
     load_candidates,
     load_state,
     load_vocab,
     promote_candidate,
+    raw_file,
+    raw_target,
     render_frontmatter,
     save_state,
 )
@@ -414,3 +417,21 @@ def test_load_real_vocab_nonempty() -> None:
         terms = load_vocab(name)
         assert terms, f"словарь {name} пуст"
         assert all(isinstance(t, str) for t in terms)
+
+
+def test_raw_target_default_ext(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    assert raw_target(rec, tmp_path) == doc_dir(rec, tmp_path) / "raw.pdf"
+
+
+def test_raw_target_custom_ext(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    assert raw_target(rec, tmp_path, ext="html") == doc_dir(rec, tmp_path) / "raw.html"
+
+
+def test_raw_target_does_not_require_existing_file(tmp_path: Path) -> None:
+    """В отличие от raw_file (читает существующий), raw_target — чисто путь-конструктор."""
+    rec = SourceRecord.model_validate(valid_record())
+    target = raw_target(rec, tmp_path)
+    assert not target.exists()
+    assert raw_file(rec, tmp_path) is None  # папка ещё пуста
