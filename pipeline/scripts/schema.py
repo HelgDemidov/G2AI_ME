@@ -16,9 +16,15 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 import fsio
+from env import REPO_ROOT
 
 # Каталог контролируемых словарей: pipeline/vocab/ (sibling каталога scripts/).
 VOCAB_DIR = Path(__file__).resolve().parent.parent / "vocab"
+# Корень дерева папок-документов (corpus-layout-v2). Единственный источник —
+# env.REPO_ROOT; потребители (run_pipeline/corpus_index/build_graph) импортируют
+# отсюда, не из validate_sources — зависимость «инструмент → валидатор ради
+# константы» была неверна по направлению слоёв.
+DEFAULT_SOURCES = REPO_ROOT / "sources"
 
 # Внутренний id: kebab-slug минимум из двух сегментов, напр. ``sg-imda-mgf-agentic-2026``.
 ID_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)+$"

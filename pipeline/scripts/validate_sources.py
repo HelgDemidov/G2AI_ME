@@ -26,12 +26,9 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from schema import VOCAB_DIR, GeoScope, SourceRecord, check_layout, load_vocab
+from schema import DEFAULT_SOURCES, VOCAB_DIR, GeoScope, SourceRecord, check_layout, load_vocab
 
 _ISO2_RE = re.compile(r"[a-z]{2}")
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SOURCES = REPO_ROOT / "sources"  # корень дерева папок-документов (corpus-layout-v2)
 
 
 def validate_sources(

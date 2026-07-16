@@ -403,7 +403,7 @@ def _report(results: list[DocResult]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Идемпотентный оркестратор G2AI-пайплайна")
-    parser.add_argument("sources", nargs="?", type=Path, default=validate_sources.DEFAULT_SOURCES)
+    parser.add_argument("sources", nargs="?", type=Path, default=schema.DEFAULT_SOURCES)
     parser.add_argument("--db", type=Path, default=corpus_index.DEFAULT_DB)
     parser.add_argument("--only", default=None, help="обработать только документ с этим id")
     parser.add_argument("--force", action="store_true", help="переиграть все стадии независимо от состояния")

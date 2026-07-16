@@ -25,10 +25,10 @@ from typing import Any
 import networkx as nx
 import yaml
 
-from schema import GeoScope, SourceRecord
-from validate_sources import DEFAULT_SOURCES, validate_sources
+from schema import VOCAB_DIR, DEFAULT_SOURCES, GeoScope, SourceRecord
+from validate_sources import validate_sources
 
-JURISDICTIONS_PATH = Path(__file__).resolve().parent.parent / "vocab" / "jurisdictions.yaml"
+JURISDICTIONS_PATH = VOCAB_DIR / "jurisdictions.yaml"
 
 
 # --- идентификаторы узлов: префикс по типу, чтобы id разных типов не сталкивались ---
