@@ -149,8 +149,27 @@ def index_chunks(
     conn.commit()
 
 
+def sanitize_fts_query(q: str) -> str:
+    """Безопасно превратить произвольную пользовательскую строку в FTS5 MATCH-запрос.
+
+    По грамматике FTS5 bareword — буквы/цифры/подчёркивание/не-ASCII; всё прочее
+    (``-``, ``:``, ``(``, ``"``, …) — синтаксис. Дефис в barewords не входит: без
+    экранирования запрос вида ``state-as-mcp`` — синтаксическая ошибка, не фраза
+    (верифицировано по sqlite.org/fts5.html). Каждый токен оборачивается в
+    двойные кавычки (внутренние — удваиваются, SQL-style), implicit-AND
+    многословного запроса сохраняется.
+    """
+    tokens = q.split()
+    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens) or '""'
+
+
 def fts_search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[SearchHit]:
-    """Полнотекстовый поиск (FTS5 MATCH), ранжирование bm25 (меньше = лучше)."""
+    """Полнотекстовый поиск (FTS5 MATCH), ранжирование bm25 (меньше = лучше).
+
+    ``query`` — уже готовая MATCH-строка (санитизация — на границе пользовательского
+    ввода, см. ``sanitize_fts_query``/CLI ``--raw``; API-функция принимает и честный
+    FTS5-синтаксис — NEAR/колонки понадобятся будущему analyze-слою).
+    """
     cur = conn.execute(
         "SELECT c.doc_id, c.chunk_index, bm25(chunks_fts) AS rank, "
         "snippet(chunks_fts, 0, '[', ']', '…', 12) AS snip "
@@ -196,7 +215,13 @@ def _cmd_search(args: argparse.Namespace) -> int:
         print(f"индекс не найден: {args.db} (сначала build)", file=sys.stderr)
         return 2
     conn = sqlite3.connect(args.db)
-    hits = fts_search(conn, args.query, args.limit)
+    query = args.query if args.raw else sanitize_fts_query(args.query)
+    try:
+        hits = fts_search(conn, query, args.limit)
+    except sqlite3.OperationalError as exc:
+        print(f"некорректный FTS5-запрос: {exc}", file=sys.stderr)
+        conn.close()
+        return 2
     conn.close()
     if not hits:
         print("ничего не найдено")
@@ -219,6 +244,10 @@ def main(argv: list[str] | None = None) -> int:
     p_search = sub.add_parser("search", help="полнотекстовый поиск")
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument(
+        "--raw", action="store_true",
+        help="не экранировать запрос — честный FTS5-синтаксис (NEAR, колонки, ...)",
+    )
     p_search.set_defaults(func=_cmd_search)
 
     args = parser.parse_args(argv)

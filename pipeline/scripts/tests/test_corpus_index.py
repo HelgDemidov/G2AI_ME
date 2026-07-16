@@ -1,6 +1,8 @@
 """Тесты FTS5-индекса на синтетических чанках (без модели/токенизатора — CI-safe)."""
 from __future__ import annotations
 
+import argparse
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -8,7 +10,17 @@ from typing import Any
 import pytest
 
 from chunking import Chunk
-from corpus_index import corpus_fingerprint, create_db, fts5_available, fts_search, index_chunks, read_meta, write_meta
+from corpus_index import (
+    _cmd_search,
+    corpus_fingerprint,
+    create_db,
+    fts5_available,
+    fts_search,
+    index_chunks,
+    read_meta,
+    sanitize_fts_query,
+    write_meta,
+)
 from test_schema import valid_record, write_doc
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="sqlite собран без FTS5")
@@ -138,3 +150,66 @@ def test_corpus_fingerprint_skips_missing_doc_md(tmp_path: Path) -> None:
 
 def test_corpus_fingerprint_empty_corpus(tmp_path: Path) -> None:
     assert corpus_fingerprint(tmp_path) == corpus_fingerprint(tmp_path)  # не падает, детерминирован
+
+
+# --- sanitize_fts_query: экранирование пользовательского FTS5-запроса ---
+
+
+def test_sanitize_hyphenated_term_quoted() -> None:
+    assert sanitize_fts_query("state-as-mcp") == '"state-as-mcp"'
+
+
+def test_sanitize_multiword_quotes_each_token() -> None:
+    assert sanitize_fts_query("state as mcp") == '"state" "as" "mcp"'
+
+
+def test_sanitize_doubles_internal_quotes() -> None:
+    assert sanitize_fts_query('он сказал "привет"') == '"он" "сказал" """привет"""'
+
+
+def test_sanitize_empty_string_does_not_crash() -> None:
+    assert sanitize_fts_query("") == '""'
+    assert sanitize_fts_query("   ") == '""'
+
+
+def test_sanitize_colon_and_parens_quoted() -> None:
+    assert sanitize_fts_query("AI:(pilot)") == '"AI:(pilot)"'
+
+
+# --- fts_search / _cmd_search: краш-кейсы FTS5-синтаксиса ---
+
+
+def test_fts_search_raw_hyphenated_query_raises_operational_error(tmp_path: Path) -> None:
+    """Демонстрирует САМУ проблему: сырой (неэкранированный) запрос с дефисом —
+    невалидный FTS5-синтаксис (дефис не входит в bareword-грамматику)."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, sample_chunks())
+    with pytest.raises(sqlite3.OperationalError):
+        fts_search(conn, "state-as-mcp")  # без sanitize_fts_query
+
+
+def test_fts_search_sanitized_hyphenated_query_works(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk("doc-a", 0, "state as mcp architecture pattern", 5)])
+    hits = fts_search(conn, sanitize_fts_query("state-as-mcp"))
+    assert len(hits) == 1
+    assert hits[0].doc_id == "doc-a"
+
+
+def test_cmd_search_default_sanitizes_hyphenated_query(tmp_path: Path) -> None:
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "state as mcp architecture pattern", 5)])
+    conn.close()
+    args = argparse.Namespace(db=db, query="state-as-mcp", limit=10, raw=False)
+    assert _cmd_search(args) == 0
+
+
+def test_cmd_search_raw_syntax_error_reported_not_raised(tmp_path: Path, capsys: Any) -> None:
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, sample_chunks())
+    conn.close()
+    args = argparse.Namespace(db=db, query="state-as-mcp", limit=10, raw=True)  # честный синтаксис — падает
+    assert _cmd_search(args) == 2
+    assert "некорректный" in capsys.readouterr().err
