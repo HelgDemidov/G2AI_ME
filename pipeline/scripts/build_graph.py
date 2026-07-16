@@ -191,9 +191,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     sources_path: Path = args.sources
-    if not sources_path.exists():
-        print(f"файл не найден: {sources_path}", file=sys.stderr)
-        return 2
 
     errors, records = validate_sources(sources_path)
     if errors:

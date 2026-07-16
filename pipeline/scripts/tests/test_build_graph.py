@@ -13,6 +13,7 @@ from build_graph import (
     export_graphml,
     lineage,
     load_jurisdictions,
+    main,
     summary,
 )
 from schema import SourceRecord
@@ -93,3 +94,12 @@ def test_load_real_jurisdictions() -> None:
     blocs = load_jurisdictions()
     assert "eu" in blocs and "asean" in blocs
     assert "sg" in blocs["asean"]["members"]
+
+
+def test_main_nonexistent_root_is_empty_valid_graph(tmp_path: Path, capsys: Any) -> None:
+    """Несуществующий корень — валидный пустой корпус (та же семантика, что у
+    validate_sources/run_pipeline), а не «файл не найден» (лексика эпохи sources.yaml)."""
+    missing = tmp_path / "does-not-exist"
+    exit_code = main([str(missing)])
+    assert exit_code == 0
+    assert "Узлов: 0" in capsys.readouterr().out
