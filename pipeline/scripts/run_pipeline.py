@@ -34,6 +34,7 @@ from enum import Enum
 from pathlib import Path
 
 from acquire import acquisition
+from convert import converters
 from graph import build_graph
 from index import corpus_index
 from core import fsio
@@ -42,7 +43,6 @@ from core import validate_sources
 from index import vector_store
 from index.chunking import strip_frontmatter
 from index.embed import get_embedder
-from convert.pdf_to_markdown import convert as pdf_convert
 
 logger = logging.getLogger("run_pipeline")
 
@@ -109,7 +109,11 @@ def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) 
     stale = False
     if raw is not None and raw.exists() and md.exists():
         stale = raw.stat().st_mtime > md.stat().st_mtime
-    if force or Stage.download in stages or not md.exists() or stale:
+    converter_changed = False
+    if raw is not None and md.exists():
+        conv = converters.resolve_converter(raw)   # UnsupportedFormat => planning-отказ (изолирован)
+        converter_changed = (state.converter_name, state.converter_version) != (conv.name, conv.version)
+    if force or Stage.download in stages or not md.exists() or stale or converter_changed:
         stages.append(Stage.convert)
 
     if Stage.convert in stages:
@@ -236,12 +240,17 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     md = schema.md_file(rec, root)
     if raw is None or not raw.exists():
         raise RuntimeError("нет raw-файла для конвертации")
+    conv = converters.resolve_converter(raw)
     md.parent.mkdir(parents=True, exist_ok=True)
     tmp = fsio.staging_path(md)
-    pdf_convert(str(raw), str(tmp))
+    conv.convert(raw, tmp, rec.language)
     if not tmp.exists() or tmp.stat().st_size == 0:
         raise RuntimeError("конвертация дала пустой файл")
     tmp.replace(md)
+    state_path = schema.state_file(rec, root)
+    state = schema.load_state(state_path)
+    state.converter_name, state.converter_version = conv.name, conv.version
+    schema.save_state(state_path, state)
 
 
 def _do_frontmatter(rec: schema.SourceRecord, root: Path) -> bool:

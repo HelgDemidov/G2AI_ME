@@ -216,6 +216,8 @@ class OperationalState(BaseModel):
     fidelity: Fidelity | None = None
     retrieved_snapshot_date: _dt.date | None = None
     translation_status: TranslationStatus = TranslationStatus.not_started
+    converter_name: str | None = None     # какой конвертер породил текущий doc.md
+    converter_version: str | None = None  # его версия (реконсиляция реконверсии)
 
 
 class SourceRecord(BaseModel):
