@@ -18,7 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
-from corpus_index import DEFAULT_DB
+from bge_tokenizer import EMBED_MAX_TOKENS
+from corpus_index import DEFAULT_DB, read_meta, write_meta
 from embed import Embedder, FloatArray, get_embedder
 from env import load_dotenv
 
@@ -41,15 +42,49 @@ class VecHit:
     text: str
 
 
+class VectorsStaleError(RuntimeError):
+    """Векторы данной модели отсутствуют или не соответствуют текущему индексу —
+    чанки пересобирались после последнего ``embed-corpus`` (``corpus_index.
+    index_chunks`` дропает таблицу ``vectors`` при пересборке, см. spec
+    index-consistency §3: старый ``chunk_id`` иначе молча указывал бы на чужой
+    текст нового поколения). Честный отказ вместо правдоподобно неверных результатов.
+    """
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.commit()
 
 
+def check_chunk_budget(conn: sqlite3.Connection) -> None:
+    """Гейт: чанки индекса не должны быть крупнее бюджета эмбеддера
+    (``EMBED_MAX_TOKENS``) — иначе ``OnnxBgeEmbedder`` молча truncate'ит каждый
+    чанк до своего лимита, и вектор представлял бы только префикс: инвариант
+    «канонический чанк целиком видим и FTS, и векторному поиску» перестал бы
+    быть проверяемым, оставаясь лишь подразумеваемым. Отсутствие
+    ``chunk_max_tokens`` в ``index_meta`` (индекс собран без него) не гейтится —
+    неизвестность не повод отказывать.
+    """
+    chunk_max_str = read_meta(conn, "chunk_max_tokens")
+    if chunk_max_str is not None and int(chunk_max_str) > EMBED_MAX_TOKENS:
+        raise ValueError(
+            f"индекс собран с чанками {chunk_max_str} > лимита эмбеддера {EMBED_MAX_TOKENS}: "
+            f"векторы представляли бы префиксы; пересоберите с --max-tokens {EMBED_MAX_TOKENS}"
+        )
+
+
 def store_vectors(
     conn: sqlite3.Connection, chunk_ids: list[int], vectors: FloatArray, model: str
 ) -> None:
-    """Полная замена векторов данной модели (идемпотентно)."""
+    """Полная замена векторов данной модели (идемпотентно).
+
+    Штампует ``vectors_fingerprint:<model>`` = текущий ``corpus_fingerprint`` этой
+    же БД (``index_meta``, пишет ``corpus_index.index_chunks``) — ``semantic_search``
+    сверяет его перед поиском. Если ``corpus_fingerprint`` в БД ещё не установлен
+    (индекс собран без него) — штамп не пишется: без опорного отпечатка свежесть
+    неизвестна, безопаснее считать векторы непроверенными, чем молча доверять им.
+    """
+    check_chunk_budget(conn)
     ensure_schema(conn)
     conn.execute("DELETE FROM vectors WHERE model = ?", (model,))
     conn.executemany(
@@ -59,6 +94,9 @@ def store_vectors(
             for i, cid in enumerate(chunk_ids)
         ],
     )
+    fp = read_meta(conn, "corpus_fingerprint")
+    if fp is not None:
+        write_meta(conn, f"vectors_fingerprint:{model}", fp)
     conn.commit()
 
 
@@ -77,6 +115,18 @@ def load_vectors(conn: sqlite3.Connection, model: str) -> tuple[list[int], Float
 def semantic_search(
     conn: sqlite3.Connection, query_vec: FloatArray, model: str, top_k: int = 10
 ) -> list[VecHit]:
+    """Семантический поиск. Перед поиском сверяет ``vectors_fingerprint:<model>``
+    с текущим ``corpus_fingerprint`` — расхождение ИЛИ отсутствие (никогда не
+    эмбеддили эту модель, либо чанки пересобирались после последнего
+    ``embed-corpus``) кидают ``VectorsStaleError``, а не молча возвращают
+    правдоподобно неверные (или пустые) результаты."""
+    current_fp = read_meta(conn, "corpus_fingerprint")
+    vectors_fp = read_meta(conn, f"vectors_fingerprint:{model}")
+    if current_fp is None or vectors_fp != current_fp:
+        raise VectorsStaleError(
+            f"векторы модели {model!r} отсутствуют или устарели для текущего индекса — "
+            "прогоните run_pipeline --embed (или vector_store.py embed-corpus)"
+        )
     ids, mat = load_vectors(conn, model)
     if not ids:
         return []
@@ -117,6 +167,12 @@ def _cmd_embed(args: argparse.Namespace) -> int:
     if not ids:
         print("нет чанков в БД", file=sys.stderr)
         return 2
+    try:
+        check_chunk_budget(conn)  # до дорогого embedder.embed() — не тратить минуты ONNX впустую
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        conn.close()
+        return 2
     embedder = _make_embedder(args.backend, args.model)
     vectors = embedder.embed(texts)
     store_vectors(conn, ids, vectors, embedder.name)
@@ -132,10 +188,15 @@ def _cmd_vsearch(args: argparse.Namespace) -> int:
     conn = sqlite3.connect(args.db)
     embedder = _make_embedder(args.backend, args.model)
     query_vec = embedder.embed([args.query])
-    hits = semantic_search(conn, query_vec[0], embedder.name, args.limit)
+    try:
+        hits = semantic_search(conn, query_vec[0], embedder.name, args.limit)
+    except VectorsStaleError as exc:
+        print(str(exc), file=sys.stderr)
+        conn.close()
+        return 2
     conn.close()
     if not hits:
-        print(f"ничего (модель {embedder.name} проиндексирована? embed-corpus --backend {args.backend})")
+        print("ничего не найдено")
         return 0
     for hit in hits:
         preview = hit.text[:120].replace("\n", " ")

@@ -197,6 +197,12 @@ class OperationalState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # stat-guard для sha256: needed_stages пересчитывает хэш ТОЛЬКО если size/mtime
+    # разошлись с записанными здесь — иначе полное чтение raw на КАЖДОМ прогоне ради
+    # «делать нечего». Старые .state.yaml без этих полей валидны (Optional) — первый
+    # прогон бэкфиллит (см. run_pipeline._adopt_untracked_raw).
+    raw_size: int | None = None
+    raw_mtime_ns: int | None = None
     acquisition_method: AcquisitionMethod | None = None
     acquisition_checked: _dt.date | None = None
     fidelity: Fidelity | None = None
