@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pdfplumber
 
+from convert import eli
 from convert.pdf_to_markdown import convert as pdf_convert
 
 
@@ -66,8 +67,27 @@ def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
     pdf_convert(str(raw), str(out))  # существующий конвертер, без изменений
 
 
+def _convert_html(raw: Path, out: Path, language: str | None) -> None:
+    import trafilatura  # ленивый импорт: pdf-путь не платит за html-зависимость
+
+    html = eli.promote_eli_headings(raw.read_bytes())  # ELI (EUR-Lex/CELLAR) -> <hN>, иначе no-op
+    text = trafilatura.extract(
+        html,                            # bytes: charset определяет trafilatura
+        output_format="markdown",
+        include_tables=True,
+        include_links=False,            # URL-хвосты — шум для чанков/эмбеддера
+        include_images=False,
+        favor_recall=True,              # гос-страницы: лучше лишний блок, чем потерянная статья
+        with_metadata=False,            # frontmatter — производная meta.yaml, не trafilatura
+    )
+    if not text or not text.strip():
+        raise ConversionError(f"{raw.name}: trafilatura не извлекла контента")
+    out.write_text(text, encoding="utf-8")
+
+
 _CONVERTERS: dict[str, Converter] = {
     "pdf": Converter("pdf", "2", _convert_pdf),  # v2: графика-пасс (spec convert-graphics)
+    "html": Converter("html", "1", _convert_html),
 }
 
 

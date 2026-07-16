@@ -1,0 +1,42 @@
+# Курируемая запись документа (corpus-layout-v2). Человек — источник истины.
+# Операционное состояние — .state.yaml (локально); оригинал — raw.html; конвертация — doc.md.
+id: eu-ai-act-2024
+entity_id: eu
+track: intl-xperience
+title: Regulation (EU) 2024/1689 of the European Parliament and of the Council of
+  13 June 2024 laying down harmonised rules on Artificial Intelligence (Artificial
+  Intelligence Act)
+issuer: European Parliament and Council of the European Union
+issuer_type: igo
+geo_scope: regional
+language: en
+dates:
+  published: '2024-07-12'
+  effective: '2024-08-01'
+  retrieved: '2026-07-16'
+  last_checked: '2026-07-16'
+doc_type: legislation
+authority: binding_law
+source_url: https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=OJ:L_202401689
+source_format: html
+sensitivity: normal
+rights: cc-by
+topics:
+- ai-governance
+- risk-management
+- human-oversight
+g2ai_pattern: []
+relations: []
+relevance:
+  target_fit: primary
+  axis: digital_sovereignty
+  assessed_stage: confirmed
+  rationale: Foundational EU AI regulatory framework (Regulation (EU) 2024/1689).
+    Montenegro's EU accession requires legal alignment with the acquis communautaire,
+    including AI regulation — primary reference for the digital-sovereignty track's
+    regulatory-alignment analysis. Confirmed by text (doc.md) — all 113 articles, 13
+    chapters, 13 annexes present intact, full risk-tiered AI regulatory framework
+    (prohibited practices, high-risk systems, GPAI models, regulatory sandboxes,
+    EU/member-state governance).
+  assessed_date: '2026-07-16'
+in_force: true

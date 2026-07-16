@@ -7,8 +7,10 @@ from typing import Any
 import pytest
 
 from convert.converters import (
+    ConversionError,
     NeedsOCR,
     UnsupportedFormat,
+    _convert_html,
     _convert_pdf,
     _detect_scan,
     resolve_converter,
@@ -28,6 +30,56 @@ def test_resolve_converter_unsupported_lists_known_formats(tmp_path: Path) -> No
 def test_resolve_converter_uppercase_extension(tmp_path: Path) -> None:
     conv = resolve_converter(tmp_path / "raw.PDF")
     assert conv.name == "pdf"
+
+
+def test_resolve_converter_html(tmp_path: Path) -> None:
+    conv = resolve_converter(tmp_path / "raw.html")
+    assert conv.name == "html"
+
+
+# --- _convert_html: реальная trafilatura на инлайн-фикстуре (ни сети, ни модели) ---
+
+_HTML_FIXTURE = """<!doctype html>
+<html><head><title>Test Act</title></head>
+<body>
+<nav><a href="/">Home</a><a href="/about">About</a></nav>
+<header>Site chrome — should not survive extraction</header>
+<article>
+<h1>Article 1</h1>
+<p>This is the operative text of the article, long enough to be recognised as
+real content by trafilatura's boilerplate-vs-content heuristics rather than
+being pruned as a short unimportant fragment.</p>
+<table>
+<tr><th>Term</th><th>Definition</th></tr>
+<tr><td>AI system</td><td>A machine-based system.</td></tr>
+</table>
+</article>
+<footer>Copyright footer — should not survive extraction</footer>
+</body></html>"""
+
+
+def test_convert_html_extracts_article_and_table(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.html"
+    raw.write_text(_HTML_FIXTURE, encoding="utf-8")
+    out = tmp_path / "out.md"
+    _convert_html(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "Article 1" in text
+    assert "operative text of the article" in text
+    assert "AI system" in text and "machine-based system" in text  # таблица сохранена
+    assert "Site chrome" not in text  # nav — не контент
+    assert "Copyright footer" not in text
+
+
+def test_convert_html_empty_content_raises(tmp_path: Path) -> None:
+    """С favor_recall=True даже голая nav-строка выживет как fallback-контент (боязнь
+    потерь > боязнь шума, см. spec §design rationale) — по-настоящему пустой ConversionError
+    ловит случай, где extract() вернул None целиком (напр. пустой <body>)."""
+    raw = tmp_path / "raw.html"
+    raw.write_text("<html><body></body></html>", encoding="utf-8")
+    out = tmp_path / "out.md"
+    with pytest.raises(ConversionError, match="не извлекла"):
+        _convert_html(raw, out, "en")
 
 
 # --- _detect_scan: fake pdfplumber (паттерн test_pdf_to_markdown._FakeEmptyPdf) ---

@@ -304,7 +304,7 @@ def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
     rec = make()
     ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
 
-    def fake_fetch(url: str, dest: Path, *, user_agent: str, timeout: int = 30) -> ClassifiedResponse:
+    def fake_fetch(url: str, dest: Path, *, user_agent: str, timeout: int = 30, **kw: Any) -> ClassifiedResponse:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"%PDF-1.4 fake content")
         return ok
@@ -318,6 +318,24 @@ def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
     assert st.acquisition_method is not None and st.acquisition_method.value == "direct"
     assert st.fidelity is not None and st.fidelity.value == "live"
     assert st.sha256 is not None
+
+
+def test_do_download_html_record_targets_raw_html(tmp_path: Path, monkeypatch: Any) -> None:
+    """source_format=html -> цель скачивания raw.html, не raw.pdf (ext-маршрутизация)."""
+    rec = make(source_format="html")
+    ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid HTML")
+
+    def fake_fetch(url: str, dest: Path, *, user_agent: str, timeout: int = 30, **kw: Any) -> ClassifiedResponse:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"<html>fake content</html>")
+        return ok
+
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", fake_fetch)
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert (schema.doc_dir(rec, tmp_path) / "raw.html").read_bytes() == b"<html>fake content</html>"
+    assert schema.raw_file(rec, tmp_path) == schema.doc_dir(rec, tmp_path) / "raw.html"
 
 
 def test_do_download_cleans_staging_on_batch_block(tmp_path: Path, monkeypatch: Any) -> None:
@@ -350,7 +368,7 @@ def test_do_download_replaces_prior_raw_of_different_ext(tmp_path: Path, monkeyp
 
     ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF")
 
-    def fake_fetch(url: str, dest: Path, *, user_agent: str, timeout: int = 30) -> ClassifiedResponse:
+    def fake_fetch(url: str, dest: Path, *, user_agent: str, timeout: int = 30, **kw: Any) -> ClassifiedResponse:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"%PDF-1.4 fake content")
         return ok

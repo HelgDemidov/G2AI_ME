@@ -9,9 +9,9 @@ strict = true
 mypy_path = "pipeline/scripts"
 explicit_package_bases = true
 
-# networkx/tokenizers/onnxruntime не поставляют полноценные типы -> не флагать как «нет стабов».
+# networkx/tokenizers/onnxruntime/lxml не поставляют полноценные типы -> не флагать как «нет стабов».
 [[tool.mypy.overrides]]
-module = ["networkx.*", "tokenizers.*", "onnxruntime.*"]
+module = ["networkx.*", "tokenizers.*", "onnxruntime.*", "lxml.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
