@@ -152,6 +152,16 @@ def test_guards_reject_dense_prose_callout() -> None:
     assert region_guards_ok(elements, words, PAGE_AREA) is False
 
 
+def test_guards_reject_region_with_zero_words() -> None:
+    """Регион без единого слова в bbox (декоративная иконка из curve-сегментов,
+    напр. Сингапур p.26 аудита) — маркер с пустым Labels был бы чистым шумом;
+    распустить дёшево (слов и так нет, возвращать в прозу нечего)."""
+    elements = [
+        _rect(0.0, 0.0, 10.0, 10.0), _rect(15.0, 0.0, 25.0, 10.0), _rect(30.0, 0.0, 40.0, 10.0),
+    ]
+    assert region_guards_ok(elements, [], PAGE_AREA) is False
+
+
 def test_guards_accept_plausible_swot_region() -> None:
     """Правдоподобная SWOT-подобная фигура (4 бокса, короткие подписи) проходит
     все три guard'а."""

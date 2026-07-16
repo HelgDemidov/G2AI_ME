@@ -67,7 +67,7 @@ def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
 
 
 _CONVERTERS: dict[str, Converter] = {
-    "pdf": Converter("pdf", "1", _convert_pdf),
+    "pdf": Converter("pdf", "2", _convert_pdf),  # v2: графика-пасс (spec convert-graphics)
 }
 
 

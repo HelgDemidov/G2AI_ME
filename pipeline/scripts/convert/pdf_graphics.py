@@ -27,7 +27,14 @@ CLUSTER_GAP_PT = 8.0           # расширение bbox при кластер
 # --- guards региона (чартер §7.1: сомнение => проза) ---
 REGION_MIN_ELEMENTS = 3            # < 3 элементов — декор/плашка, не фигура (callout-guard)
 REGION_MAX_PAGE_FRACTION = 0.9     # регион на ~всю страницу — рамка/подложка, не фигура
-REGION_MAX_CHARS_PER_ELEMENT = 250  # больше текста на элемент — боксированная проза (callout)
+REGION_MAX_CHARS_PER_ELEMENT = 100  # больше текста на элемент — боксированная проза (callout)
+# Калибровано аудитом на реальном корпусе 2026-07-16 (spec convert-graphics §4,
+# открытый вопрос): стартовое значение 250 пропускало явный кейс-стади-callout
+# Сингапура p.37 (17 элементов, 138 симв./элемент — целые абзацы прозы под
+# маркером «Figure»). Легитимные фигуры на обоих документах — 2.9..74.6
+# симв./элемент (макс. — Сингапур p.10, decision-матрица с длинными подписями);
+# погран. кейс из спека (Эстония p.23, 42 rect/3168 симв.) — 75.4, тоже легитимен.
+# 100 — с запасом выше обоих легитимных максимумов и с запасом ниже 138.3.
 
 
 class WordLike(Protocol):
@@ -199,9 +206,9 @@ def region_words(words: list[Any], bbox: BBox) -> list[Any]:
 
 
 def region_guards_ok(elements: list[Element], words: list[Any], page_area: float) -> bool:
-    """Три guard'а против съедания прозы (чартер convert-graphics §7.1: ложно-
-    положительный регион — регресс хуже статус-кво). ВСЕ три обязаны пройти,
-    иначе кластер распускается — его слова остаются в прозе (вызывающая сторона
+    """Guard'ы против съедания прозы (чартер convert-graphics §7.1: ложно-
+    положительный регион — регресс хуже статус-кво). ВСЕ обязаны пройти, иначе
+    кластер распускается — его слова остаются в прозе (вызывающая сторона
     просто не изымает их)."""
     if len(elements) < REGION_MIN_ELEMENTS:
         return False
@@ -212,6 +219,14 @@ def region_guards_ok(elements: list[Element], words: list[Any], page_area: float
         return False
     total_chars = sum(len(w.text) for w in words)
     if total_chars / len(elements) > REGION_MAX_CHARS_PER_ELEMENT:
+        return False
+    if total_chars == 0:
+        # Ни одного слова в bbox региона (типично — мелкая декоративная иконка,
+        # нарисованная россыпью curve-сегментов, напр. Сингапур p.26: 4 таких
+        # кластера с пустыми Labels). Дёшево распустить: слова региона и так
+        # пусты, распускание НИЧЕГО не возвращает в прозу (нечего возвращать) —
+        # но маркер с пустым Labels добавлял бы чистый шум (найдено аудитом
+        # 2026-07-16, spec §4). Не отменяет opaque-маркер для фигур С текстом.
         return False
     return True
 
@@ -387,12 +402,24 @@ def detect_regions(
     page_height: float,
     table_bboxes: list[BBox],
 ) -> tuple[list[Region], list[Any]]:
-    """Главный конвейер §1: intake (искл. уже забранные таблицами) -> dedupe ->
-    filter -> cluster -> guards -> классификация (грид/sequence/opaque).
-    ``page`` — 1-based номер страницы (входит в region_hash). Регионы, не
-    прошедшие guard'ы, распускаются — их слова просто не изымаются из ``words``."""
+    """Главный конвейер §1: intake (искл. images — только через раздельную
+    растровую политику §1.4/classify_images, НЕ кластеризацию; искл. уже
+    забранные таблицами) -> dedupe -> filter -> cluster -> guards ->
+    классификация (грид/sequence/opaque). ``page`` — 1-based номер страницы
+    (входит в region_hash). Регионы, не прошедшие guard'ы, распускаются — их
+    слова просто не изымаются из ``words``.
+
+    Images НЕ участвуют в кластеризации (калибровка по реальному аудиту
+    2026-07-16, spec convert-graphics §4): в некоторых PDF текстовые строки
+    (напр. TOC с dot-leader'ами) растеризованы как МНОЖЕСТВО мелких image-
+    "срезов" одной высоты — по геометрии неотличимых от кластера иконок
+    реального флоучарта, но не несущих собственной графической ценности
+    (реальный текст рядом — в word-слое, растеризация лишь визуальная).
+    Настоящие флоучарты (напр. Сингапур p.6: 27 rect + 52 curve) остаются
+    детектируемыми и без images в кластере — векторная форма их и так несёт."""
     page_area = page_width * page_height
-    candidates = [e for e in elements if not _element_center_in_any_bbox(e, table_bboxes)]
+    candidates = [e for e in elements if e.kind != "image"]
+    candidates = [e for e in candidates if not _element_center_in_any_bbox(e, table_bboxes)]
     candidates = dedupe_elements(candidates)
     candidates = filter_elements(candidates, page_area)
 

@@ -4,10 +4,14 @@
 regex на нумерации — работает и для документов без "1.1.1"-нумерации), колонтитулы/
 номера страниц отсеиваются по частоте ЦЕЛЫХ строк (не отдельных слов - иначе частые
 короткие слова колонтитула стираются и из основного текста), крошечные (обычно <65%
-от размера тела) надстрочные номера сносок вычищаются как шум перед анализом разрывов
-(иначе создают ложный "признак диаграммы"), реальные диаграммы/инфографика определяются
-по разбегу локальных горизонтальных промежутков между словами и помечаются как "требует
-ручной проверки" вместо тихой порчи текста. Таблицы - через pdfplumber.extract_tables().
+от размера тела) надстрочные номера сносок вычищаются как шум перед анализом разрывов.
+Таблицы - через pdfplumber.extract_tables(). Инфографика (SWOT-матрицы, боксовые
+последовательности, флоучарты) — векторная детекция pdf_graphics.py (spec
+convert-graphics): реконструкция в семантический Markdown там, где геометрия
+однозначна (грид/последовательность), иначе честный маркер с сохранёнными подписями —
+вместо прежней word-gap-эвристики (снята §3 п.4: ложно срабатывала на оглавлении/SWOT,
+см. CLAUDE.md). Все блоки (таблицы/регионы/растр-маркеры) вставляются ПОЗИЦИОННО в
+поток колонки по вертикальной позиции — таблицы больше не приклеиваются в конец страницы.
 """
 from __future__ import annotations
 
@@ -15,10 +19,13 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
+from typing import Any
 
 import pdfplumber
 from pdfplumber.page import Page
 from pdfplumber.table import Table
+
+from convert import pdf_graphics
 
 MIN_GAP_PT = 14.0            # мин. ширина "пустого" промежутка, чтобы считать его границей колонок
 COLUMN_ZONE = (0.30, 0.70)   # разрыв должен начинаться в этой доле ширины страницы (не путать с полями)
@@ -29,8 +36,6 @@ HEADING_MIN_RATIO = 1.15      # во сколько раз крупнее тел
 TINY_MARKER_RATIO = 0.65      # порог для надстрочных номеров сносок (сильно мельче и текста сносок, и тела)
 LINE_TOP_TOLERANCE = 2.5
 PARA_GAP_RATIO = 1.6
-WORD_GAP_THRESHOLD = 25.0     # разрыв между соседними словами в "строке", похожий на диаграмму/схему
-DIAGRAM_MIN_RUN = 3           # столько подряд "подозрительных" строк, чтобы считать блок диаграммой
 DOT_LEADER_RE = re.compile(r"\.{3,}")
 
 
@@ -229,13 +234,6 @@ def heading_level(size: float, stats: DocStats) -> int | None:
     return None
 
 
-def line_is_diagram_like(line: list[Word]) -> bool:
-    if len(line) <= 1:
-        return True  # одинокое слово/номер - типично для узлов схемы
-    gaps = [line[i + 1].x0 - line[i].x1 for i in range(len(line) - 1)]
-    return max(gaps) > WORD_GAP_THRESHOLD
-
-
 def render_lines_as_paragraphs(lines: list[list[Word]]) -> str:
     if not lines:
         return ""
@@ -255,12 +253,22 @@ def render_lines_as_paragraphs(lines: list[list[Word]]) -> str:
     return "\n\n".join(out)
 
 
-def render_lines_with_diagram_detection(lines: list[list[Word]], stats: DocStats) -> str:
-    """Разбивает строки колонки на обычные абзацы/заголовки и на подозрительные
-    "диаграммные" прогоны (>= DIAGRAM_MIN_RUN строк подряд с широким разрывом/одним словом)."""
+def _render_column_with_blocks(
+    lines: list[list[Word]], blocks: list[tuple[pdf_graphics.BBox, str]], stats: DocStats
+) -> str:
+    """Мёржит строки прозы колонки с уже отрендеренными блоками (таблицы/
+    регионы/растр-маркеры) той же колонки по вертикальной позиции (``top``) —
+    позиционная вставка (spec convert-graphics §3 п.3), заменяет прежнее
+    приклеивание блоков в конец. Заголовки/абзацы внутри непрерывных прозных
+    прогонов между блоками — прежняя логика render_lines_with_diagram_detection
+    минус диаграммная ветка (снята §3 п.4: word-gap-эвристика ложно
+    срабатывала на TOC/SWOT, её работу забрала векторная детекция pdf_graphics)."""
+    stream: list[tuple[float, str, Any]] = [
+        (min(w.top for w in line), "line", line) for line in lines
+    ] + [(bbox[1], "block", text) for bbox, text in blocks]
+    stream.sort(key=lambda item: item[0])
+
     rendered: list[str] = []
-    i = 0
-    n = len(lines)
     prose_buf: list[list[Word]] = []
 
     def flush_prose() -> None:
@@ -284,25 +292,12 @@ def render_lines_with_diagram_detection(lines: list[list[Word]], stats: DocStats
         rendered.append("\n\n".join(s for s in segments if s.strip()))
         prose_buf = []
 
-    while i < n:
-        if line_is_diagram_like(lines[i]):
-            j = i
-            while j < n and line_is_diagram_like(lines[j]):
-                j += 1
-            run = lines[i:j]
-            if len(run) >= DIAGRAM_MIN_RUN:
-                flush_prose()
-                raw = "; ".join(" ".join(w.text for w in ln) for ln in run)
-                rendered.append(
-                    "> **[Требует ручной проверки — вероятная диаграмма/инфографика]**\n"
-                    f"> Извлечённые фрагменты текста (порядок не гарантирован): {raw}"
-                )
-            else:
-                prose_buf.extend(run)  # слишком короткий прогон - не диаграмма, обычный текст
-            i = j
+    for _, kind, payload in stream:
+        if kind == "line":
+            prose_buf.append(payload)
         else:
-            prose_buf.append(lines[i])
-            i += 1
+            flush_prose()
+            rendered.append(payload)
     flush_prose()
     return "\n\n".join(r for r in rendered if r.strip())
 
@@ -310,26 +305,28 @@ def render_lines_with_diagram_detection(lines: list[list[Word]], stats: DocStats
 def render_page(
     words: list[Word],
     page_width: float,
-    page_height: float,
     stats: DocStats,
-    table_bboxes: list[tuple[float, float, float, float]],
+    blocks: list[tuple[pdf_graphics.BBox, str]],
 ) -> str:
-    clean_words = strip_boilerplate_and_page_numbers(words, page_height, stats)
-    clean_words = [w for w in clean_words if not word_in_any_bbox(w, table_bboxes)]
-    main_words = [w for w in clean_words if w.size > stats.tiny_marker_max]
-
-    columns = detect_columns(main_words, page_width)
+    """``words`` — уже очищенные и лишённые слов детектированных регионов
+    (вызывающая сторона: см. ``convert``). ``blocks`` — отрендеренный текст
+    таблиц/регионов/растр-маркеров этой страницы с их bbox, для позиционной
+    вставки; назначаются колонке по центру-x bbox."""
+    columns = detect_columns(words, page_width)
     column_texts: list[str] = []
     for x0, x1 in columns:
-        col_words = [w for w in main_words if x0 <= (w.x0 + w.x1) / 2 < x1]
+        col_words = [w for w in words if x0 <= (w.x0 + w.x1) / 2 < x1]
         lines = group_into_lines(col_words)
-        column_texts.append(render_lines_with_diagram_detection(lines, stats))
+        col_blocks = [(bbox, text) for bbox, text in blocks if x0 <= (bbox[0] + bbox[2]) / 2 < x1]
+        column_texts.append(_render_column_with_blocks(lines, col_blocks, stats))
 
     return "\n\n".join(t for t in column_texts if t.strip())
 
 
-def render_tables(real_tables: list[Table]) -> list[str]:
-    tables_md = []
+def render_tables(real_tables: list[Table]) -> list[tuple[pdf_graphics.BBox, str]]:
+    """(bbox, markdown) на таблицу — bbox нужен для позиционной вставки в
+    поток колонки (render_page), не только для рендера."""
+    out: list[tuple[pdf_graphics.BBox, str]] = []
     for table in real_tables:
         raw_rows = table.extract()
         if not any(any(cell for cell in row) for row in raw_rows):
@@ -339,8 +336,8 @@ def render_tables(real_tables: list[Table]) -> list[str]:
         md = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
         for row in body:
             md.append("| " + " | ".join(row) + " |")
-        tables_md.append("\n".join(md))
-    return tables_md
+        out.append((table.bbox, "\n".join(md)))
+    return out
 
 
 def convert(pdf_path: str, out_path: str) -> None:
@@ -354,17 +351,61 @@ def convert(pdf_path: str, out_path: str) -> None:
               f"tiny_marker_max={stats.tiny_marker_max:.1f}", file=sys.stderr)
         print(f"колонтитулов/повторяющихся строк обнаружено: {len(stats.boilerplate_norms)}", file=sys.stderr)
 
+        # graphics-pass (spec convert-graphics §1/§1.4): элементы + document-wide
+        # частота content_hash растра собираются ДО постраничного рендера —
+        # декор/логотип определяется частотой ПО ВСЕМУ документу, не странице.
+        pages_elements = [pdf_graphics.collect_elements(p) for p in pdf.pages]
+        all_images = [e for elements in pages_elements for e in elements if e.kind == "image"]
+        hash_counts = pdf_graphics.document_hash_counts(all_images)
+
+        n_grid = n_sequence = n_opaque = n_raster = 0
         out_parts: list[str] = []
-        for page, words in zip(pdf.pages, pages_words):
+        for page_num, (page, words, elements) in enumerate(
+            zip(pdf.pages, pages_words, pages_elements), start=1
+        ):
             real_tables = get_real_tables(page)
             table_bboxes = [t.bbox for t in real_tables]
-            # размеры — СВОЕЙ страницы (не первой): корректно для смешанной
+
+            clean_words = strip_boilerplate_and_page_numbers(words, page.height, stats)
+            clean_words = [w for w in clean_words if not word_in_any_bbox(w, table_bboxes)]
+            main_words = [w for w in clean_words if w.size > stats.tiny_marker_max]
+
+            # регионы: слова изъяты из прозы ДО detect_columns (заодно чинит
+            # ложную 2-колоночность от широкой фигуры в центре, §3 п.2).
+            regions, remaining_words = pdf_graphics.detect_regions(
+                page_num, elements, main_words, page.width, page.height, table_bboxes
+            )
+            for r in regions:
+                if r.kind == "grid":
+                    n_grid += 1
+                elif r.kind == "sequence":
+                    n_sequence += 1
+                else:
+                    n_opaque += 1
+
+            loose_images = [e for e in elements if e.kind == "image"]
+            raster_targets = pdf_graphics.classify_images(
+                loose_images, [r.bbox for r in regions], hash_counts, page.width * page.height
+            )
+            n_raster += len(raster_targets)
+
+            blocks: list[tuple[pdf_graphics.BBox, str]] = [
+                *render_tables(real_tables),
+                *((r.bbox, pdf_graphics.render_region_block(r, page_num)) for r in regions),
+                *(
+                    ((img.x0, img.top, img.x1, img.bottom), pdf_graphics.render_raster_marker(page_num))
+                    for img in raster_targets
+                ),
+            ]
+            # ширина/высота — СВОЕЙ страницы (не первой): корректно для смешанной
             # ориентации (портретное тело + альбомные приложения-таблицы).
-            text = render_page(words, page.width, page.height, stats, table_bboxes)
-            tables = render_tables(real_tables)
-            if tables:
-                text += "\n\n" + "\n\n".join(tables)
-            out_parts.append(text)
+            out_parts.append(render_page(remaining_words, page.width, stats, blocks))
+
+        print(
+            f"инфографика: {n_grid} грид -> таблица, {n_sequence} sequence -> список, "
+            f"{n_opaque} нереконструировано (маркер); растр: {n_raster} маркеров",
+            file=sys.stderr,
+        )
 
         full_text = "\n\n".join(p for p in out_parts if p.strip())
         with open(out_path, "w", encoding="utf-8") as f:
