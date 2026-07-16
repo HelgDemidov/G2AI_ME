@@ -30,10 +30,13 @@ relations: []
 relevance:
   target_fit: primary
   axis: digital_sovereignty
-  assessed_stage: triage
+  assessed_stage: confirmed
   rationale: Foundational EU AI regulatory framework (Regulation (EU) 2024/1689).
     Montenegro's EU accession requires legal alignment with the acquis communautaire,
     including AI regulation — primary reference for the digital-sovereignty track's
-    regulatory-alignment analysis.
+    regulatory-alignment analysis. Confirmed by text (doc.md) — all 113 articles, 13
+    chapters, 13 annexes present intact, full risk-tiered AI regulatory framework
+    (prohibited practices, high-risk systems, GPAI models, regulatory sandboxes,
+    EU/member-state governance).
   assessed_date: '2026-07-16'
 in_force: true
