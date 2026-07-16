@@ -114,14 +114,21 @@ def group_into_lines(words: list[Word]) -> list[list[Word]]:
     return lines
 
 
-def compute_doc_stats(pages_words: list[list[Word]], page_height: float) -> DocStats:
+def compute_doc_stats(pages: list[tuple[list[Word], float]]) -> DocStats:
+    """``pages`` — список (слова_страницы, высота_страницы): полосы колонтитулов
+    считаются по высоте КАЖДОЙ страницы, а не единой глобальной — документы со
+    смешанной ориентацией (портретное тело + альбомные приложения-таблицы,
+    типично для гос-стратегий) иначе получали бы неверные полосы на альбомных
+    страницах. ``body_size``/``heading_sizes``/``boilerplate_norms`` остаются
+    документ-глобальными — шрифты и колонтитулы общие для всего документа.
+    """
     size_char_counts: Counter[float] = Counter()
     boilerplate_line_counts: Counter[str] = Counter()
-    n_pages = len(pages_words)
-    top_band = page_height * HEADER_FOOTER_BAND_FRAC
-    bottom_band = page_height * (1 - HEADER_FOOTER_BAND_FRAC)
+    n_pages = len(pages)
 
-    for words in pages_words:
+    for words, page_height in pages:
+        top_band = page_height * HEADER_FOOTER_BAND_FRAC
+        bottom_band = page_height * (1 - HEADER_FOOTER_BAND_FRAC)
         for w in words:
             size_char_counts[w.size] += len(w.text)
         lines = group_into_lines(words)
@@ -338,10 +345,10 @@ def render_tables(real_tables: list[Table]) -> list[str]:
 
 def convert(pdf_path: str, out_path: str) -> None:
     with pdfplumber.open(pdf_path) as pdf:
+        if not pdf.pages:
+            raise RuntimeError(f"{pdf_path}: PDF без страниц")
         pages_words = [load_words(p) for p in pdf.pages]
-        page_height = pdf.pages[0].height
-        page_width = pdf.pages[0].width
-        stats = compute_doc_stats(pages_words, page_height)
+        stats = compute_doc_stats(list(zip(pages_words, (p.height for p in pdf.pages))))
 
         print(f"body_size={stats.body_size}, heading_sizes={stats.heading_sizes}, "
               f"tiny_marker_max={stats.tiny_marker_max:.1f}", file=sys.stderr)
@@ -351,7 +358,9 @@ def convert(pdf_path: str, out_path: str) -> None:
         for page, words in zip(pdf.pages, pages_words):
             real_tables = get_real_tables(page)
             table_bboxes = [t.bbox for t in real_tables]
-            text = render_page(words, page_width, page_height, stats, table_bboxes)
+            # размеры — СВОЕЙ страницы (не первой): корректно для смешанной
+            # ориентации (портретное тело + альбомные приложения-таблицы).
+            text = render_page(words, page.width, page.height, stats, table_bboxes)
             tables = render_tables(real_tables)
             if tables:
                 text += "\n\n" + "\n\n".join(tables)
