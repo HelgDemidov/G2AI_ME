@@ -24,15 +24,14 @@ from pydantic import ValidationError
 from schema import VOCAB_DIR, SourceRecord, load_vocab
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SOURCES = REPO_ROOT / "intl_xperience" / "countries" / "sources.yaml"
+DEFAULT_SOURCES = REPO_ROOT / "sources"  # корень дерева папок-документов (corpus-layout-v2)
 
 
-def validate_sources(sources_path: Path, vocab_dir: Path = VOCAB_DIR) -> list[str]:
-    """Вернуть список сообщений об ошибках (пустой список = реестр валиден)."""
+def validate_sources(sources_root: Path, vocab_dir: Path = VOCAB_DIR) -> list[str]:
+    """Вернуть список ошибок (пустой = корпус валиден). Обход ``sources/**/meta.yaml``."""
     errors: list[str] = []
-    raw: Any = yaml.safe_load(sources_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        return [f"{sources_path}: верхний уровень должен быть списком записей"]
+    if not sources_root.exists():
+        return errors  # пустой/несуществующий корпус — валиден
 
     vocabs: dict[str, set[str]] = {
         "doc_type": load_vocab("doc_types", vocab_dir),
@@ -43,17 +42,30 @@ def validate_sources(sources_path: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
 
     records: list[SourceRecord] = []
     seen_ids: set[str] = set()
-    for i, item in enumerate(raw):
+    for meta_path in sorted(sources_root.rglob("meta.yaml")):
+        loc_id = str(meta_path.relative_to(sources_root))
         try:
-            rec = SourceRecord.model_validate(item)
+            raw: Any = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+            rec = SourceRecord.model_validate(raw)
         except ValidationError as exc:
             for err in exc.errors():
                 loc = ".".join(str(x) for x in err["loc"])
-                errors.append(f"запись #{i}: {loc}: {err['msg']}")
+                errors.append(f"{loc_id}: {loc}: {err['msg']}")
+            continue
+        except yaml.YAMLError as exc:
+            errors.append(f"{loc_id}: YAML: {exc}")
             continue
 
+        doc, entity, track = meta_path.parent, meta_path.parent.parent, meta_path.parent.parent.parent
+        if doc.name != rec.id:
+            errors.append(f"{loc_id}: папка '{doc.name}' != id '{rec.id}'")
+        if entity.name != rec.entity_id:
+            errors.append(f"{loc_id}: папка сущности '{entity.name}' != entity_id '{rec.entity_id}'")
+        if track.name != rec.track.value:
+            errors.append(f"{loc_id}: верхняя папка '{track.name}' != track '{rec.track.value}'")
+
         if rec.id in seen_ids:
-            errors.append(f"запись '{rec.id}': дубль id")
+            errors.append(f"запись '{rec.id}': дубль id ({loc_id})")
         seen_ids.add(rec.id)
 
         if rec.doc_type not in vocabs["doc_type"]:
@@ -70,7 +82,7 @@ def validate_sources(sources_path: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
         if rec.relevance is None:
             errors.append(
                 f"запись '{rec.id}': отсутствует relevance "
-                "(обязателен для допущенной записи sources.yaml — прошла триаж)"
+                "(обязателен для допущенной записи — прошла триаж)"
             )
 
         records.append(rec)
@@ -91,16 +103,13 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         type=Path,
         default=DEFAULT_SOURCES,
-        help=f"путь к sources.yaml (по умолчанию {DEFAULT_SOURCES})",
+        help=f"корень sources/ (по умолчанию {DEFAULT_SOURCES})",
     )
     parser.add_argument("--vocab-dir", type=Path, default=VOCAB_DIR, help="каталог vocab_*.yaml")
     args = parser.parse_args(argv)
 
     sources_path: Path = args.sources
     vocab_dir: Path = args.vocab_dir
-    if not sources_path.exists():
-        print(f"файл не найден: {sources_path}", file=sys.stderr)
-        return 2
 
     errors = validate_sources(sources_path, vocab_dir)
     if errors:

@@ -20,6 +20,8 @@ VOCAB_DIR = Path(__file__).resolve().parent.parent / "vocab"
 
 # Внутренний id: kebab-slug минимум из двух сегментов, напр. ``sg-imda-mgf-agentic-2026``.
 ID_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)+$"
+# Слаг сущности (== папка под track): lowercase-kebab, допускает один сегмент (ee, oecd, anthropic).
+ENTITY_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 
 
 class IssuerType(str, Enum):
@@ -41,6 +43,13 @@ class GeoScope(str, Enum):
     regional = "regional"
     international = "international"
     global_ = "global"  # 'global' — ключевое слово Python, отсюда суффикс
+
+
+class Track(str, Enum):
+    """Верхний аналитический раскол корпуса (== верхняя папка под ``sources/``; corpus-layout-v2)."""
+
+    intl_xperience = "intl-xperience"
+    montenegro = "montenegro"
 
 
 class Status(str, Enum):
@@ -227,6 +236,8 @@ class SourceRecord(BaseModel):
 
     # --- идентичность ---
     id: str = Field(pattern=ID_PATTERN)
+    entity_id: str = Field(pattern=ENTITY_PATTERN)  # слаг сущности (== папка); для наций == iso2
+    track: Track  # верхний раскол корпуса (== верхняя папка)
     # --- библиография ---
     title: str = Field(min_length=1)
     issuer: str = Field(min_length=1)
@@ -311,15 +322,55 @@ class CandidateRecord(BaseModel):
     rejected_reason: str | None = None
 
 
-def load_records(sources_path: Path) -> list[SourceRecord]:
-    """Загрузить и структурно провалидировать записи реестра (raises на битой структуре).
+def doc_dir(rec: SourceRecord, root: Path) -> Path:
+    """Папка документа: ``<root>/<track>/<entity_id>/<id>/`` (corpus-layout-v2)."""
+    return root / rec.track.value / rec.entity_id / rec.id
 
-    Полную валидацию (словари, уникальность id, relations) делает validate_sources.py.
+
+def raw_file(rec: SourceRecord, root: Path) -> Path | None:
+    """Оригинал документа: ``raw.*`` в папке (ext глобится). Несколько raw.* -> ошибка."""
+    matches = sorted(doc_dir(rec, root).glob("raw.*"))
+    if len(matches) > 1:
+        names = ", ".join(p.name for p in matches)
+        raise ValueError(f"{rec.id}: несколько raw.* в папке ({names})")
+    return matches[0] if matches else None
+
+
+def md_file(rec: SourceRecord, root: Path) -> Path:
+    """Конвертация: ``<doc_dir>/doc.md``."""
+    return doc_dir(rec, root) / "doc.md"
+
+
+def state_file(rec: SourceRecord, root: Path) -> Path:
+    """Операционный sidecar: ``<doc_dir>/.state.yaml``."""
+    return doc_dir(rec, root) / ".state.yaml"
+
+
+def load_records(sources_root: Path) -> list[SourceRecord]:
+    """Собрать записи корпуса обходом дерева ``sources/**/meta.yaml`` (строго, raises).
+
+    Инварианты: имя папки документа == ``id``; папка сущности == ``entity_id``; верхняя ==
+    ``track``; глобальная уникальность ``id``. Порядок — по ``id`` (детерминизм).
+    Полную семантику (словари, relevance, relations) проверяет validate_sources.py.
     """
-    raw: Any = yaml.safe_load(sources_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        raise ValueError(f"{sources_path}: верхний уровень должен быть списком записей")
-    return [SourceRecord.model_validate(item) for item in raw]
+    records: list[SourceRecord] = []
+    seen: set[str] = set()
+    for meta_path in sorted(sources_root.rglob("meta.yaml")):
+        raw: Any = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+        rec = SourceRecord.model_validate(raw)
+        doc, entity, track = meta_path.parent, meta_path.parent.parent, meta_path.parent.parent.parent
+        if doc.name != rec.id:
+            raise ValueError(f"{meta_path}: папка '{doc.name}' != id '{rec.id}'")
+        if entity.name != rec.entity_id:
+            raise ValueError(f"{meta_path}: папка сущности '{entity.name}' != entity_id '{rec.entity_id}'")
+        if track.name != rec.track.value:
+            raise ValueError(f"{meta_path}: верхняя папка '{track.name}' != track '{rec.track.value}'")
+        if rec.id in seen:
+            raise ValueError(f"дубль id '{rec.id}' ({meta_path})")
+        seen.add(rec.id)
+        records.append(rec)
+    records.sort(key=lambda r: r.id)
+    return records
 
 
 def load_candidates(candidates_path: Path) -> list[CandidateRecord]:
@@ -360,6 +411,8 @@ def promote_candidate(
     cand: CandidateRecord,
     *,
     id: str,
+    entity_id: str,
+    track: Track,
     issuer_type: IssuerType,
     geo_scope: GeoScope,
     doc_type: str,
@@ -398,6 +451,8 @@ def promote_candidate(
 
     return SourceRecord(
         id=id,
+        entity_id=entity_id,
+        track=track,
         title=title,
         issuer=issuer,
         issuer_type=issuer_type,

@@ -24,6 +24,7 @@ from schema import (
     SourceRecord,
     Status,
     TargetFit,
+    Track,
     TranslationStatus,
     load_candidates,
     load_state,
@@ -38,6 +39,8 @@ def valid_record() -> dict[str, Any]:
     """Минимально валидная запись (термины — из реальных словарей pipeline/vocab/)."""
     return {
         "id": "sg-imda-mgf-agentic-2026",
+        "entity_id": "sg",
+        "track": "intl-xperience",
         "title": "Model AI Governance Framework for Agentic AI",
         "issuer": "Infocomm Media Development Authority (IMDA)",
         "issuer_type": "government",
@@ -60,6 +63,29 @@ def valid_record() -> dict[str, Any]:
         },
         "status": "verified",
     }
+
+
+def write_doc(
+    root: Path,
+    rec: dict[str, Any],
+    *,
+    raw: bytes | None = None,
+    md: str | None = None,
+    state: dict[str, Any] | None = None,
+) -> Path:
+    """Создать папку-документ sources/<track>/<entity>/<id>/ + meta.yaml (+ raw.pdf/doc.md/.state.yaml)."""
+    import yaml as _yaml
+
+    d = root / rec["track"] / rec["entity_id"] / rec["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.yaml").write_text(_yaml.safe_dump(rec, allow_unicode=True), encoding="utf-8")
+    if raw is not None:
+        (d / "raw.pdf").write_bytes(raw)
+    if md is not None:
+        (d / "doc.md").write_text(md, encoding="utf-8")
+    if state is not None:
+        (d / ".state.yaml").write_text(_yaml.safe_dump(state, allow_unicode=True), encoding="utf-8")
+    return d
 
 
 def test_valid_record_parses() -> None:
@@ -316,6 +342,8 @@ def test_promote_candidate_success() -> None:
     rec = promote_candidate(
         cand,
         id="ae-cabinet-agentic-2026",
+        entity_id="ae",
+        track=Track.intl_xperience,
         issuer_type=IssuerType.government,
         geo_scope=GeoScope.national,
         doc_type="framework",
@@ -343,6 +371,8 @@ def test_promote_candidate_missing_source_url_raises() -> None:
         promote_candidate(
             cand,
             id="x-y-2026",
+            entity_id="xx",
+            track=Track.intl_xperience,
             issuer_type=IssuerType.government,
             geo_scope=GeoScope.national,
             doc_type="framework",
