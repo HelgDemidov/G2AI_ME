@@ -172,8 +172,9 @@ def _do_download(
 ) -> None:
     """Скачивание через acquisition-лестницу (direct -> official_alt; см. acquisition.py).
 
-    Цель — ``<doc_dir>/raw.pdf`` (корпус — PDF; HTML/OCR-путь — будущее, бэклог #4).
-    Не резюмируется между попытками (без ``curl -C -``); лестница не кеширует блок.
+    Цель — ``<doc_dir>/raw.<ext>``, расширение из ``rec.source_format`` (pdf/html;
+    OCR-путь для сканов — будущее, бэклог #4). Не резюмируется между попытками
+    (без ``curl -C -``); лестница не кеширует блок.
 
     ``interactive`` (=есть ``--only``): при блоке ЖИВОГО документа — синхронный 1-клик
     watch-folder путь. В батче (``interactive=False``) блок репортится как отказ
@@ -193,7 +194,7 @@ def _do_download(
         raise RuntimeError("нет source_url для скачивания")
     if shutil.which("curl") is None:
         raise RuntimeError("curl не найден в PATH")
-    raw = schema.raw_target(rec, root)
+    raw = schema.raw_target(rec, root, ext=rec.source_format.value)
     raw.parent.mkdir(parents=True, exist_ok=True)
     part = fsio.staging_path(raw)
     try:

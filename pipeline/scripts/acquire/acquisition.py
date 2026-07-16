@@ -70,6 +70,7 @@ class ManualAcquisitionConflict(RuntimeError):
 
 # Challenge pages we've observed (ai.gov.ae/Cloudflare) are small HTML, well under this.
 MIN_EXPECTED_PDF_SIZE = 2048
+MIN_EXPECTED_HTML_SIZE = 1024
 CHALLENGE_BODY_MARKERS = (b"Attention Required", b"cf-chl", b"Just a moment", b"cf_captcha", b"turnstile")
 DEAD_STATUS_CODES = {404, 410}
 
@@ -105,17 +106,17 @@ def _has_cloudflare_fingerprint(headers: dict[str, str]) -> bool:
     return "__cf_bm" in headers.get("set-cookie", "")
 
 
-def classify_response(body: bytes, headers_text: str) -> ClassifiedResponse:
+def classify_response(
+    body: bytes, headers_text: str, expected: schema.SourceFormat = schema.SourceFormat.pdf
+) -> ClassifiedResponse:
     """Pure classification: given a response body and raw ``curl -D`` header dump,
     decide whether the download is a real document, a WAF block, or a dead URL.
 
-    PDF-specific by design (corpus is PDF-only for now — HTML source support is
-    tracked separately, backlog #4). A previous ``expect_pdf: bool = True``
-    parameter was dead generality: no caller ever passed ``False``, and the
-    function had no actual ok-branch for non-PDF content anyway — a real
-    multi-format classifier belongs to the HTML-path spec, where it would get
-    a real ok-path and content-type handling instead of pretending to be
-    general purpose today.
+    ``expected`` dispatches to a format-specific ok-branch (§3.2 of the convert
+    chartier); ``expected=pdf`` is the default so every pre-existing caller keeps
+    its exact behaviour unchanged. A previous ``expect_pdf: bool = True`` parameter
+    was dead generality (no caller ever passed ``False``) — this is the real
+    multi-format classifier that generality was waiting for.
     """
     status = _status_from_headers_text(headers_text)
     headers = _headers_from_text(headers_text)
@@ -123,6 +124,12 @@ def classify_response(body: bytes, headers_text: str) -> ClassifiedResponse:
     if status in DEAD_STATUS_CODES:
         return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
 
+    if expected is schema.SourceFormat.html:
+        return _classify_html(body, headers, status)
+    return _classify_pdf(body, headers, status)
+
+
+def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
     if body.startswith(b"%PDF"):
         return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid PDF")
 
@@ -135,6 +142,28 @@ def classify_response(body: bytes, headers_text: str) -> ClassifiedResponse:
     return ClassifiedResponse(AcquisitionOutcome.blocked, status, "unexpected content (not a valid PDF)")
 
 
+def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
+    # WAF-challenge check comes BEFORE the content-type check: a challenge page
+    # is itself served as "200 text/html" — a content-type-only check would wave
+    # it straight through as "ok".
+    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+        return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
+
+    if body.startswith(b"%PDF"):
+        return ClassifiedResponse(
+            AcquisitionOutcome.blocked, status,
+            "server returned PDF but source_format=html (curator mismatch?)",
+        )
+
+    content_type = headers.get("content-type", "")
+    if status == 200 and "text/html" in content_type and len(body) >= MIN_EXPECTED_HTML_SIZE:
+        return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid HTML")
+
+    return ClassifiedResponse(
+        AcquisitionOutcome.blocked, status, "unexpected content (not the expected HTML document)"
+    )
+
+
 # curl exit codes (stable across decades): 6 = couldn't resolve host, 7 = failed
 # to connect. Both mean "this URL is unreachable" — the same terminal signal as
 # a confirmed-dead HTTP status, so the ladder should treat them identically.
@@ -142,7 +171,13 @@ _CURL_UNREACHABLE_CODES = (6, 7)
 
 
 def fetch_and_classify(
-    url: str, dest: Path, *, user_agent: str, timeout: int = 30, total_timeout: int = 300
+    url: str,
+    dest: Path,
+    *,
+    user_agent: str,
+    timeout: int = 30,
+    total_timeout: int = 300,
+    expected: schema.SourceFormat = schema.SourceFormat.pdf,
 ) -> ClassifiedResponse:
     """Single download attempt (no ladder stepping — that's the caller's job).
 
@@ -182,7 +217,7 @@ def fetch_and_classify(
             raise RuntimeError(f"curl failed (exit {proc.returncode}) for {url}")
         headers_text = headers_path.read_text(encoding="utf-8", errors="replace")
         body = dest.read_bytes() if dest.exists() else b""
-        return classify_response(body, headers_text)
+        return classify_response(body, headers_text, expected)
     finally:
         headers_path.unlink(missing_ok=True)
 
@@ -243,7 +278,7 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
     """
     has_alt = bool(rec.official_alt_url)
     rung = schema.AcquisitionMethod.direct
-    classified = fetch_and_classify(rec.source_url, dest, user_agent=user_agent)
+    classified = fetch_and_classify(rec.source_url, dest, user_agent=user_agent, expected=rec.source_format)
 
     while True:
         nxt = next_rung(classified.outcome, rung, has_official_alt=has_alt, sensitivity=rec.sensitivity)
@@ -252,9 +287,20 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
         if nxt is schema.AcquisitionMethod.official_alt:
             assert rec.official_alt_url is not None  # has_alt guarantees this
             rung = nxt
-            classified = fetch_and_classify(rec.official_alt_url, dest, user_agent=user_agent)
+            classified = fetch_and_classify(
+                rec.official_alt_url, dest, user_agent=user_agent, expected=rec.source_format
+            )
             continue
         if nxt is schema.AcquisitionMethod.manual:
+            if rec.source_format is not schema.SourceFormat.pdf:
+                # manual watch-folder matching (title_matcher, PDF-magic sniff) is
+                # PDF-only in v1 — a non-PDF record can't ride that path (§3 of
+                # convert-html spec); adoption via --no-download still works.
+                raise AcquisitionBlocked(
+                    rec.source_url,
+                    f"manual watch-folder поддерживает только PDF; сохраните страницу вручную в "
+                    f"<doc_dir>/raw.{rec.source_format.value} и перезапустите с --no-download",
+                )
             if classified.outcome is AcquisitionOutcome.dead:
                 raise AcquisitionBlocked(
                     rec.source_url,
@@ -456,8 +502,10 @@ class ArchiveSnapshot:
     snapshot_url: str  # .../web/<timestamp>id_/<original> — "id_" = raw bytes, no Wayback toolbar
 
 
-def find_wayback_snapshot(original_url: str, *, timeout: int = 30) -> ArchiveSnapshot | None:
-    """CDX lookup for the freshest 200/application-pdf snapshot of ``original_url``.
+def find_wayback_snapshot(
+    original_url: str, *, mimetype: str = "application/pdf", timeout: int = 30
+) -> ArchiveSnapshot | None:
+    """CDX lookup for the freshest 200/``mimetype`` snapshot of ``original_url``.
 
     Returns ``None`` if none found. ``limit=-N`` asks the CDX server for the
     LAST N results directly (verified against the official CDX server README,
@@ -470,7 +518,7 @@ def find_wayback_snapshot(original_url: str, *, timeout: int = 30) -> ArchiveSna
     """
     query = (
         f"{WAYBACK_CDX_URL}?url={quote(original_url, safe='')}"
-        "&output=text&filter=statuscode:200&filter=mimetype:application/pdf&limit=-5"
+        f"&output=text&filter=statuscode:200&filter=mimetype:{mimetype}&limit=-5"
     )
     result = subprocess.run(
         ["curl", "-sS", "--connect-timeout", str(timeout), "--max-time", str(timeout), query],
@@ -492,13 +540,16 @@ def fetch_from_archive(rec: schema.SourceRecord, dest: Path, *, user_agent: str,
     (never for a block — see §2/§9; sensitivity=confidential never reaches here,
     ``next_rung`` routes those to manual instead).
     """
-    snapshot = find_wayback_snapshot(rec.source_url, timeout=timeout)
+    mimetype = "text/html" if rec.source_format is schema.SourceFormat.html else "application/pdf"
+    snapshot = find_wayback_snapshot(rec.source_url, mimetype=mimetype, timeout=timeout)
     if snapshot is None:
         raise ArchiveUnavailable(f"нет снимка Wayback для {rec.source_url}")
-    classified = fetch_and_classify(snapshot.snapshot_url, dest, user_agent=user_agent, timeout=timeout)
+    classified = fetch_and_classify(
+        snapshot.snapshot_url, dest, user_agent=user_agent, timeout=timeout, expected=rec.source_format
+    )
     if classified.outcome is not AcquisitionOutcome.ok:
         raise ArchiveUnavailable(
-            f"снимок {snapshot.snapshot_url} не является валидным PDF: {classified.reason}"
+            f"снимок {snapshot.snapshot_url} не является валидным {rec.source_format.value.upper()}: {classified.reason}"
         )
     snapshot_date = _dt.datetime.strptime(snapshot.timestamp[:8], "%Y%m%d").date()
     return LadderResult(

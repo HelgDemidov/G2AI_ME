@@ -87,6 +87,7 @@ DEAD_404_HEADERS = "HTTP/1.1 404 Not Found\ncontent-type: text/html\n"
 DEAD_410_HEADERS = "HTTP/1.1 410 Gone\ncontent-type: text/html\n"
 
 OK_HEADERS = "HTTP/1.1 200 OK\ncontent-type: application/pdf\n"
+OK_HTML_HEADERS = "HTTP/1.1 200 OK\ncontent-type: text/html; charset=UTF-8\n"
 
 REDIRECT_THEN_BLOCK_HEADERS = (
     "HTTP/1.1 301 Moved Permanently\n"
@@ -148,6 +149,46 @@ def test_classify_redirect_keeps_only_final_hop_status_and_headers() -> None:
     result = classify_response(CLOUDFLARE_BLOCK_BODY, REDIRECT_THEN_BLOCK_HEADERS)
     assert result.http_status == 403
     assert result.outcome == AcquisitionOutcome.blocked
+
+
+# --- expected=html: мультиформатная классификация (convert-html spec §3) ---
+
+REAL_HTML_BODY = b"<html><body>" + b"x" * 2000 + b"</body></html>"
+
+
+def test_classify_html_ok() -> None:
+    result = classify_response(REAL_HTML_BODY, OK_HTML_HEADERS, schema.SourceFormat.html)
+    assert result.outcome == AcquisitionOutcome.ok
+    assert result.http_status == 200
+
+
+def test_classify_html_challenge_page_blocked_despite_200_text_html() -> None:
+    """Порядок проверок критичен: WAF-челлендж САМ отдаётся как 200 text/html —
+    проверка content-type-first пропустила бы его как валидный HTML."""
+    result = classify_response(CLOUDFLARE_BLOCK_BODY, CLOUDFLARE_BLOCK_HEADERS, schema.SourceFormat.html)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_html_pdf_magic_is_curator_mismatch() -> None:
+    result = classify_response(REAL_PDF_BODY, OK_HEADERS, schema.SourceFormat.html)
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "mismatch" in result.reason
+
+
+def test_classify_html_too_small_blocked() -> None:
+    result = classify_response(b"<html>tiny</html>", OK_HTML_HEADERS, schema.SourceFormat.html)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_html_dead_404() -> None:
+    result = classify_response(b"<html>not found</html>", DEAD_404_HEADERS, schema.SourceFormat.html)
+    assert result.outcome == AcquisitionOutcome.dead
+
+
+def test_classify_response_default_expected_is_pdf_regression() -> None:
+    """Регресс: без expected= (все существующие вызовы) поведение — прежнее PDF-only."""
+    result = classify_response(REAL_PDF_BODY, OK_HEADERS)
+    assert result.outcome == AcquisitionOutcome.ok
 
 
 class _FakeProc:
@@ -257,7 +298,7 @@ def _scripted_fetch(responses: list[ClassifiedResponse]) -> Any:
     """Подмена ``fetch_and_classify``: выдаёт по одному ответу из списка на каждый вызов."""
     calls = {"n": 0}
 
-    def fake(url: str, dest: Path, *, user_agent: str, timeout: int = 30) -> ClassifiedResponse:
+    def fake(url: str, dest: Path, *, user_agent: str, timeout: int = 30, **kw: Any) -> ClassifiedResponse:
         response = responses[calls["n"]]
         calls["n"] += 1
         return response
@@ -318,6 +359,31 @@ def test_run_ladder_dead_confidential_raises_blocked_not_dead(tmp_path: Path, mo
     with pytest.raises(AcquisitionBlocked) as exc_info:
         run_ladder(rec, tmp_path / "doc.pdf", user_agent="test-ua")
     assert "confidential" in str(exc_info.value)
+
+
+def test_run_ladder_html_blocked_no_alt_raises_manual_only_pdf_message(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Блок html-записи эскалирует в manual, но manual watch-folder — PDF-only в
+    v1: сообщение должно явно называть это и путь усыновления, а не молча
+    отправлять html-документ на watch-folder, который его не примет."""
+    blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    rec = _rec(source_format="html")
+    with pytest.raises(AcquisitionBlocked, match="только PDF"):
+        run_ladder(rec, tmp_path / "doc.html", user_agent="test-ua")
+
+
+def test_run_ladder_html_dead_confidential_also_raises_manual_only_pdf_message(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Тот же PDF-only guard должен сработать и по dead+confidential-пути в manual,
+    не только по прямому blocked-пути — оба ведут на watch-folder, который html не примет."""
+    dead = ClassifiedResponse(AcquisitionOutcome.dead, 404, "HTTP 404")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([dead]))
+    rec = _rec(source_format="html", sensitivity="confidential")
+    with pytest.raises(AcquisitionBlocked, match="только PDF"):
+        run_ladder(rec, tmp_path / "doc.html", user_agent="test-ua")
 
 
 def test_looks_like_candidate_pdf_accepts_valid(tmp_path: Path) -> None:
@@ -609,6 +675,41 @@ def test_find_wayback_snapshot_query_uses_negative_limit_and_max_time(monkeypatc
     assert "limit=-5" in query
     assert "limit=20" not in query
     assert "--max-time" in captured
+
+
+def test_find_wayback_snapshot_mimetype_param_in_query(monkeypatch: Any) -> None:
+    captured: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
+        captured.extend(cmd)
+        return _FakeCompletedProcess("")
+
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
+    find_wayback_snapshot("https://example.org/doc.html", mimetype="text/html")
+
+    query = captured[-1]
+    assert "filter=mimetype:text/html" in query
+    assert "application/pdf" not in query
+
+
+def test_fetch_from_archive_html_record_queries_html_mimetype(tmp_path: Path, monkeypatch: Any) -> None:
+    cdx_calls: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
+        cdx_calls.extend(cmd)
+        return _FakeCompletedProcess(
+            "urlkey 20220806004506 https://example.org/doc.html text/html 200 X 123\n"
+        )
+
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
+    ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid HTML")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([ok]))
+
+    rec = _rec(source_format="html")
+    result = fetch_from_archive(rec, tmp_path / "doc.html", user_agent="test-ua")
+
+    assert result.method == ARCHIVE
+    assert "filter=mimetype:text/html" in cdx_calls[-1]
 
 
 def test_find_wayback_snapshot_malformed_line_returns_none(monkeypatch: Any) -> None:
