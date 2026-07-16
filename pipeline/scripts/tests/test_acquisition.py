@@ -24,6 +24,7 @@ from acquisition import (
     find_wayback_snapshot,
     next_rung,
     run_ladder,
+    title_matcher,
     watch_and_ingest,
     _looks_like_candidate_pdf,
 )
@@ -41,6 +42,31 @@ MINIMAL_PDF = (
 )
 
 REAL_PDF_BODY = b"%PDF-1.6\n" + b"x" * 4000  # больше MIN_EXPECTED_PDF_SIZE
+
+
+def pdf_with_text(text: str) -> bytes:
+    """Валидный (с xref-таблицей) минимальный однострочный PDF — для тестов
+    title-матчера, которым нужен реальный извлекаемый текст 1-й страницы."""
+    stream = f"BT /F1 18 Tf 10 250 Td ({text}) Tj ET".encode("latin-1")
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 400]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+        b"<</Length " + str(len(stream)).encode() + b">>\nstream\n" + stream + b"\nendstream\n",
+    ]
+    body = b"%PDF-1.4\n"
+    offsets = [0]
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(body))
+        body += f"{i} 0 obj\n".encode() + obj + b"endobj\n"
+    xref_start = len(body)
+    n = len(objects) + 1
+    xref = f"xref\n0 {n}\n0000000000 65535 f \n".encode()
+    for off in offsets[1:]:
+        xref += f"{off:010d} 00000 n \n".encode()
+    trailer = f"trailer<</Size {n}/Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n".encode()
+    return body + xref + trailer
 
 CLOUDFLARE_BLOCK_HEADERS = (
     "HTTP/2 403 \n"
@@ -297,24 +323,34 @@ def test_run_ladder_dead_confidential_raises_blocked_not_dead(tmp_path: Path, mo
 def test_looks_like_candidate_pdf_accepts_valid(tmp_path: Path) -> None:
     p = tmp_path / "real.pdf"
     p.write_bytes(MINIMAL_PDF)
-    ok, reason = _looks_like_candidate_pdf(p)
+    ok, reason, text = _looks_like_candidate_pdf(p)
     assert ok is True
     assert "стр" in reason
+    assert text == ""  # MINIMAL_PDF без content stream — текста нет, но не падает
 
 
 def test_looks_like_candidate_pdf_rejects_non_pdf(tmp_path: Path) -> None:
     p = tmp_path / "not_a_pdf.txt"
     p.write_bytes(b"hello world, this is definitely not a PDF")
-    ok, reason = _looks_like_candidate_pdf(p)
+    ok, reason, text = _looks_like_candidate_pdf(p)
     assert ok is False
     assert "%PDF" in reason
+    assert text == ""
 
 
 def test_looks_like_candidate_pdf_rejects_corrupt(tmp_path: Path) -> None:
     p = tmp_path / "corrupt.pdf"
     p.write_bytes(b"%PDF-1.4\ngarbage garbage garbage, no real structure at all")
-    ok, reason = _looks_like_candidate_pdf(p)
+    ok, reason, text = _looks_like_candidate_pdf(p)
     assert ok is False
+
+
+def test_looks_like_candidate_pdf_extracts_first_page_text(tmp_path: Path) -> None:
+    p = tmp_path / "real.pdf"
+    p.write_bytes(pdf_with_text("Hello World Test Document"))
+    ok, reason, text = _looks_like_candidate_pdf(p)
+    assert ok is True
+    assert "Hello World Test Document" in text
 
 
 def test_watch_and_ingest_picks_up_preexisting_file(tmp_path: Path) -> None:
@@ -379,6 +415,135 @@ def test_watch_and_ingest_timeout_is_deterministic_no_real_sleep(tmp_path: Path)
             now=fake_now, sleep=fake_sleep, poll_interval=1.0, timeout=5.0,
         )
     assert len(sleep_calls) == 5  # 5 "секунд" дедлайна — без единого реального time.sleep
+
+
+def test_title_matcher_accepts_text_containing_title_words() -> None:
+    rec = _rec(title="Model AI Governance Framework for Agentic AI")
+    match = title_matcher(rec)
+    ok, reason = match("This document describes a Model AI Governance Framework for Agentic AI systems.")
+    assert ok is True
+
+
+def test_title_matcher_rejects_unrelated_text() -> None:
+    rec = _rec(title="Model AI Governance Framework for Agentic AI")
+    match = title_matcher(rec)
+    ok, reason = match("Invoice #4821 — thank you for your purchase at ACME Store.")
+    assert ok is False
+
+
+def test_title_matcher_empty_tokens_always_matches() -> None:
+    """Title без слов >=4 букв (нет сигнала для сверки) — гейт не должен блокировать добычу."""
+    rec = _rec(title="AI 2026")
+    match = title_matcher(rec)
+    ok, reason = match("совершенно любой текст")
+    assert ok is True
+
+
+def test_watch_and_ingest_matcher_filters_unrelated_pdf(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "invoice.pdf").write_bytes(pdf_with_text("Invoice Receipt Payment Thanks"))
+    (watch_dir / "real.pdf").write_bytes(pdf_with_text("Model AI Governance Framework for Agentic AI"))
+    dest = tmp_path / "dest.pdf"
+    rec = _rec(title="Model AI Governance Framework for Agentic AI")
+
+    result = watch_and_ingest(
+        dest, watch_dir=watch_dir, matcher=title_matcher(rec),
+        now=lambda: 0.0, sleep=lambda s: None, timeout=1.0,
+    )
+
+    assert result == dest
+    assert (watch_dir / "invoice.pdf").exists()  # отвергнутый кандидат не тронут
+
+
+def test_watch_and_ingest_no_matcher_accepts_any_valid_pdf(tmp_path: Path) -> None:
+    """matcher=None (явный --watch-dir) — прежнее поведение, без сверки принадлежности."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "unrelated.pdf").write_bytes(pdf_with_text("Totally Unrelated Content"))
+    dest = tmp_path / "dest.pdf"
+
+    result = watch_and_ingest(
+        dest, watch_dir=watch_dir, matcher=None, now=lambda: 0.0, sleep=lambda s: None, timeout=1.0
+    )
+    assert result == dest
+
+
+def test_watch_and_ingest_timeout_lists_rejected_candidates(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "invoice.pdf").write_bytes(pdf_with_text("Invoice Receipt Payment Thanks"))
+    rec = _rec(title="Model AI Governance Framework for Agentic AI")
+
+    clock = {"t": 0.0}
+    with pytest.raises(ManualAcquisitionTimeout) as exc_info:
+        watch_and_ingest(
+            tmp_path / "dest.pdf", watch_dir=watch_dir, matcher=title_matcher(rec),
+            now=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+            timeout=1.0, poll_interval=1.0,
+        )
+    assert "invoice.pdf" in str(exc_info.value)
+
+
+def test_watch_and_ingest_memoizes_inspection_across_polls(tmp_path: Path, monkeypatch: Any) -> None:
+    """Неизменившийся отвергнутый кандидат не парсится pdfplumber заново на каждой
+    итерации поллинга — только один раз (мемоизация по path/size/mtime_ns)."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "other.pdf").write_bytes(pdf_with_text("Unrelated Content Here"))
+
+    real_inspect = _looks_like_candidate_pdf
+    calls = {"n": 0}
+
+    def counting_inspect(path: Path) -> tuple[bool, str, str]:
+        calls["n"] += 1
+        return real_inspect(path)
+
+    monkeypatch.setattr("acquisition._looks_like_candidate_pdf", counting_inspect)
+
+    rec = _rec(title="Model AI Governance Framework for Agentic AI")
+    clock = {"t": 0.0}
+    with pytest.raises(ManualAcquisitionTimeout):
+        watch_and_ingest(
+            tmp_path / "dest.pdf", watch_dir=watch_dir, matcher=title_matcher(rec),
+            now=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+            timeout=3.0, poll_interval=1.0,
+        )
+    assert calls["n"] == 1  # 4 итерации поллинга, но инспекция — одна
+
+
+def test_acquire_manually_default_dir_uses_title_matcher(tmp_path: Path, monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_watch_and_ingest(dest: Path, *, watch_dir: Path, matcher: Any = None, **kw: Any) -> Path:
+        captured["matcher"] = matcher
+        return dest
+
+    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check=False: None)
+    monkeypatch.setattr("acquisition.default_watch_dir", lambda: tmp_path / "downloads")
+    monkeypatch.setattr("acquisition.watch_and_ingest", fake_watch_and_ingest)
+
+    acquire_manually(_rec(), tmp_path / "dest.pdf")  # watch_dir не передан -> дефолтная папка
+
+    assert captured["matcher"] is not None
+
+
+def test_acquire_manually_explicit_watch_dir_disables_matcher(tmp_path: Path, monkeypatch: Any) -> None:
+    """--watch-dir — escape hatch: явная папка отключает сверку принадлежности."""
+    captured: dict[str, Any] = {}
+
+    def fake_watch_and_ingest(dest: Path, *, watch_dir: Path, matcher: Any = None, **kw: Any) -> Path:
+        captured["matcher"] = matcher
+        return dest
+
+    monkeypatch.setattr("acquisition.subprocess.run", lambda cmd, check=False: None)
+    monkeypatch.setattr("acquisition.watch_and_ingest", fake_watch_and_ingest)
+
+    acquire_manually(_rec(), tmp_path / "dest.pdf", watch_dir=tmp_path / "custom")
+
+    assert captured["matcher"] is None
 
 
 def test_acquire_manually_opens_browser_and_ingests(tmp_path: Path, monkeypatch: Any) -> None:
