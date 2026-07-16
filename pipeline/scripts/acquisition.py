@@ -8,6 +8,7 @@ that calls into it, same separation as ``build_graph.py``/``corpus_index.py``.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 import subprocess
 import tempfile
 import time
@@ -128,14 +129,30 @@ def classify_response(
     return ClassifiedResponse(AcquisitionOutcome.blocked, status, "unexpected content (not a valid PDF)")
 
 
+# curl exit codes (stable across decades): 6 = couldn't resolve host, 7 = failed
+# to connect. Both mean "this URL is unreachable" — the same terminal signal as
+# a confirmed-dead HTTP status, so the ladder should treat them identically.
+_CURL_UNREACHABLE_CODES = (6, 7)
+
+
 def fetch_and_classify(
-    url: str, dest: Path, *, user_agent: str, timeout: int = 30
+    url: str, dest: Path, *, user_agent: str, timeout: int = 30, total_timeout: int = 300
 ) -> ClassifiedResponse:
     """Single download attempt (no ladder stepping — that's the caller's job).
 
     Deliberately omits ``-f``: a hard HTTP error (403/404) must still land its
     status/body so ``classify_response`` can tell a block apart from a dead URL —
     with ``-f`` curl discards the response before we ever see it.
+
+    A network-level curl failure (exit 6/7 — DNS/connect unreachable) is
+    classified as ``dead`` directly: this is the single most common shape of
+    "the URL is gone" (a decommissioned government domain), and without this
+    check it would raise instead of routing to the archive rung. Offline-vs-
+    dead-domain is not disambiguated here — see design rationale in the spec:
+    the archive rung's own curl call fails the same way, so the worst case is
+    one wasted archive attempt, not silent corruption. ``--max-time`` bounds
+    the whole transfer (``--connect-timeout`` alone doesn't cap a stalled
+    transfer on a slow LTE link).
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix="acq-headers-", suffix=".txt", delete=False) as tmp:
@@ -143,10 +160,20 @@ def fetch_and_classify(
     try:
         cmd = [
             "curl", "-sSL", "--retry", "3", "--retry-delay", "2",
-            "--connect-timeout", str(timeout), "-A", user_agent,
+            "--connect-timeout", str(timeout), "--max-time", str(total_timeout),
+            "-A", user_agent,
             "-D", str(headers_path), "-o", str(dest), url,
         ]
-        subprocess.run(cmd, check=True)
+        proc = subprocess.run(cmd, check=False)
+        if proc.returncode in _CURL_UNREACHABLE_CODES:
+            return ClassifiedResponse(
+                AcquisitionOutcome.dead, None,
+                f"curl exit {proc.returncode}: host unreachable (DNS/connect)",
+            )
+        if proc.returncode != 0:
+            # 28 = timeout after --retry already exhausted transients; anything
+            # else is an unexpected curl failure — not a classification, a bug/env issue.
+            raise RuntimeError(f"curl failed (exit {proc.returncode}) for {url}")
         headers_text = headers_path.read_text(encoding="utf-8", errors="replace")
         body = dest.read_bytes() if dest.exists() else b""
         return classify_response(body, headers_text)
@@ -252,31 +279,62 @@ def default_watch_dir() -> Path:
     return Path.home() / "Downloads"  # разумный fallback без xdg-user-dir
 
 
-def _looks_like_candidate_pdf(path: Path) -> tuple[bool, str]:
+def _looks_like_candidate_pdf(path: Path) -> tuple[bool, str, str]:
     """Дешёвая магия сначала (не читаем весь файл ради больших не-PDF в папке
-    загрузок), pdfplumber — только если магия совпала. Возвращает (валиден, причина).
+    загрузок), pdfplumber — только если магия совпала (один парс, не два — тут же
+    извлекается текст 1-й страницы для матчера принадлежности, §5b спека
+    ingest-hardening). Возвращает (валиден, причина, текст_первой_страницы).
     """
     try:
         with path.open("rb") as fh:
             head = fh.read(8)
     except OSError as exc:
-        return False, f"не удалось прочитать: {exc}"
+        return False, f"не удалось прочитать: {exc}", ""
     if not head.startswith(b"%PDF"):
-        return False, "не PDF (нет магии %PDF)"
+        return False, "не PDF (нет магии %PDF)", ""
     try:
         with pdfplumber.open(path) as pdf:
             n_pages = len(pdf.pages)
+            first_page_text = (pdf.pages[0].extract_text() or "") if n_pages else ""
     except Exception as exc:  # noqa: BLE001 — битый/недописанный PDF, не наш кандидат (пока)
-        return False, f"PDF повреждён или ещё не дописан: {exc}"
+        return False, f"PDF повреждён или ещё не дописан: {exc}", ""
     if n_pages < 1:
-        return False, "0 страниц"
-    return True, f"{n_pages} стр."
+        return False, "0 страниц", ""
+    return True, f"{n_pages} стр.", first_page_text
+
+
+TITLE_MATCH_MIN_TOKEN_FRACTION = 0.4  # доля содержательных слов title, которую нужно найти на 1-й странице
+
+
+def title_matcher(rec: schema.SourceRecord) -> Callable[[str], tuple[bool, str]]:
+    """Предикат принадлежности PDF документу ``rec`` по тексту 1-й страницы
+    (текст передаётся вызывающей стороной — уже извлечён ``watch_and_ingest`` при
+    валидации кандидата, повторного парсинга PDF не требуется).
+
+    Грубый порог (40% содержательных слов title, юникод-«словами» >=4 буквы —
+    работает и для диакритики õ/ä/č) — достаточен против целевого сценария
+    (посторонний файл, лежавший в папке загрузок), при этом не ломается на
+    небуквальных/переводных заголовках. Пустой набор токенов (крайне короткий
+    title) — сверка пропускается: не блокировать добычу из-за отсутствия сигнала.
+    """
+    tokens = {t for t in re.findall(r"[^\W\d_]{4,}", rec.title.casefold())}
+
+    def match(first_page_text: str) -> tuple[bool, str]:
+        if not tokens:
+            return True, "нет содержательных токенов в title — сверка пропущена"
+        text = first_page_text.casefold()
+        found = sum(1 for t in tokens if t in text)
+        need = max(1, round(len(tokens) * TITLE_MATCH_MIN_TOKEN_FRACTION))
+        return found >= need, f"{found}/{len(tokens)} токенов титула"
+
+    return match
 
 
 def watch_and_ingest(
     dest: Path,
     *,
     watch_dir: Path,
+    matcher: Callable[[str], tuple[bool, str]] | None = None,
     now: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
@@ -287,19 +345,50 @@ def watch_and_ingest(
     лежащих файлов (резюмируемость после прерванного прогона — §6), отдельного
     "initial scan" шага не требуется по построению.
 
-    НЕ кеширует отказы кандидатов между итерациями: недописанный браузером файл
-    должен быть перепроверен на следующем цикле, а не забыт навсегда. Батч
-    (>1 валидных кандидатов одновременно) не разрешается угадыванием — конфликт.
+    ``matcher`` (опционален) — дополнительный гейт принадлежности поверх «валиден
+    как PDF» (обычно ``title_matcher(rec)``): кандидаты, не прошедшие его,
+    логируются как отвергнутые и не участвуют в конфликте. ``None`` — прежнее
+    поведение (первый валидный PDF принимается без сверки) — используется, когда
+    пользователь явно указал выделенную ``--watch-dir``, где сверка избыточна.
+
+    НЕ кеширует ОТКАЗЫ кандидатов между итерациями: недописанный браузером файл
+    должен быть перепроверен на следующем цикле, а не забыт навсегда. Инспекция
+    (магия+pdfplumber+matcher) мемоизируется по ``(path, size, mtime_ns)`` —
+    неизменившийся посторонний файл не парсится pdfplumber заново на каждой
+    итерации поллинга; изменившийся (size/mtime другие) честно перепроверяется.
+    Батч (>1 ПРОШЕДШИХ кандидата одновременно) не разрешается угадыванием — конфликт.
 
     ``now``/``sleep`` инжектируемы ради детерминированных тестов (без реального sleep).
     """
     deadline = now() + timeout
+    cache: dict[tuple[Path, int, int], tuple[bool, str, str]] = {}
+    rejected: dict[str, str] = {}  # имя файла -> причина отказа (для таймаут-диагностики)
+
+    def inspect(path: Path) -> tuple[bool, str, str]:
+        try:
+            st = path.stat()
+        except OSError as exc:
+            return False, f"не удалось прочитать: {exc}", ""
+        key = (path, st.st_size, st.st_mtime_ns)
+        if key not in cache:
+            cache[key] = _looks_like_candidate_pdf(path)
+        return cache[key]
+
     while True:
-        candidates = [
-            path
-            for path in sorted(watch_dir.iterdir())
-            if path.is_file() and _looks_like_candidate_pdf(path)[0]
-        ]
+        candidates: list[Path] = []
+        for path in sorted(watch_dir.iterdir()):
+            if not path.is_file():
+                continue
+            valid, reason, text = inspect(path)
+            if not valid:
+                rejected[path.name] = reason
+                continue
+            if matcher is not None:
+                belongs, match_reason = matcher(text)
+                if not belongs:
+                    rejected[path.name] = match_reason
+                    continue
+            candidates.append(path)
         if len(candidates) > 1:
             names = ", ".join(p.name for p in candidates)
             raise ManualAcquisitionConflict(
@@ -310,7 +399,9 @@ def watch_and_ingest(
             candidates[0].replace(dest)
             return dest
         if now() >= deadline:
-            raise ManualAcquisitionTimeout(f"не дождался файла в {watch_dir} за {timeout:.0f}с")
+            detail = "; ".join(f"{name}: {reason}" for name, reason in rejected.items())
+            suffix = f" (отвергнутые кандидаты — {detail})" if detail else ""
+            raise ManualAcquisitionTimeout(f"не дождался файла в {watch_dir} за {timeout:.0f}с{suffix}")
         sleep(poll_interval)
 
 
@@ -324,9 +415,17 @@ def acquire_manually(
     """1-клик путь: открыть ``rec.source_url`` в браузере пользователя, дождаться
     файла в watch-папке, перенести в ``dest``. Сбой ``xdg-open`` не фатален —
     URL уже напечатан вызывающей стороной, пользователь может кликнуть сам.
+
+    Сверка принадлежности по титулу (``title_matcher``) применяется ТОЛЬКО к
+    дефолтной (системной) watch-папке. Явный ``--watch-dir`` — escape hatch:
+    пользователь сам изолировал папку под этот прогон, дополнительная сверка
+    избыточна и рискует отсеять скан без текстового слоя.
     """
     subprocess.run(["xdg-open", rec.source_url], check=False)
-    watch_and_ingest(dest, watch_dir=watch_dir or default_watch_dir(), timeout=timeout)
+    matcher = title_matcher(rec) if watch_dir is None else None
+    watch_and_ingest(
+        dest, watch_dir=watch_dir or default_watch_dir(), matcher=matcher, timeout=timeout
+    )
     return LadderResult(
         schema.AcquisitionMethod.manual,
         schema.Fidelity.manual,
@@ -354,25 +453,31 @@ class ArchiveSnapshot:
 def find_wayback_snapshot(original_url: str, *, timeout: int = 30) -> ArchiveSnapshot | None:
     """CDX lookup for the freshest 200/application-pdf snapshot of ``original_url``.
 
-    Returns ``None`` if none found. CDX sorts by timestamp ascending, so the
-    last line is the freshest snapshot — a closer match to the document's
-    final official content than an old one (still not a fidelity guarantee,
-    see spec §7 — the record's ``fidelity`` is set to ``archived_snapshot``,
-    never ``live``, regardless).
+    Returns ``None`` if none found. ``limit=-N`` asks the CDX server for the
+    LAST N results directly (verified against the official CDX server README,
+    2026-07-16: "Set limit=-N to return the last N results"). A plain
+    ``limit=20`` (no sign) instead returns the FIRST 20 — CDX sorts ascending
+    by timestamp, so for a URL with more than 20 matching snapshots that
+    silently picked a stale one instead of the freshest (still not a fidelity
+    guarantee either way, see spec §7 — the record's ``fidelity`` is set to
+    ``archived_snapshot``, never ``live``, regardless).
     """
     query = (
         f"{WAYBACK_CDX_URL}?url={quote(original_url, safe='')}"
-        "&output=text&filter=statuscode:200&filter=mimetype:application/pdf&limit=20"
+        "&output=text&filter=statuscode:200&filter=mimetype:application/pdf&limit=-5"
     )
     result = subprocess.run(
-        ["curl", "-sS", "--connect-timeout", str(timeout), query],
+        ["curl", "-sS", "--connect-timeout", str(timeout), "--max-time", str(timeout), query],
         check=True, capture_output=True, text=True,
     )
     lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
     if not lines:
         return None
     # CDX text format: <urlkey> <timestamp> <original> <mimetype> <statuscode> <digest> <length>
-    timestamp = lines[-1].split()[1]
+    fields = lines[-1].split()
+    if len(fields) < 2:
+        return None  # неразбираемая строка — трактуем как «снимка нет», не IndexError
+    timestamp = fields[1]
     return ArchiveSnapshot(timestamp, f"https://web.archive.org/web/{timestamp}id_/{original_url}")
 
 
