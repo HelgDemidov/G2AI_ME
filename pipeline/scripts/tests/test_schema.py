@@ -17,16 +17,20 @@ from schema import (
     Fidelity,
     GeoScope,
     IssuerType,
+    OperationalState,
     Relevance,
     Rights,
     Sensitivity,
     SourceRecord,
     Status,
     TargetFit,
+    TranslationStatus,
     load_candidates,
+    load_state,
     load_vocab,
     promote_candidate,
     render_frontmatter,
+    save_state,
 )
 
 
@@ -362,6 +366,48 @@ def test_discovery_provenance_default_merged_from() -> None:
 def test_source_record_discovery_default_none() -> None:
     rec = SourceRecord.model_validate(valid_record())
     assert rec.discovery is None
+
+
+def test_operational_state_default() -> None:
+    st = OperationalState()
+    assert st.sha256 is None
+    assert st.acquisition_method is None
+    assert st.translation_status == TranslationStatus.not_started
+
+
+def test_operational_state_parse() -> None:
+    st = OperationalState.model_validate(
+        {
+            "sha256": "a" * 64,
+            "acquisition_method": "direct",
+            "fidelity": "live",
+            "acquisition_checked": "2026-07-16",
+        }
+    )
+    assert st.acquisition_method == AcquisitionMethod.direct
+    assert st.fidelity == Fidelity.live
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [("sha256", "xyz"), ("acquisition_method", "torrent"), ("fidelity", "nope")],
+)
+def test_operational_state_bad_rejected(field: str, bad: str) -> None:
+    with pytest.raises(ValidationError):
+        OperationalState.model_validate({field: bad})
+
+
+def test_load_state_missing(tmp_path: Path) -> None:
+    assert load_state(tmp_path / "nope.state.yaml") == OperationalState()
+
+
+def test_save_load_state_roundtrip(tmp_path: Path) -> None:
+    path = tmp_path / ".state.yaml"
+    st = OperationalState.model_validate(
+        {"sha256": "b" * 64, "acquisition_method": "archive", "fidelity": "archived_snapshot"}
+    )
+    save_state(path, st)
+    assert load_state(path) == st
 
 
 def test_load_real_vocab_nonempty() -> None:

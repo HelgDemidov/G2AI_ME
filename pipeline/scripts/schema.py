@@ -203,6 +203,23 @@ class DiscoveryProvenance(BaseModel):
     merged_from: list[str] = Field(default_factory=list)
 
 
+class OperationalState(BaseModel):
+    """Производное/операционное состояние документа — sidecar ``.state.yaml`` (corpus-layout-v2).
+
+    Машиннописаное (пайплайн/ладдер), отдельно от курируемого ``meta.yaml``: целостность,
+    канал добычи, статус процессов. Отсутствующий файл == пустое состояние (свежий документ).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    acquisition_method: AcquisitionMethod | None = None
+    acquisition_checked: _dt.date | None = None
+    fidelity: Fidelity | None = None
+    retrieved_snapshot_date: _dt.date | None = None
+    translation_status: TranslationStatus = TranslationStatus.not_started
+
+
 class SourceRecord(BaseModel):
     """Одна запись реестра первоисточников (один документ корпуса)."""
 
@@ -318,6 +335,25 @@ def load_candidates(candidates_path: Path) -> list[CandidateRecord]:
     if not isinstance(raw, list):
         raise ValueError(f"{candidates_path}: верхний уровень должен быть списком кандидатов")
     return [CandidateRecord.model_validate(item) for item in raw]
+
+
+def load_state(state_path: Path) -> OperationalState:
+    """Загрузить операционное состояние ``.state.yaml`` (отсутствует/пуст -> пустое состояние)."""
+    if not state_path.exists():
+        return OperationalState()
+    raw: Any = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    if raw is None:
+        return OperationalState()
+    return OperationalState.model_validate(raw)
+
+
+def save_state(state_path: Path, state: OperationalState) -> None:
+    """Атомарно записать операционное состояние (машиннописаный файл, plain YAML + tmp->rename)."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = state.model_dump(mode="json", exclude_none=True)
+    tmp = state_path.parent / (state_path.name + ".tmp")
+    tmp.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp.replace(state_path)
 
 
 def promote_candidate(
