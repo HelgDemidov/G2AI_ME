@@ -58,7 +58,7 @@ def _detect_scan(raw: Path) -> None:
     if with_text / n < SCAN_MIN_TEXTPAGE_FRACTION:
         raise NeedsOCR(
             f"{raw.name}: текст-слой лишь на {with_text}/{n} страниц — вероятен скан; "
-            f"OCR-путь не реализован (см. pipeline/setup/convert-ocr)"
+            f"OCR-путь не реализован (см. docs/pipeline/convert/tech_specs/convert-ocr)"
         )
 
 

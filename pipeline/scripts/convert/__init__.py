@@ -1,1 +1,1 @@
-"""Слой конвертации raw.* -> doc.md (чартер pipeline/setup/convert/architecture.md)."""
+"""Слой конвертации raw.* -> doc.md (чартер docs/pipeline/convert/charters/architecture.md)."""

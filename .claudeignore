@@ -3,3 +3,10 @@
 .pytest_cache/
 .ruff_cache/
 __pycache__/
+# производные артефакты покрытия
+.coverage
+htmlcov/
+# editor-конфиг (трекается в git как расшаренный, но не исходник — вне внимания Claude)
+.vscode/
+# секреты — Claude не должен читать реальный ключ (.env.example остаётся видимым)
+.env

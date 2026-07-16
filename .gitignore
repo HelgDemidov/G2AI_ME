@@ -26,8 +26,10 @@ htmlcov/
 /sources/**
 !/sources/**/
 !/sources/**/meta.yaml
-/agenda/vision_and_plan.md
-# внутренняя кухня: проектные анализы и планы, локально
-/pipeline/setup/
+# внутренняя кухня: вся документация проекта локально — docs/project_core (видение)
+# + docs/pipeline (чартеры/спеки по функц. блокам + general/ = стратегия пайплайна).
+# Корневой README (если появится) — трекать отдельным исключением.
+# Реорганизовано из /agenda/ и /pipeline/setup/.
+/docs/
 # внутренняя кухня: кастомные команды/настройки Claude Code, локально
 /.claude/

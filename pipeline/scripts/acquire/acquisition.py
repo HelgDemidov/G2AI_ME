@@ -1,7 +1,7 @@
 """Acquisition ladder for ``source_url`` downloads: block detection, ladder
 routing, manual watch-folder ingestion, and Wayback archive fallback.
 
-See ``pipeline/setup/source-acquisition-ladder/spec.md``. This module holds
+See ``docs/pipeline/acquire/tech_specs/source-acquisition-ladder/spec.md``. This module holds
 the WAF-aware acquisition logic; ``run_pipeline.py`` stays a thin orchestrator
 that calls into it, same separation as ``build_graph.py``/``corpus_index.py``.
 """
