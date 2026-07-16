@@ -2,5 +2,20 @@
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
   "python.analysis.extraPaths": ["pipeline/scripts"],
   "python.testing.pytestEnabled": true,
-  "python.testing.pytestArgs": ["pipeline/scripts/tests"]
+  "python.testing.pytestArgs": ["pipeline/scripts/tests"],
+  // CLI-шимы (repo-layout, PR #10): визуально свёрнуты под оркестратором —
+  // это 8-строчные указатели на пакетные модули, не самостоятельный код.
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.patterns": {
+    "run_pipeline.py": "ab_eval.py, build_graph.py, corpus_index.py, pdf_to_markdown.py, validate_sources.py, vector_store.py"
+  },
+  // Защита от случайного редактирования шима вместо реального модуля пакета.
+  "files.readonlyInclude": {
+    "pipeline/scripts/ab_eval.py": true,
+    "pipeline/scripts/build_graph.py": true,
+    "pipeline/scripts/corpus_index.py": true,
+    "pipeline/scripts/pdf_to_markdown.py": true,
+    "pipeline/scripts/validate_sources.py": true,
+    "pipeline/scripts/vector_store.py": true
+  }
 }
