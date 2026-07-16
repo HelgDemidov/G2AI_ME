@@ -122,12 +122,22 @@ def index_chunks(
 ) -> None:
     """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно).
 
+    Пересборка чанков делает ЛЮБЫЕ существующие векторы (всех моделей) невалидными:
+    таблица ``chunks`` без ``AUTOINCREMENT`` переиспользует ``chunk_id`` заново, и
+    старый вектор молча привязался бы к ЧУЖОМУ тексту нового поколения. Векторная
+    таблица дропается целиком — стоп-гэп до content-hash-инкрементальности
+    (``index-incremental``, там векторы перестанут гибнуть вовсе);
+    ``vector_store.ensure_schema`` пересоздаст её при следующем ``embed-corpus``.
+
     ``corpus_fingerprint``, если передан, пишется в ``index_meta`` АТОМАРНО с
     чанками — в одном ``conn.commit()``. На этом полагается реконсиляция
     пересборки в ``run_pipeline``: крах между шагами оставляет старый (или
     отсутствующий) отпечаток, следующий прогон честно пересоберёт —
     самовосстановление по построению, без отдельного флага/статуса.
     """
+    conn.execute("DROP TABLE IF EXISTS vectors")
+    conn.execute(_META_SCHEMA)  # defensive — index_meta может не существовать без create_db
+    conn.execute("DELETE FROM index_meta WHERE key LIKE 'vectors_fingerprint:%'")
     conn.execute("DELETE FROM chunks")
     conn.executemany(
         "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens) VALUES (?, ?, ?, ?)",
