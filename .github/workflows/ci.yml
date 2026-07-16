@@ -35,8 +35,8 @@ jobs:
         # рекурсивно по каталогу: подпакеты слоёв + тесты (file-glob *.py их не видел)
         run: python -m mypy pipeline/scripts
 
-      - name: Pytest (без модель-зависимых)
-        run: python -m pytest -m "not model"
+      - name: Pytest (без модель- и корпус-зависимых)
+        run: python -m pytest -m "not model and not corpus"
 
       - name: Validate corpus registry (sources/**/meta.yaml)
         run: python pipeline/scripts/validate_sources.py
