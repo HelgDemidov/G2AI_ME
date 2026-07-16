@@ -35,6 +35,7 @@ from pathlib import Path
 import acquisition
 import build_graph
 import corpus_index
+import fsio
 import schema
 import validate_sources
 import vector_store
@@ -127,6 +128,13 @@ def _do_download(
     watch-folder путь. В батче (``interactive=False``) блок репортится как отказ
     документа (батч не прерывается). Мёртвый URL -> archive (автоматически, оба режима).
 
+    Скачивание идёт во временный staging-файл (``fsio.staging_path`` — dot-префикс,
+    невидим для глоба ``raw.*``); при ЛЮБОМ отказе (в т.ч. пробрасываемый наверх
+    batch-блок) staging убирается в ``finally`` — challenge-тело/огрызок никогда не
+    остаётся под именем, которое ``schema.raw_file`` мог бы принять за оригинал.
+    При успехе — single-raw финализация: прежние ``raw.*`` (иной канал/формат)
+    удаляются перед публикацией нового, чтобы в папке не оказалось двух оригиналов.
+
     После успеха пишет операционное состояние (sha256/acquisition_method/fidelity/
     checked) в ``.state.yaml`` (машиннописаный sidecar, corpus-layout-v2).
     """
@@ -134,22 +142,32 @@ def _do_download(
         raise RuntimeError("нет source_url для скачивания")
     if shutil.which("curl") is None:
         raise RuntimeError("curl не найден в PATH")
-    raw = schema.doc_dir(rec, root) / "raw.pdf"
+    raw = schema.raw_target(rec, root)
     raw.parent.mkdir(parents=True, exist_ok=True)
-    part = raw.parent / (raw.name + ".part")  # атомарный (rename) staging-файл
+    part = fsio.staging_path(raw)
     try:
-        result = acquisition.run_ladder(rec, part, user_agent=USER_AGENT)
-    except acquisition.AcquisitionBlocked as exc:
-        if not interactive:
-            raise
-        logger.info("  %s: %s", rec.id, exc)
-        logger.info("  открываю в браузере и жду файл (папка: %s)…", watch_dir or acquisition.default_watch_dir())
-        result = acquisition.acquire_manually(rec, part, watch_dir=watch_dir)
-    except acquisition.AcquisitionDead as exc:
-        logger.info("  %s: %s", rec.id, exc)
-        logger.info("  ищу снимок в Wayback…")
-        result = acquisition.fetch_from_archive(rec, part, user_agent=USER_AGENT)
-    part.replace(raw)
+        try:
+            result = acquisition.run_ladder(rec, part, user_agent=USER_AGENT)
+        except acquisition.AcquisitionBlocked as exc:
+            if not interactive:
+                raise
+            logger.info("  %s: %s", rec.id, exc)
+            logger.info(
+                "  открываю в браузере и жду файл (папка: %s)…",
+                watch_dir or acquisition.default_watch_dir(),
+            )
+            result = acquisition.acquire_manually(rec, part, watch_dir=watch_dir)
+        except acquisition.AcquisitionDead as exc:
+            logger.info("  %s: %s", rec.id, exc)
+            logger.info("  ищу снимок в Wayback…")
+            result = acquisition.fetch_from_archive(rec, part, user_agent=USER_AGENT)
+        for old in schema.doc_dir(rec, root).glob("raw.*"):
+            if old != raw:
+                old.unlink()  # смена канала/формата -> заменяем оригинал целиком
+        part.replace(raw)
+    finally:
+        part.unlink(missing_ok=True)  # после успешного replace part не существует — no-op;
+        # при любом исключении (в т.ч. пробрасываемом AcquisitionBlocked) убирает огрызок
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     state.sha256 = _sha256(raw)
@@ -213,6 +231,7 @@ def process_docs(
     changed = False
     for rec in records:
         res = DocResult(rec.id)
+        fsio.cleanup_staging(schema.doc_dir(rec, root))  # останки упавшего прогона — самовосстановление
         stages = needed_stages(rec, root, force=force)
         if not stages:
             res.up_to_date = True
