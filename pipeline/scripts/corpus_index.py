@@ -1,10 +1,15 @@
 """Единый SQLite-индекс корпуса: канонические чанки + полнотекстовый поиск FTS5.
 
-Схема (одна БД, векторный слой Фазы 3 c6 добавит таблицу сюда же):
-  chunks(chunk_id, doc_id, chunk_index, text, n_tokens)
+Схема (одна БД, векторный слой в vector_store.py):
+  chunks(chunk_id, doc_id, chunk_index, text, n_tokens, content_hash)
+    content_hash = sha256(text) — стабильный «адрес» СОДЕРЖИМОГО чанка: к нему
+    привязан вектор (vector_store), поэтому пере-чанковка не осиротит эмбеддинги
+    неизменившихся чанков, а старый вектор физически не может указать на чужой текст.
   chunks_fts — внешне-контентная FTS5 над chunks.text, tokenize=unicode61 (многоязычно).
-  index_meta(key, value) — ключ-значение: corpus_fingerprint/chunk_max_tokens
-  (пишет этот модуль), vectors_fingerprint:<model> (пишет vector_store).
+  doc_state(doc_id, fingerprint) — per-doc отпечаток проиндексированного doc.md;
+    инкрементальная переиндексация трогает только изменившиеся документы.
+  index_meta(key, value) — ключ-значение: corpus_fingerprint/chunk_max_tokens/
+    schema_version (пишет этот модуль), vectors_fingerprint:<model> (пишет vector_store).
 
 CLI: собрать индекс из ``doc.md`` корпуса (записи — обход ``sources/**/meta.yaml``,
 пути выводятся из папок-документов) и/или искать.
@@ -25,19 +30,36 @@ from schema import DEFAULT_SOURCES, load_records, md_file
 
 DEFAULT_DB = REPO_ROOT / "pipeline" / "index" / "corpus.db"
 
+# Версия схемы производного слоя. Инкремент = несовместимая форма таблиц; открытие
+# старой БД (create_db) пересоздаёт производные таблицы с нуля (артефакт производный,
+# цена нулевая на текущем корпусе). v1 = vectors на chunk_id, chunks без content_hash;
+# v2 = content_hash в chunks + doc_state + vectors на content_hash (spec index-incremental).
+SCHEMA_VERSION = "2"
+
+# Производные (пересоздаваемые) таблицы — дропаются при миграции легаси-БД. Порядок
+# важен: FTS5-таблица внешнего контента дропается ДО своей content-таблицы chunks.
+_DERIVED_TABLES = ("chunks_fts", "chunks", "doc_state", "vectors")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id    INTEGER PRIMARY KEY,
-    doc_id      TEXT    NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    text        TEXT    NOT NULL,
-    n_tokens    INTEGER NOT NULL
+    chunk_id     INTEGER PRIMARY KEY,
+    doc_id       TEXT    NOT NULL,
+    chunk_index  INTEGER NOT NULL,
+    text         TEXT    NOT NULL,
+    n_tokens     INTEGER NOT NULL,
+    content_hash TEXT    NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_chunks_doc  ON chunks(doc_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(content_hash);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5 (
     text,
     content='chunks',
     content_rowid='chunk_id',
     tokenize='unicode61'
+);
+CREATE TABLE IF NOT EXISTS doc_state (
+    doc_id      TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS index_meta (
     key   TEXT PRIMARY KEY,
@@ -46,6 +68,14 @@ CREATE TABLE IF NOT EXISTS index_meta (
 """
 
 _META_SCHEMA = "CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+
+
+def content_hash(text: str) -> str:
+    """sha256-hex текста чанка (полный, 64 hex): стабильный ключ содержимого для
+    векторного слоя. Коллизии на 10–30 тыс. чанков исключены практикой; усечение
+    отвергнуто (spec index-incremental) — экономия нулевая, рассуждать о коллизиях
+    не хочется вовсе."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def read_meta(conn: sqlite3.Connection, key: str) -> str | None:
@@ -108,11 +138,40 @@ def fts5_available() -> bool:
     return True
 
 
+def _is_legacy_schema(conn: sqlite3.Connection) -> bool:
+    """БД требует миграции (пересоздания производных таблиц)? Легаси, если таблица
+    ``chunks`` существует, но без колонки ``content_hash`` ИЛИ ``schema_version`` в
+    ``index_meta`` не совпадает с текущей. Свежая БД (нет ``chunks``) — не легаси."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    if not cols:
+        return False
+    if "content_hash" not in cols:
+        return True
+    return read_meta(conn, "schema_version") != SCHEMA_VERSION
+
+
+def _reset_derived_tables(conn: sqlite3.Connection) -> None:
+    """Снести производные таблицы старого поколения (миграция). Артефакт производный —
+    следующий rebuild соберёт заново; отпечатки/бюджет прошлого поколения невалидны."""
+    conn.execute("DROP TABLE IF EXISTS chunks_fts")  # внешний контент — до content-таблицы
+    conn.execute("DROP TABLE IF EXISTS chunks")
+    conn.execute("DROP TABLE IF EXISTS doc_state")
+    conn.execute("DROP TABLE IF EXISTS vectors")
+    conn.execute(_META_SCHEMA)
+    conn.execute("DELETE FROM index_meta")
+    conn.commit()
+
+
 def create_db(db_path: Path) -> sqlite3.Connection:
-    """Открыть/создать БД со схемой."""
+    """Открыть/создать БД со схемой; мигрировать легаси-форму (пересоздать производные
+    таблицы). ``schema_version`` штампуется в ``index_meta`` — детект будущих миграций."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
+    if _is_legacy_schema(conn):
+        _reset_derived_tables(conn)
     conn.executescript(_SCHEMA)
+    write_meta(conn, "schema_version", SCHEMA_VERSION)
+    conn.commit()
     return conn
 
 
@@ -146,8 +205,9 @@ def index_chunks(
     conn.execute("DELETE FROM index_meta WHERE key LIKE 'vectors_fingerprint:%'")
     conn.execute("DELETE FROM chunks")
     conn.executemany(
-        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens) VALUES (?, ?, ?, ?)",
-        [(c.doc_id, c.index, c.text, c.n_tokens) for c in chunks],
+        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text)) for c in chunks],
     )
     conn.execute("INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild')")
     if corpus_fingerprint is not None:

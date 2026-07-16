@@ -11,7 +11,9 @@ import pytest
 
 from chunking import Chunk
 from corpus_index import (
+    SCHEMA_VERSION,
     _cmd_search,
+    content_hash,
     corpus_fingerprint,
     create_db,
     fts5_available,
@@ -213,3 +215,108 @@ def test_cmd_search_raw_syntax_error_reported_not_raised(tmp_path: Path, capsys:
     args = argparse.Namespace(db=db, query="state-as-mcp", limit=10, raw=True)  # честный синтаксис — падает
     assert _cmd_search(args) == 2
     assert "некорректный" in capsys.readouterr().err
+
+
+# --- content_hash: ключ содержимого чанка (spec index-incremental §1) ---
+
+
+def test_content_hash_matches_sha256() -> None:
+    import hashlib
+
+    assert content_hash("hello") == hashlib.sha256(b"hello").hexdigest()
+    assert len(content_hash("hello")) == 64  # полный sha256-hex, не усечённый
+
+
+def test_content_hash_deterministic_and_distinguishing() -> None:
+    assert content_hash("abc") == content_hash("abc")
+    assert content_hash("abc") != content_hash("abd")
+
+
+def test_index_chunks_stores_content_hash(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, sample_chunks())
+    rows = conn.execute("SELECT text, content_hash FROM chunks ORDER BY chunk_id").fetchall()
+    assert rows
+    for text, ch in rows:
+        assert ch == content_hash(text)
+
+
+# --- схема v2 + миграция легаси-БД (spec index-incremental §1) ---
+
+
+def _table_names(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _chunks_columns(conn: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+
+
+def test_create_db_fresh_has_v2_schema(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "fresh.db")
+    assert "content_hash" in _chunks_columns(conn)
+    assert "doc_state" in _table_names(conn)
+    assert read_meta(conn, "schema_version") == SCHEMA_VERSION
+    conn.close()
+
+
+def test_create_db_reopen_current_preserves_data(tmp_path: Path) -> None:
+    """Повторное открытие уже-v2 БД НЕ считается легаси — данные не сносятся."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, sample_chunks())
+    conn.close()
+    conn2 = create_db(db)
+    assert conn2.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == len(sample_chunks())
+    conn2.close()
+
+
+def _make_legacy_db(path: Path) -> None:
+    """БД схемы v1: chunks без content_hash, vectors на chunk_id, без schema_version."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE chunks (
+            chunk_id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL, n_tokens INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE chunks_fts USING fts5 (
+            text, content='chunks', content_rowid='chunk_id', tokenize='unicode61'
+        );
+        CREATE TABLE vectors (
+            chunk_id INTEGER NOT NULL, model TEXT NOT NULL, vec BLOB NOT NULL,
+            PRIMARY KEY (chunk_id, model)
+        );
+        CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """
+    )
+    conn.execute(
+        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens) VALUES ('old', 0, 'legacy', 1)"
+    )
+    conn.execute("INSERT INTO index_meta (key, value) VALUES ('corpus_fingerprint', 'old-fp')")
+    conn.commit()
+    conn.close()
+
+
+def test_migration_legacy_db_recreates_derived_tables(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.db"
+    _make_legacy_db(db)
+    conn = create_db(db)  # обязан мигрировать
+    assert "content_hash" in _chunks_columns(conn)
+    assert "doc_state" in _table_names(conn)
+    assert read_meta(conn, "schema_version") == SCHEMA_VERSION
+    # легаси-данные снесены (chunks пуст, старый fingerprint очищен)
+    assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+    assert read_meta(conn, "corpus_fingerprint") is None
+    conn.close()
+
+
+def test_migration_then_index_works(tmp_path: Path) -> None:
+    """После миграции индекс собирается и ищется штатно (content_hash NOT NULL не мешает)."""
+    db = tmp_path / "legacy.db"
+    _make_legacy_db(db)
+    conn = create_db(db)
+    index_chunks(conn, sample_chunks())
+    hits = fts_search(conn, "governance")
+    assert len(hits) == 1
+    conn.close()
