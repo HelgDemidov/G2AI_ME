@@ -21,7 +21,7 @@ def load_tokenizer(path: Path = TOKENIZER_JSON) -> Any:
     if not path.exists():
         raise FileNotFoundError(
             f"токенизатор bge-m3 не найден: {path} — скачать модель "
-            "(см. pipeline/setup/knowledge_graph_and_metadata_design.md)"
+            "(см. pipeline/setup/knowledge-graph-metadata/spec.md)"
         )
     return Tokenizer.from_file(str(path))
 

@@ -18,8 +18,6 @@ __pycache__/
 # OS / editor
 .DS_Store
 
-# Не публикуемые в этом репо материалы
-/intl_xperience/countries/
 # corpus-layout-v2: документы локально (raw/doc.md/.state.yaml), курируемая meta.yaml — в git
 /sources/**
 !/sources/**/
