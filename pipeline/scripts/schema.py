@@ -223,7 +223,10 @@ class SourceRecord(BaseModel):
     issuer: str = Field(min_length=1)
     issuer_type: IssuerType
     geo_scope: GeoScope
-    language: str = Field(pattern=r"^[a-z]{2}$")  # ISO 639-1
+    # ISO 639-1 (2 буквы), где код существует; иначе ISO 639-3 (3 буквы) — напр.
+    # черногорский 'cnr' не имеет 639-1-кода. Использовать 639-1, когда он есть
+    # (`en`, не `eng`; `sr`, не `srp`) — 639-3 только для языков без 639-1.
+    language: str = Field(pattern=r"^[a-z]{2,3}$")
     dates: Dates = Field(default_factory=Dates)
     doc_type: str = Field(min_length=1)      # словарь — validate_sources.py
     authority: str = Field(min_length=1)     # словарь — validate_sources.py

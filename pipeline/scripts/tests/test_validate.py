@@ -63,7 +63,7 @@ def test_valid_relation_between_records(tmp_path: Path) -> None:
 
 def test_structural_error_reported(tmp_path: Path) -> None:
     rec = valid_record()
-    rec["language"] = "eng"  # не ISO 639-1
+    rec["language"] = "english"  # не проходит ни ISO 639-1, ни 639-3 по форме
     write_doc(tmp_path, rec)
     assert any("language" in e for e in validate_sources(tmp_path, VOCAB_DIR))
 
@@ -81,3 +81,27 @@ def test_missing_relevance_rejected(tmp_path: Path) -> None:
     del rec["relevance"]
     write_doc(tmp_path, rec)
     assert any("relevance" in e for e in validate_sources(tmp_path, VOCAB_DIR))
+
+
+def test_national_entity_id_iso2_form_accepted(tmp_path: Path) -> None:
+    rec = valid_record()  # geo_scope=national, entity_id='sg' — уже форма iso2
+    write_doc(tmp_path, rec)
+    assert validate_sources(tmp_path, VOCAB_DIR) == []
+
+
+def test_national_entity_id_non_iso2_rejected(tmp_path: Path) -> None:
+    rec = valid_record()
+    rec["entity_id"] = "singapore"
+    write_doc(tmp_path, rec)
+    errors = validate_sources(tmp_path, VOCAB_DIR)
+    assert any(
+        "geo_scope=national требует entity_id формы iso2" in e and "singapore" in e for e in errors
+    )
+
+
+def test_non_national_entity_id_not_gated(tmp_path: Path) -> None:
+    rec = valid_record()
+    rec["geo_scope"] = "international"
+    rec["entity_id"] = "oecd"
+    write_doc(tmp_path, rec)
+    assert validate_sources(tmp_path, VOCAB_DIR) == []

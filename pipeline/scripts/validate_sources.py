@@ -5,7 +5,10 @@
 (3) уникальность ``id``; (4) ссылочную целостность ``relations`` (цель — существующий id);
 (5) наличие ``relevance`` (каждая запись корпуса — допущенная триажем; см.
 source-relevance-triage); (6) инварианты папок (папка документа == ``id``,
-папка сущности == ``entity_id``, верхняя == ``track``).
+папка сущности == ``entity_id``, верхняя == ``track``); (7) для
+``geo_scope: national`` — ``entity_id`` имеет форму iso2 (2 буквы); членство
+в конкретных блоках (``jurisdictions.yaml``) не проверяется — список блоков
+заведомо неполон.
 
 Возвращает ненулевой код при ошибках — пригодно для pre-commit и CI.
 Запуск::
@@ -15,6 +18,7 @@ source-relevance-triage); (6) инварианты папок (папка док
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,7 +26,9 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from schema import VOCAB_DIR, SourceRecord, load_vocab
+from schema import VOCAB_DIR, GeoScope, SourceRecord, load_vocab
+
+_ISO2_RE = re.compile(r"[a-z]{2}")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SOURCES = REPO_ROOT / "sources"  # корень дерева папок-документов (corpus-layout-v2)
@@ -79,6 +85,12 @@ def validate_sources(sources_root: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
         for pattern in rec.g2ai_pattern:
             if pattern not in vocabs["g2ai_pattern"]:
                 errors.append(f"запись '{rec.id}': g2ai_pattern '{pattern}' вне словаря")
+
+        if rec.geo_scope is GeoScope.national and not _ISO2_RE.fullmatch(rec.entity_id):
+            errors.append(
+                f"запись '{rec.id}': geo_scope=national требует entity_id формы iso2 "
+                f"(2 буквы), получено '{rec.entity_id}'"
+            )
 
         if rec.relevance is None:
             errors.append(
