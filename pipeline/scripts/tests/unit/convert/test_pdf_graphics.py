@@ -8,14 +8,17 @@ from typing import Any
 from convert.pdf_graphics import (
     Element,
     Region,
+    classify_images,
     cluster_elements,
     dedupe_elements,
     detect_regions,
+    document_hash_counts,
     filter_elements,
     region_guards_ok,
     region_hash,
     region_id,
     region_words,
+    render_raster_marker,
     render_region_block,
     try_grid,
     try_sequence,
@@ -370,6 +373,72 @@ def test_detect_regions_dissolved_cluster_keeps_words_in_prose() -> None:
     )
     assert regions == []
     assert remaining == [word]
+
+
+def _image(x0: float, top: float, x1: float, bottom: float, content_hash: str | None) -> Element:
+    return Element("image", x0, top, x1, bottom, content_hash=content_hash)
+
+
+# --- растровая политика: document_hash_counts / classify_images (§1.4) ---
+
+
+def test_document_hash_counts_counts_across_whole_document() -> None:
+    """Частота — ПО ДОКУМЕНТУ (все страницы в одном плоском списке), не по
+    странице: логотип, встреченный по разу на 3 разных страницах, должен
+    засчитаться 3 раза, а не остаться по 1 на страницу."""
+    images = [_image(0, 0, 10, 10, "logo"), _image(0, 0, 10, 10, "logo"), _image(0, 0, 10, 10, "logo")]
+    assert document_hash_counts(images) == {"logo": 3}
+
+
+def test_document_hash_counts_ignores_missing_hash() -> None:
+    images = [_image(0, 0, 10, 10, None), _image(0, 0, 10, 10, None)]
+    assert document_hash_counts(images) == {}
+
+
+def test_classify_images_excludes_repeated_decor() -> None:
+    """Повторяется >= RASTER_DECOR_MIN_REPEATS (3) раз по документу — декор,
+    молча, даже если крупное на этой конкретной странице."""
+    big_logo = _image(0, 0, PAGE_W, PAGE_H, "logo")  # 100% площади — крупное
+    marked = classify_images([big_logo], consumed_bboxes=[], hash_counts={"logo": 3}, page_area=PAGE_AREA)
+    assert marked == []
+
+
+def test_classify_images_marks_unique_large_image() -> None:
+    big_unique = _image(0.0, 0.0, PAGE_W, PAGE_H * 0.5, "unique-chart")  # 50% площади
+    marked = classify_images(
+        [big_unique], consumed_bboxes=[], hash_counts={"unique-chart": 1}, page_area=PAGE_AREA
+    )
+    assert marked == [big_unique]
+
+
+def test_classify_images_silent_for_small_icon() -> None:
+    icon = _image(0.0, 0.0, 20.0, 20.0, "icon")  # << 8% площади страницы
+    marked = classify_images([icon], consumed_bboxes=[], hash_counts={"icon": 1}, page_area=PAGE_AREA)
+    assert marked == []
+
+
+def test_classify_images_missing_hash_treated_as_unique() -> None:
+    """Битый/зашифрованный поток (content_hash=None) — НЕ декор по построению
+    (никогда не совпадёт по hash_counts), крупное -> помечается."""
+    broken_stream = _image(0.0, 0.0, PAGE_W, PAGE_H * 0.5, None)
+    marked = classify_images([broken_stream], consumed_bboxes=[], hash_counts={}, page_area=PAGE_AREA)
+    assert marked == [broken_stream]
+
+
+def test_classify_images_excludes_image_already_inside_a_region() -> None:
+    """Изображение — часть уже детектированного региона (напр. флоучарт из
+    img+rect+curve) — не получает ОТДЕЛЬНЫЙ растровый маркер поверх маркера
+    региона (не дублируем)."""
+    inside = _image(10.0, 10.0, 90.0, 90.0, "unique-in-flowchart")
+    region_bbox = (0.0, 0.0, 200.0, 200.0)
+    marked = classify_images(
+        [inside], consumed_bboxes=[region_bbox], hash_counts={"unique-in-flowchart": 1}, page_area=PAGE_AREA
+    )
+    assert marked == []
+
+
+def test_render_raster_marker_matches_grammar() -> None:
+    assert render_raster_marker(page=2) == "> [Image, p. 2 — raster content not analyzed]"
 
 
 def test_detect_regions_excludes_elements_inside_table_bbox() -> None:

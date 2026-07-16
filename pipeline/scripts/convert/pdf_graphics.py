@@ -459,3 +459,47 @@ def _render_opaque(words: list[Any], page: int, rid: str) -> str:
         f"> [Figure, p. {page}, region {rid} — structure not reconstructed]\n"
         f"> Labels (reading order not guaranteed): {labels}"
     )
+
+
+# --- растровая политика (§1.4, чартер §4.1): детектировать, НЕ распознавать ---
+
+RASTER_DECOR_MIN_REPEATS = 3     # изображение чаще — декор/логотип (частота ПО ДОКУМЕНТУ)
+RASTER_MIN_PAGE_FRACTION = 0.08  # мельче — иконка, молча
+
+
+def document_hash_counts(all_images: list[Element]) -> dict[str, int]:
+    """Частота ``content_hash`` по ВСЕМУ документу, не странице — декор/логотип
+    типично повторяется по разу НА КАЖДОЙ странице (header/footer), а не
+    многократно на одной; частота меньше документа не поймала бы это (§1.4)."""
+    counts: dict[str, int] = {}
+    for img in all_images:
+        if img.content_hash is not None:
+            counts[img.content_hash] = counts.get(img.content_hash, 0) + 1
+    return counts
+
+
+def classify_images(
+    page_images: list[Element],
+    consumed_bboxes: list[BBox],
+    hash_counts: dict[str, int],
+    page_area: float,
+) -> list[Element]:
+    """Изображения ОДНОЙ страницы, заслуживающие отдельного маркера «raster
+    content not analyzed»: не поглощены уже детектированным регионом
+    (``consumed_bboxes`` — bbox'ы Region из detect_regions той же страницы), не
+    повторяются >= RASTER_DECOR_MIN_REPEATS раз по документу (декор — молча),
+    площадь на странице >= RASTER_MIN_PAGE_FRACTION (иначе — иконка, молча).
+    ``hash_counts`` — предпосчитан ``document_hash_counts`` по ВСЕМУ документу."""
+    loose = [img for img in page_images if not _element_center_in_any_bbox(img, consumed_bboxes)]
+    marked: list[Element] = []
+    for img in loose:
+        if img.content_hash is not None and hash_counts.get(img.content_hash, 0) >= RASTER_DECOR_MIN_REPEATS:
+            continue
+        if _area(_bbox(img)) < RASTER_MIN_PAGE_FRACTION * page_area:
+            continue
+        marked.append(img)
+    return marked
+
+
+def render_raster_marker(page: int) -> str:
+    return f"> [Image, p. {page} — raster content not analyzed]"
