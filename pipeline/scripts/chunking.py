@@ -45,18 +45,50 @@ def _sentences(text: str) -> list[str]:
 
 
 def _hard_split(text: str, count_tokens: TokenCounter, max_tokens: int) -> list[str]:
-    """Жёсткая нарезка по словам для аномально длинных предложений."""
+    """Жёсткая нарезка по словам для аномально длинных предложений (типовой выход
+    pdf_to_markdown на дампах диаграмм/таблиц без пунктуации).
+
+    Бюджет накапливается ДЕШЁВОЙ суммой per-word ``count_tokens(word)`` — O(1)
+    работы на слово, а не повторной токенизацией всей растущей строки на каждом
+    добавленном слове (O(n²) символов: предложение на 5000 слов давало ~12М
+    токенизированных "слово-эквивалентов" вместо 5К). Когда оценка превышает
+    ``max_tokens`` — ОДНА проверка ``count_tokens`` на полном кандидате; если она
+    тоже превышает (subword-склейка на границах слов может дать больше суммы по
+    словам, чем реальный совместный счёт) — бинарный поиск точки разреза (O(log n)
+    энкодов). Свойство «чанк <= max_tokens» — точное (финальная верификация),
+    меняется только СТОИМОСТЬ его достижения.
+    """
+    words = text.split()
+    if not words:
+        return []
     out: list[str] = []
-    current: list[str] = []
-    for word in text.split():
-        current.append(word)
-        if count_tokens(" ".join(current)) > max_tokens:
-            current.pop()
-            if current:
-                out.append(" ".join(current))
-            current = [word]
-    if current:
-        out.append(" ".join(current))
+    i, n = 0, len(words)
+    while i < n:
+        j, budget = i, 0
+        while j < n:
+            w_tokens = count_tokens(words[j])
+            if budget + w_tokens > max_tokens and j > i:
+                break
+            budget += w_tokens
+            j += 1
+        candidate = " ".join(words[i:j])
+        if j == i + 1 or count_tokens(candidate) <= max_tokens:
+            # одно слово (дальше резать некуда, даже если оно само больше лимита)
+            # либо честная проверка подтвердила оценку — принимаем как есть
+            out.append(candidate)
+            i = j
+            continue
+        # оценка соврала (subword-склейка) -> бинарный поиск точки разреза внутри [i, j)
+        lo, hi, best = i + 1, j, i + 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if count_tokens(" ".join(words[i:mid])) <= max_tokens:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        out.append(" ".join(words[i:best]))
+        i = best
     return out
 
 
@@ -112,4 +144,11 @@ def chunk_text(
         current_tokens += n
     flush()
 
+    # count_tokens(chunk) здесь пересчитывает готовый текст ЗАНОВО, хотя суммы уже
+    # накапливались по пути (current_tokens/_split_long_paragraph) — избыточно, но
+    # НЕ квадратично (один линейный проход по уже собранным чанкам, не по n²
+    # растущих префиксов, как было в _hard_split). Оставлено как есть: чтобы нести
+    # накопленное значение через flush()/_split_long_paragraph/_hard_split, все три
+    # должны были бы возвращать (text, n_tokens) вместо str — не стоит сложности
+    # ради устранения уже-линейной работы (см. spec code-consolidation §5).
     return [Chunk(doc_id, i, chunk, count_tokens(chunk)) for i, chunk in enumerate(raw)]
