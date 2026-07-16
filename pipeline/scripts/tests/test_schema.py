@@ -414,6 +414,24 @@ def test_save_load_state_roundtrip(tmp_path: Path) -> None:
     assert load_state(path) == st
 
 
+def test_save_state_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any) -> None:
+    """Мигрировано на fsio.atomic_write_text — единая staging-политика."""
+    import fsio
+
+    calls: list[Path] = []
+    real = fsio.atomic_write_text
+
+    def spy(target: Path, text: str) -> None:
+        calls.append(target)
+        real(target, text)
+
+    monkeypatch.setattr("schema.fsio.atomic_write_text", spy)
+    path = tmp_path / ".state.yaml"
+    save_state(path, OperationalState(sha256="a" * 64))
+    assert calls == [path]
+    assert load_state(path).sha256 == "a" * 64
+
+
 def test_load_real_vocab_nonempty() -> None:
     for name in ("doc_types", "authority", "topics", "g2ai_patterns"):
         terms = load_vocab(name)

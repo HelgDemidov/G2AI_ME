@@ -15,6 +15,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+import fsio
+
 # Каталог контролируемых словарей: pipeline/vocab/ (sibling каталога scripts/).
 VOCAB_DIR = Path(__file__).resolve().parent.parent / "vocab"
 
@@ -389,11 +391,9 @@ def load_state(state_path: Path) -> OperationalState:
 
 def save_state(state_path: Path, state: OperationalState) -> None:
     """Атомарно записать операционное состояние (машиннописаный файл, plain YAML + tmp->rename)."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
     payload = state.model_dump(mode="json", exclude_none=True)
-    tmp = state_path.parent / (state_path.name + ".tmp")
-    tmp.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    tmp.replace(state_path)
+    text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    fsio.atomic_write_text(state_path, text)
 
 
 def promote_candidate(

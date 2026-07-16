@@ -237,7 +237,7 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     if raw is None or not raw.exists():
         raise RuntimeError("нет raw-файла для конвертации")
     md.parent.mkdir(parents=True, exist_ok=True)
-    tmp = md.parent / (md.name + ".tmp")
+    tmp = fsio.staging_path(md)
     pdf_convert(str(raw), str(tmp))
     if not tmp.exists() or tmp.stat().st_size == 0:
         raise RuntimeError("конвертация дала пустой файл")
@@ -253,9 +253,7 @@ def _do_frontmatter(rec: schema.SourceRecord, root: Path) -> bool:
     desired = _compose_md(rec, current)
     if desired == current:
         return False
-    tmp = md.parent / (md.name + ".tmp")
-    tmp.write_text(desired, encoding="utf-8")
-    tmp.replace(md)
+    fsio.atomic_write_text(md, desired)
     return True
 
 
