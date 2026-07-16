@@ -15,10 +15,12 @@ import acquisition
 import corpus_index
 import schema
 from acquisition import AcquisitionOutcome, ClassifiedResponse
+import fsio
 from run_pipeline import (
     Stage,
     _adopt_untracked_raw,
     _compose_md,
+    _do_convert,
     _do_download,
     _do_frontmatter,
     _needs_index_rebuild,
@@ -101,6 +103,56 @@ def test_do_frontmatter_syncs_and_idempotent(tmp_path: Path) -> None:
     assert content.startswith("---\n")
     assert "Body only" in content
     assert _do_frontmatter(rec, tmp_path) is False  # второй раз — уже синхронно
+
+
+def test_do_frontmatter_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any) -> None:
+    """Мигрировано на fsio.atomic_write_text — единая staging-политика (dot-файл,
+    не отдельный .tmp-суффикс)."""
+    rec = make()
+    _place(rec, tmp_path, md="Body only, no frontmatter.\n")
+    calls: list[Path] = []
+    real = fsio.atomic_write_text
+
+    def spy(target: Path, text: str) -> None:
+        calls.append(target)
+        real(target, text)
+
+    monkeypatch.setattr("run_pipeline.fsio.atomic_write_text", spy)
+    _do_frontmatter(rec, tmp_path)
+    assert calls == [schema.md_file(rec, tmp_path)]
+
+
+def test_do_convert_staging_uses_dot_prefix_on_failure(tmp_path: Path, monkeypatch: Any) -> None:
+    """_do_convert мигрирован на fsio.staging_path — при отказе конвертации огрызок
+    остаётся под dot-префиксным именем (совместимым с fsio.cleanup_staging), не
+    старым '.tmp'-суффиксом."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+
+    def fake_convert(src: str, dst: str) -> None:
+        Path(dst).write_bytes(b"")  # пустой вывод -> _do_convert бросит RuntimeError
+
+    monkeypatch.setattr("run_pipeline.pdf_convert", fake_convert)
+
+    with pytest.raises(RuntimeError, match="пустой файл"):
+        _do_convert(rec, tmp_path)
+
+    staging_files = list(schema.doc_dir(rec, tmp_path).glob(".*.part"))
+    assert [p.name for p in staging_files] == [".doc.md.part"]
+
+
+def test_do_convert_success_leaves_no_staging(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+
+    def fake_convert(src: str, dst: str) -> None:
+        Path(dst).write_text("converted body", encoding="utf-8")
+
+    monkeypatch.setattr("run_pipeline.pdf_convert", fake_convert)
+    _do_convert(rec, tmp_path)
+
+    assert schema.md_file(rec, tmp_path).read_text(encoding="utf-8") == "converted body"
+    assert list(schema.doc_dir(rec, tmp_path).glob(".*.part")) == []
 
 
 def test_dry_run_no_side_effects(tmp_path: Path) -> None:

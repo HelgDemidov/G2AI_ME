@@ -237,7 +237,7 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     if raw is None or not raw.exists():
         raise RuntimeError("нет raw-файла для конвертации")
     md.parent.mkdir(parents=True, exist_ok=True)
-    tmp = md.parent / (md.name + ".tmp")
+    tmp = fsio.staging_path(md)
     pdf_convert(str(raw), str(tmp))
     if not tmp.exists() or tmp.stat().st_size == 0:
         raise RuntimeError("конвертация дала пустой файл")
@@ -253,9 +253,7 @@ def _do_frontmatter(rec: schema.SourceRecord, root: Path) -> bool:
     desired = _compose_md(rec, current)
     if desired == current:
         return False
-    tmp = md.parent / (md.name + ".tmp")
-    tmp.write_text(desired, encoding="utf-8")
-    tmp.replace(md)
+    fsio.atomic_write_text(md, desired)
     return True
 
 
@@ -405,7 +403,7 @@ def _report(results: list[DocResult]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Идемпотентный оркестратор G2AI-пайплайна")
-    parser.add_argument("sources", nargs="?", type=Path, default=validate_sources.DEFAULT_SOURCES)
+    parser.add_argument("sources", nargs="?", type=Path, default=schema.DEFAULT_SOURCES)
     parser.add_argument("--db", type=Path, default=corpus_index.DEFAULT_DB)
     parser.add_argument("--only", default=None, help="обработать только документ с этим id")
     parser.add_argument("--force", action="store_true", help="переиграть все стадии независимо от состояния")
@@ -423,14 +421,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     # quality-gate: реестр обязан быть валиден (пустой/несуществующий корень — валиден)
-    errors = validate_sources.validate_sources(args.sources)
+    errors, records = validate_sources.validate_sources(args.sources)
     if errors:
         logger.error("реестр невалиден (%d) — исправьте перед прогоном:", len(errors))
         for err in errors:
             logger.error("  %s", err)
         return 1
 
-    records = schema.load_records(args.sources)
     if args.only:
         records = [r for r in records if r.id == args.only]
         if not records:

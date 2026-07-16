@@ -4,11 +4,11 @@
 ``doc_type``/``authority``/``topics``/``g2ai_pattern`` контролируемым словарям;
 (3) уникальность ``id``; (4) ссылочную целостность ``relations`` (цель — существующий id);
 (5) наличие ``relevance`` (каждая запись корпуса — допущенная триажем; см.
-source-relevance-triage); (6) инварианты папок (папка документа == ``id``,
-папка сущности == ``entity_id``, верхняя == ``track``); (7) для
-``geo_scope: national`` — ``entity_id`` имеет форму iso2 (2 буквы); членство
-в конкретных блоках (``jurisdictions.yaml``) не проверяется — список блоков
-заведомо неполон.
+source-relevance-triage); (6) инварианты папок — ``schema.check_layout`` (папка
+документа == ``id``, папка сущности == ``entity_id``, верхняя == ``track``);
+(7) для ``geo_scope: national`` — ``entity_id`` имеет форму iso2 (2 буквы);
+членство в конкретных блоках (``jurisdictions.yaml``) не проверяется — список
+блоков заведомо неполон.
 
 Возвращает ненулевой код при ошибках — пригодно для pre-commit и CI.
 Запуск::
@@ -26,19 +26,25 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from schema import VOCAB_DIR, GeoScope, SourceRecord, load_vocab
+from schema import DEFAULT_SOURCES, VOCAB_DIR, GeoScope, SourceRecord, check_layout, load_vocab
 
 _ISO2_RE = re.compile(r"[a-z]{2}")
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SOURCES = REPO_ROOT / "sources"  # корень дерева папок-документов (corpus-layout-v2)
 
+def validate_sources(
+    sources_root: Path, vocab_dir: Path = VOCAB_DIR
+) -> tuple[list[str], list[SourceRecord]]:
+    """Вернуть (ошибки, успешно распарсенные записи); пустой список ошибок =
+    корпус валиден. Обход ``sources/**/meta.yaml``.
 
-def validate_sources(sources_root: Path, vocab_dir: Path = VOCAB_DIR) -> list[str]:
-    """Вернуть список ошибок (пустой = корпус валиден). Обход ``sources/**/meta.yaml``."""
+    Возвращает и записи — вызывающая сторона (``run_pipeline``/``build_graph``)
+    переиспользует их вместо повторного ``load_records()`` (двойной обход
+    дерева на каждый прогон, включая no-op). Записи отсортированы по ``id`` —
+    тот же порядок, что даёт ``schema.load_records``.
+    """
     errors: list[str] = []
     if not sources_root.exists():
-        return errors  # пустой/несуществующий корпус — валиден
+        return errors, []  # пустой/несуществующий корпус — валиден
 
     vocabs: dict[str, set[str]] = {
         "doc_type": load_vocab("doc_types", vocab_dir),
@@ -50,7 +56,8 @@ def validate_sources(sources_root: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
     records: list[SourceRecord] = []
     seen_ids: set[str] = set()
     for meta_path in sorted(sources_root.rglob("meta.yaml")):
-        loc_id = str(meta_path.relative_to(sources_root))
+        rel_path = meta_path.relative_to(sources_root)
+        loc_id = str(rel_path)
         try:
             raw: Any = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
             rec = SourceRecord.model_validate(raw)
@@ -63,16 +70,7 @@ def validate_sources(sources_root: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
             errors.append(f"{loc_id}: YAML: {exc}")
             continue
 
-        doc, entity, track = meta_path.parent, meta_path.parent.parent, meta_path.parent.parent.parent
-        if doc.name != rec.id:
-            errors.append(f"{loc_id}: папка '{doc.name}' != id '{rec.id}'")
-        if entity.name != rec.entity_id:
-            errors.append(f"{loc_id}: папка сущности '{entity.name}' != entity_id '{rec.entity_id}'")
-        if track.name != rec.track.value:
-            errors.append(f"{loc_id}: верхняя папка '{track.name}' != track '{rec.track.value}'")
-
-        if rec.id in seen_ids:
-            errors.append(f"запись '{rec.id}': дубль id ({loc_id})")
+        errors.extend(check_layout(rel_path, rec, seen_ids))
         seen_ids.add(rec.id)
 
         if rec.doc_type not in vocabs["doc_type"]:
@@ -106,7 +104,8 @@ def validate_sources(sources_root: Path, vocab_dir: Path = VOCAB_DIR) -> list[st
                 errors.append(
                     f"запись '{rec.id}': relation {rel.type.value} -> неизвестный id '{rel.target}'"
                 )
-    return errors
+    records.sort(key=lambda r: r.id)
+    return errors, records
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -124,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     sources_path: Path = args.sources
     vocab_dir: Path = args.vocab_dir
 
-    errors = validate_sources(sources_path, vocab_dir)
+    errors, _ = validate_sources(sources_path, vocab_dir)
     if errors:
         for err in errors:
             print(err, file=sys.stderr)

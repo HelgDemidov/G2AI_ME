@@ -15,8 +15,16 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+import fsio
+from env import REPO_ROOT
+
 # Каталог контролируемых словарей: pipeline/vocab/ (sibling каталога scripts/).
 VOCAB_DIR = Path(__file__).resolve().parent.parent / "vocab"
+# Корень дерева папок-документов (corpus-layout-v2). Единственный источник —
+# env.REPO_ROOT; потребители (run_pipeline/corpus_index/build_graph) импортируют
+# отсюда, не из validate_sources — зависимость «инструмент → валидатор ради
+# константы» была неверна по направлению слоёв.
+DEFAULT_SOURCES = REPO_ROOT / "sources"
 
 # Внутренний id: kebab-slug минимум из двух сегментов, напр. ``sg-imda-mgf-agentic-2026``.
 ID_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)+$"
@@ -319,28 +327,44 @@ def state_file(rec: SourceRecord, root: Path) -> Path:
     return doc_dir(rec, root) / ".state.yaml"
 
 
+def check_layout(meta_path: Path, rec: SourceRecord, seen_ids: set[str]) -> list[str]:
+    """Чистые инварианты раскладки corpus-layout-v2: папка документа == ``id``;
+    папка сущности == ``entity_id``; верхняя папка == ``track``; глобальная
+    уникальность ``id`` (по ``seen_ids``). Пустой список = ок.
+
+    Единственный источник этого знания — ``load_records`` (raise-режим) и
+    ``validate_sources.validate_sources`` (collect-режим) вызывают одну и ту же
+    проверку вместо двух дрейфующих копий. НЕ мутирует ``seen_ids`` — когда и
+    как регистрировать проверенный id, решает вызывающая сторона.
+    """
+    errors: list[str] = []
+    doc, entity, track = meta_path.parent, meta_path.parent.parent, meta_path.parent.parent.parent
+    if doc.name != rec.id:
+        errors.append(f"{meta_path}: папка '{doc.name}' != id '{rec.id}'")
+    if entity.name != rec.entity_id:
+        errors.append(f"{meta_path}: папка сущности '{entity.name}' != entity_id '{rec.entity_id}'")
+    if track.name != rec.track.value:
+        errors.append(f"{meta_path}: верхняя папка '{track.name}' != track '{rec.track.value}'")
+    if rec.id in seen_ids:
+        errors.append(f"{meta_path}: дубль id '{rec.id}'")
+    return errors
+
+
 def load_records(sources_root: Path) -> list[SourceRecord]:
     """Собрать записи корпуса обходом дерева ``sources/**/meta.yaml`` (строго, raises).
 
-    Инварианты: имя папки документа == ``id``; папка сущности == ``entity_id``; верхняя ==
-    ``track``; глобальная уникальность ``id``. Порядок — по ``id`` (детерминизм).
+    Инварианты — см. ``check_layout``. Порядок — по ``id`` (детерминизм).
     Полную семантику (словари, relevance, relations) проверяет validate_sources.py.
     """
     records: list[SourceRecord] = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
     for meta_path in sorted(sources_root.rglob("meta.yaml")):
         raw: Any = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
         rec = SourceRecord.model_validate(raw)
-        doc, entity, track = meta_path.parent, meta_path.parent.parent, meta_path.parent.parent.parent
-        if doc.name != rec.id:
-            raise ValueError(f"{meta_path}: папка '{doc.name}' != id '{rec.id}'")
-        if entity.name != rec.entity_id:
-            raise ValueError(f"{meta_path}: папка сущности '{entity.name}' != entity_id '{rec.entity_id}'")
-        if track.name != rec.track.value:
-            raise ValueError(f"{meta_path}: верхняя папка '{track.name}' != track '{rec.track.value}'")
-        if rec.id in seen:
-            raise ValueError(f"дубль id '{rec.id}' ({meta_path})")
-        seen.add(rec.id)
+        errors = check_layout(meta_path, rec, seen_ids)
+        if errors:
+            raise ValueError("\n".join(errors))
+        seen_ids.add(rec.id)
         records.append(rec)
     records.sort(key=lambda r: r.id)
     return records
@@ -373,11 +397,9 @@ def load_state(state_path: Path) -> OperationalState:
 
 def save_state(state_path: Path, state: OperationalState) -> None:
     """Атомарно записать операционное состояние (машиннописаный файл, plain YAML + tmp->rename)."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
     payload = state.model_dump(mode="json", exclude_none=True)
-    tmp = state_path.parent / (state_path.name + ".tmp")
-    tmp.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    tmp.replace(state_path)
+    text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    fsio.atomic_write_text(state_path, text)
 
 
 def promote_candidate(

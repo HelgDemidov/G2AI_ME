@@ -20,10 +20,9 @@ from pathlib import Path
 
 from bge_tokenizer import EMBED_MAX_TOKENS, token_counter
 from chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
-from schema import load_records, md_file
-from validate_sources import DEFAULT_SOURCES
+from env import REPO_ROOT
+from schema import DEFAULT_SOURCES, load_records, md_file
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = REPO_ROOT / "pipeline" / "index" / "corpus.db"
 
 _SCHEMA = """

@@ -105,11 +105,17 @@ def _has_cloudflare_fingerprint(headers: dict[str, str]) -> bool:
     return "__cf_bm" in headers.get("set-cookie", "")
 
 
-def classify_response(
-    body: bytes, headers_text: str, *, expect_pdf: bool = True
-) -> ClassifiedResponse:
+def classify_response(body: bytes, headers_text: str) -> ClassifiedResponse:
     """Pure classification: given a response body and raw ``curl -D`` header dump,
     decide whether the download is a real document, a WAF block, or a dead URL.
+
+    PDF-specific by design (corpus is PDF-only for now — HTML source support is
+    tracked separately, backlog #4). A previous ``expect_pdf: bool = True``
+    parameter was dead generality: no caller ever passed ``False``, and the
+    function had no actual ok-branch for non-PDF content anyway — a real
+    multi-format classifier belongs to the HTML-path spec, where it would get
+    a real ok-path and content-type handling instead of pretending to be
+    general purpose today.
     """
     status = _status_from_headers_text(headers_text)
     headers = _headers_from_text(headers_text)
@@ -117,7 +123,7 @@ def classify_response(
     if status in DEAD_STATUS_CODES:
         return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
 
-    if expect_pdf and body.startswith(b"%PDF"):
+    if body.startswith(b"%PDF"):
         return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid PDF")
 
     if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):

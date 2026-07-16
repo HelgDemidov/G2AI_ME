@@ -24,8 +24,10 @@ from schema import (
     TargetFit,
     Track,
     TranslationStatus,
+    check_layout,
     doc_dir,
     load_candidates,
+    load_records,
     load_state,
     load_vocab,
     promote_candidate,
@@ -412,6 +414,24 @@ def test_save_load_state_roundtrip(tmp_path: Path) -> None:
     assert load_state(path) == st
 
 
+def test_save_state_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any) -> None:
+    """Мигрировано на fsio.atomic_write_text — единая staging-политика."""
+    import fsio
+
+    calls: list[Path] = []
+    real = fsio.atomic_write_text
+
+    def spy(target: Path, text: str) -> None:
+        calls.append(target)
+        real(target, text)
+
+    monkeypatch.setattr("schema.fsio.atomic_write_text", spy)
+    path = tmp_path / ".state.yaml"
+    save_state(path, OperationalState(sha256="a" * 64))
+    assert calls == [path]
+    assert load_state(path).sha256 == "a" * 64
+
+
 def test_load_real_vocab_nonempty() -> None:
     for name in ("doc_types", "authority", "topics", "g2ai_patterns"):
         terms = load_vocab(name)
@@ -435,3 +455,81 @@ def test_raw_target_does_not_require_existing_file(tmp_path: Path) -> None:
     target = raw_target(rec, tmp_path)
     assert not target.exists()
     assert raw_file(rec, tmp_path) is None  # папка ещё пуста
+
+
+# --- check_layout: единый источник инвариантов раскладки (raise в load_records, collect в validate) ---
+
+
+def test_check_layout_clean_returns_empty(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    meta_path = tmp_path / rec.track.value / rec.entity_id / rec.id / "meta.yaml"
+    assert check_layout(meta_path, rec, set()) == []
+
+
+def test_check_layout_folder_name_mismatch(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    meta_path = tmp_path / rec.track.value / rec.entity_id / "wrong-folder-name" / "meta.yaml"
+    errors = check_layout(meta_path, rec, set())
+    assert any("!= id" in e for e in errors)
+
+
+def test_check_layout_entity_folder_mismatch(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    meta_path = tmp_path / rec.track.value / "wrong-entity" / rec.id / "meta.yaml"
+    errors = check_layout(meta_path, rec, set())
+    assert any("entity_id" in e for e in errors)
+
+
+def test_check_layout_track_folder_mismatch(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    meta_path = tmp_path / "wrong-track" / rec.entity_id / rec.id / "meta.yaml"
+    errors = check_layout(meta_path, rec, set())
+    assert any("track" in e for e in errors)
+
+
+def test_check_layout_duplicate_id(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    meta_path = tmp_path / rec.track.value / rec.entity_id / rec.id / "meta.yaml"
+    errors = check_layout(meta_path, rec, {rec.id})  # id уже "видели"
+    assert any("дубль id" in e for e in errors)
+
+
+def test_check_layout_does_not_mutate_seen_ids(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    meta_path = tmp_path / rec.track.value / rec.entity_id / rec.id / "meta.yaml"
+    seen: set[str] = set()
+    check_layout(meta_path, rec, seen)
+    assert seen == set()  # регистрация id — забота вызывающей стороны, не check_layout
+
+
+def test_load_records_collects_documents_sorted_by_id(tmp_path: Path) -> None:
+    a = valid_record()
+    a["id"], a["entity_id"] = "zz-later-doc-2026", "zz"
+    b = valid_record()
+    b["id"], b["entity_id"] = "aa-earlier-doc-2026", "aa"
+    write_doc(tmp_path, a)
+    write_doc(tmp_path, b)
+    records = load_records(tmp_path)
+    assert [r.id for r in records] == ["aa-earlier-doc-2026", "zz-later-doc-2026"]
+
+
+def test_load_records_raises_on_folder_invariant_violation(tmp_path: Path) -> None:
+    rec = valid_record()
+    d = tmp_path / rec["track"] / "WRONG" / rec["id"]  # папка сущности != entity_id
+    d.mkdir(parents=True)
+    import yaml as _yaml
+
+    (d / "meta.yaml").write_text(_yaml.safe_dump(rec, allow_unicode=True), encoding="utf-8")
+    with pytest.raises(ValueError, match="entity_id"):
+        load_records(tmp_path)
+
+
+def test_load_records_raises_on_duplicate_id(tmp_path: Path) -> None:
+    a = valid_record()
+    a["entity_id"] = "e1"
+    b = valid_record()
+    b["entity_id"] = "e2"  # тот же id, другая сущность (папка)
+    write_doc(tmp_path, a)
+    write_doc(tmp_path, b)
+    with pytest.raises(ValueError, match="дубль id"):
+        load_records(tmp_path)

@@ -25,10 +25,10 @@ from typing import Any
 import networkx as nx
 import yaml
 
-from schema import GeoScope, SourceRecord, load_records
-from validate_sources import DEFAULT_SOURCES, validate_sources
+from schema import VOCAB_DIR, DEFAULT_SOURCES, GeoScope, SourceRecord
+from validate_sources import validate_sources
 
-JURISDICTIONS_PATH = Path(__file__).resolve().parent.parent / "vocab" / "jurisdictions.yaml"
+JURISDICTIONS_PATH = VOCAB_DIR / "jurisdictions.yaml"
 
 
 # --- идентификаторы узлов: префикс по типу, чтобы id разных типов не сталкивались ---
@@ -191,18 +191,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     sources_path: Path = args.sources
-    if not sources_path.exists():
-        print(f"файл не найден: {sources_path}", file=sys.stderr)
-        return 2
 
-    errors = validate_sources(sources_path)
+    errors, records = validate_sources(sources_path)
     if errors:
         print("реестр невалиден — сначала исправьте (validate_sources.py):", file=sys.stderr)
         for err in errors:
             print(f"  {err}", file=sys.stderr)
         return 1
 
-    graph = build_graph(load_records(sources_path), load_jurisdictions())
+    graph = build_graph(records, load_jurisdictions())
     print(summary(graph))
 
     # примеры запросов
