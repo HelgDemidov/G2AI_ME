@@ -19,7 +19,7 @@ from pathlib import Path
 from corpus_index import DEFAULT_DB
 from embed import Embedder, get_embedder
 from env import load_dotenv
-from vector_store import chunk_texts, semantic_search, store_vectors
+from vector_store import chunk_hashes, semantic_search, store_vectors
 
 
 @dataclass(frozen=True)
@@ -71,12 +71,14 @@ def hit_at_k(ranked_texts: list[str], expect: tuple[str, ...], k: int) -> bool:
 def evaluate(
     conn: sqlite3.Connection,
     embedder: Embedder,
-    ids: list[int],
+    hashes: list[str],
     texts: list[str],
     queries: list[ControlQuery],
     k: int = 3,
 ) -> ModelResult:
-    store_vectors(conn, ids, embedder.embed(texts), embedder.name)
+    # Бенч эмбеддит ПОЛНУЮ матрицу хэшей корпуса на модель (не инкремент — сравнение
+    # моделей); store_vectors ключуется content_hash (spec index-incremental §3a).
+    store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
     outcomes: list[QueryOutcome] = []
     for cq in queries:
         query_vec = embedder.embed([cq.query])
@@ -127,14 +129,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     load_dotenv()
     conn = sqlite3.connect(args.db)
-    ids, texts = chunk_texts(conn)
-    if not ids:
+    hashes, texts = chunk_hashes(conn)  # уникальные хэши корпуса — полная матрица на модель
+    if not hashes:
         print("нет чанков в БД", file=sys.stderr)
         return 2
 
     results: list[ModelResult] = []
     print(f"Локальный bge-m3: эмбеддинг {len(texts)} чанков + {len(CONTROL_QUERIES)} запросов…")
-    results.append(evaluate(conn, get_embedder("bge"), ids, texts, CONTROL_QUERIES, args.k))
+    results.append(evaluate(conn, get_embedder("bge"), hashes, texts, CONTROL_QUERIES, args.k))
 
     if not args.no_reference:
         try:
@@ -143,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nэталон пропущен: {exc}", file=sys.stderr)
         else:
             print(f"Эталон {args.reference_model} через OpenRouter…")
-            results.append(evaluate(conn, ref, ids, texts, CONTROL_QUERIES, args.k))
+            results.append(evaluate(conn, ref, hashes, texts, CONTROL_QUERIES, args.k))
 
     conn.close()
     _report(results, args.k)

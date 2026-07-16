@@ -9,7 +9,7 @@
   doc_state(doc_id, fingerprint) — per-doc отпечаток проиндексированного doc.md;
     инкрементальная переиндексация трогает только изменившиеся документы.
   index_meta(key, value) — ключ-значение: corpus_fingerprint/chunk_max_tokens/
-    schema_version (пишет этот модуль), vectors_fingerprint:<model> (пишет vector_store).
+    schema_version (пишет этот модуль).
 
 CLI: собрать индекс из ``doc.md`` корпуса (записи — обход ``sources/**/meta.yaml``,
 пути выводятся из папок-документов) и/или искать.
@@ -196,12 +196,12 @@ def index_chunks(
 ) -> None:
     """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно).
 
-    Пересборка чанков делает ЛЮБЫЕ существующие векторы (всех моделей) невалидными:
-    таблица ``chunks`` без ``AUTOINCREMENT`` переиспользует ``chunk_id`` заново, и
-    старый вектор молча привязался бы к ЧУЖОМУ тексту нового поколения. Векторная
-    таблица дропается целиком — стоп-гэп до content-hash-инкрементальности
-    (``index-incremental``, там векторы перестанут гибнуть вовсе);
-    ``vector_store.ensure_schema`` пересоздаст её при следующем ``embed-corpus``.
+    Векторы (``vector_store``) НЕ трогаются: они ключуются ``content_hash``, а не
+    ``chunk_id``, поэтому переживают пересборку — неизменившийся текст даёт тот же
+    хэш и тот же валидный вектор; осиротевшие (текст исчез) подчистит ``gc_vectors``
+    при следующем ``embed-corpus``. Стоп-гэп «DROP vectors при любой пересборке»
+    (index-consistency §3) упразднён — вектор физически не может указать на чужой
+    текст (spec index-incremental §3).
 
     ``corpus_fingerprint``/``chunk_max_tokens``, если переданы, пишутся в
     ``index_meta`` АТОМАРНО с чанками — в одном ``conn.commit()``. На этом
@@ -212,9 +212,7 @@ def index_chunks(
     сверяет его с лимитом эмбеддера перед ``embed-corpus`` (см. spec
     index-consistency §6: инвариант «чанк целиком видим обоим поискам»).
     """
-    conn.execute("DROP TABLE IF EXISTS vectors")
     conn.execute(_META_SCHEMA)  # defensive — index_meta может не существовать без create_db
-    conn.execute("DELETE FROM index_meta WHERE key LIKE 'vectors_fingerprint:%'")
     conn.execute("DELETE FROM chunks")
     conn.executemany(
         "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash) "

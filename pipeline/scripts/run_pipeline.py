@@ -355,10 +355,12 @@ def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, force: bool
     if embed:
         embedder = get_embedder("bge")
         conn = sqlite3.connect(db_path)
-        ids, texts = vector_store.chunk_texts(conn)
-        vector_store.store_vectors(conn, ids, embedder.embed(texts), embedder.name)
+        hashes, texts = vector_store.chunk_hashes(conn, not_embedded_for=embedder.name)
+        if hashes:  # эмбеддим только НОВЫЕ хэши (правка 1 документа != пере-embed всего корпуса)
+            vector_store.store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
+        removed = vector_store.gc_vectors(conn, embedder.name)
         conn.close()
-        status += f"; векторы: {len(ids)} ({embedder.name})"
+        status += f"; векторы: +{len(hashes)} ({embedder.name}), GC {removed}"
     return status
 
 
