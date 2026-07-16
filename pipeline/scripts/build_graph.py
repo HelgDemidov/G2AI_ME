@@ -25,7 +25,7 @@ from typing import Any
 import networkx as nx
 import yaml
 
-from schema import GeoScope, SourceRecord, load_records
+from schema import GeoScope, SourceRecord
 from validate_sources import DEFAULT_SOURCES, validate_sources
 
 JURISDICTIONS_PATH = Path(__file__).resolve().parent.parent / "vocab" / "jurisdictions.yaml"
@@ -195,14 +195,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"файл не найден: {sources_path}", file=sys.stderr)
         return 2
 
-    errors = validate_sources(sources_path)
+    errors, records = validate_sources(sources_path)
     if errors:
         print("реестр невалиден — сначала исправьте (validate_sources.py):", file=sys.stderr)
         for err in errors:
             print(f"  {err}", file=sys.stderr)
         return 1
 
-    graph = build_graph(load_records(sources_path), load_jurisdictions())
+    graph = build_graph(records, load_jurisdictions())
     print(summary(graph))
 
     # примеры запросов

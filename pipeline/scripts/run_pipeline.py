@@ -423,14 +423,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     # quality-gate: реестр обязан быть валиден (пустой/несуществующий корень — валиден)
-    errors = validate_sources.validate_sources(args.sources)
+    errors, records = validate_sources.validate_sources(args.sources)
     if errors:
         logger.error("реестр невалиден (%d) — исправьте перед прогоном:", len(errors))
         for err in errors:
             logger.error("  %s", err)
         return 1
 
-    records = schema.load_records(args.sources)
     if args.only:
         records = [r for r in records if r.id == args.only]
         if not records:
