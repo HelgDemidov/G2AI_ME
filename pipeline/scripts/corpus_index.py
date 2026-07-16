@@ -117,14 +117,25 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def index_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
-    """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно)."""
+def index_chunks(
+    conn: sqlite3.Connection, chunks: list[Chunk], *, corpus_fingerprint: str | None = None
+) -> None:
+    """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно).
+
+    ``corpus_fingerprint``, если передан, пишется в ``index_meta`` АТОМАРНО с
+    чанками — в одном ``conn.commit()``. На этом полагается реконсиляция
+    пересборки в ``run_pipeline``: крах между шагами оставляет старый (или
+    отсутствующий) отпечаток, следующий прогон честно пересоберёт —
+    самовосстановление по построению, без отдельного флага/статуса.
+    """
     conn.execute("DELETE FROM chunks")
     conn.executemany(
         "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens) VALUES (?, ?, ?, ?)",
         [(c.doc_id, c.index, c.text, c.n_tokens) for c in chunks],
     )
     conn.execute("INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild')")
+    if corpus_fingerprint is not None:
+        write_meta(conn, "corpus_fingerprint", corpus_fingerprint)
     conn.commit()
 
 
@@ -163,7 +174,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         return 3
     chunks = chunks_from_corpus(args.sources, token_counter(), args.max_tokens)
     conn = create_db(args.db)
-    index_chunks(conn, chunks)
+    index_chunks(conn, chunks, corpus_fingerprint=corpus_fingerprint(args.sources))
     n_docs = len({c.doc_id for c in chunks})
     print(f"Проиндексировано: {len(chunks)} чанков из {n_docs} документов -> {args.db}")
     conn.close()

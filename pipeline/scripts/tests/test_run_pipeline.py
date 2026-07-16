@@ -11,11 +11,22 @@ from typing import Any
 import pytest
 
 import acquisition
+import corpus_index
 import schema
 from acquisition import AcquisitionOutcome, ClassifiedResponse
-from run_pipeline import Stage, _compose_md, _do_download, _do_frontmatter, needed_stages, process_docs
+from run_pipeline import (
+    Stage,
+    _compose_md,
+    _do_download,
+    _do_frontmatter,
+    _needs_index_rebuild,
+    _read_index_fingerprint,
+    needed_stages,
+    process_docs,
+    rebuild_index,
+)
 from schema import SourceRecord, render_frontmatter
-from test_schema import valid_record
+from test_schema import valid_record, write_doc
 
 
 def make(**over: Any) -> SourceRecord:
@@ -91,11 +102,10 @@ def test_do_frontmatter_syncs_and_idempotent(tmp_path: Path) -> None:
 
 def test_dry_run_no_side_effects(tmp_path: Path) -> None:
     rec = make()
-    results, changed = process_docs(
+    results = process_docs(
         [rec], tmp_path,
         force=False, dry_run=True, no_download=False, pause=0,
     )
-    assert changed is False
     assert results[0].done == [Stage.download, Stage.convert, Stage.frontmatter]
     assert not schema.doc_dir(rec, tmp_path).exists()  # ничего не создано
 
@@ -105,7 +115,7 @@ def test_failure_isolation(tmp_path: Path) -> None:
     b = make(id="b-doc-2026", entity_id="bb")
     _place(b, tmp_path, raw=b"pdf", md=_compose_md(b, ""))  # b актуален
 
-    results, changed = process_docs(
+    results = process_docs(
         [a, b], tmp_path,
         force=False, dry_run=False, no_download=True, pause=0,  # a падает на download
     )
@@ -113,7 +123,6 @@ def test_failure_isolation(tmp_path: Path) -> None:
     rb = next(r for r in results if r.doc_id == "b-doc-2026")
     assert ra.error is not None and "download" in ra.error  # a упал, но не оборвал батч
     assert rb.up_to_date is True
-    assert changed is False
 
 
 def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
@@ -187,13 +196,12 @@ def test_process_docs_cleans_stale_staging_before_planning(tmp_path: Path) -> No
     doc_dir = schema.doc_dir(rec, tmp_path)
     (doc_dir / ".raw.pdf.part").write_bytes(b"stale leftover")
 
-    results, changed = process_docs(
+    results = process_docs(
         [rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0
     )
 
     assert not (doc_dir / ".raw.pdf.part").exists()
     assert results[0].up_to_date is True
-    assert changed is False
 
 
 def test_planning_failure_isolated_from_batch(tmp_path: Path) -> None:
@@ -209,7 +217,7 @@ def test_planning_failure_isolated_from_batch(tmp_path: Path) -> None:
     ok = make(id="ok-doc-2026", entity_id="oo")
     _place(ok, tmp_path, raw=b"pdf", md=_compose_md(ok, ""))  # актуален
 
-    results, changed = process_docs(
+    results = process_docs(
         [broken, ok], tmp_path, force=False, dry_run=False, no_download=False, pause=0
     )
 
@@ -217,7 +225,6 @@ def test_planning_failure_isolated_from_batch(tmp_path: Path) -> None:
     r_ok = next(r for r in results if r.doc_id == "ok-doc-2026")
     assert r_broken.error is not None and r_broken.error.startswith("planning:")
     assert r_ok.up_to_date is True  # батч не оборван
-    assert changed is False
 
 
 def test_render_frontmatter_used_in_compose(tmp_path: Path) -> None:
@@ -225,3 +232,91 @@ def test_render_frontmatter_used_in_compose(tmp_path: Path) -> None:
     composed = _compose_md(rec, "old body")
     assert composed.startswith(render_frontmatter(rec))
     assert composed.rstrip().endswith("old body")
+
+
+# --- реконсиляция пересборки индекса по fingerprint (не по in-run флагу) ---
+
+
+def _corpus_doc(root: Path, **over: Any) -> Path:
+    rec = valid_record()
+    rec.update(over)
+    return write_doc(root, rec, raw=b"pdf", md="some body text")
+
+
+def test_needs_index_rebuild_true_when_no_db(tmp_path: Path) -> None:
+    _corpus_doc(tmp_path)
+    needs, fp = _needs_index_rebuild(tmp_path, tmp_path / "nope.db", force=False)
+    assert needs is True
+    assert fp  # непустой отпечаток посчитан
+
+
+def test_needs_index_rebuild_false_when_fingerprint_matches(tmp_path: Path) -> None:
+    _corpus_doc(tmp_path)
+    db = tmp_path / "c.db"
+    conn = corpus_index.create_db(db)
+    corpus_index.write_meta(conn, "corpus_fingerprint", corpus_index.corpus_fingerprint(tmp_path))
+    conn.commit()
+    conn.close()
+
+    needs, _ = _needs_index_rebuild(tmp_path, db, force=False)
+    assert needs is False
+
+
+def test_needs_index_rebuild_true_when_corpus_changed(tmp_path: Path) -> None:
+    _corpus_doc(tmp_path)
+    db = tmp_path / "c.db"
+    conn = corpus_index.create_db(db)
+    corpus_index.write_meta(conn, "corpus_fingerprint", "stale-fingerprint-from-before")
+    conn.commit()
+    conn.close()
+
+    needs, _ = _needs_index_rebuild(tmp_path, db, force=False)
+    assert needs is True
+
+
+def test_needs_index_rebuild_true_when_force(tmp_path: Path) -> None:
+    _corpus_doc(tmp_path)
+    db = tmp_path / "c.db"
+    conn = corpus_index.create_db(db)
+    corpus_index.write_meta(conn, "corpus_fingerprint", corpus_index.corpus_fingerprint(tmp_path))
+    conn.commit()
+    conn.close()
+
+    needs, _ = _needs_index_rebuild(tmp_path, db, force=True)  # совпадает, но --force
+    assert needs is True
+
+
+def test_rebuild_index_writes_fingerprint_on_success(tmp_path: Path, monkeypatch: Any) -> None:
+    _corpus_doc(tmp_path)
+    monkeypatch.setattr("bge_tokenizer.token_counter", lambda: (lambda text: len(text.split())))
+
+    db = tmp_path / "c.db"
+    status = rebuild_index(tmp_path, db, embed=False, fingerprint="fp-123")
+
+    assert "FTS" in status
+    assert _read_index_fingerprint(db) == "fp-123"
+
+
+def test_rebuild_index_without_model_does_not_touch_existing_fingerprint(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Модель временно недоступна: rebuild_index не трогает уже существующий индекс/
+    отпечаток — следующий прогон (когда модель появится) честно доиндексирует.
+    Мокаем token_counter напрямую — реальное наличие/отсутствие bge-m3 на машине,
+    где гоняются тесты, не должно влиять на детерминизм этого теста."""
+
+    def fake_token_counter() -> Any:
+        raise FileNotFoundError("bge-m3 не найден (тест)")
+
+    monkeypatch.setattr("bge_tokenizer.token_counter", fake_token_counter)
+
+    db = tmp_path / "c.db"
+    conn = corpus_index.create_db(db)
+    corpus_index.write_meta(conn, "corpus_fingerprint", "old-fingerprint")
+    conn.commit()
+    conn.close()
+
+    status = rebuild_index(tmp_path, db, embed=False, fingerprint="new-fingerprint")
+
+    assert "пропущен" in status
+    assert _read_index_fingerprint(db) == "old-fingerprint"

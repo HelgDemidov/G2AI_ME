@@ -27,6 +27,7 @@ import datetime as _dt
 import hashlib
 import logging
 import shutil
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -220,8 +221,8 @@ def process_docs(
     pause: float,
     interactive: bool = False,
     watch_dir: Path | None = None,
-) -> tuple[list[DocResult], bool]:
-    """Прогнать документы по стадиям. Возвращает результаты и флаг «что-то изменилось».
+) -> list[DocResult]:
+    """Прогнать документы по стадиям. Возвращает результаты по каждому документу.
 
     ``interactive`` включает синхронный 1-клик watch-folder путь для manual-блоков
     (осмысленно только для одно-документных прогонов — ``main()`` включает его
@@ -231,9 +232,13 @@ def process_docs(
     не только исполнение стадий: битый ``.state.yaml`` или папка с несколькими
     ``raw.*`` (``schema.raw_file`` кидает ``ValueError``) роняют только этот
     документ, а не весь батч.
+
+    Не отслеживает «что-то изменилось» (раньше — in-run флаг ``changed``):
+    решение о пересборке индекса теперь реконсилируется по ``corpus_index.
+    corpus_fingerprint`` в ``main()`` ПОСЛЕ вызова этой функции (конвертация
+    меняет mtime ``doc.md``) — а не по эфемерному флагу, теряемому при крахе.
     """
     results: list[DocResult] = []
-    changed = False
     for rec in records:
         res = DocResult(rec.id)
         try:
@@ -267,18 +272,24 @@ def process_docs(
                     if not dry_run:
                         _do_frontmatter(rec, root)
                 res.done.append(stage)
-                if not dry_run:
-                    changed = True
             except Exception as exc:  # noqa: BLE001 — изоляция отказа документа
                 res.error = f"{stage.value}: {exc}"
                 logger.error("  ✗ %s: %s", rec.id, res.error)
                 break  # остальные стадии этого документа пропускаем
         results.append(res)
-    return results, changed
+    return results
 
 
-def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool) -> str:
-    """Пересобрать корпусный индекс: FTS5 (всегда) + векторы (если embed). Требует токенизатор bge-m3."""
+def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, fingerprint: str) -> str:
+    """Пересобрать корпусный индекс: FTS5 (всегда) + векторы (если embed). Требует
+    токенизатор bge-m3.
+
+    ``fingerprint`` — заранее посчитанный ``corpus_index.corpus_fingerprint``
+    (считается ВЫЗЫВАЮЩЕЙ стороной ПОСЛЕ ``process_docs``, т.к. конвертация меняет
+    mtime ``doc.md``); пишется в ``index_meta`` атомарно с чанками — см.
+    ``corpus_index.index_chunks``. Ветка «нет токенизатора» намеренно НЕ пишет
+    fingerprint: следующий прогон (когда модель появится) честно доиндексирует.
+    """
     from bge_tokenizer import token_counter  # ленивый импорт: модель-зависимо
 
     try:
@@ -287,19 +298,39 @@ def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool) -> str:
         return f"пропущен (нет токенизатора bge-m3: {exc})"
     chunks = corpus_index.chunks_from_corpus(sources_path, counter)
     conn = corpus_index.create_db(db_path)
-    corpus_index.index_chunks(conn, chunks)
+    corpus_index.index_chunks(conn, chunks, corpus_fingerprint=fingerprint)
     conn.close()
     status = f"FTS: {len(chunks)} чанков"
     if embed:
         embedder = get_embedder("bge")
-        import sqlite3
-
         conn = sqlite3.connect(db_path)
         ids, texts = vector_store.chunk_texts(conn)
         vector_store.store_vectors(conn, ids, embedder.embed(texts), embedder.name)
         conn.close()
         status += f"; векторы: {len(ids)} ({embedder.name})"
     return status
+
+
+def _read_index_fingerprint(db_path: Path) -> str | None:
+    """Прочитать ``corpus_fingerprint`` уже собранного индекса. ``None``, если БД
+    ещё нет (не создаём пустой файл ради чтения — ``sqlite3.connect`` иначе
+    сделал бы это сам) или ключ отсутствует (индекс собран без него/устарел)."""
+    if not db_path.exists():
+        return None
+    conn = sqlite3.connect(db_path)
+    try:
+        return corpus_index.read_meta(conn, "corpus_fingerprint")
+    finally:
+        conn.close()
+
+
+def _needs_index_rebuild(sources_path: Path, db_path: Path, *, force: bool) -> tuple[bool, str]:
+    """Решить, нужна ли пересборка индекса (реконсиляция по fingerprint, а не по
+    in-run флагу), и вернуть уже посчитанный текущий fingerprint — чтобы вызывающая
+    сторона передала его в ``rebuild_index`` без повторного пересчёта."""
+    current_fp = corpus_index.corpus_fingerprint(sources_path)
+    stored_fp = _read_index_fingerprint(db_path)
+    return (force or stored_fp != current_fp), current_fp
 
 
 def _report(results: list[DocResult]) -> int:
@@ -351,19 +382,27 @@ def main(argv: list[str] | None = None) -> int:
 
     # Синхронный manual watch-folder путь — только осмыслен для одно-документного
     # прогона (--only): пользователь реально сидит и ждёт клика (§6 спека, решение №2).
-    results, changed = process_docs(
+    results = process_docs(
         records, args.sources,
         force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
         interactive=bool(args.only), watch_dir=args.watch_dir,
     )
 
-    # корпусный индекс: пересобираем, если что-то изменилось / нет БД / --force
+    # корпусный индекс: реконсилируется по fingerprint (не по in-run флагу —
+    # краш/прерывание между конвертацией и пересборкой не должны оставлять индекс
+    # устаревшим навсегда). fp считается ПОСЛЕ process_docs — конвертация меняет
+    # mtime doc.md.
     if args.dry_run:
         logger.info("Индекс: dry-run, не трогаем")
-    elif changed or args.force or not args.db.exists():
-        logger.info("Индекс: %s", rebuild_index(args.sources, args.db, embed=args.embed))
     else:
-        logger.info("Индекс: без изменений, пересборка не нужна")
+        needs_rebuild, current_fp = _needs_index_rebuild(args.sources, args.db, force=args.force)
+        if needs_rebuild:
+            logger.info(
+                "Индекс: %s",
+                rebuild_index(args.sources, args.db, embed=args.embed, fingerprint=current_fp),
+            )
+        else:
+            logger.info("Индекс: актуален (fingerprint совпадает)")
 
     if args.graphml is not None and not args.dry_run:
         graph = build_graph.build_graph(records, build_graph.load_jurisdictions())
