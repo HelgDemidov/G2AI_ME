@@ -2,39 +2,82 @@
 
 OCR-нормализация (`_ocr_normalize`) кладёт невидимый текст-слой шрифтом GlyphLessFont,
 масштабированным под bounding-box каждого слова — считываемый `pdf_to_markdown` размер
-шрифта на таком слое шумная геометрическая подгонка, а не типографский кегль исходника,
-и детектор заголовков `pdf_to_markdown` реагирует только на размер. Поэтому его
-кластеризация на скане ненадёжна, и OCR-документ выходит из pdf_convert плоским.
+шрифта на таком слое шумная геометрическая подгонка, а не типографский кегль исходника.
+Живой полевой тест (Zakon o registraciji, ME, 2026-07-17) подтвердил это эмпирически:
+встроенная кластеризация `pdf_to_markdown` по размеру ДЕЙСТВИТЕЛЬНО что-то ловит на OCR-
+bbox (не полный шум), но с 1pt-джиттером назначает ОДНОМУ семантическому уровню («Član N»)
+то `##`, то `###` — шум geometрии, принятый алгоритмом, калиброванным на чистых цифровых
+кеглях, за два разных уровня.
 
-Этот модуль — отдельный markdown->markdown пост-проход, вызываемый ТОЛЬКО из OCR-ветки
-`_convert_pdf` (см. converters.py). Цифровой PDF-путь и `pdf_to_markdown.py` не трогаются:
-регекс-по-нумерации для цифровых PDF мы сознательно отвергли (там кластеризация по
-размеру чище), а на скане размер ненадёжен и layout-независимые сигналы надёжнее.
+Поэтому этот модуль на OCR-ветке — ЕДИНСТВЕННЫЙ источник истины по заголовкам: любая
+существующая разметка (в т.ч. от кластеризации `pdf_to_markdown`) СНИМАЕТСЯ и строка
+переоценивается заново по layout-независимым правилам ниже — не два несогласованных
+источника, а один. `pdf_to_markdown.py` при этом не трогается ни строкой (цифровой PDF-
+путь как был, так и остался на кластеризации — она там калибрована и работает чище).
 
 Precision-first (решение пользователя, спек convert-ocr v2): калибровочного скана в
-корпусе ещё нет, ложные заголовки (особенно из нумерации под-клауз закона) дали бы
-структуру ХУЖЕ честного плоского текста. Три тира по убыванию точности — при
-неоднозначности строка остаётся телом, а не промоутится вслепую.
+корпусе ещё не было при проектировании, ложные заголовки (особенно из нумерации под-
+клауз закона) дали бы структуру ХУЖЕ честного плоского текста. Три тира по убыванию
+точности — при неоднозначности строка остаётся телом, а не промоутится вслепую.
 """
 from __future__ import annotations
 
 import re
 
-HEADING_MAX_LEN = 80  # длиннее -> скорее предложение тела, чем заголовок
-CAPS_MAX_LEN = 60      # Тир 2 короче Тир 1 — CAPS-эвристика менее надёжна, требует строже
+HEADING_MAX_LEN = 80   # длиннее -> скорее предложение тела, чем заголовок
+# Было 60 — калибровка по первому реальному скану (2026-07-17): заголовок закона/указа
+# длиной 70 символов отсекался чисто по длине, ложноотрицательно. Поднято с запасом.
+CAPS_MAX_LEN = 100      # Тир 2 всё равно строже Тир 1 по остальным guard'ам (см. ниже)
 
-_TIER1_LEVEL1 = frozenset({"ANNEX", "CHAPTER", "TITLE", "PART"})
-_TIER1_LEVEL2 = frozenset({"SECTION", "ARTICLE", "APPENDIX"})
-_TIER1_LEADING_WORD = re.compile(r"^([A-Za-z]+)\b")
+# ANNEX/CHAPTER/TITLE/PART -> #; SECTION/Article/Appendix -> ##.
+# CLAN/ČLAN — региональный (Черногория/Балканы) эквивалент Article, ПОДТВЕРЖДЁН эмпирически
+# (первый реальный скан, 2026-07-17); GLAVA/PRILOG/ODJELJAK/DIO — та же законодательная
+# традиция (Chapter/Annex/Section/Part), добавлены проактивно по общеизвестной конвенции
+# южнославянского юридического drafting'а, ЕЩЁ не встречены в живом документе — если
+# ошибка (документ таки не использует конкретно этот термин как структурный) — Тир 1
+# просто не сработает на нём, ложноположительного риска для НЕ-структурных слов нет
+# (сравнение проверяет заголовок листа keyword'ов целиком, не частичное совпадение).
+_TIER1_LEVEL1 = frozenset({"ANNEX", "CHAPTER", "TITLE", "PART", "GLAVA", "PRILOG"})
+_TIER1_LEVEL2 = frozenset({"SECTION", "ARTICLE", "APPENDIX", "CLAN", "ČLAN", "ODJELJAK", "DIO"})
+
+# Unicode-буквы (НЕ только ASCII A-Za-z) — «Član» начинается с Č (U+010C, LATIN CAPITAL
+# LETTER C WITH CARON), которую [A-Za-z] не матчит вовсе (баг, найденный тем же полевым
+# тестом: Тир 1 молча не срабатывал на любом слове с диакритикой).
+_TIER1_LEADING_WORD = re.compile(r"^([^\W\d_]+)", re.UNICODE)
+
+# «Član3 1» -> «Član 31»: OCR на сканах систематически (не единично — 5 из ~48 статей
+# этого документа) роняет пробел между keyword и первой цифрой номера, а между двумя
+# цифрами самого номера — наоборот, вставляет лишний (шум individual-bbox между соседними
+# символами). Реджойн вызывается ТОЛЬКО из _tier1_heading — то есть ТОЛЬКО когда keyword
+# уже подтверждён — не общий текстовый паттерн «слово+цифра» по всему телу документа.
+# d1 <= 3 цифр (номера статей вплоть до тройной значности), d2 — ровно одна цифра
+# (наблюдаемый паттерн — оторвался последний разряд, не производный самостоятельный номер).
+_GLUED_NUMBER_RE = re.compile(r"^([^\W\d_]+)(\d{1,3})(?:\s+(\d))?\s*(.*)$", re.DOTALL)
 
 _TIER3_NUMBERING = re.compile(r"^(\d+)(\.(\d+))?\.?\s+(.+)$")
 
+_EXISTING_HEADING_RE = re.compile(r"^#{1,6}\s+")
+
+
+def _degrue_leading_number(stripped: str) -> str:
+    """Восстановить «keyword N» из OCR-расклеенного «keywordD [D]» (см. _GLUED_NUMBER_RE).
+
+    No-op на уже чистых заголовках («Član 19 ...») — маска требует, чтобы цифра шла
+    СРАЗУ за keyword без пробела, иначе не матчит вовсе."""
+    m = _GLUED_NUMBER_RE.match(stripped)
+    if not m:
+        return stripped
+    word, d1, d2, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+    number = d1 + d2 if d2 else d1
+    return f"{word} {number}" + (f" {rest}" if rest else "")
+
 
 def _tier1_heading(stripped: str) -> str | None:
-    """ANNEX/CHAPTER/TITLE/PART -> #; SECTION/Article/Appendix -> ##.
+    """ANNEX/CHAPTER/TITLE/PART/GLAVA/PRILOG -> #; SECTION/Article/Appendix/ČLAN/ODJELJAK/DIO -> ##.
 
     Guard против тела-предложения («Article 6 shall apply to…»): короче HEADING_MAX_LEN
-    И не оканчивается точкой/точкой-с-запятой.
+    И не оканчивается точкой/точкой-с-запятой. Восстанавливает OCR-расклеенный номер
+    (см. _degrue_leading_number) ПОСЛЕ подтверждения keyword'а.
     """
     if len(stripped) >= HEADING_MAX_LEN or stripped.endswith((".", ";")):
         return None
@@ -43,9 +86,9 @@ def _tier1_heading(stripped: str) -> str | None:
         return None
     word = m.group(1).upper()
     if word in _TIER1_LEVEL1:
-        return f"# {stripped}"
+        return f"# {_degrue_leading_number(stripped)}"
     if word in _TIER1_LEVEL2:
-        return f"## {stripped}"
+        return f"## {_degrue_leading_number(stripped)}"
     return None
 
 
@@ -108,15 +151,18 @@ def _next_nonblank(lines: list[str], i: int) -> str:
 def promote_flat_headings(md: str) -> str:
     """Восстановить высокоуверенный скелет заголовков в плоском OCR-markdown.
 
-    Строки, уже начинающиеся с `#`, не трогаются. При неоднозначности — строка
-    остаётся как есть (precision-first). Идемпотентно: промоутнутая строка (уже с
-    `#`-префиксом) на повторном прогоне снова пропускается тем же инвариантом.
+    Существующая разметка (`#`-префикс от кластеризации `pdf_to_markdown` по размеру
+    шрифта — на OCR bbox ненадёжна, см. docstring модуля) СНИМАЕТСЯ, строка оценивается
+    заново тремя тирами ниже — единый источник истины вместо двух несогласованных.
+    При неоднозначности — строка остаётся телом (precision-first). Идемпотентно: на
+    повторном прогоне уже промоутнутая (моими же правилами) строка снова даёт тот же
+    результат — тиры детерминированы по содержимому, не по факту наличия `#`.
     """
     lines = md.split("\n")
     out: list[str] = []
     for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        stripped = _EXISTING_HEADING_RE.sub("", line.strip(), count=1)
+        if not stripped:
             out.append(line)
             continue
         next_line = _next_nonblank(lines, i)
@@ -125,5 +171,5 @@ def promote_flat_headings(md: str) -> str:
             or _tier2_heading(stripped, next_line)
             or _tier3_heading(stripped, next_line)
         )
-        out.append(heading if heading is not None else line)
+        out.append(heading if heading is not None else stripped)
     return "\n".join(out)
