@@ -1,0 +1,16 @@
+# Контрольные запросы A/B-харнесса качества retrieval (ab_eval.py, spec analyze-retrieval §6).
+# Перефразировки без буквального совпадения слов — hit@k проверяет семантическое
+# попадание, не keyword-match. Правится вручную; трекается в git (тела документов
+# корпуса — нет, только сами запросы и ожидаемые термины).
+queries:
+  - query: "who is accountable when an autonomous agent makes a harmful decision"
+    expect: ["account", "responsib"]
+    note: "SG agentic framework"
+  - query: "how should AI agents be tested before they are deployed"
+    expect: ["test"]
+  - query: "restricting which tools and permissions an agent is allowed to use"
+    expect: ["permission", "tool"]
+  - query: "keeping a human overseeing the agent's actions"
+    expect: ["oversight", "human"]
+  - query: "monitoring agent behaviour after it is deployed"
+    expect: ["monitor"]
