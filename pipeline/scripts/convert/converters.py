@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +17,7 @@ import pdfplumber
 
 from convert import eli
 from convert.pdf_to_markdown import convert as pdf_convert
+from core import fsio
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +93,77 @@ def _tesseract_langs(language: str | None) -> str:
     return f"{mapped}+eng"
 
 
+OCR_TIMEOUT = 7200      # 2 ч — потолок для ~200-страничного скана на i5-6200U
+OCR_PAGE_WARN = 200     # страниц > порога -> лог оценки времени до запуска
+_OCR_STDERR_TAIL = 500  # символов stderr в ConversionError — достаточно для диагноза
+
+
+def _check_langs_available(langs: str) -> None:
+    """tesseract --list-langs -> ConversionError с apt-командой, если traineddata нет.
+
+    Проверяется ДО (потенциально долгого) ocrmypdf — быстрый честный отказ вместо
+    невнятной ошибки из недр ocrmypdf/tesseract.
+    """
+    result = subprocess.run(
+        ["tesseract", "--list-langs"], check=False, capture_output=True, text=True
+    )
+    installed = set(result.stdout.splitlines()[1:])  # первая строка — заголовок списка
+    missing = [code for code in langs.split("+") if code not in installed]
+    if missing:
+        apt_pkgs = " ".join(f"tesseract-ocr-{code.replace('_', '-')}" for code in missing)
+        raise ConversionError(f"нет traineddata для {', '.join(missing)} — sudo apt install {apt_pkgs}")
+
+
+def _ocr_normalize(raw: Path, language: str | None) -> Path:
+    """Нормализовать скан в PDF с невидимым текст-слоем (кэш `.ocr.pdf` рядом с raw).
+
+    Вызывается только из OCR-ветки `_convert_pdf` (после `NeedsOCR` от `_detect_scan`).
+    Кэш — по mtime: OCR 50 стр. на 2 ядрах ≈ десятки минут, повторный прогон реконсиляции
+    не должен его платить дважды.
+    """
+    cached = raw.parent / ".ocr.pdf"
+    if cached.exists() and cached.stat().st_mtime >= raw.stat().st_mtime:
+        return cached
+
+    if shutil.which("ocrmypdf") is None:
+        raise NeedsOCR(
+            f"{raw.name}: ocrmypdf не установлен — sudo apt install ocrmypdf "
+            f"tesseract-ocr-srp-latn tesseract-ocr-est"
+        )
+
+    langs = _tesseract_langs(language)
+    _check_langs_available(langs)
+
+    with pdfplumber.open(raw) as pdf:
+        n = len(pdf.pages)
+    if n > OCR_PAGE_WARN:
+        logger.warning(
+            "%s: %d страниц — OCR займёт ориентировочно %d–%d мин",
+            raw.name, n, n * 20 // 60, n * 40 // 60,
+        )
+
+    staging = fsio.staging_path(cached)
+    result = subprocess.run(
+        [
+            "ocrmypdf", "--skip-text", "-l", langs, "--output-type", "pdf", "--quiet",
+            str(raw), str(staging),
+        ],
+        check=False, capture_output=True, text=True, timeout=OCR_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise ConversionError(
+            f"{raw.name}: ocrmypdf завершился с кодом {result.returncode}: "
+            f"{result.stderr[-_OCR_STDERR_TAIL:]}"
+        )
+    staging.replace(cached)
+    return cached
+
+
 def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
-    _detect_scan(raw)
+    try:
+        _detect_scan(raw)
+    except NeedsOCR:
+        raw = _ocr_normalize(raw, language)   # скан -> .ocr.pdf с текст-слоем
     pdf_convert(str(raw), str(out))  # существующий конвертер, без изменений
 
 
@@ -114,7 +186,7 @@ def _convert_html(raw: Path, out: Path, language: str | None) -> None:
 
 
 _CONVERTERS: dict[str, Converter] = {
-    "pdf": Converter("pdf", "2", _convert_pdf),  # v2: графика-пасс (spec convert-graphics)
+    "pdf": Converter("pdf", "3", _convert_pdf),  # v3: OCR-нормализация сканов (spec convert-ocr)
     "html": Converter("html", "1", _convert_html),
 }
 

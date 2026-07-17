@@ -1,6 +1,9 @@
 """Тесты реестра конвертеров: resolve_converter, детекция скана (_detect_scan)."""
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +13,11 @@ from convert.converters import (
     ConversionError,
     NeedsOCR,
     UnsupportedFormat,
+    _check_langs_available,
     _convert_html,
     _convert_pdf,
     _detect_scan,
+    _ocr_normalize,
     _tesseract_langs,
     resolve_converter,
 )
@@ -140,6 +145,18 @@ def _patch_open(monkeypatch: Any, pages: list[Any]) -> None:
     monkeypatch.setattr("convert.converters.pdfplumber.open", lambda path: _FakePdf(pages))
 
 
+def _touch_after(target: Path, reference: Path) -> None:
+    """Выставить mtime target заведомо позже reference (для проверки кэш-свежести)."""
+    ref_mtime = reference.stat().st_mtime
+    os.utime(target, (ref_mtime + 10, ref_mtime + 10))
+
+
+def _touch_before(target: Path, reference: Path) -> None:
+    """Выставить mtime target заведомо раньше reference (для проверки протухшего кэша)."""
+    ref_mtime = reference.stat().st_mtime
+    os.utime(target, (ref_mtime - 10, ref_mtime - 10))
+
+
 def test_detect_scan_raises_when_all_pages_empty(monkeypatch: Any, tmp_path: Path) -> None:
     _patch_open(monkeypatch, [_FakePage(""), _FakePage(""), _FakePage("")])
     with pytest.raises(NeedsOCR, match="0/3"):
@@ -179,14 +196,132 @@ def test_convert_pdf_calls_pdf_convert_only_after_scan_check(monkeypatch: Any, t
     assert calls == ["pdf_convert"]
 
 
-def test_convert_pdf_propagates_needs_ocr_without_calling_pdf_convert(
+def test_convert_pdf_routes_scan_through_ocr_normalize(monkeypatch: Any, tmp_path: Path) -> None:
+    """С convert-ocr NeedsOCR больше не пропагируется наружу — скан идёт через
+    _ocr_normalize, а pdf_convert затем вызывается на её результате."""
+    _patch_open(monkeypatch, [_FakePage(""), _FakePage("")])
+    ocr_result = tmp_path / ".ocr.pdf"
+    ocr_result.write_bytes(b"fake ocr-normalized pdf")
+
+    normalize_calls: list[tuple[Path, str | None]] = []
+
+    def fake_normalize(raw: Path, language: str | None) -> Path:
+        normalize_calls.append((raw, language))
+        return ocr_result
+
+    monkeypatch.setattr("convert.converters._ocr_normalize", fake_normalize)
+    convert_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "convert.converters.pdf_convert",
+        lambda src, dst: convert_calls.append((src, dst)),
+    )
+    out = tmp_path / "out.md"
+    _convert_pdf(tmp_path / "raw.pdf", out, "en")
+    assert normalize_calls == [(tmp_path / "raw.pdf", "en")]
+    assert convert_calls == [(str(ocr_result), str(out))]
+
+
+# --- _check_langs_available / _ocr_normalize ---
+
+
+def test_check_langs_available_all_present(monkeypatch: Any) -> None:
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout="List of available languages (3):\neng\nsrp_latn\nest\n", stderr="",
+    )
+    monkeypatch.setattr("convert.converters.subprocess.run", lambda *a, **kw: fake)
+    _check_langs_available("srp_latn+eng")  # не бросает
+
+
+def test_check_langs_available_missing_raises_with_apt_command(monkeypatch: Any) -> None:
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="List of available languages (1):\neng\n", stderr=""
+    )
+    monkeypatch.setattr("convert.converters.subprocess.run", lambda *a, **kw: fake)
+    with pytest.raises(ConversionError, match="tesseract-ocr-chi-sim"):
+        _check_langs_available("chi_sim")
+
+
+def test_ocr_normalize_missing_binary_raises_needs_ocr_with_apt_command(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
-    _patch_open(monkeypatch, [_FakePage(""), _FakePage("")])
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: None)
+    with pytest.raises(NeedsOCR, match="apt install ocrmypdf"):
+        _ocr_normalize(raw, "en")
 
-    def fail_if_called(src: str, dst: str) -> None:
-        raise AssertionError("pdf_convert не должен вызываться на скане")
 
-    monkeypatch.setattr("convert.converters.pdf_convert", fail_if_called)
-    with pytest.raises(NeedsOCR):
-        _convert_pdf(tmp_path / "raw.pdf", tmp_path / "out.md", "en")
+def test_ocr_normalize_uses_fresh_cache_without_subprocess(monkeypatch: Any, tmp_path: Path) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 fake")
+    cached = tmp_path / ".ocr.pdf"
+    cached.write_bytes(b"%PDF-1.4 cached")
+    _touch_after(cached, raw)  # кэш заведомо свежее raw
+
+    def fail_if_called(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("subprocess не должен вызываться при свежем кэше")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fail_if_called)
+    assert _ocr_normalize(raw, "en") == cached
+
+
+def test_ocr_normalize_stale_cache_triggers_ocr(monkeypatch: Any, tmp_path: Path) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 fake")
+    cached = tmp_path / ".ocr.pdf"
+    cached.write_bytes(b"stale")
+    _touch_before(cached, raw)  # кэш старее raw -> протух
+
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    _patch_open(monkeypatch, [_FakePage("")])
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"%PDF-1.4 ocr result")  # ocrmypdf пишет staging
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+    result = _ocr_normalize(raw, "en")
+    assert calls  # subprocess реально вызван
+    assert result == cached
+    assert cached.read_bytes() == b"%PDF-1.4 ocr result"
+
+
+def test_ocr_normalize_nonzero_exit_raises_conversion_error_with_stderr_tail(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    _patch_open(monkeypatch, [_FakePage("")])
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="boom: bad scan")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+    with pytest.raises(ConversionError, match="boom: bad scan"):
+        _ocr_normalize(raw, "en")
+
+
+def test_ocr_normalize_warns_on_large_page_count(
+    monkeypatch: Any, tmp_path: Path, caplog: Any
+) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    _patch_open(monkeypatch, [_FakePage("")] * 250)  # > OCR_PAGE_WARN
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        Path(cmd[-1]).write_bytes(b"ocr result")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+    with caplog.at_level(logging.WARNING):
+        _ocr_normalize(raw, "en")
+    assert "250" in caplog.text
