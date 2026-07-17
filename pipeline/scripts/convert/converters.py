@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pdfplumber
 
-from convert import eli
+from convert import eli, ocr_headings
 from convert.pdf_to_markdown import convert as pdf_convert
 from core import fsio
 
@@ -160,11 +160,18 @@ def _ocr_normalize(raw: Path, language: str | None) -> Path:
 
 
 def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
+    scanned = False
     try:
         _detect_scan(raw)
     except NeedsOCR:
         raw = _ocr_normalize(raw, language)   # скан -> .ocr.pdf с текст-слоем
+        scanned = True
     pdf_convert(str(raw), str(out))  # существующий конвертер, без изменений
+    if scanned:  # только OCR-ветка: цифровой путь не трогаем (размер-кластеризация там чище)
+        out.write_text(
+            ocr_headings.promote_flat_headings(out.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
 
 
 def _convert_html(raw: Path, out: Path, language: str | None) -> None:

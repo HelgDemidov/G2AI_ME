@@ -198,7 +198,8 @@ def test_convert_pdf_calls_pdf_convert_only_after_scan_check(monkeypatch: Any, t
 
 def test_convert_pdf_routes_scan_through_ocr_normalize(monkeypatch: Any, tmp_path: Path) -> None:
     """С convert-ocr NeedsOCR больше не пропагируется наружу — скан идёт через
-    _ocr_normalize, а pdf_convert затем вызывается на её результате."""
+    _ocr_normalize, а pdf_convert затем вызывается на её результате, и вывод проходит
+    post-проход ocr_headings (только OCR-ветка)."""
     _patch_open(monkeypatch, [_FakePage(""), _FakePage("")])
     ocr_result = tmp_path / ".ocr.pdf"
     ocr_result.write_bytes(b"fake ocr-normalized pdf")
@@ -211,14 +212,33 @@ def test_convert_pdf_routes_scan_through_ocr_normalize(monkeypatch: Any, tmp_pat
 
     monkeypatch.setattr("convert.converters._ocr_normalize", fake_normalize)
     convert_calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        "convert.converters.pdf_convert",
-        lambda src, dst: convert_calls.append((src, dst)),
-    )
+
+    def fake_pdf_convert(src: str, dst: str) -> None:
+        convert_calls.append((src, dst))
+        Path(dst).write_text("ANNEX I\nSome body text.\n", encoding="utf-8")
+
+    monkeypatch.setattr("convert.converters.pdf_convert", fake_pdf_convert)
     out = tmp_path / "out.md"
     _convert_pdf(tmp_path / "raw.pdf", out, "en")
     assert normalize_calls == [(tmp_path / "raw.pdf", "en")]
     assert convert_calls == [(str(ocr_result), str(out))]
+    assert out.read_text(encoding="utf-8") == "# ANNEX I\nSome body text.\n"  # ocr_headings применён
+
+
+def test_convert_pdf_digital_path_skips_ocr_headings_postprocessing(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Цифровой путь (текст-слой есть) НЕ проходит ocr_headings — во избежание
+    регресса калиброванной размер-кластеризации pdf_to_markdown (Сингапур/Эстония)."""
+    _patch_open(monkeypatch, [_FakePage("x" * 60)])  # текст есть — не скан
+
+    def fake_pdf_convert(src: str, dst: str) -> None:
+        Path(dst).write_text("ANNEX I\nSome body text.\n", encoding="utf-8")
+
+    monkeypatch.setattr("convert.converters.pdf_convert", fake_pdf_convert)
+    out = tmp_path / "out.md"
+    _convert_pdf(tmp_path / "raw.pdf", out, "en")
+    assert out.read_text(encoding="utf-8") == "ANNEX I\nSome body text.\n"  # без изменений
 
 
 # --- _check_langs_available / _ocr_normalize ---
