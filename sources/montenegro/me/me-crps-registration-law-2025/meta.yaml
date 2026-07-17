@@ -42,7 +42,12 @@ relevance:
     by text (doc.md, OCR path) — all 48 articles present, structure intact (VIII
     sections), readable Montenegrin despite OCR noise typical of a scanned gazette
     issue; also served as the first real-scan field test of convert-ocr (spec,
-    PR14), which surfaced and fixed a genuine bug in ocr_headings' next-line
-    lookahead (blank paragraph separators were defeating Tier 2/3 guards).
+    PR14), across two rounds of fixes it surfaced — (1) ocr_headings' next-line
+    lookahead (blank paragraph separators were defeating Tier 2/3 guards), (2)
+    one-PDF-file architecture (raw mutated in-place instead of a .ocr.pdf sidecar,
+    with an ocrmypdf-metadata marker so reconversion still re-applies heading
+    restoration), (3) Unicode-aware regional keywords (Član/Clan) + OCR-glued-
+    number rejoin + CAPS-length recalibration, unifying heading levels that used
+    to disagree between pdf_to_markdown's own size clustering and ocr_headings.
   assessed_date: '2026-07-17'
 in_force: true
