@@ -200,6 +200,33 @@ def test_do_convert_writes_converter_name_and_version_to_state(tmp_path: Path, m
     assert (state.converter_name, state.converter_version) == ("pdf", "7")
 
 
+def test_do_convert_refreshes_sha256_when_converter_mutates_raw_in_place(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """convert-ocr (2026-07-17): OCR-нормализация мутирует raw.pdf IN-PLACE (один файл,
+    без сайдкара .ocr.pdf) — _do_convert обязан пересчитать sha256/размер/mtime ПОСЛЕ
+    конвертации, иначе следующий stat-guard (needed_stages) увидит расхождение со
+    старой записью и решит, что raw «повреждён», затребовав передобычу."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"original scanned bytes")
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        raw.write_bytes(b"ocr-normalized bytes, different content")  # имитирует _ocr_normalize
+        dst.write_text("body", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    _do_convert(rec, tmp_path)
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.sha256 == _sha256(raw)
+    assert state.raw_size == raw.stat().st_size
+    assert state.raw_mtime_ns == raw.stat().st_mtime_ns
+    # реконсиляция после мутации не должна ложно требовать передобычу
+    assert Stage.download not in needed_stages(rec, tmp_path)
+
+
 def test_do_convert_passes_record_language_to_converter(tmp_path: Path, monkeypatch: Any) -> None:
     rec = make(language="et")
     _place(rec, tmp_path, raw=b"pdf")
