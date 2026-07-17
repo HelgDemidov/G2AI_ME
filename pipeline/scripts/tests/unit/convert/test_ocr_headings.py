@@ -115,3 +115,39 @@ def test_ordinary_prose_untouched() -> None:
 
 def test_empty_string_untouched() -> None:
     assert promote_flat_headings("") == ""
+
+
+# --- Регресс: реальный markdown-вывод разделяет абзацы ПУСТОЙ строкой (pdf_to_markdown/
+# OCR-путь всегда так форматирует, см. golden-документы) — Тир 2/3 должны видеть следующий
+# АБЗАЦ, а не буквально следующую строку массива (которая почти всегда пустой разделитель).
+# Баг найден живым полевым тестом на реальном скане (Zakon o registraciji, MNE, 2026-07-17):
+# каждый Тир 2/3 кандидат имел next_line="" из-за пустой строки-разделителя и не промоутился.
+
+
+def test_tier2_fires_with_blank_paragraph_separator() -> None:
+    text = "I. OSNOVNE ODREDBE\n\nPredmet Clan 1 Ovim zakonom uređuje se nešto.\n"
+    out = promote_flat_headings(text)
+    assert out.startswith("## I. OSNOVNE ODREDBE\n\n")
+
+
+def test_tier3_fires_with_blank_paragraph_separator() -> None:
+    text = "1.1 Scope\n\nThis section defines the scope of application.\n"
+    out = promote_flat_headings(text)
+    assert out.startswith("### 1.1 Scope\n\n")
+
+
+def test_tier2_still_rejects_when_no_body_at_all_after_blanks() -> None:
+    """Guard «нет тела следом» должен по-прежнему работать — просто искать нужно
+    сквозь пустые строки, а не путать их с отсутствием тела."""
+    text = "GENERAL PROVISIONS\n\n\n"
+    assert promote_flat_headings(text) == text
+
+
+def test_idempotent_double_pass_with_blank_separators() -> None:
+    """Идемпотентность должна сохраняться и на реалистичном (blank-separated) выводе,
+    не только на плотных фикстурах без пустых строк-разделителей."""
+    text = "ANNEX I\n\nGENERAL PROVISIONS\n\n1.1 Scope\n\nBody text follows.\n"
+    once = promote_flat_headings(text)
+    twice = promote_flat_headings(once)
+    assert once == twice
+    assert once == "# ANNEX I\n\n## GENERAL PROVISIONS\n\n### 1.1 Scope\n\nBody text follows.\n"

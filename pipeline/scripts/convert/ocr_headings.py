@@ -92,6 +92,19 @@ def _tier3_heading(stripped: str, next_line: str) -> str | None:
     return f"{'#' * depth} {stripped}"
 
 
+def _next_nonblank(lines: list[str], i: int) -> str:
+    """Первая непустая строка ПОСЛЕ индекса ``i``, пропуская пустые строки-разделители
+    абзацев. Реальный markdown (pdf_to_markdown/OCR-вывод) всегда разделяет абзацы
+    пустой строкой — буквальный ``lines[i + 1]`` почти всегда сама пустая строка-
+    разделитель, а не следующий абзац (баг, найденный живым полевым тестом на
+    Тир 2/3: гарды «есть тело следом» никогда не срабатывали на реальном выводе)."""
+    for candidate in lines[i + 1 :]:
+        stripped = candidate.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
 def promote_flat_headings(md: str) -> str:
     """Восстановить высокоуверенный скелет заголовков в плоском OCR-markdown.
 
@@ -100,14 +113,13 @@ def promote_flat_headings(md: str) -> str:
     `#`-префиксом) на повторном прогоне снова пропускается тем же инвариантом.
     """
     lines = md.split("\n")
-    n = len(lines)
     out: list[str] = []
     for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             out.append(line)
             continue
-        next_line = lines[i + 1].strip() if i + 1 < n else ""
+        next_line = _next_nonblank(lines, i)
         heading = (
             _tier1_heading(stripped)
             or _tier2_heading(stripped, next_line)
