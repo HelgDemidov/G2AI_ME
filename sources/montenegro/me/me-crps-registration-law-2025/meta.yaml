@@ -1,0 +1,48 @@
+# Курируемая запись документа (corpus-layout-v2). Человек — источник истины.
+# Операционное состояние — .state.yaml (локально); оригинал — raw.pdf; конвертация — doc.md.
+id: me-crps-registration-law-2025
+entity_id: me
+track: montenegro
+title: Zakon o registraciji privrednih i drugih subjekata
+issuer: Skupština Crne Gore
+issuer_type: government
+geo_scope: national
+language: cnr
+dates:
+  published: '2025-08-01'
+  retrieved: '2026-07-17'
+  last_checked: '2026-07-17'
+doc_type: legislation
+authority: binding_law
+source_url: https://natlex.ilo.org/dyn/natlex2/natlex2/files/download/118479/MNE-118479.pdf
+source_format: pdf
+sensitivity: normal
+rights: unknown
+topics:
+- e-government
+g2ai_pattern: []
+summary: Montenegrin law (2025) establishing the Central Register of Business and
+  Other Entities (CRPS) as a public electronic database. Registration decisions
+  are authenticated via qualified electronic signature and seal; publication is
+  electronic display on the CRPS website.
+relations: []
+relevance:
+  target_fit: context
+  axis: digital_sovereignty
+  assessed_stage: confirmed
+  rationale: Law establishing Montenegro's Central Register of Business and Other
+    Entities (CRPS) as a public electronic database — registration decisions authenticated
+    by qualified electronic signature/seal (Art. 7), filing exclusively electronic
+    (Art. 19), publication via electronic display on the CRPS website (Art. 35,
+    39). Notably transposes EU digitalization-of-company-law directives (2017/1132,
+    2019/1151 — Art. 47, applicable from EU accession), directly tying this to
+    Montenegro's EU-accession digital-alignment track. Not AI-specific, but genuine
+    e-government legal/technical infrastructure (digital-registry pattern) —
+    relevant to the digital_sovereignty axis for the montenegro track. Confirmed
+    by text (doc.md, OCR path) — all 48 articles present, structure intact (VIII
+    sections), readable Montenegrin despite OCR noise typical of a scanned gazette
+    issue; also served as the first real-scan field test of convert-ocr (spec,
+    PR14), which surfaced and fixed a genuine bug in ocr_headings' next-line
+    lookahead (blank paragraph separators were defeating Tier 2/3 guards).
+  assessed_date: '2026-07-17'
+in_force: true
