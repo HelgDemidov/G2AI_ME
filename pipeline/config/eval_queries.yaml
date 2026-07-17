@@ -14,3 +14,23 @@ queries:
     expect: ["oversight", "human"]
   - query: "monitoring agent behaviour after it is deployed"
     expect: ["monitor"]
+
+  # cnr-приёмка (spec analyze-retrieval §7.4, чартер §8.6): кросс-язычный retrieval —
+  # EN-запрос, ожидаемые термины — реальные cnr-слова из doc.md me-crps-registration-law-2025
+  # (Zakon o registraciji privrednih i drugih subjekata, Crna Gora). Цель — hit@10 по
+  # vector/hybrid каналам; результат (включая провал) записывается в спек, не CI-гейт.
+  - query: "electronic signature verification for business registration"
+    expect: ["potpis"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "which government body oversees the central registry of businesses"
+    expect: ["crps"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "unique identifier assigned to companies in the EU registry interconnection system"
+    expect: ["euid"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "appeal against a business registration decision"
+    expect: ["žalb"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "deleting a business entity from the registry"
+    expect: ["brisanj"]
+    note: "cnr — me-crps-registration-law-2025"
