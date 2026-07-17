@@ -89,6 +89,83 @@ def test_semantic_search_empty_when_no_vectors(tmp_path: Path) -> None:
     assert semantic_search(conn, np.zeros(3, dtype=np.float32), "m", 5) == []
 
 
+# --- embed_input: эмбеддер видит breadcrumb-контекст (spec analyze-retrieval §3.1) ---
+
+
+def test_chunk_hashes_applies_embed_input_with_breadcrumb(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk("doc-a", 0, "body text", 2, "H1 › H2")])
+    _, texts = chunk_hashes(conn)
+    assert texts == ["H1 › H2\nbody text"]
+
+
+def test_chunk_hashes_no_breadcrumb_returns_plain_text(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    _, texts = chunk_hashes(conn)
+    assert set(texts) == {"first", "second", "third"}
+
+
+# --- semantic_search: allowed_doc_ids фасетный фильтр (spec analyze-retrieval §3.2) ---
+
+
+def test_semantic_search_allowed_doc_ids_drops_excluded_carriers(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [
+            Chunk("doc-a", 0, "boilerplate", 1),
+            Chunk("doc-b", 0, "boilerplate", 1),
+        ],
+    )
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes, l2_normalize(np.eye(1, dtype=np.float32)), "m")
+    hits = semantic_search(
+        conn, l2_normalize(np.eye(1, dtype=np.float32))[0], "m", top_k=10, allowed_doc_ids={"doc-a"}
+    )
+    assert {h.doc_id for h in hits} == {"doc-a"}
+
+
+def test_semantic_search_backfills_top_k_past_filtered_hash(tmp_path: Path) -> None:
+    """Хэш без носителей внутри фильтра НЕ занимает место бюджета top_k — следующий
+    по score хэш добирает недостающий слот (spec analyze-retrieval §3.2)."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [
+            Chunk("doc-excluded", 0, "best match", 2),
+            Chunk("doc-allowed", 0, "second best", 2),
+        ],
+    )
+    hashes, texts = chunk_hashes(conn)
+    # вектор "best match" ближе к запросу, чем "second best" — обычный (0), (1) порядок eye
+    vecs = l2_normalize(np.eye(len(hashes), dtype=np.float32))
+    store_vectors(conn, hashes, vecs, "m")
+    query = vecs[texts.index("best match")]
+    hits = semantic_search(conn, query, "m", top_k=1, allowed_doc_ids={"doc-allowed"})
+    assert len(hits) == 1
+    assert hits[0].doc_id == "doc-allowed"
+
+
+def test_semantic_search_none_allowed_doc_ids_matches_prior_behavior(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    hashes, texts = chunk_hashes(conn)
+    vecs = l2_normalize(np.eye(len(hashes), dtype=np.float32))
+    store_vectors(conn, hashes, vecs, "m")
+    ti = texts.index("second")
+    hits_unfiltered = semantic_search(conn, vecs[ti], "m", top_k=len(hashes))
+    hits_none = semantic_search(conn, vecs[ti], "m", top_k=len(hashes), allowed_doc_ids=None)
+    assert hits_unfiltered == hits_none
+
+
+def test_vec_hit_carries_breadcrumb(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk("doc-a", 0, "body", 1, "Chapter One")])
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes, l2_normalize(np.eye(1, dtype=np.float32)), "m")
+    hits = semantic_search(conn, l2_normalize(np.eye(1, dtype=np.float32))[0], "m", top_k=1)
+    assert hits[0].breadcrumb == "Chapter One"
+
+
 # --- boilerplate: общий хэш двух документов = один вектор, оба чанка находимы ---
 
 
