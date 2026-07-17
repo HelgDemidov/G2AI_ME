@@ -7,6 +7,10 @@
 инжектируется (``count_tokens``). В рантайме передаётся токенизатор bge-m3
 (см. bge_tokenizer.py); в тестах — простой счётчик слов. Так логику можно
 проверять в CI без модели.
+
+Секционирование (spec analyze-retrieval §1): текст режется на секции по строкам-
+заголовкам markdown ДО packing-логики — чанк никогда не пересекает границу секции,
+у каждого чанка есть breadcrumb (цепочка заголовков-предков).
 """
 from __future__ import annotations
 
@@ -19,16 +23,22 @@ TokenCounter = Callable[[str], int]
 _FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
 _PARA_RE = re.compile(r"\n\s*\n")
 _SENT_RE = re.compile(r"(?<=[.!?;])\s+|\n")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
 
 @dataclass(frozen=True)
 class Chunk:
-    """Канонический чанк: принадлежит документу doc_id, порядковый index."""
+    """Канонический чанк: принадлежит документу doc_id, порядковый index.
+
+    ``breadcrumb`` — цепочка заголовков-предков (`"H1 › H2 › H3"`), "" для текста
+    до первого заголовка или документа без заголовков вовсе.
+    """
 
     doc_id: str
     index: int
     text: str
     n_tokens: int
+    breadcrumb: str = ""
 
 
 def strip_frontmatter(md: str) -> str:
@@ -42,6 +52,36 @@ def _paragraphs(text: str) -> list[str]:
 
 def _sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENT_RE.split(text) if s.strip()]
+
+
+def _sections(text: str) -> list[tuple[str, list[str]]]:
+    """Разбить абзацы текста на секции по строкам-заголовкам.
+
+    Заголовок = абзац, чья ПЕРВАЯ строка матчит ``^#{1,6}\\s+.*$`` (pdf_to_markdown
+    эмитит заголовок отдельным абзацем). Стек заголовков: уровень N сбрасывает все
+    уровни >= N, затем пишет себя; breadcrumb секции = "› "-цепочка стека. Строка
+    заголовка остаётся первым абзацем своей секции (искомый контент, не только
+    метаданные). Документ без заголовков -> одна секция с breadcrumb "".
+    """
+    sections: list[tuple[str, list[str]]] = []
+    stack: list[tuple[int, str]] = []
+    breadcrumb = ""
+    current: list[str] = []
+    for para in _paragraphs(text):
+        m = _HEADING_RE.match(para.splitlines()[0])
+        if m:
+            if current:
+                sections.append((breadcrumb, current))
+            level, title = len(m.group(1)), m.group(2).strip()
+            stack = [(lv, t) for lv, t in stack if lv < level]
+            stack.append((level, title))
+            breadcrumb = " › ".join(t for _, t in stack)
+            current = [para]
+        else:
+            current.append(para)
+    if current:
+        sections.append((breadcrumb, current))
+    return sections
 
 
 def _hard_split(text: str, count_tokens: TokenCounter, max_tokens: int) -> list[str]:
@@ -115,13 +155,9 @@ def _split_long_paragraph(para: str, count_tokens: TokenCounter, max_tokens: int
     return out
 
 
-def chunk_text(
-    text: str,
-    count_tokens: TokenCounter,
-    max_tokens: int = 512,
-    doc_id: str = "",
-) -> list[Chunk]:
-    """Разбить текст на чанки <= max_tokens, стараясь не резать абзацы/предложения."""
+def _pack_paragraphs(paras: list[str], count_tokens: TokenCounter, max_tokens: int) -> list[str]:
+    """Упаковать абзацы ОДНОЙ секции в чанки <= max_tokens, стараясь не резать
+    абзацы/предложения (packing-логика, вынесена из ``chunk_text`` для секционирования)."""
     raw: list[str] = []
     current: list[str] = []
     current_tokens = 0
@@ -132,7 +168,7 @@ def chunk_text(
             raw.append("\n\n".join(current))
             current, current_tokens = [], 0
 
-    for para in _paragraphs(text):
+    for para in paras:
         n = count_tokens(para)
         if n > max_tokens:
             flush()
@@ -143,12 +179,38 @@ def chunk_text(
         current.append(para)
         current_tokens += n
     flush()
+    return raw
 
+
+def chunk_text(
+    text: str,
+    count_tokens: TokenCounter,
+    max_tokens: int = 512,
+    doc_id: str = "",
+) -> list[Chunk]:
+    """Разбить текст на чанки <= max_tokens, стараясь не резать абзацы/предложения.
+
+    Секционируется ПЕРЕД packing (см. ``_sections``): чанк никогда не пересекает
+    границу секции, у каждого чанка breadcrumb секции, к которой он принадлежит.
+    """
+    raw: list[tuple[str, str]] = [
+        (breadcrumb, chunk)
+        for breadcrumb, paras in _sections(text)
+        for chunk in _pack_paragraphs(paras, count_tokens, max_tokens)
+    ]
     # count_tokens(chunk) здесь пересчитывает готовый текст ЗАНОВО, хотя суммы уже
-    # накапливались по пути (current_tokens/_split_long_paragraph) — избыточно, но
+    # накапливались по пути (_pack_paragraphs/_split_long_paragraph) — избыточно, но
     # НЕ квадратично (один линейный проход по уже собранным чанкам, не по n²
     # растущих префиксов, как было в _hard_split). Оставлено как есть: чтобы нести
     # накопленное значение через flush()/_split_long_paragraph/_hard_split, все три
     # должны были бы возвращать (text, n_tokens) вместо str — не стоит сложности
     # ради устранения уже-линейной работы (см. spec code-consolidation §5).
-    return [Chunk(doc_id, i, chunk, count_tokens(chunk)) for i, chunk in enumerate(raw)]
+    return [
+        Chunk(doc_id, i, chunk, count_tokens(chunk), breadcrumb)
+        for i, (breadcrumb, chunk) in enumerate(raw)
+    ]
+
+
+def embed_input(breadcrumb: str, text: str) -> str:
+    """Текст, который видит эмбеддер: breadcrumb-контекст + тело чанка."""
+    return f"{breadcrumb}\n{text}" if breadcrumb else text

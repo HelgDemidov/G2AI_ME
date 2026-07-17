@@ -1,0 +1,36 @@
+# Контрольные запросы A/B-харнесса качества retrieval (ab_eval.py, spec analyze-retrieval §6).
+# Перефразировки без буквального совпадения слов — hit@k проверяет семантическое
+# попадание, не keyword-match. Правится вручную; трекается в git (тела документов
+# корпуса — нет, только сами запросы и ожидаемые термины).
+queries:
+  - query: "who is accountable when an autonomous agent makes a harmful decision"
+    expect: ["account", "responsib"]
+    note: "SG agentic framework"
+  - query: "how should AI agents be tested before they are deployed"
+    expect: ["test"]
+  - query: "restricting which tools and permissions an agent is allowed to use"
+    expect: ["permission", "tool"]
+  - query: "keeping a human overseeing the agent's actions"
+    expect: ["oversight", "human"]
+  - query: "monitoring agent behaviour after it is deployed"
+    expect: ["monitor"]
+
+  # cnr-приёмка (spec analyze-retrieval §7.4, чартер §8.6): кросс-язычный retrieval —
+  # EN-запрос, ожидаемые термины — реальные cnr-слова из doc.md me-crps-registration-law-2025
+  # (Zakon o registraciji privrednih i drugih subjekata, Crna Gora). Цель — hit@10 по
+  # vector/hybrid каналам; результат (включая провал) записывается в спек, не CI-гейт.
+  - query: "electronic signature verification for business registration"
+    expect: ["potpis"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "which government body oversees the central registry of businesses"
+    expect: ["crps"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "unique identifier assigned to companies in the EU registry interconnection system"
+    expect: ["euid"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "appeal against a business registration decision"
+    expect: ["žalb"]
+    note: "cnr — me-crps-registration-law-2025"
+  - query: "deleting a business entity from the registry"
+    expect: ["brisanj"]
+    note: "cnr — me-crps-registration-law-2025"

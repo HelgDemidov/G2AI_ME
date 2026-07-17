@@ -1,12 +1,12 @@
-"""A/B-харнесс качества эмбеддингов: локальный bge-m3 vs эталон (gemini через OpenRouter).
+"""A/B-харнесс качества retrieval: режимы каналов (fts/vector/hybrid) x модели.
 
-На КОНТРОЛЬНЫХ запросах-перефразировках (часто без буквального совпадения слов) считает
-hit@k: попал ли в топ-k семантического поиска чанк, содержащий ожидаемый термин.
-Сравнивает модели бок о бок.
+На КОНТРОЛЬНЫХ запросах-перефразировках (часто без буквального совпадения слов, см.
+``pipeline/config/eval_queries.yaml``) считает hit@k: попал ли в топ-k выдачи чанк,
+содержащий ожидаемый термин.
 
-ВНИМАНИЕ: на маленьком корпусе (пока 1 документ) это смоук-сравнение плумбинга и первый
-сигнал, а не строгий бенчмарк — становится показательным по мере роста корпуса.
-Требует .env с OPENROUTER_API_KEY (для эталона) и локально скачанный bge-m3.
+ВНИМАНИЕ: на маленьком корпусе это смоук-сравнение плумбинга и первый сигнал, а не
+строгий бенчмарк — становится показательным по мере роста корпуса. Векторные режимы
+требуют .env с OPENROUTER_API_KEY (для эталона, опционально) и локально скачанный bge-m3.
 """
 from __future__ import annotations
 
@@ -15,11 +15,17 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from index.corpus_index import DEFAULT_DB
+import yaml
+
+from analyze.retrieve import retrieve
+from index.corpus_index import DEFAULT_DB, fts_search, sanitize_fts_query
 from index.embed import Embedder, get_embedder
-from core.env import load_dotenv
+from core.env import REPO_ROOT, load_dotenv
 from index.vector_store import chunk_hashes, semantic_search, store_vectors
+
+DEFAULT_EVAL_QUERIES = REPO_ROOT / "pipeline" / "config" / "eval_queries.yaml"
 
 
 @dataclass(frozen=True)
@@ -28,19 +34,25 @@ class ControlQuery:
     expect: tuple[str, ...]  # любой из терминов в топ-чанке = попадание (регистронезависимо)
 
 
-CONTROL_QUERIES: list[ControlQuery] = [
-    ControlQuery(
-        "who is accountable when an autonomous agent makes a harmful decision",
-        ("account", "responsib"),
-    ),
-    ControlQuery("how should AI agents be tested before they are deployed", ("test",)),
-    ControlQuery(
-        "restricting which tools and permissions an agent is allowed to use",
-        ("permission", "tool"),
-    ),
-    ControlQuery("keeping a human overseeing the agent's actions", ("oversight", "human")),
-    ControlQuery("monitoring agent behaviour after it is deployed", ("monitor",)),
-]
+def load_eval_queries(path: Path) -> list[ControlQuery]:
+    """Загрузить контрольные запросы из YAML (spec analyze-retrieval §6).
+
+    Пустой/отсутствующий ключ ``queries`` или запись без ``query``/``expect`` (или
+    с пустым ``expect``) -> понятная ``ValueError`` — молчаливый пропуск проверок
+    хуже явного отказа."""
+    raw: Any = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    items = raw.get("queries")
+    if not items:
+        raise ValueError(f"{path}: пустой или отсутствующий ключ 'queries'")
+    queries: list[ControlQuery] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or "query" not in item or "expect" not in item:
+            raise ValueError(f"{path}: запись #{i} без обязательных полей query/expect: {item!r}")
+        expect = item["expect"]
+        if not expect:
+            raise ValueError(f"{path}: запись #{i} с пустым expect: {item!r}")
+        queries.append(ControlQuery(str(item["query"]), tuple(str(e) for e in expect)))
+    return queries
 
 
 @dataclass(frozen=True)
@@ -53,7 +65,7 @@ class QueryOutcome:
 
 @dataclass(frozen=True)
 class ModelResult:
-    name: str
+    name: str  # напр. "fts" (модель-независим) или "bge-m3-onnx-int8 · hybrid"
     hit1_rate: float
     hitk_rate: float
     outcomes: list[QueryOutcome]
@@ -68,7 +80,41 @@ def hit_at_k(ranked_texts: list[str], expect: tuple[str, ...], k: int) -> bool:
     return False
 
 
-def evaluate(
+def _summarize(name: str, outcomes: list[QueryOutcome], n_queries: int) -> ModelResult:
+    n = n_queries or 1
+    return ModelResult(
+        name,
+        sum(o.hit1 for o in outcomes) / n,
+        sum(o.hitk for o in outcomes) / n,
+        outcomes,
+    )
+
+
+def evaluate_fts(conn: sqlite3.Connection, queries: list[ControlQuery], k: int = 3) -> ModelResult:
+    """fts-режим: ранжированные ПОЛНЫЕ тексты (не snippet) из ``fts_search`` —
+    модель-независим, вычисляется один раз вне зависимости от выбора эмбеддера."""
+    outcomes: list[QueryOutcome] = []
+    for cq in queries:
+        hits = fts_search(conn, sanitize_fts_query(cq.query), k)
+        ranked = []
+        for h in hits:
+            row = conn.execute(
+                "SELECT text FROM chunks WHERE doc_id = ? AND chunk_index = ?",
+                (h.doc_id, h.chunk_index),
+            ).fetchone()
+            ranked.append(str(row[0]) if row else "")
+        outcomes.append(
+            QueryOutcome(
+                cq.query,
+                hit_at_k(ranked, cq.expect, 1),
+                hit_at_k(ranked, cq.expect, k),
+                hits[0].rank if hits else 0.0,  # bm25: меньше = лучше (в отличие от cosine-строк ниже)
+            )
+        )
+    return _summarize("fts", outcomes, len(queries))
+
+
+def evaluate_vector(
     conn: sqlite3.Connection,
     embedder: Embedder,
     hashes: list[str],
@@ -76,8 +122,8 @@ def evaluate(
     queries: list[ControlQuery],
     k: int = 3,
 ) -> ModelResult:
-    # Бенч эмбеддит ПОЛНУЮ матрицу хэшей корпуса на модель (не инкремент — сравнение
-    # моделей); store_vectors ключуется content_hash (spec index-incremental §3a).
+    """vector-режим: полная матрица хэшей корпуса эмбеддится и сохраняется (не
+    инкремент — сравнение режимов/моделей), затем ``semantic_search`` на запрос."""
     store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
     outcomes: list[QueryOutcome] = []
     for cq in queries:
@@ -92,18 +138,32 @@ def evaluate(
                 hits[0].score if hits else 0.0,
             )
         )
-    n = len(queries) or 1
-    return ModelResult(
-        embedder.name,
-        sum(o.hit1 for o in outcomes) / n,
-        sum(o.hitk for o in outcomes) / n,
-        outcomes,
-    )
+    return _summarize(f"{embedder.name} · vector", outcomes, len(queries))
 
 
-def _report(results: list[ModelResult], k: int) -> None:
+def evaluate_hybrid(
+    conn: sqlite3.Connection, embedder: Embedder, queries: list[ControlQuery], k: int = 3
+) -> ModelResult:
+    """hybrid-режим: ``retrieve()`` (RRF FTS+вектор). Предполагает, что векторы
+    ``embedder`` УЖЕ сохранены (см. ``evaluate_vector`` — вызывается раньше в main)."""
+    outcomes: list[QueryOutcome] = []
+    for cq in queries:
+        scored = retrieve(conn, cq.query, embedder, k)
+        ranked = [c.text for c in scored]
+        outcomes.append(
+            QueryOutcome(
+                cq.query,
+                hit_at_k(ranked, cq.expect, 1),
+                hit_at_k(ranked, cq.expect, k),
+                scored[0].rrf_score if scored else 0.0,
+            )
+        )
+    return _summarize(f"{embedder.name} · hybrid", outcomes, len(queries))
+
+
+def _report(results: list[ModelResult], k: int, n_queries: int) -> None:
     print("=" * 72)
-    print(f"A/B качества эмбеддингов — hit@1 / hit@{k} на {len(CONTROL_QUERIES)} контрольных запросах")
+    print(f"A/B качества retrieval — hit@1 / hit@{k} на {n_queries} контрольных запросах")
     print("=" * 72)
     for res in results:
         print(f"\n### {res.name}   hit@1={res.hit1_rate:.0%}   hit@{k}={res.hitk_rate:.0%}")
@@ -111,13 +171,17 @@ def _report(results: list[ModelResult], k: int) -> None:
             mark = "✓" if out.hit1 else ("~" if out.hitk else "✗")
             print(f"  {mark} [top={out.top_score:.3f}] {out.query}")
     print("\nЛегенда: ✓ ожидаемый термин в топ-1, ~ в топ-k, ✗ не найден.")
-    print("NB: корпус мал (1 документ) — это смоук-сравнение, не строгий бенчмарк.")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="A/B качества эмбеддингов bge-m3 vs эталон")
+    parser = argparse.ArgumentParser(description="A/B качества retrieval: режимы каналов x модели")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--k", type=int, default=3)
+    parser.add_argument("--eval-queries", type=Path, default=DEFAULT_EVAL_QUERIES)
+    parser.add_argument(
+        "--mode", choices=["fts", "vector", "hybrid", "all"], default="all",
+        help="fts — модель-независим; vector/hybrid — требуют эмбеддер(ы)",
+    )
     parser.add_argument(
         "--reference-model", default="google/gemini-embedding-001", help="эталон через OpenRouter"
     )
@@ -127,28 +191,43 @@ def main(argv: list[str] | None = None) -> int:
     if not args.db.exists():
         print(f"нет БД {args.db} — сначала corpus_index.py build", file=sys.stderr)
         return 2
-    load_dotenv()
-    conn = sqlite3.connect(args.db)
-    hashes, texts = chunk_hashes(conn)  # уникальные хэши корпуса — полная матрица на модель
-    if not hashes:
-        print("нет чанков в БД", file=sys.stderr)
+    try:
+        queries = load_eval_queries(args.eval_queries)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
 
+    load_dotenv()
+    conn = sqlite3.connect(args.db)
+    modes = ["fts", "vector", "hybrid"] if args.mode == "all" else [args.mode]
     results: list[ModelResult] = []
-    print(f"Локальный bge-m3: эмбеддинг {len(texts)} чанков + {len(CONTROL_QUERIES)} запросов…")
-    results.append(evaluate(conn, get_embedder("bge"), hashes, texts, CONTROL_QUERIES, args.k))
 
-    if not args.no_reference:
-        try:
-            ref = get_embedder("openrouter", model=args.reference_model)
-        except RuntimeError as exc:
-            print(f"\nэталон пропущен: {exc}", file=sys.stderr)
-        else:
-            print(f"Эталон {args.reference_model} через OpenRouter…")
-            results.append(evaluate(conn, ref, hashes, texts, CONTROL_QUERIES, args.k))
+    if "fts" in modes:
+        results.append(evaluate_fts(conn, queries, args.k))
+
+    if "vector" in modes or "hybrid" in modes:
+        hashes, texts = chunk_hashes(conn)
+        if not hashes:
+            print("нет чанков в БД", file=sys.stderr)
+            conn.close()
+            return 2
+        embedders: list[Embedder] = [get_embedder("bge")]
+        if not args.no_reference:
+            try:
+                embedders.append(get_embedder("openrouter", model=args.reference_model))
+            except RuntimeError as exc:
+                print(f"\nэталон пропущен: {exc}", file=sys.stderr)
+
+        for embedder in embedders:
+            if "vector" in modes:
+                results.append(evaluate_vector(conn, embedder, hashes, texts, queries, args.k))
+            else:
+                store_vectors(conn, hashes, embedder.embed(texts), embedder.name)  # hybrid тоже нужен
+            if "hybrid" in modes:
+                results.append(evaluate_hybrid(conn, embedder, queries, args.k))
 
     conn.close()
-    _report(results, args.k)
+    _report(results, args.k, len(queries))
     return 0
 
 

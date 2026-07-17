@@ -15,6 +15,8 @@ from index.chunking import Chunk
 from index.corpus_index import (
     SCHEMA_VERSION,
     _cmd_search,
+    _delete_doc_chunks,
+    _rebuild_facets,
     content_hash,
     corpus_fingerprint,
     create_db,
@@ -27,6 +29,7 @@ from index.corpus_index import (
     sanitize_fts_query,
     write_meta,
 )
+from core.schema import SourceRecord
 from tests.support import valid_record, write_doc
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="sqlite собран без FTS5")
@@ -158,6 +161,18 @@ def test_corpus_fingerprint_empty_corpus(tmp_path: Path) -> None:
     assert corpus_fingerprint(tmp_path) == corpus_fingerprint(tmp_path)  # не падает, детерминирован
 
 
+def test_corpus_fingerprint_sensitive_to_meta_touch_without_md_change(tmp_path: Path) -> None:
+    """Meta-aware отпечаток (spec analyze-retrieval §2.3): правка meta.yaml БЕЗ
+    изменения doc.md всё равно сдвигает corpus_fingerprint — иначе понижение тира
+    ленивой Стадией 2 осталось бы невидимо гейту run_pipeline."""
+    d = _write_corpus_doc(tmp_path)
+    fp1 = corpus_fingerprint(tmp_path)
+    time.sleep(0.01)
+    meta_path = d / "meta.yaml"
+    meta_path.write_text(meta_path.read_text(encoding="utf-8"), encoding="utf-8")  # тот же контент, новый mtime
+    assert corpus_fingerprint(tmp_path) != fp1
+
+
 # --- sanitize_fts_query: экранирование пользовательского FTS5-запроса ---
 
 
@@ -221,19 +236,30 @@ def test_cmd_search_raw_syntax_error_reported_not_raised(tmp_path: Path, capsys:
     assert "некорректный" in capsys.readouterr().err
 
 
-# --- content_hash: ключ содержимого чанка (spec index-incremental §1) ---
+# --- content_hash: ключ содержимого чанка (spec index-incremental §1;
+#     breadcrumb входит в хэш — spec analyze-retrieval §2.2) ---
 
 
-def test_content_hash_matches_sha256() -> None:
+def test_content_hash_matches_sha256_of_breadcrumb_and_text() -> None:
     import hashlib
 
-    assert content_hash("hello") == hashlib.sha256(b"hello").hexdigest()
+    assert content_hash("hello") == hashlib.sha256("\x00hello".encode()).hexdigest()
+    assert content_hash("hello", "H1") == hashlib.sha256("H1\x00hello".encode()).hexdigest()
     assert len(content_hash("hello")) == 64  # полный sha256-hex, не усечённый
 
 
 def test_content_hash_deterministic_and_distinguishing() -> None:
     assert content_hash("abc") == content_hash("abc")
     assert content_hash("abc") != content_hash("abd")
+
+
+def test_content_hash_empty_breadcrumb_is_stable_form() -> None:
+    assert content_hash("abc") == content_hash("abc", "")
+
+
+def test_content_hash_same_text_different_breadcrumb_differs() -> None:
+    assert content_hash("same body", "H1") != content_hash("same body", "H2")
+    assert content_hash("same body", "H1") != content_hash("same body")
 
 
 def test_index_chunks_stores_content_hash(tmp_path: Path) -> None:
@@ -324,6 +350,145 @@ def test_migration_then_index_works(tmp_path: Path) -> None:
     hits = fts_search(conn, "governance")
     assert len(hits) == 1
     conn.close()
+
+
+def _make_v2_db(path: Path) -> None:
+    """БД схемы v2 (spec index-incremental): content_hash есть, но нет breadcrumb-
+    колонки/doc_facets/topics_map. Тестирует миграцию v2 -> v3 (spec analyze-retrieval)."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE chunks (
+            chunk_id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL, n_tokens INTEGER NOT NULL, content_hash TEXT NOT NULL
+        );
+        CREATE VIRTUAL TABLE chunks_fts USING fts5 (
+            text, content='chunks', content_rowid='chunk_id', tokenize='unicode61'
+        );
+        CREATE TABLE doc_state (doc_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);
+        CREATE TABLE vectors (
+            content_hash TEXT NOT NULL, model TEXT NOT NULL, vec BLOB NOT NULL,
+            PRIMARY KEY (content_hash, model)
+        );
+        CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """
+    )
+    conn.execute(
+        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash) "
+        "VALUES ('old', 0, 'legacy v2', 1, 'deadbeef')"
+    )
+    conn.execute("INSERT INTO index_meta (key, value) VALUES ('schema_version', '2')")
+    conn.commit()
+    conn.close()
+
+
+def test_migration_v2_to_v3_adds_breadcrumb_and_facet_tables(tmp_path: Path) -> None:
+    db = tmp_path / "v2.db"
+    _make_v2_db(db)
+    conn = create_db(db)  # обязан мигрировать v2 -> v3
+    assert "breadcrumb" in _chunks_columns(conn)
+    assert {"doc_facets", "topics_map"} <= _table_names(conn)
+    assert read_meta(conn, "schema_version") == SCHEMA_VERSION
+    assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0  # легаси-данные снесены
+    conn.close()
+
+
+# --- doc_facets / topics_map: наполнение из курируемых записей (spec analyze-retrieval §2.3) ---
+
+
+def test_rebuild_facets_populates_both_tables(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    conn = create_db(tmp_path / "c.db")
+    _rebuild_facets(conn, [rec])
+    conn.commit()
+    row = conn.execute(
+        "SELECT entity_id, track, doc_type, authority, language, axis, target_fit, assessed_stage "
+        "FROM doc_facets WHERE doc_id = ?",
+        (rec.id,),
+    ).fetchone()
+    assert row == ("sg", "intl-xperience", "framework", "soft_law", "en", "agentic_g2ai", "primary", "confirmed")
+    topics = {r[0] for r in conn.execute("SELECT topic FROM topics_map WHERE doc_id = ?", (rec.id,))}
+    assert topics == {"ai-governance", "agentic-ai"}
+
+
+def test_rebuild_facets_overwrites_on_repeated_call(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    conn = create_db(tmp_path / "c.db")
+    _rebuild_facets(conn, [rec])
+    _rebuild_facets(conn, [rec])  # повторный вызов — не дублирует
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM doc_facets").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM topics_map WHERE doc_id = ?", (rec.id,)
+    ).fetchone()[0] == 2
+
+
+def test_rebuild_facets_null_axis_when_no_relevance(tmp_path: Path) -> None:
+    rec_dict = valid_record()
+    rec_dict.pop("relevance")
+    rec = SourceRecord.model_validate(rec_dict)
+    conn = create_db(tmp_path / "c.db")
+    _rebuild_facets(conn, [rec])
+    row = conn.execute(
+        "SELECT axis, target_fit, assessed_stage FROM doc_facets WHERE doc_id = ?", (rec.id,)
+    ).fetchone()
+    assert row == (None, None, None)
+
+
+# --- breadcrumb в FTS: поиск + delete-инвариант двухколоночного external content ---
+
+
+def test_breadcrumb_is_searchable_via_fts(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk("doc-a", 0, "plain body text", 3, "Accountability Chapter")])
+    hits = fts_search(conn, "accountability")
+    assert len(hits) == 1
+    assert hits[0].breadcrumb == "Accountability Chapter"
+
+
+def test_delete_doc_purges_breadcrumb_from_fts(tmp_path: Path) -> None:
+    """Регресс-инвариант двухколоночного external-content FTS (spec analyze-retrieval
+    §2.1): удаление документа выметает термины из ОБЕИХ индексируемых колонок —
+    breadcrumb не остаётся висячим постингом."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [
+            Chunk("doc-a", 0, "plain body one", 3, "Accountability Chapter"),
+            Chunk("doc-b", 0, "plain body two", 3, "Other Chapter"),
+        ],
+    )
+    assert len(fts_search(conn, "accountability")) == 1
+    _delete_doc_chunks(conn, "doc-a")
+    conn.commit()
+    assert fts_search(conn, "accountability") == []
+    assert len(fts_search(conn, "chapter")) == 1  # breadcrumb doc-b цел
+
+
+# --- fts_search: allowed_doc_ids фасетный фильтр (spec analyze-retrieval §4) ---
+
+
+def test_fts_search_allowed_doc_ids_filters_hits(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, sample_chunks())
+    hits = fts_search(conn, "governance", allowed_doc_ids={"doc-b"})
+    assert hits == []  # governance только у doc-a
+    hits = fts_search(conn, "governance", allowed_doc_ids={"doc-a", "doc-b"})
+    assert len(hits) == 1
+
+
+def test_fts_search_empty_allowed_doc_ids_short_circuits(tmp_path: Path) -> None:
+    """Пустое множество (все фильтры исключили корпус) -> [] без похода в FTS
+    (пустой IN () невалиден в SQLite)."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, sample_chunks())
+    assert fts_search(conn, "governance", allowed_doc_ids=set()) == []
+
+
+def test_fts_search_none_allowed_doc_ids_is_unfiltered(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, sample_chunks())
+    assert fts_search(conn, "governance", allowed_doc_ids=None) == fts_search(conn, "governance")
 
 
 # --- инкрементальная переиндексация по doc-fingerprint (spec index-incremental §2) ---
@@ -439,6 +604,36 @@ def test_incremental_purges_removed_doc(tmp_path: Path) -> None:
     assert _fts_docs(conn, "monitoring") == set()  # и FTS-строки B ушли (не висячие постинги)
     assert conn.execute("SELECT COUNT(*) FROM doc_state WHERE doc_id=?", ("doc-beta-2026",)).fetchone()[0] == 0
     assert _fts_docs(conn, "governance") == {("doc-alpha-2026", 0)}  # A цел
+    conn.close()
+
+
+def test_meta_touch_does_not_rechunk_but_updates_facets(tmp_path: Path) -> None:
+    """Meta-aware freshness (spec analyze-retrieval §2.3): правка meta.yaml (напр.
+    topics) БЕЗ изменения doc.md НЕ пере-чанковывает документ (per-doc фингерпринт
+    в doc_state — только по doc.md), но фасеты обновляются каждым прогоном."""
+    import yaml
+
+    root = tmp_path / "src"
+    d = _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    a_ids_before = _chunk_ids_of(conn, "doc-alpha-2026")
+
+    meta_path = d / "meta.yaml"
+    rec = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+    rec["topics"] = ["new-topic"]
+    meta_path.write_text(yaml.safe_dump(rec, allow_unicode=True), encoding="utf-8")
+
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (0, 0)  # doc.md не менялся — НЕ пере-чанкован
+    assert _chunk_ids_of(conn, "doc-alpha-2026") == a_ids_before  # chunk_id не перевыдан
+    topics = {
+        r[0] for r in conn.execute(
+            "SELECT topic FROM topics_map WHERE doc_id=?", ("doc-alpha-2026",)
+        )
+    }
+    assert topics == {"new-topic"}  # фасеты обновлены
     conn.close()
 
 

@@ -1,11 +1,13 @@
 """Единый SQLite-индекс корпуса: канонические чанки + полнотекстовый поиск FTS5.
 
 Схема (одна БД, векторный слой в vector_store.py):
-  chunks(chunk_id, doc_id, chunk_index, text, n_tokens, content_hash)
-    content_hash = sha256(text) — стабильный «адрес» СОДЕРЖИМОГО чанка: к нему
-    привязан вектор (vector_store), поэтому пере-чанковка не осиротит эмбеддинги
+  chunks(chunk_id, doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb)
+    content_hash = sha256(breadcrumb + text) — стабильный «адрес» СОДЕРЖИМОГО чанка: к
+    нему привязан вектор (vector_store), поэтому пере-чанковка не осиротит эмбеддинги
     неизменившихся чанков, а старый вектор физически не может указать на чужой текст.
-  chunks_fts — внешне-контентная FTS5 над chunks.text, tokenize=unicode61 (многоязычно).
+  chunks_fts — внешне-контентная FTS5 над chunks.text + chunks.breadcrumb, tokenize=unicode61.
+  doc_facets(doc_id, ...) / topics_map(doc_id, topic) — фасеты метаданных для retrieval-
+    фильтров (spec analyze-retrieval §2.3); полная перезапись при каждой индексации.
   doc_state(doc_id, fingerprint) — per-doc отпечаток проиндексированного doc.md;
     инкрементальная переиндексация трогает только изменившиеся документы.
   index_meta(key, value) — ключ-значение: corpus_fingerprint/chunk_max_tokens/
@@ -26,19 +28,20 @@ from pathlib import Path
 from index.bge_tokenizer import EMBED_MAX_TOKENS, token_counter
 from index.chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
 from core.env import REPO_ROOT
-from core.schema import DEFAULT_SOURCES, load_records, md_file
+from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, md_file
 
 DEFAULT_DB = REPO_ROOT / "pipeline" / "index" / "corpus.db"
 
 # Версия схемы производного слоя. Инкремент = несовместимая форма таблиц; открытие
 # старой БД (create_db) пересоздаёт производные таблицы с нуля (артефакт производный,
 # цена нулевая на текущем корпусе). v1 = vectors на chunk_id, chunks без content_hash;
-# v2 = content_hash в chunks + doc_state + vectors на content_hash (spec index-incremental).
-SCHEMA_VERSION = "2"
+# v2 = content_hash в chunks + doc_state + vectors на content_hash (spec index-incremental);
+# v3 = breadcrumb в chunks/FTS + doc_facets/topics_map (spec analyze-retrieval).
+SCHEMA_VERSION = "3"
 
 # Производные (пересоздаваемые) таблицы — дропаются при миграции легаси-БД. Порядок
 # важен: FTS5-таблица внешнего контента дропается ДО своей content-таблицы chunks.
-_DERIVED_TABLES = ("chunks_fts", "chunks", "doc_state", "vectors")
+_DERIVED_TABLES = ("chunks_fts", "chunks", "doc_state", "vectors", "doc_facets", "topics_map")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
@@ -47,12 +50,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_index  INTEGER NOT NULL,
     text         TEXT    NOT NULL,
     n_tokens     INTEGER NOT NULL,
-    content_hash TEXT    NOT NULL
+    content_hash TEXT    NOT NULL,
+    breadcrumb   TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc  ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(content_hash);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5 (
     text,
+    breadcrumb,
     content='chunks',
     content_rowid='chunk_id',
     tokenize='unicode61'
@@ -65,17 +70,35 @@ CREATE TABLE IF NOT EXISTS index_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS doc_facets (
+    doc_id         TEXT PRIMARY KEY,
+    entity_id      TEXT NOT NULL,
+    track          TEXT NOT NULL,
+    doc_type       TEXT NOT NULL,
+    authority      TEXT NOT NULL,
+    language       TEXT NOT NULL,
+    axis           TEXT,
+    target_fit     TEXT,
+    assessed_stage TEXT
+);
+CREATE TABLE IF NOT EXISTS topics_map (
+    doc_id TEXT NOT NULL,
+    topic  TEXT NOT NULL,
+    PRIMARY KEY (doc_id, topic)
+);
 """
 
 _META_SCHEMA = "CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 
 
-def content_hash(text: str) -> str:
-    """sha256-hex текста чанка (полный, 64 hex): стабильный ключ содержимого для
-    векторного слоя. Коллизии на 10–30 тыс. чанков исключены практикой; усечение
-    отвергнуто (spec index-incremental) — экономия нулевая, рассуждать о коллизиях
-    не хочется вовсе."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def content_hash(text: str, breadcrumb: str = "") -> str:
+    """sha256-hex ``breadcrumb + "\\x00" + text``: стабильный ключ содержимого чанка
+    для векторного слоя. Breadcrumb входит в хэш (spec analyze-retrieval §2.2) — тот
+    же текст под разным заголовком-предком получает другой вектор (embed_input их
+    склеивает); разделитель ``\\x00`` исключает коллизию склейки breadcrumb+text
+    разных разбиений. Коллизии sha256 на масштабе корпуса исключены практикой;
+    усечение отвергнуто (spec index-incremental) — экономия нулевая."""
+    return hashlib.sha256(f"{breadcrumb}\x00{text}".encode("utf-8")).hexdigest()
 
 
 def read_meta(conn: sqlite3.Connection, key: str) -> str | None:
@@ -100,10 +123,11 @@ def write_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-def _doc_fingerprint(md: Path) -> str:
-    """Per-doc отпечаток ``doc.md`` (только ``stat``): ``"<size>:<mtime_ns>"``.
-    Единица инкрементальной переиндексации — хранится в ``doc_state``."""
-    st = md.stat()
+def _doc_fingerprint(path: Path) -> str:
+    """Отпечаток файла (только ``stat``): ``"<size>:<mtime_ns>"``. Единица инкрементальной
+    переиндексации (``doc.md`` в ``doc_state``) И слагаемое глобального ``corpus_fingerprint``
+    (``doc.md`` + ``meta.yaml`` — см. ``corpus_fingerprint``)."""
+    st = path.stat()
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
@@ -116,15 +140,21 @@ def _fingerprint_from_parts(parts: list[str]) -> str:
 
 def corpus_fingerprint(sources_root: Path) -> str:
     """Дешёвый (только ``stat``, без чтения содержимого) отпечаток состояния корпуса:
-    sha256 отсортированных ``"<id>:<size>:<mtime_ns>"`` по всем СУЩЕСТВУЮЩИМ ``doc.md``.
+    sha256 отсортированных ``"<id>:<size>:<mtime_ns жизни doc.md>:<size>:<mtime_ns жизни
+    meta.yaml>"`` по всем записям с существующим ``doc.md``.
 
-    Документы без ``doc.md`` не входят — их появление (после конвертации) меняет
-    отпечаток и триггерит пересборку индекса. На ~200 документах — ~200 ``stat()``,
-    миллисекунды. Остаётся быстрым глобальным гейтом «есть ли работа вообще»
-    (реконсиляция run_pipeline); тонкую per-doc инкрементальность даёт ``doc_state``.
+    Meta-aware (spec analyze-retrieval §2.3): правка ``meta.yaml`` БЕЗ изменения
+    ``doc.md`` (например, ленивая Стадия 2 триажа понижает тир) обязана сдвинуть этот
+    отпечаток — иначе ``run_pipeline`` счёл бы индекс актуальным, и даунгрейд остался
+    бы невидим фасетным фильтрам retrieval. Per-doc фингерпринт в ``doc_state``
+    (``_doc_fingerprint`` документа) НАМЕРЕННО остаётся только по ``doc.md`` — правка
+    meta НЕ должна пере-чанковывать/пере-эмбеддить документ, только обновить фасеты
+    (см. ``index_corpus``/``index_corpus_incremental``). Документы без ``doc.md`` не
+    входят — их появление (после конвертации) меняет отпечаток и триггерит
+    пересборку. На ~200 документах — ~400 ``stat()``, миллисекунды.
     """
     parts = [
-        f"{rec.id}:{_doc_fingerprint(md)}"
+        f"{rec.id}:{_doc_fingerprint(md)}:{_doc_fingerprint(md.parent / 'meta.yaml')}"
         for rec in load_records(sources_root)
         if (md := md_file(rec, sources_root)).exists()
     ]
@@ -137,6 +167,7 @@ class SearchHit:
     chunk_index: int
     rank: float
     snippet: str
+    breadcrumb: str
 
 
 def fts5_available() -> bool:
@@ -165,10 +196,8 @@ def _is_legacy_schema(conn: sqlite3.Connection) -> bool:
 def _reset_derived_tables(conn: sqlite3.Connection) -> None:
     """Снести производные таблицы старого поколения (миграция). Артефакт производный —
     следующий rebuild соберёт заново; отпечатки/бюджет прошлого поколения невалидны."""
-    conn.execute("DROP TABLE IF EXISTS chunks_fts")  # внешний контент — до content-таблицы
-    conn.execute("DROP TABLE IF EXISTS chunks")
-    conn.execute("DROP TABLE IF EXISTS doc_state")
-    conn.execute("DROP TABLE IF EXISTS vectors")
+    for table in _DERIVED_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
     conn.execute(_META_SCHEMA)
     conn.execute("DELETE FROM index_meta")
     conn.commit()
@@ -187,12 +216,45 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> None:
+    """Перезаписать ``doc_facets``/``topics_map`` из курируемых записей (полная
+    перезапись — O(сотен строк), дешевле любой инкрементальности diff'а). ``axis``/
+    ``target_fit``/``assessed_stage`` — ``None``, если у записи ещё нет ``relevance``
+    (spec analyze-retrieval §2.3)."""
+    conn.execute("DELETE FROM doc_facets")
+    conn.execute("DELETE FROM topics_map")
+    conn.executemany(
+        "INSERT INTO doc_facets "
+        "(doc_id, entity_id, track, doc_type, authority, language, axis, target_fit, assessed_stage) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                rec.id,
+                rec.entity_id,
+                rec.track.value,
+                rec.doc_type,
+                rec.authority,
+                rec.language,
+                rec.relevance.axis.value if rec.relevance else None,
+                rec.relevance.target_fit.value if rec.relevance else None,
+                rec.relevance.assessed_stage.value if rec.relevance else None,
+            )
+            for rec in records
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO topics_map (doc_id, topic) VALUES (?, ?)",
+        [(rec.id, topic) for rec in records for topic in rec.topics],
+    )
+
+
 def index_chunks(
     conn: sqlite3.Connection,
     chunks: list[Chunk],
     *,
     corpus_fingerprint: str | None = None,
     chunk_max_tokens: int | None = None,
+    records: list[SourceRecord] | None = None,
 ) -> None:
     """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно).
 
@@ -202,6 +264,9 @@ def index_chunks(
     при следующем ``embed-corpus``. Стоп-гэп «DROP vectors при любой пересборке»
     (index-consistency §3) упразднён — вектор физически не может указать на чужой
     текст (spec index-incremental §3).
+
+    ``records``, если передан, перезаписывает фасеты (``_rebuild_facets``) той же
+    транзакцией (spec analyze-retrieval §2.3).
 
     ``corpus_fingerprint``/``chunk_max_tokens``, если переданы, пишутся в
     ``index_meta`` АТОМАРНО с чанками — в одном ``conn.commit()``. На этом
@@ -215,11 +280,16 @@ def index_chunks(
     conn.execute(_META_SCHEMA)  # defensive — index_meta может не существовать без create_db
     conn.execute("DELETE FROM chunks")
     conn.executemany(
-        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [(c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text)) for c in chunks],
+        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb), c.breadcrumb)
+            for c in chunks
+        ],
     )
     conn.execute("INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild')")
+    if records is not None:
+        _rebuild_facets(conn, records)
     if corpus_fingerprint is not None:
         write_meta(conn, "corpus_fingerprint", corpus_fingerprint)
     if chunk_max_tokens is not None:
@@ -231,18 +301,22 @@ def _delete_doc_chunks(conn: sqlite3.Connection, doc_id: str) -> None:
     """Удалить чанки документа из ``chunks`` И из внешне-контентного FTS-индекса.
 
     FTS5 external content не самосинхронизируется (триггеров нет): удаление строки —
-    ТОЛЬКО через ``INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', …)``
-    с ТЕМ ЖЕ текстом, что был проиндексирован, иначе в индексе остаются висячие
-    постинги (верифицировано по sqlite.org/fts5). Текст берём прямо из ``chunks`` — он
-    побайтово совпадает со вставленным (``_insert_doc_chunks`` пишет FTS тем же
-    ``c.text``). Порядок принципиален: FTS-delete КАЖДОЙ строки ДО ``DELETE FROM
-    chunks`` — после удаления строки её текст для delete уже не прочитать.
+    ТОЛЬКО через ``INSERT INTO chunks_fts(chunks_fts, rowid, text, breadcrumb) VALUES
+    ('delete', …)`` с ТЕМИ ЖЕ значениями ОБЕИХ индексируемых колонок, что были
+    проиндексированы, иначе в индексе остаются висячие постинги (верифицировано по
+    sqlite.org/fts5; двухколоночный инвариант — spec analyze-retrieval §2.1). Текст/
+    breadcrumb берём прямо из ``chunks`` — они побайтово совпадают со вставленными
+    (``_insert_doc_chunks`` пишет FTS теми же ``c.text``/``c.breadcrumb``). Порядок
+    принципиален: FTS-delete КАЖДОЙ строки ДО ``DELETE FROM chunks`` — после удаления
+    строки её текст для delete уже не прочитать.
     """
-    old = conn.execute("SELECT chunk_id, text FROM chunks WHERE doc_id = ?", (doc_id,)).fetchall()
-    for chunk_id, text in old:
+    old = conn.execute(
+        "SELECT chunk_id, text, breadcrumb FROM chunks WHERE doc_id = ?", (doc_id,)
+    ).fetchall()
+    for chunk_id, text, breadcrumb in old:
         conn.execute(
-            "INSERT INTO chunks_fts (chunks_fts, rowid, text) VALUES ('delete', ?, ?)",
-            (chunk_id, text),
+            "INSERT INTO chunks_fts (chunks_fts, rowid, text, breadcrumb) VALUES ('delete', ?, ?, ?)",
+            (chunk_id, text, breadcrumb),
         )
     conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
 
@@ -250,14 +324,17 @@ def _delete_doc_chunks(conn: sqlite3.Connection, doc_id: str) -> None:
 def _insert_doc_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
     """Вставить чанки документа в ``chunks`` + вручную синхронизировать FTS.
     ``chunk_id`` присваивается rowid'ом при INSERT — берём ``lastrowid`` и пишем в FTS
-    ТОТ ЖЕ текст (инвариант для последующего ``_delete_doc_chunks``)."""
+    ТЕ ЖЕ text/breadcrumb (инвариант для последующего ``_delete_doc_chunks``)."""
     for c in chunks:
         cur = conn.execute(
-            "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text)),
+            "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb), c.breadcrumb),
         )
-        conn.execute("INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)", (cur.lastrowid, c.text))
+        conn.execute(
+            "INSERT INTO chunks_fts (rowid, text, breadcrumb) VALUES (?, ?, ?)",
+            (cur.lastrowid, c.text, c.breadcrumb),
+        )
 
 
 def _rebuild_doc_state(conn: sqlite3.Connection, sources_root: Path) -> None:
@@ -284,16 +361,21 @@ def index_corpus_incremental(
 ) -> tuple[int, int]:
     """Инкрементальная переиндексация: пере-чанкуются (дорогая bge-токенизация) и
     пере-индексируются в FTS ТОЛЬКО документы, чей ``doc.md`` изменился (fingerprint
-    разошёлся с ``doc_state``) или исчез из корпуса. Возвращает ``(изменено, удалено)``.
+    разошёлся с ``doc_state``) или исчез из корпуса. Фасеты (``doc_facets``/
+    ``topics_map``) перезаписываются ПОЛНОСТЬЮ каждый прогон — независимо от того,
+    какие документы изменились (дёшево, spec analyze-retrieval §2.3). Возвращает
+    ``(изменено, удалено)``.
 
     Одна транзакция на прогон (``with conn``): краш откатывает к консистентному
     прошлому поколению — ``doc_state`` не обгоняет ``chunks``. DDL/миграция здесь
     ОТСУТСТВУЮТ (они в ``create_db``): питоновский ``sqlite3`` неявно коммитит на DDL
-    и порвал бы атомарность. ``corpus_fingerprint``/``chunk_max_tokens`` пишутся той
-    же транзакцией — глобальный гейт реконсиляции остаётся согласован с чанками.
+    и порвал бы атомарность. ``corpus_fingerprint`` — ЕДИНАЯ meta-aware функция
+    (та же, что глобальный гейт ``run_pipeline``), не локальная пересборка из
+    per-doc частей — иначе форматы разошлись бы (spec analyze-retrieval §2.3).
     """
+    all_records = list(load_records(sources_root))
     current: dict[str, tuple[str, Path]] = {}
-    for rec in load_records(sources_root):
+    for rec in all_records:
         md = md_file(rec, sources_root)
         if md.exists():
             current[rec.id] = (_doc_fingerprint(md), md)
@@ -304,7 +386,7 @@ def index_corpus_incremental(
 
     changed = [doc_id for doc_id, (fp, _) in current.items() if stored.get(doc_id) != fp]
     vanished = [doc_id for doc_id in stored if doc_id not in current]
-    corpus_fp = _fingerprint_from_parts([f"{d}:{fp}" for d, (fp, _) in current.items()])
+    corpus_fp = corpus_fingerprint(sources_root)
 
     with conn:  # атомарно: либо всё новое поколение, либо ничего
         for doc_id in (*changed, *vanished):
@@ -320,6 +402,7 @@ def index_corpus_incremental(
             )
         for doc_id in vanished:
             conn.execute("DELETE FROM doc_state WHERE doc_id = ?", (doc_id,))
+        _rebuild_facets(conn, all_records)
         write_meta(conn, "corpus_fingerprint", corpus_fp)
         write_meta(conn, "chunk_max_tokens", str(max_tokens))
     return len(changed), len(vanished)
@@ -346,6 +429,7 @@ def index_corpus(
             conn, chunks,
             corpus_fingerprint=corpus_fingerprint(sources_root),
             chunk_max_tokens=max_tokens,
+            records=list(load_records(sources_root)),
         )
         _rebuild_doc_state(conn, sources_root)
         return f"полная пересборка: {len(chunks)} чанков"
@@ -369,21 +453,41 @@ def sanitize_fts_query(q: str) -> str:
     return " ".join('"' + t.replace('"', '""') + '"' for t in tokens) or '""'
 
 
-def fts_search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[SearchHit]:
+def fts_search(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 10,
+    *,
+    allowed_doc_ids: set[str] | None = None,
+) -> list[SearchHit]:
     """Полнотекстовый поиск (FTS5 MATCH), ранжирование bm25 (меньше = лучше).
 
     ``query`` — уже готовая MATCH-строка (санитизация — на границе пользовательского
     ввода, см. ``sanitize_fts_query``/CLI ``--raw``; API-функция принимает и честный
-    FTS5-синтаксис — NEAR/колонки понадобятся будущему analyze-слою).
+    FTS5-синтаксис — NEAR/колонки понадобятся будущему analyze-слою). ``allowed_doc_ids``
+    — опциональный фасетный фильтр (``retrieve()``, spec analyze-retrieval §4): пустое
+    множество (все фильтры исключили корпус целиком) даёт [] без обращения к FTS —
+    пустой ``IN ()`` невалиден в SQLite.
     """
-    cur = conn.execute(
+    if allowed_doc_ids is not None and not allowed_doc_ids:
+        return []
+    sql = (
         "SELECT c.doc_id, c.chunk_index, bm25(chunks_fts) AS rank, "
-        "snippet(chunks_fts, 0, '[', ']', '…', 12) AS snip "
+        "snippet(chunks_fts, 0, '[', ']', '…', 12) AS snip, c.breadcrumb "
         "FROM chunks_fts JOIN chunks c ON c.chunk_id = chunks_fts.rowid "
-        "WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-        (query, limit),
+        "WHERE chunks_fts MATCH ?"
     )
-    return [SearchHit(str(r[0]), int(r[1]), float(r[2]), str(r[3])) for r in cur.fetchall()]
+    params: list[str | int] = [query]
+    if allowed_doc_ids is not None:
+        sql += f" AND c.doc_id IN ({','.join('?' * len(allowed_doc_ids))})"
+        params.extend(sorted(allowed_doc_ids))
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
+    cur = conn.execute(sql, params)
+    return [
+        SearchHit(str(r[0]), int(r[1]), float(r[2]), str(r[3]), str(r[4]))
+        for r in cur.fetchall()
+    ]
 
 
 def chunks_from_corpus(

@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from index.bge_tokenizer import EMBED_MAX_TOKENS
+from index.chunking import embed_input
 from index.corpus_index import DEFAULT_DB, read_meta
 from index.embed import Embedder, FloatArray, get_embedder
 from core.env import load_dotenv
@@ -47,6 +48,7 @@ class VecHit:
     chunk_index: int
     score: float
     text: str
+    breadcrumb: str
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -105,53 +107,79 @@ def load_vectors(conn: sqlite3.Connection, model: str) -> tuple[list[str], Float
 
 
 def semantic_search(
-    conn: sqlite3.Connection, query_vec: FloatArray, model: str, top_k: int = 10
+    conn: sqlite3.Connection,
+    query_vec: FloatArray,
+    model: str,
+    top_k: int = 10,
+    *,
+    allowed_doc_ids: set[str] | None = None,
 ) -> list[VecHit]:
     """Семантический поиск по векторам модели (брутфорс-косинус). Вектор ключуется
     ``content_hash`` — join к ``chunks`` раздаёт score ВСЕМ носителям хэша (общий
     boilerplate-чанк находим в каждом документе-носителе). Fingerprint-гейт УПРАЗДНЁН:
     вектор не может указать на чужой текст (ключ — содержимое), устаревших
     результатов не бывает; неполноту (часть чанков ещё не заэмбеддена) репортит
-    CLI по ``unembedded_count``."""
+    CLI по ``unembedded_count``.
+
+    ``allowed_doc_ids`` — опциональный фасетный фильтр (``retrieve()``, spec
+    analyze-retrieval §3.2): носители вне множества отбрасываются на этапе раздачи
+    хэша носителям; если у хэша не осталось носителей — хэш пропускается БЕЗ учёта в
+    бюджете ``top_k``, следующий по score хэш добирает бюджет (итерация по полному
+    ``order`` до наполнения — НЕ срез ``[:top_k]`` до фильтра, иначе легитимные хиты
+    терялись бы за отфильтрованными). ``None`` — прежнее поведение (бюджет — по
+    числу рассмотренных хэшей, как раньше)."""
     hashes, mat = load_vectors(conn, model)
     if not hashes:
         return []
     query = query_vec.reshape(-1).astype(np.float32)
     scores = mat @ query
-    order = np.argsort(-scores)[:top_k]
+    order = np.argsort(-scores)
     hits: list[VecHit] = []
+    contributed = 0
     for idx in order:
+        if contributed >= top_k:
+            break
         score = float(scores[int(idx)])
         rows = conn.execute(
-            "SELECT chunk_id, doc_id, chunk_index, text FROM chunks WHERE content_hash = ? "
+            "SELECT chunk_id, doc_id, chunk_index, text, breadcrumb FROM chunks WHERE content_hash = ? "
             "ORDER BY doc_id, chunk_index",
             (hashes[int(idx)],),
         ).fetchall()
-        hits.extend(VecHit(int(r[0]), str(r[1]), int(r[2]), score, str(r[3])) for r in rows)
+        if allowed_doc_ids is not None:
+            rows = [r for r in rows if str(r[1]) in allowed_doc_ids]
+        if not rows:
+            continue  # хэш без носителей внутри фильтра — не считается в бюджет top_k
+        contributed += 1
+        hits.extend(
+            VecHit(int(r[0]), str(r[1]), int(r[2]), score, str(r[3]), str(r[4])) for r in rows
+        )
     return hits
 
 
 def chunk_hashes(
     conn: sqlite3.Connection, *, not_embedded_for: str | None = None
 ) -> tuple[list[str], list[str]]:
-    """Уникальные ``(content_hash, text)`` чанков корпуса. ``not_embedded_for=<model>``
-    — только хэши, ещё НЕ заэмбедженные этой моделью (инкрементальный отбор: правка
-    одного документа эмбеддит лишь его новые хэши, дубли boilerplate — один раз);
-    ``None`` — все (ab_eval: полная матрица на модель). ``content_hash`` NOT NULL,
-    так что ``NOT IN`` без NULL-ловушки."""
+    """Уникальные ``(content_hash, embed_input(breadcrumb, text))`` чанков корпуса —
+    эмбеддер видит breadcrumb-контекст (spec analyze-retrieval §3.1), не голый text.
+    ``not_embedded_for=<model>`` — только хэши, ещё НЕ заэмбедженные этой моделью
+    (инкрементальный отбор: правка одного документа эмбеддит лишь его новые хэши,
+    дубли boilerplate — один раз); ``None`` — все (ab_eval: полная матрица на модель).
+    ``content_hash`` NOT NULL, так что ``NOT IN`` без NULL-ловушки."""
     if not_embedded_for is None:
         rows = conn.execute(
-            "SELECT DISTINCT content_hash, text FROM chunks ORDER BY content_hash"
+            "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks ORDER BY content_hash"
         ).fetchall()
     else:
         ensure_schema(conn)  # первый embed: таблицы vectors ещё нет — подзапрос иначе падает
         rows = conn.execute(
-            "SELECT DISTINCT content_hash, text FROM chunks "
+            "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks "
             "WHERE content_hash NOT IN (SELECT content_hash FROM vectors WHERE model = ?) "
             "ORDER BY content_hash",
             (not_embedded_for,),
         ).fetchall()
-    return [str(r[0]) for r in rows], [str(r[1]) for r in rows]
+    hashes = [str(r[0]) for r in rows]
+    texts = [embed_input(str(r[1]), str(r[2])) for r in rows]
+    return hashes, texts
 
 
 def gc_vectors(conn: sqlite3.Connection, model: str) -> int:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from index.chunking import _hard_split, chunk_text, strip_frontmatter
+from index.chunking import _hard_split, chunk_text, embed_input, strip_frontmatter
 
 
 def wc(text: str) -> int:
@@ -131,3 +131,81 @@ def test_hard_split_matches_old_behavior_on_monster_sentence() -> None:
     chunks = _hard_split(text, wc, max_tokens=5)
     assert [c.count(" ") + 1 for c in chunks] == [5, 5, 5, 5, 5, 5, 5, 2]
     assert sum(wc(c) for c in chunks) == 37
+
+
+# --- breadcrumb-секционирование (spec analyze-retrieval §1) ---
+
+
+def test_no_headings_single_section_empty_breadcrumb() -> None:
+    text = "\n\n".join("word " * 5 for _ in range(3))
+    chunks = chunk_text(text.strip(), wc, max_tokens=100)
+    assert len(chunks) == 1
+    assert chunks[0].breadcrumb == ""
+
+
+def test_single_h1_heading_sets_breadcrumb() -> None:
+    text = "# Introduction\n\nsome body text here"
+    chunks = chunk_text(text, wc, max_tokens=100)
+    assert len(chunks) == 1
+    assert chunks[0].breadcrumb == "Introduction"
+
+
+def test_heading_line_retained_in_chunk_text() -> None:
+    text = "# Introduction\n\nbody text"
+    chunks = chunk_text(text, wc, max_tokens=100)
+    assert "# Introduction" in chunks[0].text
+    assert "body text" in chunks[0].text
+
+
+def test_nested_headings_build_breadcrumb_stack() -> None:
+    text = (
+        "# H1\n\npara one\n\n"
+        "## H2a\n\npara two\n\n"
+        "### H3\n\npara three\n\n"
+        "## H2b\n\npara four"
+    )
+    chunks = chunk_text(text, wc, max_tokens=100)
+    breadcrumbs = [c.breadcrumb for c in chunks]
+    assert breadcrumbs == ["H1", "H1 › H2a", "H1 › H2a › H3", "H1 › H2b"]
+
+
+def test_section_change_flushes_chunk_even_under_budget() -> None:
+    """Два коротких раздела с большим max_tokens всё равно дают ДВА чанка — секция
+    не пересекается packing-логикой, даже если оба текста уместились бы в один."""
+    text = "# A\n\nshort\n\n# B\n\nshort too"
+    chunks = chunk_text(text, wc, max_tokens=1000)
+    assert len(chunks) == 2
+    assert chunks[0].breadcrumb == "A"
+    assert chunks[1].breadcrumb == "B"
+
+
+def test_indices_sequential_across_sections() -> None:
+    text = "# A\n\n" + "\n\n".join("word " * 5 for _ in range(3)) + "\n\n# B\n\nword " * 5
+    chunks = chunk_text(text, wc, max_tokens=10)
+    assert [c.index for c in chunks] == list(range(len(chunks)))
+
+
+def test_pre_heading_text_has_empty_breadcrumb() -> None:
+    text = "intro before any heading\n\n# First Heading\n\nbody"
+    chunks = chunk_text(text, wc, max_tokens=100)
+    assert chunks[0].breadcrumb == ""
+    assert chunks[1].breadcrumb == "First Heading"
+
+
+def test_sibling_heading_resets_deeper_level() -> None:
+    """Заголовок того же уровня сбрасывает более глубокие уровни в стеке (не
+    накапливает H3 из предыдущей ветки)."""
+    text = "## H2a\n\n### H3\n\npara\n\n## H2b\n\npara"
+    chunks = chunk_text(text, wc, max_tokens=100)
+    assert chunks[-1].breadcrumb == "H2b"
+
+
+# --- embed_input (spec analyze-retrieval §1.3) ---
+
+
+def test_embed_input_prefixes_breadcrumb() -> None:
+    assert embed_input("H1 › H2", "body text") == "H1 › H2\nbody text"
+
+
+def test_embed_input_no_breadcrumb_returns_text_unchanged() -> None:
+    assert embed_input("", "body text") == "body text"
