@@ -23,7 +23,7 @@ from analyze.retrieve import retrieve
 from index.corpus_index import DEFAULT_DB, fts_search, sanitize_fts_query
 from index.embed import Embedder, get_embedder
 from core.env import REPO_ROOT, load_dotenv
-from index.vector_store import chunk_hashes, semantic_search, store_vectors
+from index.vector_store import check_chunk_budget, chunk_hashes, semantic_search, store_vectors
 
 DEFAULT_EVAL_QUERIES = REPO_ROOT / "pipeline" / "config" / "eval_queries.yaml"
 
@@ -127,7 +127,7 @@ def evaluate_vector(
     store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
     outcomes: list[QueryOutcome] = []
     for cq in queries:
-        query_vec = embedder.embed([cq.query])
+        query_vec = embedder.embed([cq.query], kind="query")
         hits = semantic_search(conn, query_vec[0], embedder.name, k)
         ranked = [h.text for h in hits]
         outcomes.append(
@@ -219,6 +219,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"\nэталон пропущен: {exc}", file=sys.stderr)
 
         for embedder in embedders:
+            # ПОСЛЕ создания эмбеддера (нужен embedder.max_tokens), по каждому
+            # эмбеддеру отдельно — разные модели могут иметь разный бюджет
+            # (spec embed-local-swap §4); намеренно без try/except — несовместимость
+            # чанков с бюджетом сравниваемой модели должна остановить прогон, не спрятаться.
+            check_chunk_budget(conn, embedder.max_tokens)
             if "vector" in modes:
                 results.append(evaluate_vector(conn, embedder, hashes, texts, queries, args.k))
             else:

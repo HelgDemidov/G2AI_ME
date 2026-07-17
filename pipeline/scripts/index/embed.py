@@ -15,7 +15,7 @@ import os
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,6 +26,8 @@ FloatArray = NDArray[np.float32]
 
 DEFAULT_ONNX = MODEL_DIR / "model_int8.onnx"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
+INTRA_OP_THREADS = 4  # физический лимит машины: 2 ядра/4 потока (spec embed-local-swap §3) —
+# лечит документированную оверсабскрипцию (onnxruntime иначе создаёт потоков больше ядер)
 
 
 def l2_normalize(mat: FloatArray) -> FloatArray:
@@ -36,12 +38,20 @@ def l2_normalize(mat: FloatArray) -> FloatArray:
 
 
 class Embedder(Protocol):
-    """Общий интерфейс: name (идентификатор модели), dim, embed(texts) -> (n, dim)."""
+    """Общий интерфейс: name (идентификатор модели), dim, max_tokens (бюджет в
+    СОБСТВЕННЫХ токенах модели; None — гейт неприменим/неизвестен, напр. облачный
+    эмбеддер без фиксированного лимита), embed(texts, kind) -> (n, dim).
+
+    ``kind`` — асимметрия документ/запрос: модели с промпт-префиксами (напр.
+    EmbeddingGemma) кодируют запрос и документ по-разному и без префикса теряют
+    качество (spec embed-local-swap §2); симметричные бэкенды параметр принимают,
+    но игнорируют — сигнатура едина для ВСЕХ реализаций."""
 
     name: str
     dim: int
+    max_tokens: int | None
 
-    def embed(self, texts: list[str]) -> FloatArray: ...
+    def embed(self, texts: list[str], *, kind: Literal["doc", "query"] = "doc") -> FloatArray: ...
 
 
 class OnnxBgeEmbedder:
@@ -49,6 +59,9 @@ class OnnxBgeEmbedder:
 
     name = "bge-m3-onnx-int8"
     dim = 1024
+    # тип аннотирован явно: Protocol.max_tokens инвариантен для изменяемых атрибутов
+    # (mypy иначе выводит голый int и ругается на несовместимость с int | None)
+    max_tokens: int | None = EMBED_MAX_TOKENS
 
     def __init__(
         self,
@@ -61,8 +74,10 @@ class OnnxBgeEmbedder:
 
         if not model_path.exists():
             raise FileNotFoundError(f"модель не найдена: {model_path} — скачать bge-m3?")
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = INTRA_OP_THREADS  # лечит оверсабскрипцию (bge_tokenizer §11)
         self._session: Any = ort.InferenceSession(
-            str(model_path), providers=["CPUExecutionProvider"]
+            str(model_path), sess_options=opts, providers=["CPUExecutionProvider"]
         )
         self._tok: Any = load_tokenizer(tokenizer_path)
         pad_id = self._tok.token_to_id("<pad>")
@@ -70,7 +85,8 @@ class OnnxBgeEmbedder:
         self._tok.enable_padding(pad_id=pad_id if pad_id is not None else 1, pad_token="<pad>")
         self._batch = batch_size
 
-    def embed(self, texts: list[str]) -> FloatArray:
+    def embed(self, texts: list[str], *, kind: Literal["doc", "query"] = "doc") -> FloatArray:
+        # bge-m3 симметрична — kind игнорируется, сигнатура едина с протоколом
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
         out: list[FloatArray] = []
@@ -99,6 +115,7 @@ class OpenRouterEmbedder:
     ) -> None:
         self.name = model
         self.dim = 0  # станет известно после первого ответа
+        self.max_tokens: int | None = None  # облачный лимит не фиксирован здесь — гейт неприменим
         self._model = model
         self._batch = batch_size
         self._url = url
@@ -123,7 +140,8 @@ class OpenRouterEmbedder:
         items = sorted(data["data"], key=lambda x: x["index"])
         return [list(item["embedding"]) for item in items]
 
-    def embed(self, texts: list[str]) -> FloatArray:
+    def embed(self, texts: list[str], *, kind: Literal["doc", "query"] = "doc") -> FloatArray:
+        # OpenRouter-модели (текущий каталог) симметричны — kind игнорируется
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
         vecs: list[list[float]] = []

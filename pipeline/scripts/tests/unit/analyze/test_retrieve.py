@@ -24,11 +24,12 @@ class FakeEmbedder:
 
     name = MODEL
     dim = 1
+    max_tokens: int | None = None
 
     def __init__(self, query_vec: FloatArray) -> None:
         self._vec = query_vec
 
-    def embed(self, texts: list[str]) -> FloatArray:
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
         return np.vstack([self._vec for _ in texts])
 
 

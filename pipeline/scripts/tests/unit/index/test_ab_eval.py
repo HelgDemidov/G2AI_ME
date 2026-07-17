@@ -96,9 +96,22 @@ def test_default_eval_queries_file_loads() -> None:
 class _FakeEmbedder:
     name = "fake-model"
     dim = 2
+    max_tokens = None
 
-    def embed(self, texts: list[str]) -> FloatArray:
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
         return np.ones((len(texts), self.dim), dtype=np.float32)
+
+
+class _FakeEmbedderSmallBudget:
+    """max_tokens намеренно меньше chunk_max_tokens корпуса — гейт обязан отсечь
+    ДО embed() (spec embed-local-swap §4)."""
+
+    name = "fake-small-budget"
+    dim = 2
+    max_tokens = 10
+
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+        raise AssertionError("embed() не должен вызываться — гейт обязан отсечь раньше")
 
 
 def _build_db(path: Path) -> None:
@@ -164,6 +177,25 @@ def test_main_mode_all_reports_all_three(tmp_path: Path, monkeypatch: Any, capsy
     assert "### fts" in out
     assert "fake-model · vector" in out
     assert "fake-model · hybrid" in out
+
+
+def test_main_vector_mode_propagates_chunk_budget_error(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """check_chunk_budget вызывается ПО КАЖДОМУ эмбеддеру в цикле (spec
+    embed-local-swap §4) — несовместимость чанков с бюджетом модели останавливает
+    прогон (без try/except: это не должно прятаться)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "accountability text", 5)], chunk_max_tokens=100)
+    conn.close()
+    q = _write_queries(tmp_path / "q.yaml")
+    monkeypatch.setattr("index.ab_eval.get_embedder", lambda backend, **kw: _FakeEmbedderSmallBudget())
+    monkeypatch.setattr("index.ab_eval.load_dotenv", lambda: None)
+
+    argv = ["--db", str(db), "--eval-queries", str(q), "--mode", "vector", "--k", "1", "--no-reference"]
+    with pytest.raises(ValueError, match="100"):
+        main(argv)
 
 
 def test_main_missing_db_reports_error(tmp_path: Path, capsys: Any) -> None:

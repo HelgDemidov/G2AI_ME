@@ -109,7 +109,7 @@ def retrieve(
     fts_hits: list[SearchHit] = fts_search(conn, sanitize_fts_query(query), POOL, allowed_doc_ids=allowed)
     vec_hits: list[VecHit] = []
     if embedder is not None:
-        query_vec = embedder.embed([query])[0]
+        query_vec = embedder.embed([query], kind="query")[0]
         vec_hits = semantic_search(conn, query_vec, embedder.name, POOL, allowed_doc_ids=allowed)
 
     fts_rank = _rank_map([(h.doc_id, h.chunk_index) for h in fts_hits])

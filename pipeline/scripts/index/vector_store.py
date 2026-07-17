@@ -25,7 +25,6 @@ from pathlib import Path
 
 import numpy as np
 
-from index.bge_tokenizer import EMBED_MAX_TOKENS
 from index.chunking import embed_input
 from index.corpus_index import DEFAULT_DB, read_meta
 from index.embed import Embedder, FloatArray, get_embedder
@@ -56,20 +55,28 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def check_chunk_budget(conn: sqlite3.Connection) -> None:
-    """Гейт: чанки индекса не должны быть крупнее бюджета эмбеддера
-    (``EMBED_MAX_TOKENS``) — иначе ``OnnxBgeEmbedder`` молча truncate'ит каждый
-    чанк до своего лимита, и вектор представлял бы только префикс: инвариант
-    «канонический чанк целиком видим и FTS, и векторному поиску» перестал бы
-    быть проверяемым, оставаясь лишь подразумеваемым. Отсутствие
-    ``chunk_max_tokens`` в ``index_meta`` (индекс собран без него) не гейтится —
-    неизвестность не повод отказывать.
+def check_chunk_budget(conn: sqlite3.Connection, embedder_max: int | None) -> None:
+    """Гейт: чанки индекса не должны быть крупнее бюджета КОНКРЕТНОГО эмбеддера
+    (``embedder_max``, в его собственных токенах) — иначе эмбеддер молча
+    truncate'ит каждый чанк до своего лимита, и вектор представлял бы только
+    префикс: инвариант «канонический чанк целиком видим и FTS, и векторному
+    поиску» перестал бы быть проверяемым, оставаясь лишь подразумеваемым.
+
+    ``embedder_max=None`` — гейт неприменим (напр. облачный эмбеддер без
+    фиксированного/известного лимита, spec embed-local-swap §4) — return без
+    проверки. Отсутствие ``chunk_max_tokens`` в ``index_meta`` (индекс собран без
+    него) не гейтится — неизвестность не повод отказывать.
+
+    Ответственность вызывающего (он знает ``embedder.max_tokens``), НЕ писателя
+    ``store_vectors`` — тот эмбеддера не видит (spec embed-local-swap §4).
     """
+    if embedder_max is None:
+        return
     chunk_max_str = read_meta(conn, "chunk_max_tokens")
-    if chunk_max_str is not None and int(chunk_max_str) > EMBED_MAX_TOKENS:
+    if chunk_max_str is not None and int(chunk_max_str) > embedder_max:
         raise ValueError(
-            f"индекс собран с чанками {chunk_max_str} > лимита эмбеддера {EMBED_MAX_TOKENS}: "
-            f"векторы представляли бы префиксы; пересоберите с --max-tokens {EMBED_MAX_TOKENS}"
+            f"индекс собран с чанками {chunk_max_str} > лимита эмбеддера {embedder_max}: "
+            f"векторы представляли бы префиксы; пересоберите с --max-tokens {embedder_max}"
         )
 
 
@@ -79,12 +86,14 @@ def store_vectors(
     """Идемпотентный upsert векторов по ключу ``(content_hash, model)``.
 
     Тупой писатель: НЕ решает, какие хэши эмбеддить (это ``chunk_hashes`` —
-    инкрементальный отбор для production, полная матрица для ab_eval), и НЕ штампует
-    fingerprint. Ключ — СОДЕРЖИМОЕ чанка (sha256), поэтому вектор физически не может
-    указать на чужой текст: класс дефекта «векторы врут» (spec index-consistency
-    §0.1) устранён по построению, а не сверкой отпечатков (упразднена).
+    инкрементальный отбор для production, полная матрица для ab_eval), НЕ штампует
+    fingerprint и НЕ гейтит бюджет чанка (``check_chunk_budget`` — ответственность
+    ВЫЗЫВАЮЩЕГО, он знает ``embedder.max_tokens``; писатель эмбеддера не видит,
+    spec embed-local-swap §4). Ключ — СОДЕРЖИМОЕ чанка (sha256), поэтому вектор
+    физически не может указать на чужой текст: класс дефекта «векторы врут» (spec
+    index-consistency §0.1) устранён по построению, а не сверкой отпечатков
+    (упразднена).
     """
-    check_chunk_budget(conn)
     ensure_schema(conn)
     conn.executemany(
         "INSERT INTO vectors (content_hash, model, vec) VALUES (?, ?, ?) "
@@ -226,13 +235,15 @@ def _cmd_embed(args: argparse.Namespace) -> int:
         print("нет чанков в БД", file=sys.stderr)
         conn.close()
         return 2
+    embedder = _make_embedder(args.backend, args.model)
     try:
-        check_chunk_budget(conn)  # до дорогого embedder.embed() — не тратить минуты ONNX впустую
+        # ПОСЛЕ создания эмбеддера (нужен embedder.max_tokens), но ДО дорогого
+        # embedder.embed() — не тратить минуты инференса впустую (spec embed-local-swap §4)
+        check_chunk_budget(conn, embedder.max_tokens)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         conn.close()
         return 2
-    embedder = _make_embedder(args.backend, args.model)
     hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)  # только НОВЫЕ хэши
     if hashes:
         store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
@@ -248,7 +259,7 @@ def _cmd_vsearch(args: argparse.Namespace) -> int:
         return 2
     conn = sqlite3.connect(args.db)
     embedder = _make_embedder(args.backend, args.model)
-    query_vec = embedder.embed([args.query])
+    query_vec = embedder.embed([args.query], kind="query")
     hits = semantic_search(conn, query_vec[0], embedder.name, args.limit)
     has_vectors = (
         conn.execute("SELECT 1 FROM vectors WHERE model = ? LIMIT 1", (embedder.name,)).fetchone()

@@ -251,48 +251,68 @@ def test_gc_keeps_vectors_still_referenced(tmp_path: Path) -> None:
     assert _vec_count(conn, "m") == 3
 
 
-# --- check_chunk_budget: инвариант «чанк целиком видим обоим поискам» (index-consistency §6) ---
+# --- check_chunk_budget: инвариант «чанк целиком видим обоим поискам» (index-consistency §6,
+# сигнатура — embedder_max явным параметром вместо константы, spec embed-local-swap §4) ---
 
 
 def test_check_chunk_budget_passes_when_within_limit(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS)
-    check_chunk_budget(conn)  # не должно бросать
+    check_chunk_budget(conn, EMBED_MAX_TOKENS)  # не должно бросать
 
 
 def test_check_chunk_budget_passes_when_absent(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)])  # без chunk_max_tokens
-    check_chunk_budget(conn)  # неизвестность — не повод отказывать
+    check_chunk_budget(conn, EMBED_MAX_TOKENS)  # неизвестность — не повод отказывать
 
 
 def test_check_chunk_budget_raises_when_exceeds_limit(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
     with pytest.raises(ValueError, match=str(EMBED_MAX_TOKENS)):
-        check_chunk_budget(conn)
+        check_chunk_budget(conn, EMBED_MAX_TOKENS)
 
 
-def test_store_vectors_raises_when_chunk_budget_exceeded(tmp_path: Path) -> None:
+def test_check_chunk_budget_none_max_never_raises(tmp_path: Path) -> None:
+    """embedder_max=None — гейт неприменим (облачный эмбеддер без фиксированного
+    лимита) — не бросает ДАЖЕ при огромном chunk_max_tokens (spec embed-local-swap §4)."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 100)
+    check_chunk_budget(conn, None)  # не должно бросать
+
+
+def test_store_vectors_does_not_gate_chunk_budget(tmp_path: Path) -> None:
+    """store_vectors — тупой писатель: НЕ вызывает check_chunk_budget (ответственность
+    вызывающего, он знает embedder.max_tokens — spec embed-local-swap §4). Раньше
+    store_vectors сам бросал ValueError на превышении бюджета — это поведение снято."""
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
-    with pytest.raises(ValueError):
-        store_vectors(conn, ["deadbeef"], l2_normalize(np.eye(1, dtype=np.float32)), "m")
+    store_vectors(conn, ["deadbeef"], l2_normalize(np.eye(1, dtype=np.float32)), "m")  # не бросает
 
 
-def test_cmd_embed_reports_budget_error_without_calling_embedder(
+def test_cmd_embed_reports_budget_error_without_calling_embed(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
-    """Гейт срабатывает ДО дорогого embedder.embed() — не тратить минуты ONNX впустую."""
+    """Гейт срабатывает ПОСЛЕ создания эмбеддера (нужен embedder.max_tokens), но ДО
+    дорогого embedder.embed() — не тратить минуты инференса впустую (spec
+    embed-local-swap §4)."""
     db = tmp_path / "c.db"
     conn = create_db(db)
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
     conn.close()
 
-    def fail_if_called(backend: str, model: str | None) -> Any:
-        raise AssertionError("эмбеддер не должен вызываться — гейт обязан отсечь раньше")
+    class _FakeBudgetEmbedder:
+        name = "fake"
+        dim = 1
+        max_tokens = EMBED_MAX_TOKENS
 
-    monkeypatch.setattr("index.vector_store._make_embedder", fail_if_called)
+        def embed(self, texts: list[str], *, kind: str = "doc") -> Any:
+            raise AssertionError("embed() не должен вызываться — гейт обязан отсечь раньше")
+
+    monkeypatch.setattr(
+        "index.vector_store._make_embedder", lambda backend, model: _FakeBudgetEmbedder()
+    )
 
     args = argparse.Namespace(db=db, backend="bge", model=None)
     assert _cmd_embed(args) == 2
