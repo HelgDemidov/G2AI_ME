@@ -68,6 +68,20 @@ def _detect_scan(raw: Path) -> None:
         )
 
 
+def _was_ocr_normalized(raw: Path) -> bool:
+    """PDF уже прошёл OCR-нормализацию РАНЬШЕ (по метаданным ocrmypdf).
+
+    `_ocr_normalize` мутирует `raw` in-place (один файл, не сайдкар) — после первого
+    успеха текст-слой уже есть, и `_detect_scan` больше НЕ поднимет `NeedsOCR` на
+    повторных конвертациях (`--force`, бамп версии конвертера). Без этой проверки
+    `ocr_headings` перестал бы применяться после первого прогона — метаданные ocrmypdf
+    (`Creator: ocrmypdf ...`) переживают мутацию текст-слоя и остаются надёжным маркером.
+    """
+    with pdfplumber.open(raw) as pdf:
+        creator = (pdf.metadata.get("Creator") or "").lower()
+    return "ocrmypdf" in creator
+
+
 # rec.language (schema.py: ISO 639-1, либо 639-3 где нет 639-1, напр. cnr) -> tesseract langcode.
 TESSERACT_LANGS = {
     "en": "eng", "et": "est", "sr": "srp_latn", "cnr": "srp_latn",
@@ -114,17 +128,17 @@ def _check_langs_available(langs: str) -> None:
         raise ConversionError(f"нет traineddata для {', '.join(missing)} — sudo apt install {apt_pkgs}")
 
 
-def _ocr_normalize(raw: Path, language: str | None) -> Path:
-    """Нормализовать скан в PDF с невидимым текст-слоем (кэш `.ocr.pdf` рядом с raw).
+def _ocr_normalize(raw: Path, language: str | None) -> None:
+    """OCR-нормализовать скан IN-PLACE: `raw` заменяется версией с невидимым текст-слоем.
 
-    Вызывается только из OCR-ветки `_convert_pdf` (после `NeedsOCR` от `_detect_scan`).
-    Кэш — по mtime: OCR 50 стр. на 2 ядрах ≈ десятки минут, повторный прогон реконсиляции
-    не должен его платить дважды.
+    Один PDF-файл на документ, без сайдкара `.ocr.pdf` (раньше кэш жил отдельным файлом —
+    двойное хранение того же документа; убрано по решению пользователя). Кэширование
+    получается «бесплатно» иначе: после успеха `raw` САМ содержит текст-слой, поэтому
+    следующий `_detect_scan(raw)` больше не поднимет `NeedsOCR`, и `_ocr_normalize` не
+    вызовется повторно без явного `--force`/бампа версии конвертера. Вызывающий
+    (`_do_convert` в run_pipeline.py) ОБЯЗАН пересчитать sha256/размер/mtime в
+    `.state.yaml` после конвертации — raw физически изменился.
     """
-    cached = raw.parent / ".ocr.pdf"
-    if cached.exists() and cached.stat().st_mtime >= raw.stat().st_mtime:
-        return cached
-
     if shutil.which("ocrmypdf") is None:
         raise NeedsOCR(
             f"{raw.name}: ocrmypdf не установлен — sudo apt install ocrmypdf "
@@ -142,7 +156,7 @@ def _ocr_normalize(raw: Path, language: str | None) -> Path:
             raw.name, n, n * 20 // 60, n * 40 // 60,
         )
 
-    staging = fsio.staging_path(cached)
+    staging = fsio.staging_path(raw)
     result = subprocess.run(
         [
             "ocrmypdf", "--skip-text", "-l", langs, "--output-type", "pdf", "--quiet",
@@ -155,16 +169,15 @@ def _ocr_normalize(raw: Path, language: str | None) -> Path:
             f"{raw.name}: ocrmypdf завершился с кодом {result.returncode}: "
             f"{result.stderr[-_OCR_STDERR_TAIL:]}"
         )
-    staging.replace(cached)
-    return cached
+    staging.replace(raw)
 
 
 def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
-    scanned = False
     try:
         _detect_scan(raw)
+        scanned = _was_ocr_normalized(raw)  # текст есть — но, может, уже был нормализован раньше
     except NeedsOCR:
-        raw = _ocr_normalize(raw, language)   # скан -> .ocr.pdf с текст-слоем
+        _ocr_normalize(raw, language)   # мутирует raw IN-PLACE (текст-слой встроен)
         scanned = True
     pdf_convert(str(raw), str(out))  # существующий конвертер, без изменений
     if scanned:  # только OCR-ветка: цифровой путь не трогаем (размер-кластеризация там чище)

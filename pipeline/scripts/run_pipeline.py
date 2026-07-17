@@ -251,6 +251,15 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     state.converter_name, state.converter_version = conv.name, conv.version
+    # OCR-путь (convert-ocr) мутирует raw IN-PLACE (один PDF-файл на документ, без
+    # сайдкара .ocr.pdf) — sha256/размер/mtime обязаны обновиться здесь, иначе
+    # следующий stat-guard (needed_stages) увидит расхождение со старой записью и
+    # решит, что raw «повреждён», затребовав передобычу поверх уже нормализованного
+    # файла. Пересчёт безвреден и для не-OCR форматов (raw не менялся — sha совпадёт).
+    st = raw.stat()
+    state.sha256 = _sha256(raw)
+    state.raw_size = st.st_size
+    state.raw_mtime_ns = st.st_mtime_ns
     schema.save_state(state_path, state)
 
 

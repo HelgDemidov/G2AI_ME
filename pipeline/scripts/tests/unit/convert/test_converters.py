@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,7 @@ from convert.converters import (
     _detect_scan,
     _ocr_normalize,
     _tesseract_langs,
+    _was_ocr_normalized,
     resolve_converter,
 )
 
@@ -131,8 +131,9 @@ class _FakePage:
 
 
 class _FakePdf:
-    def __init__(self, pages: list[_FakePage]) -> None:
+    def __init__(self, pages: list[_FakePage], metadata: dict[str, str] | None = None) -> None:
         self.pages = pages
+        self.metadata = metadata or {}
 
     def __enter__(self) -> "_FakePdf":
         return self
@@ -141,20 +142,10 @@ class _FakePdf:
         return None
 
 
-def _patch_open(monkeypatch: Any, pages: list[Any]) -> None:
-    monkeypatch.setattr("convert.converters.pdfplumber.open", lambda path: _FakePdf(pages))
-
-
-def _touch_after(target: Path, reference: Path) -> None:
-    """Выставить mtime target заведомо позже reference (для проверки кэш-свежести)."""
-    ref_mtime = reference.stat().st_mtime
-    os.utime(target, (ref_mtime + 10, ref_mtime + 10))
-
-
-def _touch_before(target: Path, reference: Path) -> None:
-    """Выставить mtime target заведомо раньше reference (для проверки протухшего кэша)."""
-    ref_mtime = reference.stat().st_mtime
-    os.utime(target, (ref_mtime - 10, ref_mtime - 10))
+def _patch_open(monkeypatch: Any, pages: list[Any], metadata: dict[str, str] | None = None) -> None:
+    monkeypatch.setattr(
+        "convert.converters.pdfplumber.open", lambda path: _FakePdf(pages, metadata)
+    )
 
 
 def test_detect_scan_raises_when_all_pages_empty(monkeypatch: Any, tmp_path: Path) -> None:
@@ -185,6 +176,24 @@ def test_detect_scan_none_extract_text_treated_as_empty(monkeypatch: Any, tmp_pa
         _detect_scan(tmp_path / "raw.pdf")
 
 
+# --- _was_ocr_normalized: метка ocrmypdf в метаданных переживает мутацию raw ---
+
+
+def test_was_ocr_normalized_true_when_creator_mentions_ocrmypdf(monkeypatch: Any, tmp_path: Path) -> None:
+    _patch_open(monkeypatch, [], metadata={"Creator": "ocrmypdf 15.2.0+dfsg1 / Tesseract OCR-PDF 5.3.4"})
+    assert _was_ocr_normalized(tmp_path / "raw.pdf") is True
+
+
+def test_was_ocr_normalized_false_for_born_digital_pdf(monkeypatch: Any, tmp_path: Path) -> None:
+    _patch_open(monkeypatch, [], metadata={"Creator": "Microsoft® Word 2019"})
+    assert _was_ocr_normalized(tmp_path / "raw.pdf") is False
+
+
+def test_was_ocr_normalized_false_when_no_metadata_at_all(monkeypatch: Any, tmp_path: Path) -> None:
+    _patch_open(monkeypatch, [])  # metadata=None -> {}
+    assert _was_ocr_normalized(tmp_path / "raw.pdf") is False
+
+
 def test_convert_pdf_calls_pdf_convert_only_after_scan_check(monkeypatch: Any, tmp_path: Path) -> None:
     calls: list[str] = []
     _patch_open(monkeypatch, [_FakePage("x" * 60)])
@@ -198,17 +207,17 @@ def test_convert_pdf_calls_pdf_convert_only_after_scan_check(monkeypatch: Any, t
 
 def test_convert_pdf_routes_scan_through_ocr_normalize(monkeypatch: Any, tmp_path: Path) -> None:
     """С convert-ocr NeedsOCR больше не пропагируется наружу — скан идёт через
-    _ocr_normalize, а pdf_convert затем вызывается на её результате, и вывод проходит
-    post-проход ocr_headings (только OCR-ветка)."""
+    _ocr_normalize (мутирует raw IN-PLACE, один файл — не сайдкар), pdf_convert
+    затем вызывается на ТОМ ЖЕ raw, и вывод проходит post-проход ocr_headings
+    (только OCR-ветка)."""
     _patch_open(monkeypatch, [_FakePage(""), _FakePage("")])
-    ocr_result = tmp_path / ".ocr.pdf"
-    ocr_result.write_bytes(b"fake ocr-normalized pdf")
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"fake scanned pdf")
 
     normalize_calls: list[tuple[Path, str | None]] = []
 
-    def fake_normalize(raw: Path, language: str | None) -> Path:
-        normalize_calls.append((raw, language))
-        return ocr_result
+    def fake_normalize(raw_arg: Path, language: str | None) -> None:
+        normalize_calls.append((raw_arg, language))
 
     monkeypatch.setattr("convert.converters._ocr_normalize", fake_normalize)
     convert_calls: list[tuple[str, str]] = []
@@ -219,9 +228,9 @@ def test_convert_pdf_routes_scan_through_ocr_normalize(monkeypatch: Any, tmp_pat
 
     monkeypatch.setattr("convert.converters.pdf_convert", fake_pdf_convert)
     out = tmp_path / "out.md"
-    _convert_pdf(tmp_path / "raw.pdf", out, "en")
-    assert normalize_calls == [(tmp_path / "raw.pdf", "en")]
-    assert convert_calls == [(str(ocr_result), str(out))]
+    _convert_pdf(raw, out, "en")
+    assert normalize_calls == [(raw, "en")]
+    assert convert_calls == [(str(raw), str(out))]  # тот же raw, не отдельный файл
     assert out.read_text(encoding="utf-8") == "# ANNEX I\nSome body text.\n"  # ocr_headings применён
 
 
@@ -239,6 +248,28 @@ def test_convert_pdf_digital_path_skips_ocr_headings_postprocessing(
     out = tmp_path / "out.md"
     _convert_pdf(tmp_path / "raw.pdf", out, "en")
     assert out.read_text(encoding="utf-8") == "ANNEX I\nSome body text.\n"  # без изменений
+
+
+def test_convert_pdf_reapplies_ocr_headings_on_already_normalized_raw(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Регресс: raw уже нормализован ПРЕДЫДУЩИМ прогоном (текст-слой есть, _detect_scan
+    больше не поднимет NeedsOCR) — но ocr_headings обязан примениться СНОВА на этой
+    повторной конвертации (--force/бамп версии конвертера), иначе восстановление
+    заголовков теряется после первого же прогона. Метка — метаданные ocrmypdf,
+    переживающие мутацию текст-слоя (см. _was_ocr_normalized)."""
+    _patch_open(
+        monkeypatch, [_FakePage("x" * 60)],
+        metadata={"Creator": "ocrmypdf 15.2.0+dfsg1 / Tesseract OCR-PDF 5.3.4"},
+    )
+
+    def fake_pdf_convert(src: str, dst: str) -> None:
+        Path(dst).write_text("ANNEX I\nSome body text.\n", encoding="utf-8")
+
+    monkeypatch.setattr("convert.converters.pdf_convert", fake_pdf_convert)
+    out = tmp_path / "out.md"
+    _convert_pdf(tmp_path / "raw.pdf", out, "en")
+    assert out.read_text(encoding="utf-8") == "# ANNEX I\nSome body text.\n"  # ocr_headings применён
 
 
 # --- _check_langs_available / _ocr_normalize ---
@@ -272,26 +303,11 @@ def test_ocr_normalize_missing_binary_raises_needs_ocr_with_apt_command(
         _ocr_normalize(raw, "en")
 
 
-def test_ocr_normalize_uses_fresh_cache_without_subprocess(monkeypatch: Any, tmp_path: Path) -> None:
+def test_ocr_normalize_mutates_raw_in_place_no_sidecar_file(monkeypatch: Any, tmp_path: Path) -> None:
+    """Один PDF-файл на документ — не сайдкар .ocr.pdf (решение пользователя, ревизия
+    convert-ocr от 2026-07-17): raw.pdf заменяется версией с текст-слоем НА МЕСТЕ."""
     raw = tmp_path / "raw.pdf"
-    raw.write_bytes(b"%PDF-1.4 fake")
-    cached = tmp_path / ".ocr.pdf"
-    cached.write_bytes(b"%PDF-1.4 cached")
-    _touch_after(cached, raw)  # кэш заведомо свежее raw
-
-    def fail_if_called(*a: Any, **kw: Any) -> Any:
-        raise AssertionError("subprocess не должен вызываться при свежем кэше")
-
-    monkeypatch.setattr("convert.converters.subprocess.run", fail_if_called)
-    assert _ocr_normalize(raw, "en") == cached
-
-
-def test_ocr_normalize_stale_cache_triggers_ocr(monkeypatch: Any, tmp_path: Path) -> None:
-    raw = tmp_path / "raw.pdf"
-    raw.write_bytes(b"%PDF-1.4 fake")
-    cached = tmp_path / ".ocr.pdf"
-    cached.write_bytes(b"stale")
-    _touch_before(cached, raw)  # кэш старее raw -> протух
+    raw.write_bytes(b"%PDF-1.4 fake scan")
 
     monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
     monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
@@ -305,10 +321,33 @@ def test_ocr_normalize_stale_cache_triggers_ocr(monkeypatch: Any, tmp_path: Path
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
-    result = _ocr_normalize(raw, "en")
+    _ocr_normalize(raw, "en")
     assert calls  # subprocess реально вызван
-    assert result == cached
-    assert cached.read_bytes() == b"%PDF-1.4 ocr result"
+    assert raw.read_bytes() == b"%PDF-1.4 ocr result"  # raw САМ теперь содержит OCR-результат
+    assert not (tmp_path / ".ocr.pdf").exists()  # никакого сайдкара
+
+
+def test_ocr_normalize_always_calls_subprocess_no_cache_check(monkeypatch: Any, tmp_path: Path) -> None:
+    """Без сайдкара нечего и проверять на свежесть — _ocr_normalize безусловно
+    вызывает subprocess при каждом вызове (кэш получается «бесплатно» иначе: после
+    успеха raw САМ содержит текст, и _detect_scan больше не поднимет NeedsOCR — то
+    есть _ocr_normalize вообще не будет вызван на следующих прогонах, без кэш-файла)."""
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 fake scan")
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    _patch_open(monkeypatch, [_FakePage("")])
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"ocr result")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+    _ocr_normalize(raw, "en")
+    assert len(calls) == 1
 
 
 def test_ocr_normalize_nonzero_exit_raises_conversion_error_with_stderr_tail(

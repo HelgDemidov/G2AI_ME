@@ -50,4 +50,5 @@ def test_ocr_path_extracts_text_and_restores_annex_heading(tmp_path: Path) -> No
     text = out.read_text(encoding="utf-8")
     assert "smoke" in text.lower()
     assert "# ANNEX" in text  # ocr_headings: Тир 1 сработал (ключевое слово ANNEX)
-    assert (raw.parent / ".ocr.pdf").exists()  # кэш-сайдкар создан
+    assert raw.exists()  # один файл на документ — не сайдкар .ocr.pdf
+    assert converters._was_ocr_normalized(raw)  # raw мутирован in-place, метка ocrmypdf на месте
