@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,8 @@ import pdfplumber
 
 from convert import eli
 from convert.pdf_to_markdown import convert as pdf_convert
+
+logger = logging.getLogger(__name__)
 
 
 class ConversionError(RuntimeError):
@@ -60,6 +63,31 @@ def _detect_scan(raw: Path) -> None:
             f"{raw.name}: текст-слой лишь на {with_text}/{n} страниц — вероятен скан; "
             f"OCR-путь не реализован (см. docs/pipeline/convert/tech_specs/convert-ocr)"
         )
+
+
+# rec.language (schema.py: ISO 639-1, либо 639-3 где нет 639-1, напр. cnr) -> tesseract langcode.
+TESSERACT_LANGS = {
+    "en": "eng", "et": "est", "sr": "srp_latn", "cnr": "srp_latn",
+    "hr": "hrv", "bs": "bos", "sl": "slv", "sq": "sqi", "mk": "mkd",
+    "de": "deu", "fr": "fra", "it": "ita", "es": "spa",
+    "ru": "rus", "ar": "ara", "zh": "chi_sim", "ja": "jpn",
+    # zh по умолчанию упрощённый (материк); традиционный (HK/TW) — chi_tra, добавить при нужде.
+}
+# CJK/арабский — БЕЗ +eng: удваивает проход и иногда интерферирует (иные скрипты).
+_NO_ENG_SUFFIX = frozenset({"chi_sim", "chi_tra", "jpn", "ara"})
+
+
+def _tesseract_langs(language: str | None) -> str:
+    """rec.language -> tesseract -l аргумент. Латиница получает +eng (гос-документы часто
+    со вставками EN); CJK/арабский — нет (см. _NO_ENG_SUFFIX). Неизвестный код -> честный
+    eng-fallback с предупреждением (не молчаливая порча качества)."""
+    mapped = TESSERACT_LANGS.get(language or "en")
+    if mapped is None:
+        logger.warning("неизвестный языковой код %r для OCR — используется eng", language)
+        mapped = "eng"
+    if mapped == "eng" or mapped in _NO_ENG_SUFFIX:
+        return mapped
+    return f"{mapped}+eng"
 
 
 def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:

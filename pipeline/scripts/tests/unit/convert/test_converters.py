@@ -13,6 +13,7 @@ from convert.converters import (
     _convert_html,
     _convert_pdf,
     _detect_scan,
+    _tesseract_langs,
     resolve_converter,
 )
 
@@ -80,6 +81,37 @@ def test_convert_html_empty_content_raises(tmp_path: Path) -> None:
     out = tmp_path / "out.md"
     with pytest.raises(ConversionError, match="не извлекла"):
         _convert_html(raw, out, "en")
+
+
+# --- _tesseract_langs: rec.language -> tesseract -l аргумент ---
+
+
+def test_tesseract_langs_english() -> None:
+    assert _tesseract_langs("en") == "eng"
+
+
+def test_tesseract_langs_latin_script_gets_eng_suffix() -> None:
+    assert _tesseract_langs("cnr") == "srp_latn+eng"
+    assert _tesseract_langs("et") == "est+eng"
+    assert _tesseract_langs("es") == "spa+eng"
+
+
+def test_tesseract_langs_cjk_and_arabic_no_eng_suffix() -> None:
+    assert _tesseract_langs("zh") == "chi_sim"
+    assert _tesseract_langs("ja") == "jpn"
+    assert _tesseract_langs("ar") == "ara"
+
+
+def test_tesseract_langs_unknown_code_falls_back_to_eng(caplog: Any) -> None:
+    result = _tesseract_langs("xx")
+    assert result == "eng"
+    assert "xx" in caplog.text
+
+
+def test_tesseract_langs_none_defaults_to_eng_silently(caplog: Any) -> None:
+    result = _tesseract_langs(None)
+    assert result == "eng"
+    assert caplog.text == ""
 
 
 # --- _detect_scan: fake pdfplumber (паттерн test_pdf_to_markdown._FakeEmptyPdf) ---
