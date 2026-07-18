@@ -109,6 +109,17 @@ class OnnxBgeEmbedder:
         return np.vstack(out).astype(np.float32)
 
 
+class _InbandError(Exception):
+    """Ошибка, пришедшая в ТЕЛЕ HTTP-200 ответа OpenRouter ({"error": {...}}) —
+    транспортного HTTPError нет, ретраябельность решается по коду из тела той же
+    логикой, что для HTTP-кодов: 429/5xx — временное, прочее — неисправимо."""
+
+    def __init__(self, code: Any, body: str) -> None:
+        super().__init__(body)
+        self.body = body
+        self.retryable = code == 429 or (isinstance(code, int) and code >= 500)
+
+
 class OpenRouterEmbedder:
     """Production/эталонный эмбеддер через OpenRouter (OpenAI-совместимый /embeddings).
 
@@ -144,11 +155,12 @@ class OpenRouterEmbedder:
         self._key = key
 
     def _request(self, batch: list[str]) -> list[list[float]]:
-        body: dict[str, Any] = {"model": self._model, "input": batch}
-        if self._dims is not None:
-            body["dimensions"] = self._dims  # opportunистически — провайдер может проигнорировать,
-            # клиентский срез в embed() даёт тот же результат в любом случае
-        payload = json.dumps(body).encode("utf-8")
+        # "dimensions" в payload НЕ передаётся (отступление от spec §2-bis, живой факт
+        # 2026-07-18): провайдер с фиксированной нативной размерностью не игнорирует
+        # неподдержанное значение, а ОТВЕРГАЕТ запрос (nemotron: «dimensions must be
+        # one of 2048»). Клиентский срез в embed() — единственный механизм усечения,
+        # работает поверх любого провайдера.
+        payload = json.dumps({"model": self._model, "input": batch}).encode("utf-8")
         req = urllib.request.Request(
             self._url,
             data=payload,
@@ -156,6 +168,11 @@ class OpenRouterEmbedder:
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
             data: Any = json.loads(resp.read())
+        if "data" not in data:
+            # OpenRouter заворачивает провайдерские ошибки в HTTP 200 с {"error": …} —
+            # транспортного HTTPError нет, класс отказа маппится на код ИЗ ТЕЛА
+            err = data.get("error") or {}
+            raise _InbandError(err.get("code"), json.dumps(data, ensure_ascii=False)[:500])
         items = sorted(data["data"], key=lambda x: x["index"])
         return [list(item["embedding"]) for item in items]
 
@@ -170,6 +187,10 @@ class OpenRouterEmbedder:
                 if exc.code != 429 and exc.code < 500:
                     raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body}") from exc
                 reason = f"HTTP {exc.code}: {body}"
+            except _InbandError as exc:
+                if not exc.retryable:
+                    raise RuntimeError(f"OpenRouter (ошибка в теле 200): {exc.body}") from exc
+                reason = f"ошибка в теле 200: {exc.body}"
             except (urllib.error.URLError, TimeoutError) as exc:
                 reason = str(exc)
             if attempt == total_attempts:

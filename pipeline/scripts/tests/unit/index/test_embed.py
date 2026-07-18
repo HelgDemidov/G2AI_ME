@@ -124,30 +124,59 @@ def test_dims_none_keeps_full_vector_and_unsuffixed_name(monkeypatch: Any) -> No
     assert embedder.name == "google/gemini-embedding-001"
 
 
-def test_dims_present_in_request_payload(monkeypatch: Any) -> None:
+def test_dims_never_sent_in_request_payload(monkeypatch: Any) -> None:
+    """Живой факт 2026-07-18 (nemotron: «dimensions must be one of 2048»): провайдер
+    с фиксированной размерностью ОТВЕРГАЕТ неподдержанное значение, а не игнорирует.
+    Усечение — ТОЛЬКО клиентским срезом; payload без "dimensions" при любом dims."""
+    for dims in (1024, None):
+        embedder = _make_embedder(monkeypatch, dims=dims)
+        captured: dict[str, Any] = {}
+
+        def fake_urlopen(req: Any, timeout: int = 120) -> Any:
+            captured["body"] = json.loads(req.data)
+            return _FakeResponse(_payload(2048))
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        embedder.embed(["a"])
+        assert "dimensions" not in captured["body"]
+
+
+# --- ошибка в теле HTTP-200 (OpenRouter заворачивает провайдерские отказы) ---
+
+
+def test_inband_error_400_raises_immediately_without_sleep(monkeypatch: Any) -> None:
     embedder = _make_embedder(monkeypatch, dims=1024)
-    captured: dict[str, Any] = {}
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=120: _FakeResponse(
+            {"error": {"message": "dimensions must be one of 2048", "code": 400}}
+        ),
+    )
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
 
-    def fake_urlopen(req: Any, timeout: int = 120) -> Any:
-        captured["body"] = json.loads(req.data)
-        return _FakeResponse(_payload(1024))
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    embedder.embed(["a"])
-    assert captured["body"]["dimensions"] == 1024
+    with pytest.raises(RuntimeError, match="ошибка в теле 200"):
+        embedder.embed(["a"])
+    assert sleeps == []
 
 
-def test_dims_absent_from_payload_when_none(monkeypatch: Any) -> None:
+def test_inband_error_429_is_retried_then_succeeds(monkeypatch: Any) -> None:
     embedder = _make_embedder(monkeypatch, dims=None)
-    captured: dict[str, Any] = {}
+    calls = {"n": 0}
+    sleeps: list[float] = []
 
     def fake_urlopen(req: Any, timeout: int = 120) -> Any:
-        captured["body"] = json.loads(req.data)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeResponse({"error": {"message": "rate limited", "code": 429}})
         return _FakeResponse(_payload(3))
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    embedder.embed(["a"])
-    assert "dimensions" not in captured["body"]
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+    out = embedder.embed(["a"])
+    assert out.shape == (1, 3)
+    assert sleeps == [RETRY_SCHEDULE[0]]
 
 
 def test_missing_api_key_raises(monkeypatch: Any) -> None:
