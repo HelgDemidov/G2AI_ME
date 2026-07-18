@@ -16,6 +16,7 @@ from index.corpus_index import (
     SCHEMA_VERSION,
     _cmd_search,
     _delete_doc_chunks,
+    _ensure_facets_sensitivity,
     _rebuild_facets,
     content_hash,
     corpus_fingerprint,
@@ -433,6 +434,62 @@ def test_rebuild_facets_null_axis_when_no_relevance(tmp_path: Path) -> None:
         "SELECT axis, target_fit, assessed_stage FROM doc_facets WHERE doc_id = ?", (rec.id,)
     ).fetchone()
     assert row == (None, None, None)
+
+
+# --- doc_facets.sensitivity: аддитивная миграция (spec embed-api-first §3.1) ---
+
+
+def test_rebuild_facets_writes_sensitivity(tmp_path: Path) -> None:
+    rec_dict = valid_record()
+    rec_dict["sensitivity"] = "confidential"
+    rec = SourceRecord.model_validate(rec_dict)
+    conn = create_db(tmp_path / "c.db")
+    _rebuild_facets(conn, [rec])
+    row = conn.execute(
+        "SELECT sensitivity FROM doc_facets WHERE doc_id = ?", (rec.id,)
+    ).fetchone()
+    assert row == ("confidential",)
+
+
+def test_rebuild_facets_sensitivity_defaults_to_normal(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())  # sensitivity не указана -> normal
+    conn = create_db(tmp_path / "c.db")
+    _rebuild_facets(conn, [rec])
+    row = conn.execute(
+        "SELECT sensitivity FROM doc_facets WHERE doc_id = ?", (rec.id,)
+    ).fetchone()
+    assert row == ("normal",)
+
+
+def _doc_facets_columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
+
+
+def test_ensure_facets_sensitivity_adds_column_to_legacy_v3_facets(tmp_path: Path) -> None:
+    """doc_facets уже v3 (без миграции chunks/breadcrumb), но БЕЗ колонки sensitivity —
+    аддитивная миграция добавляет её без бампа SCHEMA_VERSION (без сноса данных)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)  # свежая БД -> сразу с sensitivity
+    conn.execute("ALTER TABLE doc_facets DROP COLUMN sensitivity")
+    conn.execute(
+        "INSERT INTO doc_facets (doc_id, entity_id, track, doc_type, authority, language) "
+        "VALUES ('old', 'sg', 'intl-xperience', 'framework', 'soft_law', 'en')"
+    )
+    conn.commit()
+    assert "sensitivity" not in _doc_facets_columns(conn)
+
+    _ensure_facets_sensitivity(conn)
+    assert "sensitivity" in _doc_facets_columns(conn)
+    row = conn.execute("SELECT sensitivity FROM doc_facets WHERE doc_id = 'old'").fetchone()
+    assert row == ("public",)  # DEFAULT для строк, существовавших до миграции
+
+    _ensure_facets_sensitivity(conn)  # повторный вызов — no-op, не падает
+    assert "sensitivity" in _doc_facets_columns(conn)
+
+
+def test_ensure_facets_sensitivity_noop_when_table_absent(tmp_path: Path) -> None:
+    conn = sqlite3.connect(tmp_path / "empty.db")
+    _ensure_facets_sensitivity(conn)  # doc_facets ещё не существует -> не падает
 
 
 # --- breadcrumb в FTS: поиск + delete-инвариант двухколоночного external content ---

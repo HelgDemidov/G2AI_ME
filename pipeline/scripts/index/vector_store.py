@@ -195,27 +195,57 @@ def semantic_search(
     return hits
 
 
+def confidential_doc_ids(conn: sqlite3.Connection) -> set[str]:
+    """``doc_id`` документов с ``sensitivity=confidential`` (spec embed-api-first §3.2):
+    такие документы не должны покидать машину через облачный эмбеддинг — тот же
+    принцип, что у archive-ступени добычи и перевода. Легаси-БД без таблицы/колонки
+    ``doc_facets.sensitivity`` -> пустое множество (не исключение): неизвестность не
+    повод отказывать облачному эмбеддингу того, что раньше про sensitivity не знало."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
+    if "sensitivity" not in cols:
+        return set()
+    rows = conn.execute(
+        "SELECT doc_id FROM doc_facets WHERE sensitivity = 'confidential'"
+    ).fetchall()
+    return {str(r[0]) for r in rows}
+
+
 def chunk_hashes(
-    conn: sqlite3.Connection, *, not_embedded_for: str | None = None
+    conn: sqlite3.Connection,
+    *,
+    not_embedded_for: str | None = None,
+    exclude_all_carriers_in: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Уникальные ``(content_hash, embed_input(breadcrumb, text))`` чанков корпуса —
     эмбеддер видит breadcrumb-контекст (spec analyze-retrieval §3.1), не голый text.
     ``not_embedded_for=<model>`` — только хэши, ещё НЕ заэмбедженные этой моделью
     (инкрементальный отбор: правка одного документа эмбеддит лишь его новые хэши,
     дубли boilerplate — один раз); ``None`` — все (ab_eval: полная матрица на модель).
-    ``content_hash`` NOT NULL, так что ``NOT IN`` без NULL-ловушки."""
-    if not_embedded_for is None:
-        rows = conn.execute(
-            "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks ORDER BY content_hash"
-        ).fetchall()
-    else:
+    ``content_hash`` NOT NULL, так что ``NOT IN`` без NULL-ловушки.
+
+    ``exclude_all_carriers_in`` — sensitivity-гейт (spec embed-api-first §3.2/§3.3):
+    хэш ДОПУЩЕН, если у него есть хотя бы один носитель ВНЕ множества (общий
+    boilerplate-чанк confidential- и public-документов эмбеддится — текст и так
+    существует публично); хэш, ВСЕ носители которого в множестве, — исключён.
+    Пустое множество/``None`` — условие не добавляется (гейт неприменим, напр.
+    локальный бэкенд)."""
+    where_clauses: list[str] = []
+    params: list[str] = []
+    if not_embedded_for is not None:
         ensure_schema(conn)  # первый embed: таблицы vectors ещё нет — подзапрос иначе падает
-        rows = conn.execute(
-            "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks "
-            "WHERE content_hash NOT IN (SELECT content_hash FROM vectors WHERE model = ?) "
-            "ORDER BY content_hash",
-            (not_embedded_for,),
-        ).fetchall()
+        where_clauses.append("content_hash NOT IN (SELECT content_hash FROM vectors WHERE model = ?)")
+        params.append(not_embedded_for)
+    if exclude_all_carriers_in:
+        placeholders = ",".join("?" * len(exclude_all_carriers_in))
+        where_clauses.append(
+            f"content_hash IN (SELECT content_hash FROM chunks WHERE doc_id NOT IN ({placeholders}))"
+        )
+        params.extend(sorted(exclude_all_carriers_in))
+    sql = "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks"
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    sql += " ORDER BY content_hash"
+    rows = conn.execute(sql, params).fetchall()
     hashes = [str(r[0]) for r in rows]
     texts = [embed_input(str(r[1]), str(r[2])) for r in rows]
     return hashes, texts
@@ -274,12 +304,29 @@ def _cmd_embed(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         conn.close()
         return 2
-    hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)  # только НОВЫЕ хэши
+    # sensitivity-гейт (spec embed-api-first §3.3): облачный бэкенд не должен
+    # эмбеддить чанки, все носители которых — confidential-документы; локальные
+    # бэкенды — без фильтра (не покидают машину в принципе).
+    exclude = confidential_doc_ids(conn) if args.backend == "openrouter" else None
+    if exclude:
+        all_pending, _ = chunk_hashes(conn, not_embedded_for=embedder.name)
+        hashes, texts = chunk_hashes(
+            conn, not_embedded_for=embedder.name, exclude_all_carriers_in=exclude
+        )
+        skipped = len(all_pending) - len(hashes)
+    else:
+        hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)  # только НОВЫЕ хэши
+        skipped = 0
     if hashes:
         embed_and_store(conn, embedder, hashes, texts)  # чекпоинтинг батчами (spec embed-local-swap §5)
     removed = gc_vectors(conn, embedder.name)
     conn.close()
     print(f"Векторы {embedder.name}: +{len(hashes)} новых, GC удалил {removed} -> {args.db}")
+    if skipped:
+        print(
+            f"  {skipped} чанков только-confidential — пропущены облачным эмбеддером; "
+            "локальный прогон: --backend bge"
+        )
     return 0
 
 

@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from core.schema import SourceRecord
 from index.bge_tokenizer import EMBED_MAX_TOKENS
 from index.chunking import Chunk
 from index.corpus_index import create_db, fts5_available, index_chunks
@@ -21,6 +22,7 @@ from index.vector_store import (
     _cmd_embed,
     check_chunk_budget,
     chunk_hashes,
+    confidential_doc_ids,
     embed_and_store,
     gc_vectors,
     load_vectors,
@@ -28,6 +30,7 @@ from index.vector_store import (
     store_vectors,
     unembedded_count,
 )
+from tests.support import valid_record
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="sqlite без FTS5")
 
@@ -250,6 +253,122 @@ def test_gc_keeps_vectors_still_referenced(tmp_path: Path) -> None:
     store_vectors(conn, hashes, l2_normalize(np.eye(3, dtype=np.float32)), "m")
     assert gc_vectors(conn, "m") == 0  # все хэши ещё в chunks
     assert _vec_count(conn, "m") == 3
+
+
+# --- sensitivity-гейт: confidential-документы не эмбеддятся облаком (spec embed-api-first §3) ---
+
+
+def _record(id_: str, *, sensitivity: str = "normal") -> SourceRecord:
+    rec_dict = valid_record()
+    rec_dict["id"] = id_
+    rec_dict["sensitivity"] = sensitivity
+    return SourceRecord.model_validate(rec_dict)
+
+
+def test_confidential_doc_ids_reads_from_doc_facets(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "x", 1), Chunk("doc-pub", 0, "y", 1)],
+        records=[_record("doc-conf", sensitivity="confidential"), _record("doc-pub")],
+    )
+    assert confidential_doc_ids(conn) == {"doc-conf"}
+
+
+def test_confidential_doc_ids_empty_on_legacy_db_without_column(tmp_path: Path) -> None:
+    conn = sqlite3.connect(tmp_path / "legacy.db")
+    conn.execute("CREATE TABLE doc_facets (doc_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO doc_facets (doc_id) VALUES ('x')")
+    conn.commit()
+    assert confidential_doc_ids(conn) == set()
+
+
+def test_chunk_hashes_exclude_all_carriers_semantics(tmp_path: Path) -> None:
+    """spec embed-api-first §3.2: hash A (носители confidential+public) допущен, hash B
+    (только confidential) исключён, hash C (только public) допущен."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [
+            Chunk("doc-conf", 0, "shared boilerplate", 2),      # hash A: носитель confidential
+            Chunk("doc-pub", 0, "shared boilerplate", 2),       # hash A: носитель public (тот же текст)
+            Chunk("doc-conf", 1, "confidential only text", 3),  # hash B: только confidential
+            Chunk("doc-pub", 1, "public only text", 3),         # hash C: только public
+        ],
+        records=[_record("doc-conf", sensitivity="confidential"), _record("doc-pub")],
+    )
+    confidential = confidential_doc_ids(conn)
+    assert confidential == {"doc-conf"}
+
+    hashes, texts = chunk_hashes(conn, exclude_all_carriers_in=confidential)
+    assert set(texts) == {"shared boilerplate", "public only text"}  # hash B исключён
+
+
+def test_chunk_hashes_exclude_all_carriers_empty_set_is_noop(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    all_hashes, _ = chunk_hashes(conn)
+    filtered, _ = chunk_hashes(conn, exclude_all_carriers_in=set())
+    assert set(filtered) == set(all_hashes)
+
+
+class _CloudFakeEmbedder:
+    name = "cloud-model"
+    dim = 1
+    max_tokens: int | None = None
+
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+        return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+
+def test_cmd_embed_openrouter_skips_confidential_only_chunks_and_reports(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "confidential only text", 3), Chunk("doc-pub", 0, "public text", 2)],
+        records=[_record("doc-conf", sensitivity="confidential"), _record("doc-pub")],
+    )
+    conn.close()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: _CloudFakeEmbedder())
+
+    args = argparse.Namespace(db=db, backend="openrouter", model=None)
+    assert _cmd_embed(args) == 0
+    out = capsys.readouterr().out
+    assert "1 чанков только-confidential" in out
+    assert "--backend bge" in out
+
+    conn2 = sqlite3.connect(db)
+    assert _vec_count(conn2, "cloud-model") == 1  # только публичный чанк заэмбеджен
+
+
+def test_cmd_embed_bge_backend_ignores_sensitivity_gate(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """Локальный бэкенд эмбеддит confidential-чанки как обычно — гейт применим только
+    к облачному пути (данные и так не покидают машину)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "confidential only text", 3)],
+        records=[_record("doc-conf", sensitivity="confidential")],
+    )
+    conn.close()
+
+    fake = _CloudFakeEmbedder()
+    fake.name = "local-model"
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: fake)
+
+    args = argparse.Namespace(db=db, backend="bge", model=None)
+    assert _cmd_embed(args) == 0
+    out = capsys.readouterr().out
+    assert "только-confidential" not in out
+
+    conn2 = sqlite3.connect(db)
+    assert _vec_count(conn2, "local-model") == 1
 
 
 # --- check_chunk_budget: инвариант «чанк целиком видим обоим поискам» (index-consistency §6,
