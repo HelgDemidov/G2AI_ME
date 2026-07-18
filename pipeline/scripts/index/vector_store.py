@@ -20,15 +20,15 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from index.bge_tokenizer import EMBED_MAX_TOKENS
 from index.chunking import embed_input
 from index.corpus_index import DEFAULT_DB, read_meta
-from index.embed import Embedder, FloatArray, get_embedder
+from index.embed import DEFAULT_BACKEND, Embedder, FloatArray, get_embedder
 from core.env import load_dotenv
 
 _SCHEMA = """
@@ -56,20 +56,28 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def check_chunk_budget(conn: sqlite3.Connection) -> None:
-    """Гейт: чанки индекса не должны быть крупнее бюджета эмбеддера
-    (``EMBED_MAX_TOKENS``) — иначе ``OnnxBgeEmbedder`` молча truncate'ит каждый
-    чанк до своего лимита, и вектор представлял бы только префикс: инвариант
-    «канонический чанк целиком видим и FTS, и векторному поиску» перестал бы
-    быть проверяемым, оставаясь лишь подразумеваемым. Отсутствие
-    ``chunk_max_tokens`` в ``index_meta`` (индекс собран без него) не гейтится —
-    неизвестность не повод отказывать.
+def check_chunk_budget(conn: sqlite3.Connection, embedder_max: int | None) -> None:
+    """Гейт: чанки индекса не должны быть крупнее бюджета КОНКРЕТНОГО эмбеддера
+    (``embedder_max``, в его собственных токенах) — иначе эмбеддер молча
+    truncate'ит каждый чанк до своего лимита, и вектор представлял бы только
+    префикс: инвариант «канонический чанк целиком видим и FTS, и векторному
+    поиску» перестал бы быть проверяемым, оставаясь лишь подразумеваемым.
+
+    ``embedder_max=None`` — гейт неприменим (напр. облачный эмбеддер без
+    фиксированного/известного лимита, spec embed-local-swap §4) — return без
+    проверки. Отсутствие ``chunk_max_tokens`` в ``index_meta`` (индекс собран без
+    него) не гейтится — неизвестность не повод отказывать.
+
+    Ответственность вызывающего (он знает ``embedder.max_tokens``), НЕ писателя
+    ``store_vectors`` — тот эмбеддера не видит (spec embed-local-swap §4).
     """
+    if embedder_max is None:
+        return
     chunk_max_str = read_meta(conn, "chunk_max_tokens")
-    if chunk_max_str is not None and int(chunk_max_str) > EMBED_MAX_TOKENS:
+    if chunk_max_str is not None and int(chunk_max_str) > embedder_max:
         raise ValueError(
-            f"индекс собран с чанками {chunk_max_str} > лимита эмбеддера {EMBED_MAX_TOKENS}: "
-            f"векторы представляли бы префиксы; пересоберите с --max-tokens {EMBED_MAX_TOKENS}"
+            f"индекс собран с чанками {chunk_max_str} > лимита эмбеддера {embedder_max}: "
+            f"векторы представляли бы префиксы; пересоберите с --max-tokens {embedder_max}"
         )
 
 
@@ -79,12 +87,14 @@ def store_vectors(
     """Идемпотентный upsert векторов по ключу ``(content_hash, model)``.
 
     Тупой писатель: НЕ решает, какие хэши эмбеддить (это ``chunk_hashes`` —
-    инкрементальный отбор для production, полная матрица для ab_eval), и НЕ штампует
-    fingerprint. Ключ — СОДЕРЖИМОЕ чанка (sha256), поэтому вектор физически не может
-    указать на чужой текст: класс дефекта «векторы врут» (spec index-consistency
-    §0.1) устранён по построению, а не сверкой отпечатков (упразднена).
+    инкрементальный отбор для production, полная матрица для ab_eval), НЕ штампует
+    fingerprint и НЕ гейтит бюджет чанка (``check_chunk_budget`` — ответственность
+    ВЫЗЫВАЮЩЕГО, он знает ``embedder.max_tokens``; писатель эмбеддера не видит,
+    spec embed-local-swap §4). Ключ — СОДЕРЖИМОЕ чанка (sha256), поэтому вектор
+    физически не может указать на чужой текст: класс дефекта «векторы врут» (spec
+    index-consistency §0.1) устранён по построению, а не сверкой отпечатков
+    (упразднена).
     """
-    check_chunk_budget(conn)
     ensure_schema(conn)
     conn.executemany(
         "INSERT INTO vectors (content_hash, model, vec) VALUES (?, ?, ?) "
@@ -92,6 +102,35 @@ def store_vectors(
         [(h, model, vectors[i].astype(np.float32).tobytes()) for i, h in enumerate(content_hashes)],
     )
     conn.commit()
+
+
+CHECKPOINT_BATCH = 64  # чекпоинт эмбеддинга (spec embed-local-swap §5, закрывает бэклог §11):
+# обрыв (kill, OOM, закрытие терминала/VS Code, обрыв сети) теряет МАКСИМУМ один батч,
+# не весь прогон — раньше store_vectors писался одним вызовом на весь корпус целиком.
+
+
+def embed_and_store(
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    hashes: list[str],
+    texts: list[str],
+    *,
+    batch: int = CHECKPOINT_BATCH,
+    log: Callable[[str], None] = print,
+) -> int:
+    """Эмбеддит и СОХРАНЯЕТ векторы батчами по ``batch`` хэшей вместо одного
+    вызова ``embedder.embed()``/``store_vectors()`` на весь список — прогресс
+    коммитится по мере готовности. Прерывание процесса ЛЮБОЙ природы теряет не
+    более одного батча; рестарт добирает остаток через инкрементальный отбор
+    ``chunk_hashes(not_embedded_for=...)`` (не нужна отдельная логика докачки —
+    он уже пропускает заэмбедженные хэши). Возвращает число заэмбедженных хэшей."""
+    total = len(hashes)
+    for start in range(0, total, batch):
+        batch_hashes = hashes[start : start + batch]
+        batch_texts = texts[start : start + batch]
+        store_vectors(conn, batch_hashes, embedder.embed(batch_texts), embedder.name)
+        log(f"  векторы: {min(start + batch, total)}/{total} ({embedder.name})")
+    return total
 
 
 def load_vectors(conn: sqlite3.Connection, model: str) -> tuple[list[str], FloatArray]:
@@ -156,27 +195,57 @@ def semantic_search(
     return hits
 
 
+def confidential_doc_ids(conn: sqlite3.Connection) -> set[str]:
+    """``doc_id`` документов с ``sensitivity=confidential`` (spec embed-api-first §3.2):
+    такие документы не должны покидать машину через облачный эмбеддинг — тот же
+    принцип, что у archive-ступени добычи и перевода. Легаси-БД без таблицы/колонки
+    ``doc_facets.sensitivity`` -> пустое множество (не исключение): неизвестность не
+    повод отказывать облачному эмбеддингу того, что раньше про sensitivity не знало."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
+    if "sensitivity" not in cols:
+        return set()
+    rows = conn.execute(
+        "SELECT doc_id FROM doc_facets WHERE sensitivity = 'confidential'"
+    ).fetchall()
+    return {str(r[0]) for r in rows}
+
+
 def chunk_hashes(
-    conn: sqlite3.Connection, *, not_embedded_for: str | None = None
+    conn: sqlite3.Connection,
+    *,
+    not_embedded_for: str | None = None,
+    exclude_all_carriers_in: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Уникальные ``(content_hash, embed_input(breadcrumb, text))`` чанков корпуса —
     эмбеддер видит breadcrumb-контекст (spec analyze-retrieval §3.1), не голый text.
     ``not_embedded_for=<model>`` — только хэши, ещё НЕ заэмбедженные этой моделью
     (инкрементальный отбор: правка одного документа эмбеддит лишь его новые хэши,
     дубли boilerplate — один раз); ``None`` — все (ab_eval: полная матрица на модель).
-    ``content_hash`` NOT NULL, так что ``NOT IN`` без NULL-ловушки."""
-    if not_embedded_for is None:
-        rows = conn.execute(
-            "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks ORDER BY content_hash"
-        ).fetchall()
-    else:
+    ``content_hash`` NOT NULL, так что ``NOT IN`` без NULL-ловушки.
+
+    ``exclude_all_carriers_in`` — sensitivity-гейт (spec embed-api-first §3.2/§3.3):
+    хэш ДОПУЩЕН, если у него есть хотя бы один носитель ВНЕ множества (общий
+    boilerplate-чанк confidential- и public-документов эмбеддится — текст и так
+    существует публично); хэш, ВСЕ носители которого в множестве, — исключён.
+    Пустое множество/``None`` — условие не добавляется (гейт неприменим, напр.
+    локальный бэкенд)."""
+    where_clauses: list[str] = []
+    params: list[str] = []
+    if not_embedded_for is not None:
         ensure_schema(conn)  # первый embed: таблицы vectors ещё нет — подзапрос иначе падает
-        rows = conn.execute(
-            "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks "
-            "WHERE content_hash NOT IN (SELECT content_hash FROM vectors WHERE model = ?) "
-            "ORDER BY content_hash",
-            (not_embedded_for,),
-        ).fetchall()
+        where_clauses.append("content_hash NOT IN (SELECT content_hash FROM vectors WHERE model = ?)")
+        params.append(not_embedded_for)
+    if exclude_all_carriers_in:
+        placeholders = ",".join("?" * len(exclude_all_carriers_in))
+        where_clauses.append(
+            f"content_hash IN (SELECT content_hash FROM chunks WHERE doc_id NOT IN ({placeholders}))"
+        )
+        params.extend(sorted(exclude_all_carriers_in))
+    sql = "SELECT DISTINCT content_hash, breadcrumb, text FROM chunks"
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    sql += " ORDER BY content_hash"
+    rows = conn.execute(sql, params).fetchall()
     hashes = [str(r[0]) for r in rows]
     texts = [embed_input(str(r[1]), str(r[2])) for r in rows]
     return hashes, texts
@@ -226,19 +295,38 @@ def _cmd_embed(args: argparse.Namespace) -> int:
         print("нет чанков в БД", file=sys.stderr)
         conn.close()
         return 2
+    embedder = _make_embedder(args.backend, args.model)
     try:
-        check_chunk_budget(conn)  # до дорогого embedder.embed() — не тратить минуты ONNX впустую
+        # ПОСЛЕ создания эмбеддера (нужен embedder.max_tokens), но ДО дорогого
+        # embedder.embed() — не тратить минуты инференса впустую (spec embed-local-swap §4)
+        check_chunk_budget(conn, embedder.max_tokens)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         conn.close()
         return 2
-    embedder = _make_embedder(args.backend, args.model)
-    hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)  # только НОВЫЕ хэши
+    # sensitivity-гейт (spec embed-api-first §3.3): облачный бэкенд не должен
+    # эмбеддить чанки, все носители которых — confidential-документы; локальные
+    # бэкенды — без фильтра (не покидают машину в принципе).
+    exclude = confidential_doc_ids(conn) if args.backend == "openrouter" else None
+    if exclude:
+        all_pending, _ = chunk_hashes(conn, not_embedded_for=embedder.name)
+        hashes, texts = chunk_hashes(
+            conn, not_embedded_for=embedder.name, exclude_all_carriers_in=exclude
+        )
+        skipped = len(all_pending) - len(hashes)
+    else:
+        hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)  # только НОВЫЕ хэши
+        skipped = 0
     if hashes:
-        store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
+        embed_and_store(conn, embedder, hashes, texts)  # чекпоинтинг батчами (spec embed-local-swap §5)
     removed = gc_vectors(conn, embedder.name)
     conn.close()
     print(f"Векторы {embedder.name}: +{len(hashes)} новых, GC удалил {removed} -> {args.db}")
+    if skipped:
+        print(
+            f"  {skipped} чанков только-confidential — пропущены облачным эмбеддером; "
+            "локальный прогон: --backend bge"
+        )
     return 0
 
 
@@ -248,7 +336,7 @@ def _cmd_vsearch(args: argparse.Namespace) -> int:
         return 2
     conn = sqlite3.connect(args.db)
     embedder = _make_embedder(args.backend, args.model)
-    query_vec = embedder.embed([args.query])
+    query_vec = embedder.embed([args.query], kind="query")
     hits = semantic_search(conn, query_vec[0], embedder.name, args.limit)
     has_vectors = (
         conn.execute("SELECT 1 FROM vectors WHERE model = ? LIMIT 1", (embedder.name,)).fetchone()
@@ -281,7 +369,10 @@ def _cmd_vsearch(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", type=Path, default=DEFAULT_DB)
-    common.add_argument("--backend", choices=["bge", "openrouter"], default="bge")
+    common.add_argument(
+        "--backend", choices=["bge", "openrouter"], default=DEFAULT_BACKEND,
+        help="openrouter — production-дефолт (API, дёшево/быстро); bge — локальный фолбэк",
+    )
     common.add_argument("--model", default=None, help="имя модели для openrouter")
 
     parser = argparse.ArgumentParser(description="Векторный слой корпуса G2AI (эмбеддинги + поиск)")

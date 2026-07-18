@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS doc_facets (
     language       TEXT NOT NULL,
     axis           TEXT,
     target_fit     TEXT,
-    assessed_stage TEXT
+    assessed_stage TEXT,
+    sensitivity    TEXT NOT NULL DEFAULT 'public'
 );
 CREATE TABLE IF NOT EXISTS topics_map (
     doc_id TEXT NOT NULL,
@@ -203,6 +204,17 @@ def _reset_derived_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_facets_sensitivity(conn: sqlite3.Connection) -> None:
+    """Аддитивная миграция ``doc_facets.sensitivity`` (spec embed-api-first §3.1) —
+    БЕЗ бампа ``SCHEMA_VERSION`` (тот дропнул бы ``vectors``, запрещено). Свежие/
+    мигрированные БД получают колонку прямо из ``_SCHEMA``; эта функция бэкфиллит
+    её на уже существующей v3 ``doc_facets``, где колонки ещё нет. Идемпотентна;
+    отсутствие таблицы (легаси до v3, ещё будет создана ниже) — no-op."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
+    if cols and "sensitivity" not in cols:
+        conn.execute("ALTER TABLE doc_facets ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'public'")
+
+
 def create_db(db_path: Path) -> sqlite3.Connection:
     """Открыть/создать БД со схемой; мигрировать легаси-форму (пересоздать производные
     таблицы). ``schema_version`` штампуется в ``index_meta`` — детект будущих миграций."""
@@ -211,6 +223,7 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     if _is_legacy_schema(conn):
         _reset_derived_tables(conn)
     conn.executescript(_SCHEMA)
+    _ensure_facets_sensitivity(conn)
     write_meta(conn, "schema_version", SCHEMA_VERSION)
     conn.commit()
     return conn
@@ -225,8 +238,9 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
     conn.execute("DELETE FROM topics_map")
     conn.executemany(
         "INSERT INTO doc_facets "
-        "(doc_id, entity_id, track, doc_type, authority, language, axis, target_fit, assessed_stage) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(doc_id, entity_id, track, doc_type, authority, language, axis, target_fit, "
+        "assessed_stage, sensitivity) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 rec.id,
@@ -238,6 +252,7 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
                 rec.relevance.axis.value if rec.relevance else None,
                 rec.relevance.target_fit.value if rec.relevance else None,
                 rec.relevance.assessed_stage.value if rec.relevance else None,
+                rec.sensitivity.value,
             )
             for rec in records
         ],

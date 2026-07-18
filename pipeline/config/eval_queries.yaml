@@ -22,15 +22,44 @@ queries:
   - query: "electronic signature verification for business registration"
     expect: ["potpis"]
     note: "cnr — me-crps-registration-law-2025"
+    lang: "cnr"
   - query: "which government body oversees the central registry of businesses"
     expect: ["crps"]
     note: "cnr — me-crps-registration-law-2025"
+    lang: "cnr"
   - query: "unique identifier assigned to companies in the EU registry interconnection system"
     expect: ["euid"]
     note: "cnr — me-crps-registration-law-2025"
+    lang: "cnr"
   - query: "appeal against a business registration decision"
     expect: ["žalb"]
     note: "cnr — me-crps-registration-law-2025"
+    lang: "cnr"
   - query: "deleting a business entity from the registry"
     expect: ["brisanj"]
     note: "cnr — me-crps-registration-law-2025"
+    lang: "cnr"
+
+  # et-пробы (spec embed-local-swap §6, добавлены Fable 5 на чекпоинте 2026-07-18):
+  # кросс-язычный EN→et retrieval — ожидаемые термины — реальные эстонские слова из
+  # doc.md ee-mkm-ai-data-action-plan-2024 (Tehisintellekti tegevuskava, MKM, Эстония).
+  - query: "national virtual assistant chatbot for accessing government services"
+    expect: ["bürokrat"]
+    note: "et — ee-mkm-ai-data-action-plan-2024 (Bürokratt)"
+    lang: "et"
+  - query: "developing language technology for a small national language"
+    expect: ["keeletehnoloogia"]
+    note: "et — ee-mkm-ai-data-action-plan-2024"
+    lang: "et"
+  - query: "adapting the legal framework for trustworthy and human-centric AI"
+    expect: ["õigusruum"]
+    note: "et — ee-mkm-ai-data-action-plan-2024"
+    lang: "et"
+  - query: "practical support and funding offered to agencies adopting AI solutions"
+    expect: ["rahastus", "kratito"]
+    note: "et — ee-mkm-ai-data-action-plan-2024"
+    lang: "et"
+  - query: "training public sector employees to use artificial intelligence"
+    expect: ["koolitus"]
+    note: "et — ee-mkm-ai-data-action-plan-2024"
+    lang: "et"

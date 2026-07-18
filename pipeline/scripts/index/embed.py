@@ -1,9 +1,11 @@
 """Модель-агностичный интерфейс эмбеддингов для семантического поиска.
 
-Бэкенды:
-  - OnnxBgeEmbedder — локальный bge-m3 int8 ONNX (CPU, приватно, бесплатно):
-    CLS-pooling (last_hidden_state[:, 0]) + L2-нормализация -> 1024-мерный вектор.
-  - OpenRouterEmbedder — эталон (gemini-embedding-001 и др.) через OpenRouter.
+Бэкенды (API-first, spec embed-api-first §4):
+  - OpenRouterEmbedder — PRODUCTION-путь (DEFAULT_CLOUD_MODEL, выбран A/B-чекпоинтом §1):
+    корпус эмбеддится облаком за минуты и центы вместо ~100 часов локально.
+  - OnnxBgeEmbedder — локальный bge-m3 int8 ONNX (CPU, приватно, бесплатно) — ФОЛБЭК
+    (офлайн/confidential): CLS-pooling (last_hidden_state[:, 0]) + L2-нормализация
+    -> 1024-мерный вектор.
 
 Векторы ВСЕГДА L2-нормализованы, поэтому косинус = скалярное произведение.
 ВНИМАНИЕ: векторы разных моделей несравнимы — на корпусе живёт одна модель за раз.
@@ -12,10 +14,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,6 +30,17 @@ FloatArray = NDArray[np.float32]
 
 DEFAULT_ONNX = MODEL_DIR / "model_int8.onnx"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
+INTRA_OP_THREADS = 4  # физический лимит машины: 2 ядра/4 потока (spec embed-local-swap §3) —
+# лечит документированную оверсабскрипцию (onnxruntime иначе создаёт потоков больше ядер)
+RETRY_SCHEDULE = (1.0, 4.0, 15.0, 60.0)  # паузы (сек) МЕЖДУ попытками; всего ≤5 попыток
+# (spec embed-api-first §2) — 429/5xx/сетевые обрывы ретраятся, прочие 4xx неисправимы
+DEFAULT_BACKEND = "openrouter"  # production-путь эмбеддинга корпуса (spec embed-api-first §4);
+# локальный bge — фолбэк (офлайн/confidential), НЕ основной путь
+DEFAULT_CLOUD_MODEL = "google/gemini-embedding-001"  # A/B-чекпоинт §1 (2026-07-18, пользователь +
+# Fable 5): единственная из трёх кандидатов прошла все критерии — hit@10=100% на всех языках,
+# et-подсет 100% против 60% у bge; qwen3-8b и nemotron:free провалены (таблица — в Статусе спека)
+DEFAULT_CLOUD_DIMS = 1024  # MRL-срез на клиенте (§2-bis): @1536 не дал ничего сверх @1024,
+# RAM-паритет с bge (643 МБ на целевых 157k чанков)
 
 
 def l2_normalize(mat: FloatArray) -> FloatArray:
@@ -36,12 +51,20 @@ def l2_normalize(mat: FloatArray) -> FloatArray:
 
 
 class Embedder(Protocol):
-    """Общий интерфейс: name (идентификатор модели), dim, embed(texts) -> (n, dim)."""
+    """Общий интерфейс: name (идентификатор модели), dim, max_tokens (бюджет в
+    СОБСТВЕННЫХ токенах модели; None — гейт неприменим/неизвестен, напр. облачный
+    эмбеддер без фиксированного лимита), embed(texts, kind) -> (n, dim).
+
+    ``kind`` — асимметрия документ/запрос: модели с промпт-префиксами (напр.
+    EmbeddingGemma) кодируют запрос и документ по-разному и без префикса теряют
+    качество (spec embed-local-swap §2); симметричные бэкенды параметр принимают,
+    но игнорируют — сигнатура едина для ВСЕХ реализаций."""
 
     name: str
     dim: int
+    max_tokens: int | None
 
-    def embed(self, texts: list[str]) -> FloatArray: ...
+    def embed(self, texts: list[str], *, kind: Literal["doc", "query"] = "doc") -> FloatArray: ...
 
 
 class OnnxBgeEmbedder:
@@ -49,6 +72,9 @@ class OnnxBgeEmbedder:
 
     name = "bge-m3-onnx-int8"
     dim = 1024
+    # тип аннотирован явно: Protocol.max_tokens инвариантен для изменяемых атрибутов
+    # (mypy иначе выводит голый int и ругается на несовместимость с int | None)
+    max_tokens: int | None = EMBED_MAX_TOKENS
 
     def __init__(
         self,
@@ -61,8 +87,10 @@ class OnnxBgeEmbedder:
 
         if not model_path.exists():
             raise FileNotFoundError(f"модель не найдена: {model_path} — скачать bge-m3?")
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = INTRA_OP_THREADS  # лечит оверсабскрипцию (bge_tokenizer §11)
         self._session: Any = ort.InferenceSession(
-            str(model_path), providers=["CPUExecutionProvider"]
+            str(model_path), sess_options=opts, providers=["CPUExecutionProvider"]
         )
         self._tok: Any = load_tokenizer(tokenizer_path)
         pad_id = self._tok.token_to_id("<pad>")
@@ -70,7 +98,8 @@ class OnnxBgeEmbedder:
         self._tok.enable_padding(pad_id=pad_id if pad_id is not None else 1, pad_token="<pad>")
         self._batch = batch_size
 
-    def embed(self, texts: list[str]) -> FloatArray:
+    def embed(self, texts: list[str], *, kind: Literal["doc", "query"] = "doc") -> FloatArray:
+        # bge-m3 симметрична — kind игнорируется, сигнатура едина с протоколом
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
         out: list[FloatArray] = []
@@ -87,19 +116,44 @@ class OnnxBgeEmbedder:
         return np.vstack(out).astype(np.float32)
 
 
+class _InbandError(Exception):
+    """Ошибка, пришедшая в ТЕЛЕ HTTP-200 ответа OpenRouter ({"error": {...}}) —
+    транспортного HTTPError нет, ретраябельность решается по коду из тела той же
+    логикой, что для HTTP-кодов: 429/5xx — временное, прочее — неисправимо."""
+
+    def __init__(self, code: Any, body: str) -> None:
+        super().__init__(body)
+        self.body = body
+        self.retryable = code == 429 or (isinstance(code, int) and code >= 500)
+
+
 class OpenRouterEmbedder:
-    """Эталонный эмбеддер через OpenRouter (OpenAI-совместимый /embeddings)."""
+    """Production/эталонный эмбеддер через OpenRouter (OpenAI-совместимый /embeddings).
+
+    Ретраи (spec embed-api-first §2): 429/5xx/сетевые обрывы (URLError/TimeoutError,
+    напр. обрыв LTE) — до 5 попыток с паузами из ``RETRY_SCHEDULE``; прочие HTTP 4xx —
+    немедленный отказ (неисправимо, ретраить бессмысленно).
+
+    Размерность (§2-bis, MRL-усечение): ``dims`` срезает вектор ответа НА КЛИЕНТЕ и
+    ре-нормализует — держит RAM векторного индекса в узде (нативные 3072-4096d моделей-
+    кандидатов не влезают в бюджет 8ГБ-машины на масштабе целевого корпуса). Усечённые и
+    полные векторы — РАЗНЫЕ неймспейсы (``name`` получает суффикс ``@<dims>``), иначе они
+    бы смешались под одним ключом ``model`` в таблице ``vectors``.
+    """
 
     def __init__(
         self,
-        model: str = "google/gemini-embedding-001",
+        model: str = DEFAULT_CLOUD_MODEL,
         api_key: str | None = None,
         batch_size: int = 32,
         url: str = OPENROUTER_URL,
+        dims: int | None = DEFAULT_CLOUD_DIMS,
     ) -> None:
-        self.name = model
+        self.name = f"{model}@{dims}" if dims is not None else model
         self.dim = 0  # станет известно после первого ответа
+        self.max_tokens: int | None = None  # облачный лимит не фиксирован здесь — гейт неприменим
         self._model = model
+        self._dims = dims
         self._batch = batch_size
         self._url = url
         key = api_key or os.environ.get("OPENROUTER_API_KEY")
@@ -108,28 +162,64 @@ class OpenRouterEmbedder:
         self._key = key
 
     def _request(self, batch: list[str]) -> list[list[float]]:
+        # "dimensions" в payload НЕ передаётся (отступление от spec §2-bis, живой факт
+        # 2026-07-18): провайдер с фиксированной нативной размерностью не игнорирует
+        # неподдержанное значение, а ОТВЕРГАЕТ запрос (nemotron: «dimensions must be
+        # one of 2048»). Клиентский срез в embed() — единственный механизм усечения,
+        # работает поверх любого провайдера.
         payload = json.dumps({"model": self._model, "input": batch}).encode("utf-8")
         req = urllib.request.Request(
             self._url,
             data=payload,
             headers={"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data: Any = json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body}") from exc
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data: Any = json.loads(resp.read())
+        if "data" not in data:
+            # OpenRouter заворачивает провайдерские ошибки в HTTP 200 с {"error": …} —
+            # транспортного HTTPError нет, класс отказа маппится на код ИЗ ТЕЛА
+            err = data.get("error") or {}
+            raise _InbandError(err.get("code"), json.dumps(data, ensure_ascii=False)[:500])
         items = sorted(data["data"], key=lambda x: x["index"])
         return [list(item["embedding"]) for item in items]
 
-    def embed(self, texts: list[str]) -> FloatArray:
+    def _request_with_retry(self, batch: list[str]) -> list[list[float]]:
+        reason = ""
+        total_attempts = len(RETRY_SCHEDULE) + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                return self._request(batch)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")
+                if exc.code != 429 and exc.code < 500:
+                    raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body}") from exc
+                reason = f"HTTP {exc.code}: {body}"
+            except _InbandError as exc:
+                if not exc.retryable:
+                    raise RuntimeError(f"OpenRouter (ошибка в теле 200): {exc.body}") from exc
+                reason = f"ошибка в теле 200: {exc.body}"
+            except (urllib.error.URLError, TimeoutError) as exc:
+                reason = str(exc)
+            if attempt == total_attempts:
+                break
+            delay = RETRY_SCHEDULE[attempt - 1]
+            print(f"попытка {attempt}/{total_attempts} через {delay:.0f}s: {reason}", file=sys.stderr)
+            time.sleep(delay)
+        raise RuntimeError(
+            f"OpenRouter: исчерпаны попытки ({total_attempts}) — {reason}. "
+            "сеть/ключ? локальный фолбэк: --backend bge"
+        )
+
+    def embed(self, texts: list[str], *, kind: Literal["doc", "query"] = "doc") -> FloatArray:
+        # OpenRouter-модели (текущий каталог) симметричны — kind игнорируется
         if not texts:
             return np.zeros((0, self.dim), dtype=np.float32)
         vecs: list[list[float]] = []
         for start in range(0, len(texts), self._batch):
-            vecs.extend(self._request(texts[start : start + self._batch]))
+            vecs.extend(self._request_with_retry(texts[start : start + self._batch]))
         mat = np.asarray(vecs, dtype=np.float32)
+        if self._dims is not None:
+            mat = mat[:, : self._dims]
         self.dim = int(mat.shape[1])
         return l2_normalize(mat)
 

@@ -13,20 +13,24 @@ from typing import Any
 import numpy as np
 import pytest
 
+from core.schema import SourceRecord
 from index.bge_tokenizer import EMBED_MAX_TOKENS
 from index.chunking import Chunk
 from index.corpus_index import create_db, fts5_available, index_chunks
-from index.embed import l2_normalize
+from index.embed import FloatArray, l2_normalize
 from index.vector_store import (
     _cmd_embed,
     check_chunk_budget,
     chunk_hashes,
+    confidential_doc_ids,
+    embed_and_store,
     gc_vectors,
     load_vectors,
     semantic_search,
     store_vectors,
     unembedded_count,
 )
+from tests.support import valid_record
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="sqlite без FTS5")
 
@@ -251,48 +255,203 @@ def test_gc_keeps_vectors_still_referenced(tmp_path: Path) -> None:
     assert _vec_count(conn, "m") == 3
 
 
-# --- check_chunk_budget: инвариант «чанк целиком видим обоим поискам» (index-consistency §6) ---
+# --- sensitivity-гейт: confidential-документы не эмбеддятся облаком (spec embed-api-first §3) ---
+
+
+def _record(id_: str, *, sensitivity: str = "normal") -> SourceRecord:
+    rec_dict = valid_record()
+    rec_dict["id"] = id_
+    rec_dict["sensitivity"] = sensitivity
+    return SourceRecord.model_validate(rec_dict)
+
+
+def test_confidential_doc_ids_reads_from_doc_facets(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "x", 1), Chunk("doc-pub", 0, "y", 1)],
+        records=[_record("doc-conf", sensitivity="confidential"), _record("doc-pub")],
+    )
+    assert confidential_doc_ids(conn) == {"doc-conf"}
+
+
+def test_confidential_doc_ids_empty_on_legacy_db_without_column(tmp_path: Path) -> None:
+    conn = sqlite3.connect(tmp_path / "legacy.db")
+    conn.execute("CREATE TABLE doc_facets (doc_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO doc_facets (doc_id) VALUES ('x')")
+    conn.commit()
+    assert confidential_doc_ids(conn) == set()
+
+
+def test_chunk_hashes_exclude_all_carriers_semantics(tmp_path: Path) -> None:
+    """spec embed-api-first §3.2: hash A (носители confidential+public) допущен, hash B
+    (только confidential) исключён, hash C (только public) допущен."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(
+        conn,
+        [
+            Chunk("doc-conf", 0, "shared boilerplate", 2),      # hash A: носитель confidential
+            Chunk("doc-pub", 0, "shared boilerplate", 2),       # hash A: носитель public (тот же текст)
+            Chunk("doc-conf", 1, "confidential only text", 3),  # hash B: только confidential
+            Chunk("doc-pub", 1, "public only text", 3),         # hash C: только public
+        ],
+        records=[_record("doc-conf", sensitivity="confidential"), _record("doc-pub")],
+    )
+    confidential = confidential_doc_ids(conn)
+    assert confidential == {"doc-conf"}
+
+    hashes, texts = chunk_hashes(conn, exclude_all_carriers_in=confidential)
+    assert set(texts) == {"shared boilerplate", "public only text"}  # hash B исключён
+
+
+def test_chunk_hashes_exclude_all_carriers_empty_set_is_noop(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    all_hashes, _ = chunk_hashes(conn)
+    filtered, _ = chunk_hashes(conn, exclude_all_carriers_in=set())
+    assert set(filtered) == set(all_hashes)
+
+
+class _CloudFakeEmbedder:
+    name = "cloud-model"
+    dim = 1
+    max_tokens: int | None = None
+
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+        return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+
+def test_cmd_embed_openrouter_skips_confidential_only_chunks_and_reports(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "confidential only text", 3), Chunk("doc-pub", 0, "public text", 2)],
+        records=[_record("doc-conf", sensitivity="confidential"), _record("doc-pub")],
+    )
+    conn.close()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: _CloudFakeEmbedder())
+
+    args = argparse.Namespace(db=db, backend="openrouter", model=None)
+    assert _cmd_embed(args) == 0
+    out = capsys.readouterr().out
+    assert "1 чанков только-confidential" in out
+    assert "--backend bge" in out
+
+    conn2 = sqlite3.connect(db)
+    assert _vec_count(conn2, "cloud-model") == 1  # только публичный чанк заэмбеджен
+
+
+def test_cli_default_backend_is_openrouter(tmp_path: Path, monkeypatch: Any) -> None:
+    """API-first (spec embed-api-first §4): дефолт --backend CLI = openrouter."""
+    from index.vector_store import main as vs_main
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "x", 1)])
+    conn.close()
+    captured: dict[str, Any] = {}
+
+    def fake_make_embedder(backend: str, model: Any) -> Any:
+        captured["backend"] = backend
+        return _CloudFakeEmbedder()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", fake_make_embedder)
+    assert vs_main(["embed-corpus", "--db", str(db)]) == 0
+    assert captured["backend"] == "openrouter"
+
+
+def test_cmd_embed_bge_backend_ignores_sensitivity_gate(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """Локальный бэкенд эмбеддит confidential-чанки как обычно — гейт применим только
+    к облачному пути (данные и так не покидают машину)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "confidential only text", 3)],
+        records=[_record("doc-conf", sensitivity="confidential")],
+    )
+    conn.close()
+
+    fake = _CloudFakeEmbedder()
+    fake.name = "local-model"
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: fake)
+
+    args = argparse.Namespace(db=db, backend="bge", model=None)
+    assert _cmd_embed(args) == 0
+    out = capsys.readouterr().out
+    assert "только-confidential" not in out
+
+    conn2 = sqlite3.connect(db)
+    assert _vec_count(conn2, "local-model") == 1
+
+
+# --- check_chunk_budget: инвариант «чанк целиком видим обоим поискам» (index-consistency §6,
+# сигнатура — embedder_max явным параметром вместо константы, spec embed-local-swap §4) ---
 
 
 def test_check_chunk_budget_passes_when_within_limit(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS)
-    check_chunk_budget(conn)  # не должно бросать
+    check_chunk_budget(conn, EMBED_MAX_TOKENS)  # не должно бросать
 
 
 def test_check_chunk_budget_passes_when_absent(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)])  # без chunk_max_tokens
-    check_chunk_budget(conn)  # неизвестность — не повод отказывать
+    check_chunk_budget(conn, EMBED_MAX_TOKENS)  # неизвестность — не повод отказывать
 
 
 def test_check_chunk_budget_raises_when_exceeds_limit(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
     with pytest.raises(ValueError, match=str(EMBED_MAX_TOKENS)):
-        check_chunk_budget(conn)
+        check_chunk_budget(conn, EMBED_MAX_TOKENS)
 
 
-def test_store_vectors_raises_when_chunk_budget_exceeded(tmp_path: Path) -> None:
+def test_check_chunk_budget_none_max_never_raises(tmp_path: Path) -> None:
+    """embedder_max=None — гейт неприменим (облачный эмбеддер без фиксированного
+    лимита) — не бросает ДАЖЕ при огромном chunk_max_tokens (spec embed-local-swap §4)."""
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 100)
+    check_chunk_budget(conn, None)  # не должно бросать
+
+
+def test_store_vectors_does_not_gate_chunk_budget(tmp_path: Path) -> None:
+    """store_vectors — тупой писатель: НЕ вызывает check_chunk_budget (ответственность
+    вызывающего, он знает embedder.max_tokens — spec embed-local-swap §4). Раньше
+    store_vectors сам бросал ValueError на превышении бюджета — это поведение снято."""
     conn = create_db(tmp_path / "c.db")
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
-    with pytest.raises(ValueError):
-        store_vectors(conn, ["deadbeef"], l2_normalize(np.eye(1, dtype=np.float32)), "m")
+    store_vectors(conn, ["deadbeef"], l2_normalize(np.eye(1, dtype=np.float32)), "m")  # не бросает
 
 
-def test_cmd_embed_reports_budget_error_without_calling_embedder(
+def test_cmd_embed_reports_budget_error_without_calling_embed(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
-    """Гейт срабатывает ДО дорогого embedder.embed() — не тратить минуты ONNX впустую."""
+    """Гейт срабатывает ПОСЛЕ создания эмбеддера (нужен embedder.max_tokens), но ДО
+    дорогого embedder.embed() — не тратить минуты инференса впустую (spec
+    embed-local-swap §4)."""
     db = tmp_path / "c.db"
     conn = create_db(db)
     index_chunks(conn, [Chunk("doc-a", 0, "x", 1)], chunk_max_tokens=EMBED_MAX_TOKENS * 2)
     conn.close()
 
-    def fail_if_called(backend: str, model: str | None) -> Any:
-        raise AssertionError("эмбеддер не должен вызываться — гейт обязан отсечь раньше")
+    class _FakeBudgetEmbedder:
+        name = "fake"
+        dim = 1
+        max_tokens = EMBED_MAX_TOKENS
 
-    monkeypatch.setattr("index.vector_store._make_embedder", fail_if_called)
+        def embed(self, texts: list[str], *, kind: str = "doc") -> Any:
+            raise AssertionError("embed() не должен вызываться — гейт обязан отсечь раньше")
+
+    monkeypatch.setattr(
+        "index.vector_store._make_embedder", lambda backend, model: _FakeBudgetEmbedder()
+    )
 
     args = argparse.Namespace(db=db, backend="bge", model=None)
     assert _cmd_embed(args) == 2
@@ -304,3 +463,105 @@ def test_l2_normalize_unit_and_zero() -> None:
     out = l2_normalize(mat)
     assert np.allclose(np.linalg.norm(out[0]), 1.0)
     assert np.allclose(out[1], 0.0)  # нулевая строка остаётся нулевой
+
+
+# --- embed_and_store: чекпоинтинг батчами (spec embed-local-swap §5, закрывает бэклог §11) ---
+
+
+class _CountingEmbedder:
+    name = "counting"
+    dim = 1
+    max_tokens: int | None = None
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []  # длины батчей, переданных в embed()
+
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+        self.calls.append(len(texts))
+        return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+
+def _big_corpus(tmp_path: Path, n: int) -> sqlite3.Connection:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk(f"doc-{i}", 0, f"unique text {i}", 1) for i in range(n)])
+    return conn
+
+
+def test_embed_and_store_batches_calls_and_stores_all(tmp_path: Path) -> None:
+    conn = _big_corpus(tmp_path, 150)
+    hashes, texts = chunk_hashes(conn)
+    embedder = _CountingEmbedder()
+    total = embed_and_store(conn, embedder, hashes, texts, batch=64)
+    assert total == 150
+    assert embedder.calls == [64, 64, 22]  # ровно 3 вызова embed(), не один на весь корпус
+    assert _vec_count(conn, "counting") == 150
+
+
+def test_embed_and_store_empty_hashes_is_noop(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    embedder = _CountingEmbedder()
+    assert embed_and_store(conn, embedder, [], []) == 0
+    assert embedder.calls == []
+
+
+def test_embed_and_store_checkpoints_partial_progress_on_failure(tmp_path: Path) -> None:
+    """Фейк падает на 2-м батче — 1-й батч (64 хэша) уже физически в БД: обрыв
+    (kill/OOM/закрытие терминала) теряет МАКСИМУМ один батч, не весь прогон."""
+    conn = _big_corpus(tmp_path, 150)
+    hashes, texts = chunk_hashes(conn)
+
+    class _FailsOnSecondCall:
+        name = "flaky"
+        dim = 1
+        max_tokens: int | None = None
+
+        def __init__(self) -> None:
+            self.n_calls = 0
+
+        def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+            self.n_calls += 1
+            if self.n_calls == 2:
+                raise RuntimeError("обрыв (симуляция kill/OOM)")
+            return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+    with pytest.raises(RuntimeError):
+        embed_and_store(conn, _FailsOnSecondCall(), hashes, texts, batch=64)
+    assert _vec_count(conn, "flaky") == 64  # ровно 1-й батч сохранён, ничего не потеряно
+
+
+def test_embed_and_store_restart_after_failure_completes_without_duplicates(tmp_path: Path) -> None:
+    """Рестарт (новый процесс = новый экземпляр эмбеддера) добирает остаток через
+    ``chunk_hashes(not_embedded_for=...)`` без повторного счёта/дублей."""
+    conn = _big_corpus(tmp_path, 150)
+    hashes, texts = chunk_hashes(conn)
+
+    class _FailsOnSecondCall:
+        name = "flaky2"
+        dim = 1
+        max_tokens: int | None = None
+
+        def __init__(self) -> None:
+            self.n_calls = 0
+
+        def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+            self.n_calls += 1
+            if self.n_calls == 2:
+                raise RuntimeError("обрыв")
+            return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+    class _WorkingEmbedder:
+        name = "flaky2"  # тот же model-неймспейс — рестарт видит уже сохранённый 1-й батч
+        dim = 1
+        max_tokens: int | None = None
+
+        def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+            return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+    with pytest.raises(RuntimeError):
+        embed_and_store(conn, _FailsOnSecondCall(), hashes, texts, batch=64)
+    assert _vec_count(conn, "flaky2") == 64
+
+    pending_hashes, pending_texts = chunk_hashes(conn, not_embedded_for="flaky2")
+    assert len(pending_hashes) == 86  # 150 - 64, без дублей уже сохранённых
+    embed_and_store(conn, _WorkingEmbedder(), pending_hashes, pending_texts, batch=64)
+    assert _vec_count(conn, "flaky2") == 150

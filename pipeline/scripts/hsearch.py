@@ -13,7 +13,7 @@ from pathlib import Path
 from analyze.retrieve import RetrievalFilters, retrieve
 from core.env import load_dotenv
 from index.corpus_index import DEFAULT_DB
-from index.embed import Embedder, get_embedder
+from index.embed import DEFAULT_BACKEND, Embedder, get_embedder
 from index.vector_store import unembedded_count
 
 
@@ -37,7 +37,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--axis", help="фильтр по оси relevance (agentic_g2ai|digital_sovereignty)")
     parser.add_argument("--tier", dest="target_fit", help="фильтр по target_fit (primary|context|background)")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
-    parser.add_argument("--backend", choices=["bge", "openrouter", "none"], default="bge")
+    parser.add_argument(
+        "--backend", choices=["bge", "openrouter", "none"], default=DEFAULT_BACKEND,
+        help="openrouter — production-дефолт; bge — локальный фолбэк; none — FTS-only (офлайн)",
+    )
     parser.add_argument("--model", default=None, help="имя модели для openrouter")
     args = parser.parse_args(argv)
 

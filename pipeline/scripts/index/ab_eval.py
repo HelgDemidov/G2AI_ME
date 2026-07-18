@@ -21,9 +21,9 @@ import yaml
 
 from analyze.retrieve import retrieve
 from index.corpus_index import DEFAULT_DB, fts_search, sanitize_fts_query
-from index.embed import Embedder, get_embedder
+from index.embed import DEFAULT_CLOUD_MODEL, Embedder, get_embedder
 from core.env import REPO_ROOT, load_dotenv
-from index.vector_store import chunk_hashes, semantic_search, store_vectors
+from index.vector_store import check_chunk_budget, chunk_hashes, embed_and_store, semantic_search
 
 DEFAULT_EVAL_QUERIES = REPO_ROOT / "pipeline" / "config" / "eval_queries.yaml"
 
@@ -32,6 +32,7 @@ DEFAULT_EVAL_QUERIES = REPO_ROOT / "pipeline" / "config" / "eval_queries.yaml"
 class ControlQuery:
     query: str
     expect: tuple[str, ...]  # любой из терминов в топ-чанке = попадание (регистронезависимо)
+    lang: str = "en"  # per-language eval (spec embed-api-first §5) — триггер эскалации перевода
 
 
 def load_eval_queries(path: Path) -> list[ControlQuery]:
@@ -39,7 +40,7 @@ def load_eval_queries(path: Path) -> list[ControlQuery]:
 
     Пустой/отсутствующий ключ ``queries`` или запись без ``query``/``expect`` (или
     с пустым ``expect``) -> понятная ``ValueError`` — молчаливый пропуск проверок
-    хуже явного отказа."""
+    хуже явного отказа. ``lang`` опционален, дефолт ``"en"`` (spec embed-api-first §5)."""
     raw: Any = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     items = raw.get("queries")
     if not items:
@@ -51,7 +52,11 @@ def load_eval_queries(path: Path) -> list[ControlQuery]:
         expect = item["expect"]
         if not expect:
             raise ValueError(f"{path}: запись #{i} с пустым expect: {item!r}")
-        queries.append(ControlQuery(str(item["query"]), tuple(str(e) for e in expect)))
+        queries.append(
+            ControlQuery(
+                str(item["query"]), tuple(str(e) for e in expect), str(item.get("lang", "en"))
+            )
+        )
     return queries
 
 
@@ -61,6 +66,7 @@ class QueryOutcome:
     hit1: bool
     hitk: bool
     top_score: float
+    lang: str
 
 
 @dataclass(frozen=True)
@@ -109,6 +115,7 @@ def evaluate_fts(conn: sqlite3.Connection, queries: list[ControlQuery], k: int =
                 hit_at_k(ranked, cq.expect, 1),
                 hit_at_k(ranked, cq.expect, k),
                 hits[0].rank if hits else 0.0,  # bm25: меньше = лучше (в отличие от cosine-строк ниже)
+                cq.lang,
             )
         )
     return _summarize("fts", outcomes, len(queries))
@@ -122,12 +129,15 @@ def evaluate_vector(
     queries: list[ControlQuery],
     k: int = 3,
 ) -> ModelResult:
-    """vector-режим: полная матрица хэшей корпуса эмбеддится и сохраняется (не
-    инкремент — сравнение режимов/моделей), затем ``semantic_search`` на запрос."""
-    store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
+    """vector-режим: доэмбеддивает переданные (инкрементальные — только НЕ
+    заэмбедженные этой моделью, spec embed-local-swap §5) хэши батчами через
+    ``embed_and_store`` — уже посчитанное в предыдущих прогонах A/B не считается
+    заново, — затем ``semantic_search`` (по ВСЕМ векторам модели в БД, не только
+    только что добавленным) на запрос."""
+    embed_and_store(conn, embedder, hashes, texts)
     outcomes: list[QueryOutcome] = []
     for cq in queries:
-        query_vec = embedder.embed([cq.query])
+        query_vec = embedder.embed([cq.query], kind="query")
         hits = semantic_search(conn, query_vec[0], embedder.name, k)
         ranked = [h.text for h in hits]
         outcomes.append(
@@ -136,6 +146,7 @@ def evaluate_vector(
                 hit_at_k(ranked, cq.expect, 1),
                 hit_at_k(ranked, cq.expect, k),
                 hits[0].score if hits else 0.0,
+                cq.lang,
             )
         )
     return _summarize(f"{embedder.name} · vector", outcomes, len(queries))
@@ -156,6 +167,7 @@ def evaluate_hybrid(
                 hit_at_k(ranked, cq.expect, 1),
                 hit_at_k(ranked, cq.expect, k),
                 scored[0].rrf_score if scored else 0.0,
+                cq.lang,
             )
         )
     return _summarize(f"{embedder.name} · hybrid", outcomes, len(queries))
@@ -170,7 +182,41 @@ def _report(results: list[ModelResult], k: int, n_queries: int) -> None:
         for out in res.outcomes:
             mark = "✓" if out.hit1 else ("~" if out.hitk else "✗")
             print(f"  {mark} [top={out.top_score:.3f}] {out.query}")
+        # per-language срез (spec embed-api-first §5) — только если запросы разноязычны,
+        # иначе одна строка дублировала бы уже напечатанную общую сводку
+        langs = sorted({out.lang for out in res.outcomes})
+        if len(langs) > 1:
+            for lang in langs:
+                sub = [out for out in res.outcomes if out.lang == lang]
+                n = len(sub) or 1
+                h1 = sum(out.hit1 for out in sub) / n
+                hk = sum(out.hitk for out in sub) / n
+                print(f"    {lang}: hit@1={h1:.0%} hit@{k}={hk:.0%} (n={len(sub)})")
     print("\nЛегенда: ✓ ожидаемый термин в топ-1, ~ в топ-k, ✗ не найден.")
+
+
+def parse_backends(spec: str) -> list[Embedder]:
+    """Разобрать comma-список бэкендов ``bge|openrouter:<model>`` в эмбеддеры (spec
+    embed-api-first §4). ``<model>`` сам может содержать двоеточие (напр. OpenRouter
+    ``:free``-варианты) — сплит по ПЕРВОМУ ``:`` после ``openrouter``."""
+    embedders: list[Embedder] = []
+    for token in (t.strip() for t in spec.split(",")):
+        if not token:
+            continue
+        if token == "bge":
+            embedders.append(get_embedder("bge"))
+            continue
+        if token.startswith("openrouter:"):
+            model = token[len("openrouter:") :]
+            if not model:
+                raise ValueError(
+                    f"{token!r}: openrouter: требует имя модели, "
+                    "напр. openrouter:qwen/qwen3-embedding-8b"
+                )
+            embedders.append(get_embedder("openrouter", model=model))
+            continue
+        raise ValueError(f"неизвестный бэкенд: {token!r} (ожидается 'bge' или 'openrouter:<model>')")
+    return embedders
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -183,9 +229,13 @@ def main(argv: list[str] | None = None) -> int:
         help="fts — модель-независим; vector/hybrid — требуют эмбеддер(ы)",
     )
     parser.add_argument(
-        "--reference-model", default="google/gemini-embedding-001", help="эталон через OpenRouter"
+        "--backends", default="bge",
+        help="comma-список бэкендов для сравнения: bge|openrouter:<model> (спек embed-api-first)",
     )
-    parser.add_argument("--no-reference", action="store_true", help="только локальный bge-m3")
+    parser.add_argument(
+        "--reference-model", default=DEFAULT_CLOUD_MODEL, help="эталон через OpenRouter"
+    )
+    parser.add_argument("--no-reference", action="store_true", help="только бэкенды из --backends")
     args = parser.parse_args(argv)
 
     if not args.db.exists():
@@ -206,12 +256,17 @@ def main(argv: list[str] | None = None) -> int:
         results.append(evaluate_fts(conn, queries, args.k))
 
     if "vector" in modes or "hybrid" in modes:
-        hashes, texts = chunk_hashes(conn)
-        if not hashes:
+        total_row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+        if not total_row or not total_row[0]:
             print("нет чанков в БД", file=sys.stderr)
             conn.close()
             return 2
-        embedders: list[Embedder] = [get_embedder("bge")]
+        try:
+            embedders: list[Embedder] = parse_backends(args.backends)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            conn.close()
+            return 2
         if not args.no_reference:
             try:
                 embedders.append(get_embedder("openrouter", model=args.reference_model))
@@ -219,10 +274,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"\nэталон пропущен: {exc}", file=sys.stderr)
 
         for embedder in embedders:
+            # ПОСЛЕ создания эмбеддера (нужен embedder.max_tokens), по каждому
+            # эмбеддеру отдельно — разные модели могут иметь разный бюджет
+            # (spec embed-local-swap §4); намеренно без try/except — несовместимость
+            # чанков с бюджетом сравниваемой модели должна остановить прогон, не спрятаться.
+            check_chunk_budget(conn, embedder.max_tokens)
+            # инкрементально ПО КАЖДОМУ эмбеддеру (spec embed-local-swap §5): разные
+            # модели держат разные множества уже заэмбедженных хэшей; повторный A/B
+            # той же моделью не пере-считает уже посчитанное.
+            hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)
             if "vector" in modes:
                 results.append(evaluate_vector(conn, embedder, hashes, texts, queries, args.k))
             else:
-                store_vectors(conn, hashes, embedder.embed(texts), embedder.name)  # hybrid тоже нужен
+                embed_and_store(conn, embedder, hashes, texts)  # hybrid тоже нужен
             if "hybrid" in modes:
                 results.append(evaluate_hybrid(conn, embedder, queries, args.k))
 
