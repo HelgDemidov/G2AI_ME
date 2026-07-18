@@ -32,6 +32,8 @@ INTRA_OP_THREADS = 4  # физический лимит машины: 2 ядра
 # лечит документированную оверсабскрипцию (onnxruntime иначе создаёт потоков больше ядер)
 RETRY_SCHEDULE = (1.0, 4.0, 15.0, 60.0)  # паузы (сек) МЕЖДУ попытками; всего ≤5 попыток
 # (spec embed-api-first §2) — 429/5xx/сетевые обрывы ретраятся, прочие 4xx неисправимы
+DEFAULT_CLOUD_MODEL = "qwen/qwen3-embedding-8b"  # ПЛЕЙСХОЛДЕР до A/B-чекпоинта §1 спека
+# embed-api-first (Fable 5 + пользователь) — коммит 4 подтверждает или меняет по решению
 
 
 def l2_normalize(mat: FloatArray) -> FloatArray:

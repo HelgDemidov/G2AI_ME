@@ -9,7 +9,16 @@ import numpy as np
 import pytest
 import yaml
 
-from index.ab_eval import DEFAULT_EVAL_QUERIES, hit_at_k, load_eval_queries, main
+from index.ab_eval import (
+    DEFAULT_EVAL_QUERIES,
+    ModelResult,
+    QueryOutcome,
+    _report,
+    hit_at_k,
+    load_eval_queries,
+    main,
+    parse_backends,
+)
 from index.chunking import Chunk
 from index.corpus_index import create_db, fts5_available, index_chunks
 from index.embed import FloatArray
@@ -88,6 +97,27 @@ def test_default_eval_queries_file_loads() -> None:
     for cq in qs:
         assert cq.query.strip()
         assert cq.expect
+
+
+# --- lang: per-language eval (spec embed-api-first §5) ---
+
+
+def test_load_eval_queries_lang_field_parsed(tmp_path: Path) -> None:
+    p = _write_yaml(tmp_path / "q.yaml", {"queries": [{"query": "a", "expect": ["x"], "lang": "cnr"}]})
+    qs = load_eval_queries(p)
+    assert qs[0].lang == "cnr"
+
+
+def test_load_eval_queries_lang_defaults_to_en(tmp_path: Path) -> None:
+    p = _write_yaml(tmp_path / "q.yaml", {"queries": [{"query": "a", "expect": ["x"]}]})
+    qs = load_eval_queries(p)
+    assert qs[0].lang == "en"
+
+
+def test_default_eval_queries_has_cnr_and_et_lang_tags() -> None:
+    qs = load_eval_queries(DEFAULT_EVAL_QUERIES)
+    langs = {cq.lang for cq in qs}
+    assert {"cnr", "et"} <= langs
 
 
 # --- main(): диспетчер --mode (fts — без модели; vector/hybrid — фейковый эмбеддер) ---
@@ -211,3 +241,110 @@ def test_main_invalid_eval_queries_reports_error(tmp_path: Path, capsys: Any) ->
     q = _write_yaml(tmp_path / "bad.yaml", {"queries": []})
     assert main(["--db", str(db), "--eval-queries", str(q), "--mode", "fts"]) == 2
     assert "queries" in capsys.readouterr().err
+
+
+# --- parse_backends: comma-список bge|openrouter:<model> (spec embed-api-first §4) ---
+
+
+class _NamedFakeEmbedder:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.dim = 2
+        self.max_tokens: int | None = None
+
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+        return np.ones((len(texts), self.dim), dtype=np.float32)
+
+
+def _fake_get_embedder(backend: str, **kw: Any) -> Any:
+    if backend == "bge":
+        return _NamedFakeEmbedder("bge-fake")
+    return _NamedFakeEmbedder(f"or-fake:{kw.get('model')}")
+
+
+def test_parse_backends_bge_and_openrouter_correct_names(monkeypatch: Any) -> None:
+    monkeypatch.setattr("index.ab_eval.get_embedder", _fake_get_embedder)
+    embedders = parse_backends("bge,openrouter:qwen/qwen3-embedding-8b")
+    assert [e.name for e in embedders] == ["bge-fake", "or-fake:qwen/qwen3-embedding-8b"]
+
+
+def test_parse_backends_openrouter_without_model_raises() -> None:
+    with pytest.raises(ValueError, match="openrouter"):
+        parse_backends("openrouter:")
+
+
+def test_parse_backends_unknown_token_raises() -> None:
+    with pytest.raises(ValueError, match="неизвестный бэкенд"):
+        parse_backends("nonsense")
+
+
+def test_parse_backends_model_with_colon_suffix_splits_on_first_colon(monkeypatch: Any) -> None:
+    """OpenRouter ':free'-варианты содержат двоеточие В ИМЕНИ модели — сплит только
+    по первому ':' после 'openrouter'."""
+    captured: dict[str, Any] = {}
+
+    def fake_get_embedder(backend: str, **kw: Any) -> Any:
+        captured["model"] = kw.get("model")
+        return _NamedFakeEmbedder("x")
+
+    monkeypatch.setattr("index.ab_eval.get_embedder", fake_get_embedder)
+    parse_backends("openrouter:nvidia/nemotron-3-embed-1b:free")
+    assert captured["model"] == "nvidia/nemotron-3-embed-1b:free"
+
+
+def test_main_backends_flag_uses_multiple_embedders(tmp_path: Path, monkeypatch: Any, capsys: Any) -> None:
+    db = tmp_path / "c.db"
+    _build_db(db)
+    q = _write_queries(tmp_path / "q.yaml")
+    monkeypatch.setattr("index.ab_eval.get_embedder", _fake_get_embedder)
+    monkeypatch.setattr("index.ab_eval.load_dotenv", lambda: None)
+
+    argv = [
+        "--db", str(db), "--eval-queries", str(q), "--mode", "vector", "--k", "1",
+        "--backends", "bge,openrouter:some-model", "--no-reference",
+    ]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "bge-fake · vector" in out
+    assert "or-fake:some-model · vector" in out
+
+
+def test_main_default_backends_matches_prior_single_bge_behavior(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """Без --backends дефолт "bge" даёт ровно тот же единственный эмбеддер, что и
+    старое захардкоженное поведение — обратная совместимость."""
+    db = tmp_path / "c.db"
+    _build_db(db)
+    q = _write_queries(tmp_path / "q.yaml")
+    monkeypatch.setattr("index.ab_eval.get_embedder", lambda backend, **kw: _FakeEmbedder())
+    monkeypatch.setattr("index.ab_eval.load_dotenv", lambda: None)
+
+    argv = ["--db", str(db), "--eval-queries", str(q), "--mode", "vector", "--k", "1", "--no-reference"]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert out.count("· vector") == 1
+
+
+# --- _report: per-language разбивка (spec embed-api-first §5) ---
+
+
+def test_report_prints_per_language_breakdown_when_multilingual(capsys: Any) -> None:
+    outcomes = [
+        QueryOutcome("q1", True, True, 1.0, "en"),
+        QueryOutcome("q2", False, True, 0.5, "cnr"),
+        QueryOutcome("q3", False, False, 0.1, "cnr"),
+    ]
+    res = ModelResult("fake · vector", 1 / 3, 2 / 3, outcomes)
+    _report([res], k=3, n_queries=3)
+    out = capsys.readouterr().out
+    assert "cnr: hit@1=0% hit@3=50% (n=2)" in out
+    assert "en: hit@1=100% hit@3=100% (n=1)" in out
+
+
+def test_report_omits_per_language_breakdown_when_monolingual(capsys: Any) -> None:
+    outcomes = [QueryOutcome("q1", True, True, 1.0, "en")]
+    res = ModelResult("fake · vector", 1.0, 1.0, outcomes)
+    _report([res], k=1, n_queries=1)
+    out = capsys.readouterr().out
+    assert "en:" not in out
