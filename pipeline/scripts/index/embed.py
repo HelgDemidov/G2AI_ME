@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -28,6 +30,8 @@ DEFAULT_ONNX = MODEL_DIR / "model_int8.onnx"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
 INTRA_OP_THREADS = 4  # физический лимит машины: 2 ядра/4 потока (spec embed-local-swap §3) —
 # лечит документированную оверсабскрипцию (onnxruntime иначе создаёт потоков больше ядер)
+RETRY_SCHEDULE = (1.0, 4.0, 15.0, 60.0)  # паузы (сек) МЕЖДУ попытками; всего ≤5 попыток
+# (spec embed-api-first §2) — 429/5xx/сетевые обрывы ретраятся, прочие 4xx неисправимы
 
 
 def l2_normalize(mat: FloatArray) -> FloatArray:
@@ -104,7 +108,18 @@ class OnnxBgeEmbedder:
 
 
 class OpenRouterEmbedder:
-    """Эталонный эмбеддер через OpenRouter (OpenAI-совместимый /embeddings)."""
+    """Production/эталонный эмбеддер через OpenRouter (OpenAI-совместимый /embeddings).
+
+    Ретраи (spec embed-api-first §2): 429/5xx/сетевые обрывы (URLError/TimeoutError,
+    напр. обрыв LTE) — до 5 попыток с паузами из ``RETRY_SCHEDULE``; прочие HTTP 4xx —
+    немедленный отказ (неисправимо, ретраить бессмысленно).
+
+    Размерность (§2-bis, MRL-усечение): ``dims`` срезает вектор ответа НА КЛИЕНТЕ и
+    ре-нормализует — держит RAM векторного индекса в узде (нативные 3072-4096d моделей-
+    кандидатов не влезают в бюджет 8ГБ-машины на масштабе целевого корпуса). Усечённые и
+    полные векторы — РАЗНЫЕ неймспейсы (``name`` получает суффикс ``@<dims>``), иначе они
+    бы смешались под одним ключом ``model`` в таблице ``vectors``.
+    """
 
     def __init__(
         self,
@@ -112,11 +127,13 @@ class OpenRouterEmbedder:
         api_key: str | None = None,
         batch_size: int = 32,
         url: str = OPENROUTER_URL,
+        dims: int | None = 1024,
     ) -> None:
-        self.name = model
+        self.name = f"{model}@{dims}" if dims is not None else model
         self.dim = 0  # станет известно после первого ответа
         self.max_tokens: int | None = None  # облачный лимит не фиксирован здесь — гейт неприменим
         self._model = model
+        self._dims = dims
         self._batch = batch_size
         self._url = url
         key = api_key or os.environ.get("OPENROUTER_API_KEY")
@@ -125,20 +142,43 @@ class OpenRouterEmbedder:
         self._key = key
 
     def _request(self, batch: list[str]) -> list[list[float]]:
-        payload = json.dumps({"model": self._model, "input": batch}).encode("utf-8")
+        body: dict[str, Any] = {"model": self._model, "input": batch}
+        if self._dims is not None:
+            body["dimensions"] = self._dims  # opportunистически — провайдер может проигнорировать,
+            # клиентский срез в embed() даёт тот же результат в любом случае
+        payload = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             self._url,
             data=payload,
             headers={"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data: Any = json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body}") from exc
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data: Any = json.loads(resp.read())
         items = sorted(data["data"], key=lambda x: x["index"])
         return [list(item["embedding"]) for item in items]
+
+    def _request_with_retry(self, batch: list[str]) -> list[list[float]]:
+        reason = ""
+        total_attempts = len(RETRY_SCHEDULE) + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                return self._request(batch)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")
+                if exc.code != 429 and exc.code < 500:
+                    raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body}") from exc
+                reason = f"HTTP {exc.code}: {body}"
+            except (urllib.error.URLError, TimeoutError) as exc:
+                reason = str(exc)
+            if attempt == total_attempts:
+                break
+            delay = RETRY_SCHEDULE[attempt - 1]
+            print(f"попытка {attempt}/{total_attempts} через {delay:.0f}s: {reason}", file=sys.stderr)
+            time.sleep(delay)
+        raise RuntimeError(
+            f"OpenRouter: исчерпаны попытки ({total_attempts}) — {reason}. "
+            "сеть/ключ? локальный фолбэк: --backend bge"
+        )
 
     def embed(self, texts: list[str], *, kind: Literal["doc", "query"] = "doc") -> FloatArray:
         # OpenRouter-модели (текущий каталог) симметричны — kind игнорируется
@@ -146,8 +186,10 @@ class OpenRouterEmbedder:
             return np.zeros((0, self.dim), dtype=np.float32)
         vecs: list[list[float]] = []
         for start in range(0, len(texts), self._batch):
-            vecs.extend(self._request(texts[start : start + self._batch]))
+            vecs.extend(self._request_with_retry(texts[start : start + self._batch]))
         mat = np.asarray(vecs, dtype=np.float32)
+        if self._dims is not None:
+            mat = mat[:, : self._dims]
         self.dim = int(mat.shape[1])
         return l2_normalize(mat)
 
