@@ -40,9 +40,10 @@ from index import corpus_index
 from core import fsio
 from core import schema
 from core import validate_sources
+from core.env import load_dotenv
 from index import vector_store
 from index.chunking import strip_frontmatter
-from index.embed import get_embedder
+from index.embed import DEFAULT_BACKEND, get_embedder
 
 logger = logging.getLogger("run_pipeline")
 
@@ -352,15 +353,27 @@ def process_docs(
     return results
 
 
-def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, force: bool = False) -> str:
+def rebuild_index(
+    sources_path: Path,
+    db_path: Path,
+    *,
+    embed: bool,
+    force: bool = False,
+    embed_backend: str = DEFAULT_BACKEND,
+) -> str:
     """Пересобрать корпусный индекс: FTS5 (инкрементально по изменённым ``doc.md``,
-    либо полностью при ``force``) + векторы (если embed). Требует токенизатор bge-m3.
+    либо полностью при ``force``) + векторы (если embed; бэкенд — ``embed_backend``,
+    дефолт облачный, spec embed-api-first §4). Требует токенизатор bge-m3 (чанковка
+    остаётся на нём при любом эмбеддере).
 
     ``corpus_fingerprint``/``chunk_max_tokens`` пишутся в ``index_meta`` атомарно с
     чанками (см. ``corpus_index.index_corpus`` / ``index_chunks``) — реконсиляция
     пересборки в ``main`` полагается на этот отпечаток. Ветка «нет токенизатора»
     намеренно НЕ трогает индекс: следующий прогон (когда модель появится) честно
     доиндексирует по нетронутому отпечатку — самовосстановление по построению.
+    Отказ векторной стадии (облако после ретраев/нет ключа) НЕ трогает FTS-часть —
+    она уже закоммичена к этому моменту; исключение уходит в ``main`` (репорт +
+    ненулевой exit-код).
     """
     from index.bge_tokenizer import EMBED_MAX_TOKENS, token_counter  # ленивый импорт: модель-зависимо
 
@@ -372,16 +385,35 @@ def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, force: bool
     status = corpus_index.index_corpus(conn, sources_path, counter, EMBED_MAX_TOKENS, force=force)
     conn.close()
     if embed:
-        embedder = get_embedder("bge")
+        load_dotenv()  # облачному бэкенду нужен OPENROUTER_API_KEY из .env
+        embedder = get_embedder(embed_backend)
         conn = sqlite3.connect(db_path)
         vector_store.check_chunk_budget(conn, embedder.max_tokens)
-        hashes, texts = vector_store.chunk_hashes(conn, not_embedded_for=embedder.name)
+        # sensitivity-гейт (spec embed-api-first §3.3): облачный бэкенд не эмбеддит
+        # чанки, все носители которых confidential; локальный — без фильтра
+        exclude = (
+            vector_store.confidential_doc_ids(conn) if embed_backend == "openrouter" else None
+        )
+        if exclude:
+            all_pending, _ = vector_store.chunk_hashes(conn, not_embedded_for=embedder.name)
+            hashes, texts = vector_store.chunk_hashes(
+                conn, not_embedded_for=embedder.name, exclude_all_carriers_in=exclude
+            )
+            skipped = len(all_pending) - len(hashes)
+        else:
+            hashes, texts = vector_store.chunk_hashes(conn, not_embedded_for=embedder.name)
+            skipped = 0
         if hashes:  # эмбеддим только НОВЫЕ хэши (правка 1 документа != пере-embed всего корпуса)
             # чекпоинтинг батчами — обрыв теряет ≤1 батч (spec embed-local-swap §5)
             vector_store.embed_and_store(conn, embedder, hashes, texts)
         removed = vector_store.gc_vectors(conn, embedder.name)
         conn.close()
         status += f"; векторы: +{len(hashes)} ({embedder.name}), GC {removed}"
+        if skipped:
+            status += (
+                f"; {skipped} чанков только-confidential пропущены облачным эмбеддером"
+                " (локальный прогон: --embed-backend bge)"
+            )
     return status
 
 
@@ -429,7 +461,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="переиграть все стадии независимо от состояния")
     parser.add_argument("--dry-run", action="store_true", help="только показать план, без изменений")
     parser.add_argument("--no-download", action="store_true", help="не скачивать (raw добавляются вручную)")
-    parser.add_argument("--embed", action="store_true", help="также пересобрать векторы (медленно)")
+    parser.add_argument(
+        "--embed", action="store_true",
+        help="также пересобрать векторы (облачный API: дёшево и быстро; --embed-backend bge — локально/медленно)",
+    )
+    parser.add_argument(
+        "--embed-backend", choices=["openrouter", "bge"], default=DEFAULT_BACKEND,
+        help="бэкенд эмбеддинга для --embed: openrouter — production-дефолт, bge — локальный фолбэк",
+    )
     parser.add_argument("--graphml", type=Path, default=None, help="экспортировать граф в GraphML")
     parser.add_argument("--pause", type=float, default=1.0, help="пауза между скачиваниями, сек")
     parser.add_argument(
@@ -466,15 +505,26 @@ def main(argv: list[str] | None = None) -> int:
     # краш/прерывание между конвертацией и пересборкой не должны оставлять индекс
     # устаревшим навсегда). fp считается ПОСЛЕ process_docs — конвертация меняет
     # mtime doc.md.
+    index_error: str | None = None
     if args.dry_run:
         logger.info("Индекс: dry-run, не трогаем")
     else:
         needs_rebuild, _ = _needs_index_rebuild(args.sources, args.db, force=args.force)
         if needs_rebuild:
-            logger.info(
-                "Индекс: %s",
-                rebuild_index(args.sources, args.db, embed=args.embed, force=args.force),
-            )
+            try:
+                logger.info(
+                    "Индекс: %s",
+                    rebuild_index(
+                        args.sources, args.db,
+                        embed=args.embed, force=args.force, embed_backend=args.embed_backend,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — изоляция отказа стадии индекса:
+                # FTS-часть закоммичена ДО векторной (порядок в rebuild_index), отказ
+                # облака после ретраев её не рвёт; репорт + ненулевой exit, как у
+                # прочих стадий (spec embed-api-first §4)
+                index_error = str(exc)
+                logger.error("  ✗ индекс: %s", index_error)
         else:
             logger.info("Индекс: актуален (fingerprint совпадает)")
 
@@ -483,7 +533,8 @@ def main(argv: list[str] | None = None) -> int:
         build_graph.export_graphml(graph, args.graphml)
         logger.info("GraphML: %s", args.graphml)
 
-    return _report(results)
+    rc = _report(results)
+    return 1 if index_error else rc
 
 
 if __name__ == "__main__":

@@ -344,6 +344,25 @@ def test_cmd_embed_openrouter_skips_confidential_only_chunks_and_reports(
     assert _vec_count(conn2, "cloud-model") == 1  # только публичный чанк заэмбеджен
 
 
+def test_cli_default_backend_is_openrouter(tmp_path: Path, monkeypatch: Any) -> None:
+    """API-first (spec embed-api-first §4): дефолт --backend CLI = openrouter."""
+    from index.vector_store import main as vs_main
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "x", 1)])
+    conn.close()
+    captured: dict[str, Any] = {}
+
+    def fake_make_embedder(backend: str, model: Any) -> Any:
+        captured["backend"] = backend
+        return _CloudFakeEmbedder()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", fake_make_embedder)
+    assert vs_main(["embed-corpus", "--db", str(db)]) == 0
+    assert captured["backend"] == "openrouter"
+
+
 def test_cmd_embed_bge_backend_ignores_sensitivity_gate(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:

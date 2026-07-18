@@ -1,9 +1,11 @@
 """Модель-агностичный интерфейс эмбеддингов для семантического поиска.
 
-Бэкенды:
-  - OnnxBgeEmbedder — локальный bge-m3 int8 ONNX (CPU, приватно, бесплатно):
-    CLS-pooling (last_hidden_state[:, 0]) + L2-нормализация -> 1024-мерный вектор.
-  - OpenRouterEmbedder — эталон (gemini-embedding-001 и др.) через OpenRouter.
+Бэкенды (API-first, spec embed-api-first §4):
+  - OpenRouterEmbedder — PRODUCTION-путь (DEFAULT_CLOUD_MODEL, выбран A/B-чекпоинтом §1):
+    корпус эмбеддится облаком за минуты и центы вместо ~100 часов локально.
+  - OnnxBgeEmbedder — локальный bge-m3 int8 ONNX (CPU, приватно, бесплатно) — ФОЛБЭК
+    (офлайн/confidential): CLS-pooling (last_hidden_state[:, 0]) + L2-нормализация
+    -> 1024-мерный вектор.
 
 Векторы ВСЕГДА L2-нормализованы, поэтому косинус = скалярное произведение.
 ВНИМАНИЕ: векторы разных моделей несравнимы — на корпусе живёт одна модель за раз.
@@ -32,8 +34,13 @@ INTRA_OP_THREADS = 4  # физический лимит машины: 2 ядра
 # лечит документированную оверсабскрипцию (onnxruntime иначе создаёт потоков больше ядер)
 RETRY_SCHEDULE = (1.0, 4.0, 15.0, 60.0)  # паузы (сек) МЕЖДУ попытками; всего ≤5 попыток
 # (spec embed-api-first §2) — 429/5xx/сетевые обрывы ретраятся, прочие 4xx неисправимы
-DEFAULT_CLOUD_MODEL = "qwen/qwen3-embedding-8b"  # ПЛЕЙСХОЛДЕР до A/B-чекпоинта §1 спека
-# embed-api-first (Fable 5 + пользователь) — коммит 4 подтверждает или меняет по решению
+DEFAULT_BACKEND = "openrouter"  # production-путь эмбеддинга корпуса (spec embed-api-first §4);
+# локальный bge — фолбэк (офлайн/confidential), НЕ основной путь
+DEFAULT_CLOUD_MODEL = "google/gemini-embedding-001"  # A/B-чекпоинт §1 (2026-07-18, пользователь +
+# Fable 5): единственная из трёх кандидатов прошла все критерии — hit@10=100% на всех языках,
+# et-подсет 100% против 60% у bge; qwen3-8b и nemotron:free провалены (таблица — в Статусе спека)
+DEFAULT_CLOUD_DIMS = 1024  # MRL-срез на клиенте (§2-bis): @1536 не дал ничего сверх @1024,
+# RAM-паритет с bge (643 МБ на целевых 157k чанков)
 
 
 def l2_normalize(mat: FloatArray) -> FloatArray:
@@ -136,11 +143,11 @@ class OpenRouterEmbedder:
 
     def __init__(
         self,
-        model: str = "google/gemini-embedding-001",
+        model: str = DEFAULT_CLOUD_MODEL,
         api_key: str | None = None,
         batch_size: int = 32,
         url: str = OPENROUTER_URL,
-        dims: int | None = 1024,
+        dims: int | None = DEFAULT_CLOUD_DIMS,
     ) -> None:
         self.name = f"{model}@{dims}" if dims is not None else model
         self.dim = 0  # станет известно после первого ответа

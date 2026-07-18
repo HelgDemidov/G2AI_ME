@@ -665,3 +665,95 @@ def test_corrupted_raw_after_adoption_triggers_download(tmp_path: Path) -> None:
     raw.write_bytes(b"corrupted, different content, different size")
 
     assert Stage.download in needed_stages(rec, tmp_path)
+
+
+# --- дефолты API-first: --embed-backend / изоляция отказа индексной стадии
+# (spec embed-api-first §4) ---
+
+
+def test_main_embed_backend_flag_propagates_to_rebuild_index(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    captured: dict[str, Any] = {}
+
+    def fake_rebuild(*args: Any, **kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr("run_pipeline.rebuild_index", fake_rebuild)
+    from run_pipeline import main
+
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--embed", "--embed-backend", "bge"]) == 0
+    assert captured["embed_backend"] == "bge"
+    assert captured["embed"] is True
+
+
+def test_main_embed_backend_defaults_to_openrouter(tmp_path: Path, monkeypatch: Any) -> None:
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    captured: dict[str, Any] = {}
+
+    def fake_rebuild(*args: Any, **kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr("run_pipeline.rebuild_index", fake_rebuild)
+    from run_pipeline import main
+
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--embed"]) == 0
+    assert captured["embed_backend"] == "openrouter"
+
+
+def test_main_index_stage_failure_reported_nonzero_not_raised(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Отказ векторной стадии (облако после ретраев/нет ключа) не роняет прогон
+    исключением: репорт + ненулевой exit (FTS-часть закоммичена до эмбеддинга)."""
+    sources = tmp_path / "sources"
+    sources.mkdir()
+
+    def failing_rebuild(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("OpenRouter: исчерпаны попытки")
+
+    monkeypatch.setattr("run_pipeline.rebuild_index", failing_rebuild)
+    from run_pipeline import main
+
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--embed"]) == 1
+
+
+def test_rebuild_index_openrouter_skips_confidential_only_chunks(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """sensitivity-гейт в rebuild_index (spec embed-api-first §3.3): облачный бэкенд
+    не эмбеддит чанки confidential-документов; пропуск репортится в статусе."""
+    sources = tmp_path / "sources"
+    conf = {**valid_record(), "id": "sg-conf-doc-2026", "sensitivity": "confidential"}
+    pub = {**valid_record(), "id": "sg-pub-doc-2026"}
+    write_doc(sources, conf, md="конфиденциальный текст закрытого документа")
+    write_doc(sources, pub, md="публичный текст открытого документа")
+
+    # чанковка без реальной модели: токены = слова (лениво импортируемый token_counter)
+    monkeypatch.setattr("index.bge_tokenizer.token_counter", lambda: (lambda s: len(s.split())))
+    monkeypatch.setattr("run_pipeline.load_dotenv", lambda: None)
+
+    seen: list[str] = []
+
+    class _CapturingCloud:
+        name = "cloud"
+        dim = 2
+        max_tokens: Any = None
+
+        def embed(self, texts: list[str], *, kind: str = "doc") -> Any:
+            import numpy as np
+
+            seen.extend(texts)
+            return np.ones((len(texts), 2), dtype=np.float32)
+
+    monkeypatch.setattr("run_pipeline.get_embedder", lambda backend, **kw: _CapturingCloud())
+
+    status = rebuild_index(sources, tmp_path / "c.db", embed=True, embed_backend="openrouter")
+    assert "только-confidential" in status
+    assert any("публичный" in t for t in seen)
+    assert not any("конфиденциальный" in t for t in seen)

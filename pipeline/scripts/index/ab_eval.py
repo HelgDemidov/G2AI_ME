@@ -21,7 +21,7 @@ import yaml
 
 from analyze.retrieve import retrieve
 from index.corpus_index import DEFAULT_DB, fts_search, sanitize_fts_query
-from index.embed import Embedder, get_embedder
+from index.embed import DEFAULT_CLOUD_MODEL, Embedder, get_embedder
 from core.env import REPO_ROOT, load_dotenv
 from index.vector_store import check_chunk_budget, chunk_hashes, embed_and_store, semantic_search
 
@@ -233,9 +233,9 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-список бэкендов для сравнения: bge|openrouter:<model> (спек embed-api-first)",
     )
     parser.add_argument(
-        "--reference-model", default="google/gemini-embedding-001", help="эталон через OpenRouter"
+        "--reference-model", default=DEFAULT_CLOUD_MODEL, help="эталон через OpenRouter"
     )
-    parser.add_argument("--no-reference", action="store_true", help="только локальный bge-m3")
+    parser.add_argument("--no-reference", action="store_true", help="только бэкенды из --backends")
     args = parser.parse_args(argv)
 
     if not args.db.exists():

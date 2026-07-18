@@ -47,6 +47,21 @@ def test_hsearch_missing_db_reports_error(tmp_path: Path, capsys: Any) -> None:
     assert "не найден" in capsys.readouterr().err
 
 
+def test_hsearch_default_backend_is_openrouter(tmp_path: Path, monkeypatch: Any) -> None:
+    """API-first (spec embed-api-first §4): дефолт --backend = openrouter."""
+    db = tmp_path / "c.db"
+    _build_db(db)
+    captured: dict[str, Any] = {}
+
+    def fake_make_embedder(backend: str, model: Any) -> None:
+        captured["backend"] = backend
+        return None  # None -> честный FTS-only путь retrieve()
+
+    monkeypatch.setattr("hsearch._make_embedder", fake_make_embedder)
+    assert main(["governance", "--db", str(db)]) == 0
+    assert captured["backend"] == "openrouter"
+
+
 def test_hsearch_entity_filter_narrows_results(tmp_path: Path, capsys: Any) -> None:
     db = tmp_path / "c.db"
     conn = create_db(db)

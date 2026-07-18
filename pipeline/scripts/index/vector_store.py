@@ -28,7 +28,7 @@ import numpy as np
 
 from index.chunking import embed_input
 from index.corpus_index import DEFAULT_DB, read_meta
-from index.embed import Embedder, FloatArray, get_embedder
+from index.embed import DEFAULT_BACKEND, Embedder, FloatArray, get_embedder
 from core.env import load_dotenv
 
 _SCHEMA = """
@@ -369,7 +369,10 @@ def _cmd_vsearch(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", type=Path, default=DEFAULT_DB)
-    common.add_argument("--backend", choices=["bge", "openrouter"], default="bge")
+    common.add_argument(
+        "--backend", choices=["bge", "openrouter"], default=DEFAULT_BACKEND,
+        help="openrouter — production-дефолт (API, дёшево/быстро); bge — локальный фолбэк",
+    )
     common.add_argument("--model", default=None, help="имя модели для openrouter")
 
     parser = argparse.ArgumentParser(description="Векторный слой корпуса G2AI (эмбеддинги + поиск)")
