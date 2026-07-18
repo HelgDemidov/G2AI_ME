@@ -377,7 +377,8 @@ def rebuild_index(sources_path: Path, db_path: Path, *, embed: bool, force: bool
         vector_store.check_chunk_budget(conn, embedder.max_tokens)
         hashes, texts = vector_store.chunk_hashes(conn, not_embedded_for=embedder.name)
         if hashes:  # эмбеддим только НОВЫЕ хэши (правка 1 документа != пере-embed всего корпуса)
-            vector_store.store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
+            # чекпоинтинг батчами — обрыв теряет ≤1 батч (spec embed-local-swap §5)
+            vector_store.embed_and_store(conn, embedder, hashes, texts)
         removed = vector_store.gc_vectors(conn, embedder.name)
         conn.close()
         status += f"; векторы: +{len(hashes)} ({embedder.name}), GC {removed}"

@@ -16,11 +16,12 @@ import pytest
 from index.bge_tokenizer import EMBED_MAX_TOKENS
 from index.chunking import Chunk
 from index.corpus_index import create_db, fts5_available, index_chunks
-from index.embed import l2_normalize
+from index.embed import FloatArray, l2_normalize
 from index.vector_store import (
     _cmd_embed,
     check_chunk_budget,
     chunk_hashes,
+    embed_and_store,
     gc_vectors,
     load_vectors,
     semantic_search,
@@ -324,3 +325,105 @@ def test_l2_normalize_unit_and_zero() -> None:
     out = l2_normalize(mat)
     assert np.allclose(np.linalg.norm(out[0]), 1.0)
     assert np.allclose(out[1], 0.0)  # нулевая строка остаётся нулевой
+
+
+# --- embed_and_store: чекпоинтинг батчами (spec embed-local-swap §5, закрывает бэклог §11) ---
+
+
+class _CountingEmbedder:
+    name = "counting"
+    dim = 1
+    max_tokens: int | None = None
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []  # длины батчей, переданных в embed()
+
+    def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+        self.calls.append(len(texts))
+        return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+
+def _big_corpus(tmp_path: Path, n: int) -> sqlite3.Connection:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [Chunk(f"doc-{i}", 0, f"unique text {i}", 1) for i in range(n)])
+    return conn
+
+
+def test_embed_and_store_batches_calls_and_stores_all(tmp_path: Path) -> None:
+    conn = _big_corpus(tmp_path, 150)
+    hashes, texts = chunk_hashes(conn)
+    embedder = _CountingEmbedder()
+    total = embed_and_store(conn, embedder, hashes, texts, batch=64)
+    assert total == 150
+    assert embedder.calls == [64, 64, 22]  # ровно 3 вызова embed(), не один на весь корпус
+    assert _vec_count(conn, "counting") == 150
+
+
+def test_embed_and_store_empty_hashes_is_noop(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    embedder = _CountingEmbedder()
+    assert embed_and_store(conn, embedder, [], []) == 0
+    assert embedder.calls == []
+
+
+def test_embed_and_store_checkpoints_partial_progress_on_failure(tmp_path: Path) -> None:
+    """Фейк падает на 2-м батче — 1-й батч (64 хэша) уже физически в БД: обрыв
+    (kill/OOM/закрытие терминала) теряет МАКСИМУМ один батч, не весь прогон."""
+    conn = _big_corpus(tmp_path, 150)
+    hashes, texts = chunk_hashes(conn)
+
+    class _FailsOnSecondCall:
+        name = "flaky"
+        dim = 1
+        max_tokens: int | None = None
+
+        def __init__(self) -> None:
+            self.n_calls = 0
+
+        def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+            self.n_calls += 1
+            if self.n_calls == 2:
+                raise RuntimeError("обрыв (симуляция kill/OOM)")
+            return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+    with pytest.raises(RuntimeError):
+        embed_and_store(conn, _FailsOnSecondCall(), hashes, texts, batch=64)
+    assert _vec_count(conn, "flaky") == 64  # ровно 1-й батч сохранён, ничего не потеряно
+
+
+def test_embed_and_store_restart_after_failure_completes_without_duplicates(tmp_path: Path) -> None:
+    """Рестарт (новый процесс = новый экземпляр эмбеддера) добирает остаток через
+    ``chunk_hashes(not_embedded_for=...)`` без повторного счёта/дублей."""
+    conn = _big_corpus(tmp_path, 150)
+    hashes, texts = chunk_hashes(conn)
+
+    class _FailsOnSecondCall:
+        name = "flaky2"
+        dim = 1
+        max_tokens: int | None = None
+
+        def __init__(self) -> None:
+            self.n_calls = 0
+
+        def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+            self.n_calls += 1
+            if self.n_calls == 2:
+                raise RuntimeError("обрыв")
+            return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+    class _WorkingEmbedder:
+        name = "flaky2"  # тот же model-неймспейс — рестарт видит уже сохранённый 1-й батч
+        dim = 1
+        max_tokens: int | None = None
+
+        def embed(self, texts: list[str], *, kind: str = "doc") -> FloatArray:
+            return l2_normalize(np.ones((len(texts), self.dim), dtype=np.float32))
+
+    with pytest.raises(RuntimeError):
+        embed_and_store(conn, _FailsOnSecondCall(), hashes, texts, batch=64)
+    assert _vec_count(conn, "flaky2") == 64
+
+    pending_hashes, pending_texts = chunk_hashes(conn, not_embedded_for="flaky2")
+    assert len(pending_hashes) == 86  # 150 - 64, без дублей уже сохранённых
+    embed_and_store(conn, _WorkingEmbedder(), pending_hashes, pending_texts, batch=64)
+    assert _vec_count(conn, "flaky2") == 150

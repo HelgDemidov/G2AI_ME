@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -101,6 +102,35 @@ def store_vectors(
         [(h, model, vectors[i].astype(np.float32).tobytes()) for i, h in enumerate(content_hashes)],
     )
     conn.commit()
+
+
+CHECKPOINT_BATCH = 64  # чекпоинт эмбеддинга (spec embed-local-swap §5, закрывает бэклог §11):
+# обрыв (kill, OOM, закрытие терминала/VS Code, обрыв сети) теряет МАКСИМУМ один батч,
+# не весь прогон — раньше store_vectors писался одним вызовом на весь корпус целиком.
+
+
+def embed_and_store(
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    hashes: list[str],
+    texts: list[str],
+    *,
+    batch: int = CHECKPOINT_BATCH,
+    log: Callable[[str], None] = print,
+) -> int:
+    """Эмбеддит и СОХРАНЯЕТ векторы батчами по ``batch`` хэшей вместо одного
+    вызова ``embedder.embed()``/``store_vectors()`` на весь список — прогресс
+    коммитится по мере готовности. Прерывание процесса ЛЮБОЙ природы теряет не
+    более одного батча; рестарт добирает остаток через инкрементальный отбор
+    ``chunk_hashes(not_embedded_for=...)`` (не нужна отдельная логика докачки —
+    он уже пропускает заэмбедженные хэши). Возвращает число заэмбедженных хэшей."""
+    total = len(hashes)
+    for start in range(0, total, batch):
+        batch_hashes = hashes[start : start + batch]
+        batch_texts = texts[start : start + batch]
+        store_vectors(conn, batch_hashes, embedder.embed(batch_texts), embedder.name)
+        log(f"  векторы: {min(start + batch, total)}/{total} ({embedder.name})")
+    return total
 
 
 def load_vectors(conn: sqlite3.Connection, model: str) -> tuple[list[str], FloatArray]:
@@ -246,7 +276,7 @@ def _cmd_embed(args: argparse.Namespace) -> int:
         return 2
     hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)  # только НОВЫЕ хэши
     if hashes:
-        store_vectors(conn, hashes, embedder.embed(texts), embedder.name)
+        embed_and_store(conn, embedder, hashes, texts)  # чекпоинтинг батчами (spec embed-local-swap §5)
     removed = gc_vectors(conn, embedder.name)
     conn.close()
     print(f"Векторы {embedder.name}: +{len(hashes)} новых, GC удалил {removed} -> {args.db}")
