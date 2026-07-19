@@ -1,0 +1,49 @@
+# Курируемая запись документа (corpus-layout-v2). Человек — источник истины.
+# Операционное состояние — .state.yaml (локально); оригинал — raw.pdf; конвертация — doc.md.
+id: me-undp-aila-2025
+entity_id: me
+track: montenegro
+title: Artificial Intelligence Landscape Assessment (AILA) — Crna Gora, 2024
+issuer: United Nations Development Programme (UNDP) Montenegro
+issuer_type: igo
+geo_scope: national
+language: cnr
+dates:
+  published: '2025-05-13'
+  retrieved: '2026-07-19'
+  last_checked: '2026-07-19'
+doc_type: report
+authority: report
+source_url: https://www.undp.org/sites/g/files/zskgke326/files/2025-05/mne_undp-aila_montenegro.pdf
+source_format: pdf
+sensitivity: normal
+rights: unknown
+topics:
+- ai-governance
+- public-sector-ai
+- data-governance
+g2ai_pattern: []
+summary: 'First systematic assessment of Montenegro''s AI landscape (UNDP AILA methodology,
+  presented 2025-05-13, Podgorica; Montenegrin edition). Three pillars: government as AI user,
+  government as enabler of the AI ecosystem, and fostering ethical AI. Maps capabilities and
+  gaps (data interoperability, skills, infrastructure) and recommends priority AI applications
+  for public administration, tourism and environmental management.'
+relations: []
+relevance:
+  target_fit: primary
+  axis: digital_sovereignty
+  assessed_stage: confirmed
+  rationale: 'First systematic assessment of Montenegro''s AI landscape (UNDP AILA methodology):
+    government as AI user, government as ecosystem enabler, ethical AI development — direct
+    analytical input for the montenegro track (the very strategy-drafting need this corpus
+    serves). Primary on the digital_sovereignty axis: it maps the national baseline (institutions,
+    data, skills, infrastructure) that any G2AI proposal must build on. Confirmed by text
+    (doc.md, 2026-07-19): full Montenegrin edition converted cleanly (97 headings, section
+    tree Sažetak/Uvod/Pregled prioriteta/Digitalno okruženje/Rezultati i preporuke/Analiza
+    po dimenzijama intact, diacritics clean) — substantive chapters on data governance (ZZPL,
+    AZLP, GDPR draft), digital environment and per-dimension scoring incl. the UNDP Digital
+    Development Compass chart (13 dimension scores, e.g. Cybersecurity 4.62, Payments 5/TOP-10,
+    Business 0.67 — reconstructed verbatim by figures-VLM and verified against the original
+    page at 400 DPI). Also served as the figures-VLM acceptance document (convert-cloud-tier
+    checkpoint 2): 16 figure/raster markers VLM-interpreted, 0 bare left, lint clean.'
+  assessed_date: '2026-07-19'
