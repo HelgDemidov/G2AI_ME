@@ -209,3 +209,57 @@ def test_embed_input_prefixes_breadcrumb() -> None:
 
 def test_embed_input_no_breadcrumb_returns_text_unchanged() -> None:
     assert embed_input("", "body text") == "body text"
+
+
+# --- фенс-осознанность (_paragraphs): mermaid/код-блоки не рвутся чанковкой
+# (живой дефект приёмки convert-cloud-tier чекпоинт 2: VLM-mermaid sg p.6) ---
+
+
+def _fences_balanced(text: str) -> bool:
+    return len([ln for ln in text.splitlines() if ln.strip().startswith("```")]) % 2 == 0
+
+
+def test_fence_with_blank_lines_stays_in_one_chunk() -> None:
+    """Пустые строки ВНУТРИ фенса — ровно живой паттерн VLM-вывода (mermaid с
+    пустой строкой между секциями графа): раньше рвали блок на «абзацы»."""
+    mermaid = "```mermaid\ngraph TD\n    A[\"X\"] --> B[\"Y\"]\n\n    subgraph S\n    A\n    end\n```"
+    text = f"# H\n\nprose before\n\n{mermaid}\n\nprose after"
+    chunks = chunk_text(text, wc, max_tokens=100)
+    carriers = [c for c in chunks if "```mermaid" in c.text]
+    assert len(carriers) == 1
+    assert mermaid in carriers[0].text  # блок цел, байт-в-байт
+
+
+def test_fence_never_split_across_chunks_under_packing_pressure() -> None:
+    """Бюджет мал (фенс + проза не влезают вместе) — фенс уходит В СВОЙ чанк
+    целиком, а не режется по границе бюджета."""
+    mermaid = "```mermaid\ngraph LR\n    " + "\n\n    ".join(f'N{i}["node {i}"]' for i in range(6)) + "\n```"
+    prose = "word " * 30
+    text = f"{prose}\n\n{mermaid}\n\n{prose}"
+    chunks = chunk_text(text, wc, max_tokens=40)
+    assert all(_fences_balanced(c.text) for c in chunks)
+    assert sum("```mermaid" in c.text for c in chunks) == 1
+
+
+def test_heading_like_line_inside_fence_not_a_section_boundary() -> None:
+    """`# comment` внутри код-фенса — не markdown-заголовок: не должен рвать
+    секцию и попадать в breadcrumb."""
+    text = "## Real\n\n```\n# not a heading\ncode line\n```\n\ntail prose"
+    chunks = chunk_text(text, wc, max_tokens=100)
+    assert all(c.breadcrumb == "Real" for c in chunks)
+    assert not any("not a heading" in c.breadcrumb for c in chunks)
+
+
+def test_unclosed_fence_consumed_to_end_without_crash() -> None:
+    text = "prose\n\n```mermaid\ngraph TD\n    A --> B"
+    chunks = chunk_text(text, wc, max_tokens=100)
+    assert chunks  # не упало; хвост не потерян
+    assert any("A --> B" in c.text for c in chunks)
+
+
+def test_oversized_fence_degrades_to_split_not_crash() -> None:
+    """Фенс крупнее max_tokens — честная деградация в нарезку (граница
+    возможностей задокументирована в _paragraphs), не бесконечный чанк."""
+    big = "```mermaid\n" + "\n".join(f'X{i}["{i}"] --> Y{i}["{i}"]' for i in range(50)) + "\n```"
+    chunks = chunk_text(big, wc, max_tokens=20)
+    assert all(c.n_tokens <= 20 for c in chunks)

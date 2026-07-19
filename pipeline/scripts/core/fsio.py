@@ -6,6 +6,7 @@ Staging-файлы именуются dot-префиксом (``.<name>.part``),
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 
@@ -28,3 +29,12 @@ def atomic_write_text(target: Path, text: str) -> None:
     tmp = staging_path(target)
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(target)
+
+
+def sha256_file(path: Path) -> str:
+    """sha256 потоковым чтением (не грузит весь файл в память разом)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()

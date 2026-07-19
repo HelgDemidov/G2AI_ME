@@ -507,16 +507,39 @@ def merge_split_tables(md: str) -> str:
     return "\n\n".join(merged)
 
 
-def convert(pdf_path: str, out_path: str) -> None:
+@dataclass
+class PageGraphics:
+    """Графическая детекция ОДНОЙ страницы — БЕЗ финального рендера в markdown."""
+
+    page_num: int
+    width: float
+    height: float
+    real_tables: list[Table]
+    regions: list[pdf_graphics.Region]
+    raster_targets: list[pdf_graphics.Element]
+    remaining_words: list[Word]  # слова, не поглощённые ни одним регионом (проза)
+
+
+@dataclass
+class DocGraphics:
+    stats: DocStats
+    pages: list[PageGraphics]
+
+
+def compute_page_graphics(pdf_path: str) -> DocGraphics:
+    """Полный конвейер извлечения графики документа (элементы -> таблицы ->
+    регионы -> растр), общий шаг между ``convert()`` (рендерит найденное в
+    markdown-блоки) и ``figures_vlm`` (spec convert-cloud-tier §5: адресует
+    регион/изображение по ``region_id`` для VLM-пасса — пиксели рендерятся
+    отдельно, здесь только детекция). Вынесено в отдельную функцию НАМЕРЕННО:
+    ``region_hash`` зависит от boilerplate/tiny-marker/table-фильтрации слов —
+    дублирование этой фильтрации отдельным куском кода рано или поздно разошлось
+    бы с тем, что реально попало в doc.md при исходной конвертации."""
     with pdfplumber.open(pdf_path) as pdf:
         if not pdf.pages:
             raise RuntimeError(f"{pdf_path}: PDF без страниц")
         pages_words = [load_words(p) for p in pdf.pages]
         stats = compute_doc_stats(list(zip(pages_words, (p.height for p in pdf.pages))))
-
-        print(f"body_size={stats.body_size}, heading_sizes={stats.heading_sizes}, "
-              f"tiny_marker_max={stats.tiny_marker_max:.1f}", file=sys.stderr)
-        print(f"колонтитулов/повторяющихся строк обнаружено: {len(stats.boilerplate_norms)}", file=sys.stderr)
 
         # graphics-pass (spec convert-graphics §1/§1.4): элементы + document-wide
         # частота content_hash растра собираются ДО постраничного рендера —
@@ -525,8 +548,7 @@ def convert(pdf_path: str, out_path: str) -> None:
         all_images = [e for elements in pages_elements for e in elements if e.kind == "image"]
         hash_counts = pdf_graphics.document_hash_counts(all_images)
 
-        n_grid = n_sequence = n_opaque = n_raster = 0
-        out_parts: list[str] = []
+        pages_out: list[PageGraphics] = []
         for page_num, (page, words, elements) in enumerate(
             zip(pdf.pages, pages_words, pages_elements), start=1
         ):
@@ -542,42 +564,60 @@ def convert(pdf_path: str, out_path: str) -> None:
             regions, remaining_words = pdf_graphics.detect_regions(
                 page_num, elements, main_words, page.width, page.height, table_bboxes
             )
-            for r in regions:
-                if r.kind == "grid":
-                    n_grid += 1
-                elif r.kind == "sequence":
-                    n_sequence += 1
-                else:
-                    n_opaque += 1
-
             loose_images = [e for e in elements if e.kind == "image"]
             raster_targets = pdf_graphics.classify_images(
                 loose_images, [r.bbox for r in regions], hash_counts, page.width * page.height
             )
-            n_raster += len(raster_targets)
+            pages_out.append(
+                PageGraphics(
+                    page_num, page.width, page.height, real_tables, regions, raster_targets, remaining_words
+                )
+            )
+        return DocGraphics(stats, pages_out)
 
-            blocks: list[tuple[pdf_graphics.BBox, str]] = [
-                *render_tables(real_tables),
-                *((r.bbox, pdf_graphics.render_region_block(r, page_num)) for r in regions),
-                *(
-                    ((img.x0, img.top, img.x1, img.bottom), pdf_graphics.render_raster_marker(page_num))
-                    for img in raster_targets
-                ),
-            ]
-            # ширина/высота — СВОЕЙ страницы (не первой): корректно для смешанной
-            # ориентации (портретное тело + альбомные приложения-таблицы).
-            out_parts.append(render_page(remaining_words, page.width, stats, blocks))
 
-        print(
-            f"инфографика: {n_grid} грид -> таблица, {n_sequence} sequence -> список, "
-            f"{n_opaque} нереконструировано (маркер); растр: {n_raster} маркеров",
-            file=sys.stderr,
-        )
+def convert(pdf_path: str, out_path: str) -> None:
+    doc = compute_page_graphics(pdf_path)
+    stats = doc.stats
 
-        full_text = "\n\n".join(p for p in out_parts if p.strip())
-        full_text = merge_split_tables(full_text)  # A2: склейка многостраничных таблиц
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
+    print(f"body_size={stats.body_size}, heading_sizes={stats.heading_sizes}, "
+          f"tiny_marker_max={stats.tiny_marker_max:.1f}", file=sys.stderr)
+    print(f"колонтитулов/повторяющихся строк обнаружено: {len(stats.boilerplate_norms)}", file=sys.stderr)
+
+    n_grid = n_sequence = n_opaque = n_raster = 0
+    out_parts: list[str] = []
+    for pg in doc.pages:
+        for r in pg.regions:
+            if r.kind == "grid":
+                n_grid += 1
+            elif r.kind == "sequence":
+                n_sequence += 1
+            else:
+                n_opaque += 1
+        n_raster += len(pg.raster_targets)
+
+        blocks: list[tuple[pdf_graphics.BBox, str]] = [
+            *render_tables(pg.real_tables),
+            *((r.bbox, pdf_graphics.render_region_block(r, pg.page_num)) for r in pg.regions),
+            *(
+                ((img.x0, img.top, img.x1, img.bottom), pdf_graphics.render_raster_marker(pg.page_num, img))
+                for img in pg.raster_targets
+            ),
+        ]
+        # ширина/высота — СВОЕЙ страницы (не первой): корректно для смешанной
+        # ориентации (портретное тело + альбомные приложения-таблицы).
+        out_parts.append(render_page(pg.remaining_words, pg.width, stats, blocks))
+
+    print(
+        f"инфографика: {n_grid} грид -> таблица, {n_sequence} sequence -> список, "
+        f"{n_opaque} нереконструировано (маркер); растр: {n_raster} маркеров",
+        file=sys.stderr,
+    )
+
+    full_text = "\n\n".join(p for p in out_parts if p.strip())
+    full_text = merge_split_tables(full_text)  # A2: склейка многостраничных таблиц
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(full_text)
 
 
 if __name__ == "__main__":

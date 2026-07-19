@@ -528,5 +528,19 @@ def classify_images(
     return marked
 
 
-def render_raster_marker(page: int) -> str:
-    return f"> [Image, p. {page} — raster content not analyzed]"
+def image_id(image: Element, page: int) -> str:
+    """12-hex id маркера растра (spec convert-cloud-tier §4): из ``content_hash``
+    (уже посчитан для дедупа §1.4, дешёво) — та же величина, по которой
+    ``figures_vlm`` §5 матчит маркер с изображением при пере-детекции (stream-
+    хэш стабилен между прогонами, рендер пикселей — нет). ``content_hash=None``
+    (сбой декодирования потока, редкость — см. ``_image_content_hash``) не
+    должен оставлять маркер без адреса: детерминированный fallback по
+    (page, bbox) — тот же принцип, что ``region_hash`` для текстовых регионов."""
+    if image.content_hash is not None:
+        return image.content_hash[:12]
+    payload = f"{page}|{round(image.x0)},{round(image.top)},{round(image.x1)},{round(image.bottom)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def render_raster_marker(page: int, image: Element) -> str:
+    return f"> [Image, p. {page}, image {image_id(image, page)} — raster content not analyzed]"

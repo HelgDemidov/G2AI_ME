@@ -4,7 +4,7 @@
 такового ещё нет — см. спек convert-ocr §2.3, precision-first без калибровки)."""
 from __future__ import annotations
 
-from convert.ocr_headings import promote_flat_headings
+from convert.ocr_headings import merge_missing_headings, promote_flat_headings
 
 # --- Тир 1: структурные ключевые слова (ANNEX/CHAPTER/TITLE/PART -> #, SECTION/Article/Appendix -> ##) ---
 
@@ -226,3 +226,76 @@ def test_idempotent_double_pass_with_blank_separators() -> None:
     twice = promote_flat_headings(once)
     assert once == twice
     assert once == "# ANNEX I\n\n## GENERAL PROVISIONS\n\n### 1.1 Scope\n\nBody text follows.\n"
+
+# --- merge_missing_headings: additive-режим для облачного вывода (spec convert-cloud-tier
+# §2.5, поправка v2.1 чекпоинта 1). Контракт: облачная разметка неприкосновенна, добавляются
+# только Тир 1/Тир 2-заголовки для строк-тел; Тир 3 исключён; таблицы/цитаты/фенсы пропущены;
+# нетронутые строки байт-в-байт. Мотиватор — живой регресс: главы I.–VIII. me-crps. ---
+
+
+def test_merge_promotes_caps_chapter_missed_by_cloud() -> None:
+    """Ровно класс живого регресса: CAPS-глава телом среди облачных заголовков."""
+    text = "# ZAKON\n\nII. CENTRALNI REGISTAR PRIVREDNIH I DRUGIH SUBJEKATA\n\n### Član 8\n\nCRPS čine registri.\n"
+    out = merge_missing_headings(text)
+    assert "## II. CENTRALNI REGISTAR PRIVREDNIH I DRUGIH SUBJEKATA\n" in out
+
+
+def test_merge_never_touches_existing_headings() -> None:
+    """«# UKAZ» полный режим СНЯЛ бы (одинокое CAPS-слово — не заголовок по Тир 2);
+    additive-режим обязан оставить облачную разметку байт-в-байт."""
+    text = "# UKAZ\n\n### Predmet\n### Član 1\n\nBody text.\n"
+    assert merge_missing_headings(text) == text
+
+
+def test_merge_tier1_keyword_line_promoted() -> None:
+    out = merge_missing_headings("Član 5 Subjekti registracije\n\nBody text.\n")
+    assert out.startswith("## Član 5 Subjekti registracije\n")
+
+
+def test_merge_tier3_excluded() -> None:
+    """Голая нумерация (Тир 3) в additive-режиме НЕ промоутится — облако нумерованные
+    подклаузы оформляет само, риск ложного заголовка перевешивает."""
+    text = "1.1 Scope\n\nThis section defines the scope of application.\n"
+    assert merge_missing_headings(text) == text
+
+
+def test_merge_skips_tables_quotes_and_fences() -> None:
+    text = (
+        "| PRVA KOLONA | DRUGA KOLONA |\n"
+        "> CITAT U CAPS FORMI\n"
+        "```\n"
+        "GLAVA U FENSU\nne zaglavlje\n"
+        "```\n"
+        "Body follows here.\n"
+    )
+    assert merge_missing_headings(text) == text
+
+
+def test_merge_untouched_lines_byte_identical() -> None:
+    """Минимальная инвазивность: строки-тела (включая отступы/хвостовые пробелы)
+    не пересобираются — в отличие от promote_flat_headings."""
+    text = "# Title\n\n  indented body line  \nplain body.\n"
+    assert merge_missing_headings(text) == text
+
+
+def test_merge_idempotent_double_pass() -> None:
+    text = "# ZAKON\n\nVIII. PRELAZNE I ZAVRŠNE ODREDBE\n\n### Član 47\n\nOdredbe se primjenjuju.\n"
+    once = merge_missing_headings(text)
+    twice = merge_missing_headings(once)
+    assert once == twice
+    assert "## VIII. PRELAZNE I ZAVRŠNE ODREDBE\n" in once
+
+def test_tier2_identifier_line_acronym_number_roman_not_promoted() -> None:
+    """«EPA 616 XXVIII» (номер акта Скупштины в подписном блоке КАЖДОГО закона ME) —
+    живой false positive приёмки чекпоинта 1: акроним + число + римская цифра, ни
+    одного «настоящего» слова >=4 букв — не заголовок ни в одном из режимов."""
+    text = "EPA 616 XXVIII\n\nPodgorica, 31. jul 2025. godine\n"
+    assert promote_flat_headings(text) == text
+    assert merge_missing_headings(text) == text
+
+
+def test_tier2_real_chapter_with_roman_prefix_still_promoted() -> None:
+    """Guard не должен зацепить настоящие главы «римская цифра + CAPS-фраза» —
+    у них всегда есть «настоящее» слово (NADZOR, ODREDBE...)."""
+    out = merge_missing_headings("VI. NADZOR\n\nNadzor nad sprovođenjem zakona.\n")
+    assert out.startswith("## VI. NADZOR\n")

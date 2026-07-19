@@ -7,7 +7,9 @@ sha256; есть ли/свежий ли .md; синхронен ли frontmatter
 переиграется). Курируемые ``meta.yaml`` не переписываются (человек — источник истины);
 машина пишет только операционный сайдкар ``.state.yaml``.
 
-Стадии на документ: download → convert → frontmatter. Затем корпусный index
+Стадии на документ: download → convert → figures → frontmatter (figures —
+VLM-пасс фигур, spec convert-cloud-tier §5, только для документов с необра-
+ботанными маркерами и открытым облачным гейтом). Затем корпусный index
 (FTS5 + опц. векторы). Отказ одного документа не прерывает батч.
 
 Практики (актуально на июль 2026, right-sized — без Airflow/Prefect/Dagster, они серверные
@@ -19,6 +21,7 @@ CLI::
 
     run_pipeline.py [sources_root] [--only ID] [--force] [--dry-run]
                     [--no-download] [--embed] [--graphml PATH] [--db PATH]
+                    [--no-cloud] [--vlm-model MODEL]
 """
 from __future__ import annotations
 
@@ -36,7 +39,7 @@ from pathlib import Path
 import pdfplumber
 
 from acquire import acquisition
-from convert import converters, lint
+from convert import cloud_ocr, converters, figures_vlm, lint
 from graph import build_graph
 from index import corpus_index
 from core import fsio
@@ -59,6 +62,7 @@ USER_AGENT = (
 class Stage(str, Enum):
     download = "download"
     convert = "convert"
+    figures = "figures"
     frontmatter = "frontmatter"
 
 
@@ -116,13 +120,37 @@ def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) 
     if raw is not None and md.exists():
         conv = converters.resolve_converter(raw)   # UnsupportedFormat => planning-отказ (изолирован)
         converter_changed = (state.converter_name, state.converter_version) != (conv.name, conv.version)
-    if force or Stage.download in stages or not md.exists() or stale or converter_changed:
+    # ФС-реконсиляция §6.4 спека convert-cloud-tier: удаление .cloudocr.md — ЕДИНСТВЕННЫЙ
+    # способ инвалидации (отдельного флага/CLI нет) — сайдкар пропал, а state всё ещё
+    # помнит облачную модель => следующий прогон обязан пересчитать (Stage.convert
+    # заново вызовет _cached_or_call_cloud, та увидит cache-мисс и позвонит в облако).
+    cloudocr_cache_missing = (
+        raw is not None and raw.exists() and state.cloud_ocr_model is not None
+        and not cloud_ocr.cache_path(raw).exists()
+    )
+    if force or Stage.download in stages or not md.exists() or stale or converter_changed or cloudocr_cache_missing:
         stages.append(Stage.convert)
 
+    # Порядок стадий: convert -> figures -> frontmatter (spec §5). Свежая конвертация
+    # ВСЕГДА регенерирует голые маркеры (позиции/id пересчитываются заново) — figures
+    # планируется безусловно following convert, тем же паттерном, что frontmatter
+    # ниже. Без свежей конвертации — desired-state самовосстановление: документ,
+    # уже несущий необработанные маркеры (напр. первый прогон после апгрейда на
+    # convert-cloud-tier), должен доехать до figures БЕЗ форсированной реконверсии.
+    cloud_ok = converters.cloud_allowed(rec)
+    current_md_text: str | None = None
     if Stage.convert in stages:
+        if cloud_ok:
+            stages.append(Stage.figures)
+    elif md.exists():
+        current_md_text = md.read_text(encoding="utf-8")
+        if cloud_ok and figures_vlm.has_bare_markers(current_md_text):
+            stages.append(Stage.figures)
+
+    if Stage.convert in stages or Stage.figures in stages:
         stages.append(Stage.frontmatter)
     elif md.exists():
-        current = md.read_text(encoding="utf-8")
+        current = current_md_text if current_md_text is not None else md.read_text(encoding="utf-8")
         if _compose_md(rec, current) != current:
             stages.append(Stage.frontmatter)  # frontmatter разошёлся с реестром
 
@@ -239,7 +267,7 @@ def _do_download(
         time.sleep(pause)
 
 
-def _raw_text_chars(raw: Path, fmt: str) -> int | None:
+def _raw_text(raw: Path, fmt: str) -> str | None:
     """Дешёвый pdfplumber-проход для C1-линта (паттерн ``converters._detect_scan``) —
     конвертация редка (раз на документ), секунды приемлемы. html -> None:
     trafilatura срезает boilerplate, ratio raw-vs-md было бы неинформативно
@@ -247,14 +275,18 @@ def _raw_text_chars(raw: Path, fmt: str) -> int | None:
     edge-case pdfminer-флуктуация) не должно ронять УЖЕ успешную конвертацию,
     поэтому отказ тихо даёт None (text-loss просто не проверяется на этом
     документе), а не пропагирует исключение (§6: lint никогда не роняет конвертацию).
+
+    Возвращает ПОЛНЫЙ текст (не только длину): на OCR-ветке это ЖЕ tesseract-слой,
+    который служит независимым свидетелем witness-линта (spec convert-cloud-tier
+    §3) — переиспользуется вызывающей стороной вместо второго pdfplumber-прохода.
     """
     if fmt != "pdf":
         return None
     try:
         with pdfplumber.open(raw) as pdf:
-            return sum(len(p.extract_text() or "") for p in pdf.pages)
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
     except Exception:  # noqa: BLE001 — диагностический проход, см. docstring
-        logger.debug("не удалось посчитать raw_text_chars для C1-линта: %s", raw, exc_info=True)
+        logger.debug("не удалось извлечь текст raw для C1-линта: %s", raw, exc_info=True)
         return None
 
 
@@ -266,23 +298,36 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     conv = converters.resolve_converter(raw)
     md.parent.mkdir(parents=True, exist_ok=True)
     tmp = fsio.staging_path(md)
-    conv.convert(raw, tmp, rec.language)
+    conv.convert(raw, tmp, rec.language, record=rec)
     if not tmp.exists() or tmp.stat().st_size == 0:
         raise RuntimeError("конвертация дала пустой файл")
     tmp.replace(md)
 
     # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
     # никогда не роняет конвертацию, только сигналит (лог + машиночитаемый state).
+    md_text = md.read_text(encoding="utf-8")
+    raw_text = _raw_text(raw, conv.name)
     defects = lint.lint_conversion(
-        md.read_text(encoding="utf-8"),
-        raw_text_chars=_raw_text_chars(raw, conv.name),
+        md_text,
+        raw_text_chars=len(raw_text) if raw_text is not None else None,
         fmt=conv.name,
     )
-    for defect in defects:
-        logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
 
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
+    # OCR-путь мутирует raw IN-PLACE — пересчитать ДО witness-гейта (§3 спека
+    # convert-cloud-tier сверяет ТЕКУЩИЙ sha256 raw с тем, что зафиксировал облачный
+    # вызов при конвертации; устаревшая пара sha/model — это фолбэк-путь ЭТОГО
+    # прогона, а не облачный vintage, witness тут неприменим).
+    raw_sha256 = _sha256(raw)
+    if raw_text is not None and state.cloud_ocr_model is not None and state.cloud_ocr_raw_sha256 == raw_sha256:
+        # doc.md ЭТОГО прогона — подтверждённо облачный вывод (spec §3): raw_text —
+        # тот же tesseract-слой, что служит witness. Никакой сети/токенов.
+        defects.extend(lint.witness_checks(raw_text, strip_frontmatter(md_text)))
+
+    for defect in defects:
+        logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
+
     state.converter_name, state.converter_version = conv.name, conv.version
     state.lint_defects = defects
     # OCR-путь (convert-ocr) мутирует raw IN-PLACE (один PDF-файл на документ, без
@@ -291,10 +336,23 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     # решит, что raw «повреждён», затребовав передобычу поверх уже нормализованного
     # файла. Пересчёт безвреден и для не-OCR форматов (raw не менялся — sha совпадёт).
     st = raw.stat()
-    state.sha256 = _sha256(raw)
+    state.sha256 = raw_sha256
     state.raw_size = st.st_size
     state.raw_mtime_ns = st.st_mtime_ns
     schema.save_state(state_path, state)
+
+
+def _do_figures(rec: schema.SourceRecord, root: Path) -> None:
+    """VLM-пасс фигур (spec convert-cloud-tier §5) — идемпотентен по построению
+    (figures_vlm.apply_figures_pass), гейт (cloud_allowed) уже применён в
+    needed_stages при планировании этой стадии."""
+    raw = schema.raw_file(rec, root)
+    md = schema.md_file(rec, root)
+    if raw is None or not raw.exists():
+        raise RuntimeError("нет raw-файла для фигурного пасса")
+    if not md.exists():
+        raise RuntimeError("нет doc.md для фигурного пасса")
+    figures_vlm.apply_figures_pass(md, raw, model=cloud_ocr.ACTIVE_MODEL)
 
 
 def _do_frontmatter(rec: schema.SourceRecord, root: Path) -> bool:
@@ -374,6 +432,9 @@ def process_docs(
                 elif stage is Stage.convert:
                     if not dry_run:
                         _do_convert(rec, root)
+                elif stage is Stage.figures:
+                    if not dry_run:
+                        _do_figures(rec, root)
                 else:
                     if not dry_run:
                         _do_frontmatter(rec, root)
@@ -508,9 +569,22 @@ def main(argv: list[str] | None = None) -> int:
         "--watch-dir", type=Path, default=None,
         help="папка для ручного (manual) watch-folder пути; по умолчанию — системная папка загрузок",
     )
+    parser.add_argument(
+        "--no-cloud", action="store_true",
+        help="отключить облачный OCR/figures (spec convert-cloud-tier §6.3) — офлайн-режим, поведение до спека",
+    )
+    parser.add_argument(
+        "--vlm-model", default=None,
+        help="override облачной модели для OCR/figures (эскалация для критичного документа, §6.4); "
+             "единая модель на оба пути",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    converters.set_cloud_disabled(args.no_cloud)
+    if args.vlm_model:
+        cloud_ocr.ACTIVE_MODEL = args.vlm_model
 
     # quality-gate: реестр обязан быть валиден (пустой/несуществующий корень — валиден)
     errors, records = validate_sources.validate_sources(args.sources)

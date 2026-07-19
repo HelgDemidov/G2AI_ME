@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PIL import Image, ImageDraw, ImageFont
@@ -28,7 +29,7 @@ def _make_scan_pdf(path: Path) -> None:
     img.save(path)
 
 
-def test_ocr_path_extracts_text_and_restores_annex_heading(tmp_path: Path) -> None:
+def test_ocr_path_extracts_text_and_restores_annex_heading(tmp_path: Path, monkeypatch: Any) -> None:
     """Смок-тест целостности проводки (реальный subprocess), не точности layout.
 
     Синтетическая PIL-страница — один сплошной растровый объект (так работает
@@ -39,7 +40,12 @@ def test_ocr_path_extracts_text_and_restores_annex_heading(tmp_path: Path) -> No
     извлечения текста и восстановления заголовков на реалистичном документе;
     здесь проверяем только, что реальный ocrmypdf/tesseract subprocess
     отработал и что Тир 1 хоть где-то сработал — не точный текст/geometry.
+
+    Облако (spec convert-cloud-tier) явно отключено: этот тест — про локальный
+    tesseract-путь конкретно, а живой ``.env``-ключ на машине разработчика иначе
+    увёл бы синтетический скан в реальный облачный вызов.
     """
+    monkeypatch.setattr("convert.converters.cloud_allowed", lambda record: False)
     raw = tmp_path / "raw.pdf"
     _make_scan_pdf(raw)
     out = tmp_path / "out.md"

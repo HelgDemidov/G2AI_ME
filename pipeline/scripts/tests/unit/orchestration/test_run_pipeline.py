@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from acquire import acquisition
-from convert import converters
+from convert import cloud_ocr, converters, figures_vlm
 from index import corpus_index
 from core import schema
 from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
@@ -23,6 +23,7 @@ from run_pipeline import (
     _compose_md,
     _do_convert,
     _do_download,
+    _do_figures,
     _do_frontmatter,
     _needs_index_rebuild,
     _read_index_fingerprint,
@@ -149,8 +150,12 @@ def test_do_frontmatter_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any)
 
 
 def _fake_converter(fn: Any, *, name: str = "pdf", version: str = "test") -> Any:
-    """Подменить реестр реестра одним fake-конвертером: fn(raw, out, language) -> None."""
-    return converters.Converter(name, version, fn)
+    """Подменить реестр реестра одним fake-конвертером: fn(raw, out, language) -> None.
+    Адаптер поглощает ``record=`` (ConvertFn Protocol, spec convert-cloud-tier) —
+    большинство тестов не о record, писать его в каждый fake было бы шумом."""
+    def adapter(raw: Path, out: Path, language: str | None, *, record: Any = None) -> None:
+        fn(raw, out, language)
+    return converters.Converter(name, version, adapter)
 
 
 def test_do_convert_staging_uses_dot_prefix_on_failure(tmp_path: Path, monkeypatch: Any) -> None:
@@ -788,3 +793,227 @@ def test_rebuild_index_openrouter_skips_confidential_only_chunks(
     assert "только-confidential" in status
     assert any("публичный" in t for t in seen)
     assert not any("конфиденциальный" in t for t in seen)
+
+
+# --- witness-линт: гейт в _do_convert (spec convert-cloud-tier §3) ---
+
+
+def test_do_convert_witness_skipped_when_no_cloud_ocr_model(tmp_path: Path, monkeypatch: Any) -> None:
+    """Локальный (не облачный) конвертированный документ — cloud_ocr_model не
+    выставлен, witness_checks НЕ должен вызываться вовсе."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"raw bytes")
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("body text", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    monkeypatch.setattr("run_pipeline._raw_text", lambda raw, fmt: "witness text totally different")
+    monkeypatch.setattr(
+        "run_pipeline.lint.witness_checks",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("witness не должен был вызываться")),
+    )
+    _do_convert(rec, tmp_path)  # не должно упасть
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert not any(d.startswith("cloud-ocr-") for d in state.lint_defects)
+
+
+def test_do_convert_witness_skipped_when_raw_sha256_stale(tmp_path: Path, monkeypatch: Any) -> None:
+    """cloud_ocr_model выставлен, НО от старого raw (текущий фолбэк на локальный
+    путь после провала облака на изменившемся скане) — witness неприменим."""
+    rec = make()
+    _place(
+        rec, tmp_path, raw=b"raw bytes",
+        state={"cloud_ocr_model": "m", "cloud_ocr_raw_sha256": "0" * 64},
+    )
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("body text", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    monkeypatch.setattr("run_pipeline._raw_text", lambda raw, fmt: "witness text totally different")
+    monkeypatch.setattr(
+        "run_pipeline.lint.witness_checks",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("witness не должен был вызываться")),
+    )
+    _do_convert(rec, tmp_path)  # не должно упасть
+
+
+def test_do_convert_witness_runs_when_cloud_ocr_matches_current_raw(tmp_path: Path, monkeypatch: Any) -> None:
+    """cloud_ocr_model выставлен И sha256 совпадает с ТЕКУЩИМ raw — doc.md этого
+    прогона подтверждённо облачный, witness обязан отработать и добавить defect."""
+    rec = make()
+    raw_bytes = b"raw bytes matching cloud state"
+    matching_sha256 = _sha256_bytes(raw_bytes)
+    _place(
+        rec, tmp_path, raw=raw_bytes,
+        state={"cloud_ocr_model": "m", "cloud_ocr_raw_sha256": matching_sha256},
+    )
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("cloud output body", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    monkeypatch.setattr(
+        "run_pipeline._raw_text", lambda raw, fmt: "witness text unrelated to cloud output entirely"
+    )
+    _do_convert(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert any(d.startswith("cloud-ocr-text-loss") for d in state.lint_defects)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# --- стадия figures: планирование/диспетчеризация/CLI (spec convert-cloud-tier §5/§6) ---
+
+
+def test_needed_stages_schedules_figures_after_fresh_convert_when_cloud_allowed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    rec = make()
+    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.figures, Stage.frontmatter]
+
+
+def test_needed_stages_convert_without_key_skips_figures(tmp_path: Path) -> None:
+    """Дефолт conftest — ключа нет: свежий convert НЕ тянет figures (гейт закрыт)."""
+    rec = make()
+    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
+
+
+def test_needed_stages_no_cloud_flag_skips_figures_even_with_key(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(converters, "_CLOUD_DISABLED", True)
+    rec = make()
+    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
+
+
+def test_needed_stages_self_heals_bare_marker_without_forcing_convert(tmp_path: Path, monkeypatch: Any) -> None:
+    """Документ уже сконвертирован (converter версия совпадает, raw не менялся), но
+    doc.md несёт необработанный маркер (напр. первый прогон после апгрейда на
+    convert-cloud-tier) — desired-state самовосстановление: figures планируется
+    БЕЗ форсированной реконверсии."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    rec = make()
+    md_body = (
+        "prose\n\n"
+        "> [Figure, p. 1, region aaaaaaaaaaaa — structure not reconstructed]\n"
+        "> Labels (reading order not guaranteed): X\n"
+    )
+    _place(
+        rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, md_body),
+        state=_current_converter_state(),
+    )
+    assert needed_stages(rec, tmp_path) == [Stage.figures, Stage.frontmatter]
+
+
+def test_needed_stages_no_figures_when_all_markers_already_injected(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    rec = make()
+    md_body = (
+        "prose\n\n"
+        "> [Figure, p. 1, region aaaaaaaaaaaa — VLM interpretation (m); "
+        "reconstruction, verify against original]\n\nAlready injected prose.\n"
+    )
+    _place(
+        rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, md_body),
+        state=_current_converter_state(),
+    )
+    assert needed_stages(rec, tmp_path) == []
+
+
+def test_needed_stages_cloudocr_cache_missing_triggers_convert(tmp_path: Path, monkeypatch: Any) -> None:
+    """ФС-реконсиляция §6.4: сайдкар .cloudocr.md удалён вручную (единственный способ
+    инвалидации кэша — отдельного флага нет) -> следующий прогон обязан переиграть
+    convert (тот заново позвонит в облако через cache-мисс _cached_or_call_cloud)."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    rec = make()
+    raw_bytes = b"raw bytes for cloudocr cache test"
+    _place(
+        rec, tmp_path, raw=raw_bytes, md=_compose_md(rec, "body"),
+        state={
+            **_current_converter_state(),
+            "cloud_ocr_model": "m", "cloud_ocr_raw_sha256": _sha256_bytes(raw_bytes),
+        },
+    )
+    # .cloudocr.md сознательно НЕ создан — это и есть условие теста
+    assert Stage.convert in needed_stages(rec, tmp_path)
+
+
+def test_needed_stages_cloudocr_cache_present_no_forced_convert(tmp_path: Path, monkeypatch: Any) -> None:
+    """Контрольный случай: тот же state, но сайдкар НА МЕСТЕ — реконсиляция не
+    должна ложно требовать конвертацию (иначе каждый прогон облачного скана бы
+    заново конвертировался вхолостую)."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    rec = make()
+    raw_bytes = b"raw bytes for cloudocr cache present test"
+    _place(
+        rec, tmp_path, raw=raw_bytes, md=_compose_md(rec, "body"),
+        state={
+            **_current_converter_state(),
+            "cloud_ocr_model": "m", "cloud_ocr_raw_sha256": _sha256_bytes(raw_bytes),
+        },
+    )
+    (schema.doc_dir(rec, tmp_path) / ".cloudocr.md").write_text("cached", encoding="utf-8")
+    assert Stage.convert not in needed_stages(rec, tmp_path)
+
+
+def test_do_figures_calls_apply_figures_pass_with_active_model(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, "body"))
+    calls: list[dict[str, Any]] = []
+
+    def fake_apply(md: Path, raw: Path, *, model: str) -> bool:
+        calls.append({"md": md, "raw": raw, "model": model})
+        return True
+
+    monkeypatch.setattr(figures_vlm, "apply_figures_pass", fake_apply)
+    monkeypatch.setattr(cloud_ocr, "ACTIVE_MODEL", "test-active-model")
+    _do_figures(rec, tmp_path)
+    assert len(calls) == 1
+    assert calls[0]["model"] == "test-active-model"
+
+
+def test_process_docs_dispatches_figures_stage(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    rec = make()
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("prose\n\n> [Figure, p. 1, region aaaaaaaaaaaa — structure not reconstructed]\n"
+                        "> Labels (reading order not guaranteed): X\n", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    _place(rec, tmp_path, raw=b"pdf")
+
+    figures_calls: list[str] = []
+    monkeypatch.setattr(
+        "run_pipeline._do_figures", lambda rec_, root: figures_calls.append(rec_.id)
+    )
+
+    results = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=True, pause=0)
+    assert results[0].error is None
+    assert Stage.figures in results[0].done
+    assert figures_calls == [rec.id]
+
+
+def test_main_no_cloud_flag_disables_cloud_path(tmp_path: Path) -> None:
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    from run_pipeline import main
+
+    assert main([str(sources), "--no-cloud"]) == 0
+    assert converters._CLOUD_DISABLED is True
+
+
+def test_main_vlm_model_flag_overrides_active_model(tmp_path: Path, monkeypatch: Any) -> None:
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    monkeypatch.setattr(cloud_ocr, "ACTIVE_MODEL", cloud_ocr.ACTIVE_MODEL)  # регистрируем авто-восстановление
+    from run_pipeline import main
+
+    assert main([str(sources), "--vlm-model", "google/gemini-3-pro-preview"]) == 0
+    assert cloud_ocr.ACTIVE_MODEL == "google/gemini-3-pro-preview"

@@ -231,6 +231,10 @@ class OperationalState(BaseModel):
     # worksheet'у батч-триажа (spec discovery-manual), флагованные документы видны
     # при Стадии 2. Старые .state.yaml без поля валидны (Field с default).
     lint_defects: list[str] = Field(default_factory=list)
+    # spec convert-cloud-tier §2.2: валидность кэша .cloudocr.md — по этим двум
+    # полям (модель + sha256 raw НА МОМЕНТ облачного вызова, т.е. ПОСЛЕ ocrmypdf).
+    cloud_ocr_model: str | None = None
+    cloud_ocr_raw_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class SourceRecord(BaseModel):
