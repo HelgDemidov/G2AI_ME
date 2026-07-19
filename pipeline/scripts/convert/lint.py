@@ -13,6 +13,7 @@ CI-safe (без сети/модели/pdfplumber) — вход уже готов
 from __future__ import annotations
 
 import re
+from collections import Counter
 
 from index.chunking import strip_frontmatter
 
@@ -21,6 +22,14 @@ LINT_MIN_TEXT_RATIO = 0.5   # doc.md должен сохранить >= поло
 _TABLE_LINE_RE = re.compile(r"^\|.*\|$")
 _HEADING_STRIP_RE = re.compile(r"^#{1,6}\s*")
 _LIST_QUOTE_STRIP_RE = re.compile(r"^[-*>]\s+")
+
+# --- witness-линт (spec convert-cloud-tier §3): свидетель = pdfplumber.extract_text
+# нормализованного raw (tesseract-слой), сверяется с ОБЛАЧНЫМ doc.md ---
+
+WITNESS_MIN_TOKEN_RECALL = 0.80   # доля словарных токенов свидетеля, найденных в облачном тексте
+
+_WORD_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)  # буквенные токены (Unicode — диакритика)
+_NUMBER_TOKEN_RE = re.compile(r"\d+")
 
 
 def _text_length_excluding_markup(body: str) -> int:
@@ -81,5 +90,41 @@ def lint_conversion(md_text: str, *, raw_text_chars: int | None, fmt: str) -> li
     ragged = _count_ragged_table_rows(body)
     if ragged:
         defects.append(f"table-ragged: {ragged} строк")
+
+    return defects
+
+
+def witness_checks(witness_text: str, cloud_text: str) -> list[str]:
+    """Сверка облачного OCR-вывода с независимым свидетелем (tesseract-текст-слой
+    нормализованного raw, spec convert-cloud-tier §3). **Сигнал, не отказ**: живая
+    приёмка чекпоинта 1 показала ненулевую дельту у ЗАВЕДОМО корректного облака
+    (свидетель сам шумит) — расхождение маркирует «посмотреть глазами» на Стадии 2,
+    финальный арбитр — человек, не этот линт.
+
+    - Словарный token-recall (доля УНИКАЛЬНЫХ буквенных токенов свидетеля,
+      найденных где-либо в облачном тексте) ниже ``WITNESS_MIN_TOKEN_RECALL`` ->
+      ``"cloud-ocr-text-loss: <ratio>"`` — ловит выпавшие/пропущенные куски.
+    - Мультимножества числовых токенов (``\\d+``) расходятся -> ВСЕГДА (любая
+      ненулевая дельта) ``"cloud-ocr-numeric-divergence: -<n>/+<m>"`` (``n`` —
+      вхождения свидетеля без пары в облаке, ``m`` — наоборот) — самый опасный для
+      юридического корпуса класс: тихая подмена цифры в номере статьи/дате/сумме.
+    """
+    if not witness_text.strip():
+        return []  # свидетель пуст (сбой extract_text) — сигнал неинформативен, не 0.0-recall
+
+    defects: list[str] = []
+    witness_words = {w.lower() for w in _WORD_TOKEN_RE.findall(witness_text)}
+    if witness_words:
+        cloud_words = {w.lower() for w in _WORD_TOKEN_RE.findall(cloud_text)}
+        recall = len(witness_words & cloud_words) / len(witness_words)
+        if recall < WITNESS_MIN_TOKEN_RECALL:
+            defects.append(f"cloud-ocr-text-loss: {recall:.2f}")
+
+    witness_nums = Counter(_NUMBER_TOKEN_RE.findall(witness_text))
+    cloud_nums = Counter(_NUMBER_TOKEN_RE.findall(cloud_text))
+    n_missing = sum((witness_nums - cloud_nums).values())
+    n_added = sum((cloud_nums - witness_nums).values())
+    if n_missing or n_added:
+        defects.append(f"cloud-ocr-numeric-divergence: -{n_missing}/+{n_added}")
 
     return defects

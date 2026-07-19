@@ -239,7 +239,7 @@ def _do_download(
         time.sleep(pause)
 
 
-def _raw_text_chars(raw: Path, fmt: str) -> int | None:
+def _raw_text(raw: Path, fmt: str) -> str | None:
     """Дешёвый pdfplumber-проход для C1-линта (паттерн ``converters._detect_scan``) —
     конвертация редка (раз на документ), секунды приемлемы. html -> None:
     trafilatura срезает boilerplate, ratio raw-vs-md было бы неинформативно
@@ -247,14 +247,18 @@ def _raw_text_chars(raw: Path, fmt: str) -> int | None:
     edge-case pdfminer-флуктуация) не должно ронять УЖЕ успешную конвертацию,
     поэтому отказ тихо даёт None (text-loss просто не проверяется на этом
     документе), а не пропагирует исключение (§6: lint никогда не роняет конвертацию).
+
+    Возвращает ПОЛНЫЙ текст (не только длину): на OCR-ветке это ЖЕ tesseract-слой,
+    который служит независимым свидетелем witness-линта (spec convert-cloud-tier
+    §3) — переиспользуется вызывающей стороной вместо второго pdfplumber-прохода.
     """
     if fmt != "pdf":
         return None
     try:
         with pdfplumber.open(raw) as pdf:
-            return sum(len(p.extract_text() or "") for p in pdf.pages)
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
     except Exception:  # noqa: BLE001 — диагностический проход, см. docstring
-        logger.debug("не удалось посчитать raw_text_chars для C1-линта: %s", raw, exc_info=True)
+        logger.debug("не удалось извлечь текст raw для C1-линта: %s", raw, exc_info=True)
         return None
 
 
@@ -273,16 +277,29 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
 
     # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
     # никогда не роняет конвертацию, только сигналит (лог + машиночитаемый state).
+    md_text = md.read_text(encoding="utf-8")
+    raw_text = _raw_text(raw, conv.name)
     defects = lint.lint_conversion(
-        md.read_text(encoding="utf-8"),
-        raw_text_chars=_raw_text_chars(raw, conv.name),
+        md_text,
+        raw_text_chars=len(raw_text) if raw_text is not None else None,
         fmt=conv.name,
     )
-    for defect in defects:
-        logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
 
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
+    # OCR-путь мутирует raw IN-PLACE — пересчитать ДО witness-гейта (§3 спека
+    # convert-cloud-tier сверяет ТЕКУЩИЙ sha256 raw с тем, что зафиксировал облачный
+    # вызов при конвертации; устаревшая пара sha/model — это фолбэк-путь ЭТОГО
+    # прогона, а не облачный vintage, witness тут неприменим).
+    raw_sha256 = _sha256(raw)
+    if raw_text is not None and state.cloud_ocr_model is not None and state.cloud_ocr_raw_sha256 == raw_sha256:
+        # doc.md ЭТОГО прогона — подтверждённо облачный вывод (spec §3): raw_text —
+        # тот же tesseract-слой, что служит witness. Никакой сети/токенов.
+        defects.extend(lint.witness_checks(raw_text, strip_frontmatter(md_text)))
+
+    for defect in defects:
+        logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
+
     state.converter_name, state.converter_version = conv.name, conv.version
     state.lint_defects = defects
     # OCR-путь (convert-ocr) мутирует raw IN-PLACE (один PDF-файл на документ, без
@@ -291,7 +308,7 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     # решит, что raw «повреждён», затребовав передобычу поверх уже нормализованного
     # файла. Пересчёт безвреден и для не-OCR форматов (raw не менялся — sha совпадёт).
     st = raw.stat()
-    state.sha256 = _sha256(raw)
+    state.sha256 = raw_sha256
     state.raw_size = st.st_size
     state.raw_mtime_ns = st.st_mtime_ns
     schema.save_state(state_path, state)

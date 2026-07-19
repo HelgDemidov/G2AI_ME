@@ -792,3 +792,76 @@ def test_rebuild_index_openrouter_skips_confidential_only_chunks(
     assert "только-confidential" in status
     assert any("публичный" in t for t in seen)
     assert not any("конфиденциальный" in t for t in seen)
+
+
+# --- witness-линт: гейт в _do_convert (spec convert-cloud-tier §3) ---
+
+
+def test_do_convert_witness_skipped_when_no_cloud_ocr_model(tmp_path: Path, monkeypatch: Any) -> None:
+    """Локальный (не облачный) конвертированный документ — cloud_ocr_model не
+    выставлен, witness_checks НЕ должен вызываться вовсе."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"raw bytes")
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("body text", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    monkeypatch.setattr("run_pipeline._raw_text", lambda raw, fmt: "witness text totally different")
+    monkeypatch.setattr(
+        "run_pipeline.lint.witness_checks",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("witness не должен был вызываться")),
+    )
+    _do_convert(rec, tmp_path)  # не должно упасть
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert not any(d.startswith("cloud-ocr-") for d in state.lint_defects)
+
+
+def test_do_convert_witness_skipped_when_raw_sha256_stale(tmp_path: Path, monkeypatch: Any) -> None:
+    """cloud_ocr_model выставлен, НО от старого raw (текущий фолбэк на локальный
+    путь после провала облака на изменившемся скане) — witness неприменим."""
+    rec = make()
+    _place(
+        rec, tmp_path, raw=b"raw bytes",
+        state={"cloud_ocr_model": "m", "cloud_ocr_raw_sha256": "0" * 64},
+    )
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("body text", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    monkeypatch.setattr("run_pipeline._raw_text", lambda raw, fmt: "witness text totally different")
+    monkeypatch.setattr(
+        "run_pipeline.lint.witness_checks",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("witness не должен был вызываться")),
+    )
+    _do_convert(rec, tmp_path)  # не должно упасть
+
+
+def test_do_convert_witness_runs_when_cloud_ocr_matches_current_raw(tmp_path: Path, monkeypatch: Any) -> None:
+    """cloud_ocr_model выставлен И sha256 совпадает с ТЕКУЩИМ raw — doc.md этого
+    прогона подтверждённо облачный, witness обязан отработать и добавить defect."""
+    rec = make()
+    raw_bytes = b"raw bytes matching cloud state"
+    matching_sha256 = _sha256_bytes(raw_bytes)
+    _place(
+        rec, tmp_path, raw=raw_bytes,
+        state={"cloud_ocr_model": "m", "cloud_ocr_raw_sha256": matching_sha256},
+    )
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("cloud output body", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    monkeypatch.setattr(
+        "run_pipeline._raw_text", lambda raw, fmt: "witness text unrelated to cloud output entirely"
+    )
+    _do_convert(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert any(d.startswith("cloud-ocr-text-loss") for d in state.lint_defects)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
