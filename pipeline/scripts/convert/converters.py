@@ -261,8 +261,11 @@ def _convert_pdf(
     if scanned and _cloud_allowed(record):
         text = _cached_or_call_cloud(raw, language, model=cloud_ocr.ACTIVE_MODEL)
         if text is not None:
-            out.write_text(text, encoding="utf-8")
-            return  # облачный вывод: ocr_headings НЕ применяется (иерархия уже есть и лучше)
+            # Additive-режим (§2.5, v2.1): облачная иерархия — главный производитель,
+            # прецизионные тиры лишь ДОБАВЛЯЮТ пропущенное облаком (главы I.–VIII. me-crps);
+            # полный promote_flat_headings (снятие+переоценка) уничтожил бы её.
+            out.write_text(ocr_headings.merge_missing_headings(text), encoding="utf-8")
+            return
     pdf_convert(str(raw), str(out))  # существующий конвертер, без изменений (локальный путь)
     if scanned:  # только OCR-ветка: цифровой путь не трогаем (размер-кластеризация там чище)
         out.write_text(

@@ -569,15 +569,20 @@ def test_convert_pdf_digital_never_calls_cloud(monkeypatch: Any, tmp_path: Path)
     assert out.read_text(encoding="utf-8") == "body"
 
 
-def test_convert_pdf_cloud_success_skips_ocr_headings(monkeypatch: Any, tmp_path: Path) -> None:
-    """Облачный вывод НЕ проходит ocr_headings (иерархия уже есть и лучше, §Design rationale)."""
+def test_convert_pdf_cloud_success_applies_additive_merge_not_full_promote(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Облачный вывод проходит ТОЛЬКО additive-режим (§2.5, v2.1): пропущенная облаком
+    CAPS-глава промоутится в ##, а существующая облачная разметка неприкосновенна —
+    «# Cloud Title» полный promote_flat_headings СНЯЛ бы (не-CAPS строка), additive
+    обязан оставить. Живой мотиватор: главы I.–VIII. me-crps (чекпоинт 1)."""
     _reset_cloud_module_state(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     _patch_open(monkeypatch, [_FakePage("x" * 60)], metadata={"Creator": "ocrmypdf 15.2.0"})
 
     monkeypatch.setattr(
         "convert.converters._cached_or_call_cloud",
-        lambda raw, lang, *, model: "# Cloud Title\n\nBody, unflagged.",
+        lambda raw, lang, *, model: "# Cloud Title\n\nII. GLAVNI DIO TEKSTA\n\nBody, unflagged.",
     )
     monkeypatch.setattr(
         "convert.converters.pdf_convert",
@@ -585,7 +590,9 @@ def test_convert_pdf_cloud_success_skips_ocr_headings(monkeypatch: Any, tmp_path
     )
     out = tmp_path / "out.md"
     _convert_pdf(tmp_path / "raw.pdf", out, "en", record=_record())
-    assert out.read_text(encoding="utf-8") == "# Cloud Title\n\nBody, unflagged."
+    assert out.read_text(encoding="utf-8") == (
+        "# Cloud Title\n\n## II. GLAVNI DIO TEKSTA\n\nBody, unflagged."
+    )
 
 
 def test_convert_pdf_cloud_failure_falls_back_to_local_with_ocr_headings(

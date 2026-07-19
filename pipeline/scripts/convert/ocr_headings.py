@@ -148,6 +148,36 @@ def _next_nonblank(lines: list[str], i: int) -> str:
     return ""
 
 
+def merge_missing_headings(md: str) -> str:
+    """Additive-режим для ОБЛАЧНОГО OCR-вывода (spec convert-cloud-tier §2.5, v2.1).
+
+    Облачная `#`-разметка НЕПРИКОСНОВЕННА (облако — главный производитель структуры):
+    заголовки не снимаются и не переуровниваются; добавляются ТОЛЬКО те, что прецизионные
+    Тир 1/Тир 2 находят в строках, оставленных облаком телом. Живой мотиватор (чекпоинт 1):
+    8 глав «I. OSNOVNE ODREDBE … VIII.» me-crps — текст verbatim-корректен, но без
+    разметки, тогда как CAPS-правило Тира 2 ловит их детерминированно. Тир 3 исключён
+    (самый рискованный; нумерованные подклаузы облако оформляет само). Таблицы, цитаты
+    и код-фенсы пропускаются; нетронутые строки — байт-в-байт (минимальная инвазивность,
+    в отличие от promote_flat_headings, пересобирающего каждую строку). Идемпотентно:
+    промоутнутая строка на повторном прогоне уже несёт `#`-префикс и не трогается.
+    """
+    lines = md.split("\n")
+    out: list[str] = []
+    in_fence = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence or not stripped or stripped.startswith(("#", "|", ">")):
+            out.append(line)
+            continue
+        heading = _tier1_heading(stripped) or _tier2_heading(stripped, _next_nonblank(lines, i))
+        out.append(heading if heading is not None else line)
+    return "\n".join(out)
+
+
 def promote_flat_headings(md: str) -> str:
     """Восстановить высокоуверенный скелет заголовков в плоском OCR-markdown.
 
