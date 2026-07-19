@@ -11,11 +11,15 @@ from convert import pdf_graphics
 from convert.pdf_to_markdown import (
     DocStats,
     Word,
+    _bold_run,
     _drop_empty_columns,
     _is_bold,
+    _median_line_gap,
     _render_column_with_blocks,
+    _word_fontname,
     compute_doc_stats,
     convert,
+    load_words,
     merge_split_tables,
 )
 
@@ -287,3 +291,138 @@ def test_merge_split_tables_idempotent() -> None:
     )
     once = merge_split_tables(md)
     assert merge_split_tables(once) == once
+
+
+# --- _word_fontname: bold ТОЛЬКО если ВСЕ символы слова bold ---
+
+
+def test_word_fontname_all_bold_returns_representative_name() -> None:
+    chars = [{"fontname": "Arial-Bold"}, {"fontname": "Arial-Bold"}]
+    assert _word_fontname(chars) == "Arial-Bold"
+
+
+def test_word_fontname_mixed_bold_and_regular_returns_empty() -> None:
+    chars = [{"fontname": "Arial-Bold"}, {"fontname": "Arial"}]
+    assert _word_fontname(chars) == ""
+
+
+def test_word_fontname_empty_chars_returns_empty() -> None:
+    assert _word_fontname([]) == ""
+
+
+# --- load_words: регресс живого аудита (sg, IMDA Agentic AI) — границы слов
+# НЕ должны зависеть от fontname, иначе bold-термин впритык к пунктуации
+# ("Controls:") режется надвое и при рендере получает ложный пробел ---
+
+
+class _FakeWordsPage:
+    def __init__(self, words: list[dict[str, Any]]) -> None:
+        self._words = words
+        self.calls: list[dict[str, Any]] = []
+
+    def extract_words(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(kwargs)
+        return self._words
+
+
+def test_load_words_requests_word_boundaries_without_fontname() -> None:
+    page = _FakeWordsPage([
+        {
+            "text": "Controls:", "x0": 0.0, "x1": 40.0, "top": 0.0, "bottom": 10.0, "size": 10.0,
+            "chars": [{"fontname": "Arial-Bold"}] * 8 + [{"fontname": "Arial"}],  # ':' не bold
+        },
+    ])
+    words = load_words(page)  # type: ignore[arg-type]
+    assert page.calls == [{"extra_attrs": ["size"], "return_chars": True}]  # без "fontname"
+    assert [w.text for w in words] == ["Controls:"]  # не разрезано на два токена
+    assert words[0].fontname == ""  # смешанный bold/non-bold -> не bold целиком
+
+
+def test_load_words_marks_fully_bold_word() -> None:
+    page = _FakeWordsPage([
+        {
+            "text": "Heading", "x0": 0.0, "x1": 40.0, "top": 0.0, "bottom": 10.0, "size": 10.0,
+            "chars": [{"fontname": "Arial-Bold"}] * 7,
+        },
+    ])
+    words = load_words(page)  # type: ignore[arg-type]
+    assert words[0].fontname == "Arial-Bold"
+
+
+# --- _bold_run / _median_line_gap: изоляция bold-прогона (регресс sg + целевой кейс ee) ---
+
+
+def _line(text: str, top: float, *, bold: bool = False, size: float = 10.0) -> list[Word]:
+    fontname = "Arial-Bold" if bold else "Arial"
+    return [
+        Word(w, x0=0.0, x1=10.0, top=top, bottom=top + 10.0, size=size, fontname=fontname)
+        for w in text.split()
+    ]
+
+
+def test_median_line_gap_empty_or_single_line_is_zero() -> None:
+    assert _median_line_gap([]) == 0.0
+    assert _median_line_gap([_line("only", top=0.0)]) == 0.0
+
+
+def test_bold_run_single_isolated_line() -> None:
+    lines = [_line("Heading", top=0.0, bold=True)]
+    assert _bold_run(lines, 0, med_gap=10.0) == [lines[0]]
+
+
+def test_bold_run_not_bold_returns_none() -> None:
+    lines = [_line("Plain text", top=0.0, bold=False)]
+    assert _bold_run(lines, 0, med_gap=10.0) is None
+
+
+def test_bold_run_extends_across_tight_gap_when_both_bold() -> None:
+    """Перенос заголовка на вторую строку колонки (sg: "3. Implement technical
+    controls and" + "processes") — обе bold, тесный разрыв -> ОДИН прогон."""
+    lines = [_line("First line", top=0.0, bold=True), _line("second part", top=10.0, bold=True)]
+    assert _bold_run(lines, 0, med_gap=10.0) == lines
+
+
+def test_bold_run_stops_without_disqualifying_on_big_gap() -> None:
+    lines = [_line("Heading", top=0.0, bold=True), _line("unrelated later text", top=100.0, bold=False)]
+    assert _bold_run(lines, 0, med_gap=10.0) == [lines[0]]
+
+
+def test_bold_run_disqualified_by_lowercase_continuation_same_paragraph() -> None:
+    """Регресс sg: bold lead-in ("...bring forth new") впритык (тот же абзац)
+    к НЕ-bold продолжению, начинающемуся со строчной буквы ("risks are
+    severe") -> грамматическое продолжение ОДНОГО предложения, весь прогон
+    дисквалифицируется (остаётся прозой)."""
+    lines = [_line("bring forth new", top=0.0, bold=True), _line("risks are severe", top=10.0, bold=False)]
+    assert _bold_run(lines, 0, med_gap=10.0) is None
+
+
+def test_bold_run_not_disqualified_by_bullet_continuation_same_paragraph() -> None:
+    """Целевой кейс ee: короткий bold-ярлык ("Tugevused Nõrkused") впритык к
+    НЕ-bold буллет-списку (новый пункт, НЕ грамматическое продолжение) ->
+    прогон остаётся изолированным как есть."""
+    bullet_line = [
+        Word("•", x0=0.0, x1=5.0, top=10.0, bottom=20.0, size=10.0, fontname="Arial"),
+        *_line("Digitally innovative", top=10.0, bold=False),
+    ]
+    lines = [_line("Tugevused Nõrkused", top=0.0, bold=True), bullet_line]
+    assert _bold_run(lines, 0, med_gap=10.0) == [lines[0]]
+
+
+def test_flush_prose_promotes_isolated_bold_label_but_not_lead_in_sentence() -> None:
+    """Сквозной регресс-тест через _render_column_with_blocks: короткий
+    изолированный bold-ярлык становится заголовком, а bold lead-in длинного
+    предложения — остаётся ЦЕЛЬНЫМ прозным абзацем (не рвётся на фрагмент)."""
+    label = _line("Tugevused Nõrkused", top=0.0, bold=True)
+    bullet = [
+        Word("•", x0=0.0, x1=5.0, top=10.0, bottom=20.0, size=10.0, fontname="Arial"),
+        *_line("Digitally innovative ecosystem", top=10.0, bold=False),
+    ]
+    lead_in = _line("bring forth new", top=200.0, bold=True)
+    continuation = _line("risks are severe indeed", top=210.0, bold=False)
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+
+    out = _render_column_with_blocks([label, bullet, lead_in, continuation], [], stats)
+
+    assert "# Tugevused Nõrkused" in out
+    assert "bring forth new risks are severe indeed" in out  # цельный абзац, не разорван
+    assert "# bring forth new" not in out

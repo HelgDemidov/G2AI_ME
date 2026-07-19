@@ -68,14 +68,36 @@ def normalize_line(text: str) -> str:
     return re.sub(r"\d+", "#", s)
 
 
+def _word_fontname(word_chars: list[dict[str, Any]]) -> str:
+    """Fontname слова, ТОЛЬКО если оно целиком (все символы) bold — иначе "".
+
+    ``page.extract_words(extra_attrs=["fontname"])`` группирует символы в слова
+    через ``itertools.groupby`` по КАЖДОМУ extra_attr — смена fontname внутри
+    слова БЕЗ пробела (bold-термин впритык к пунктуации: "Controls:", типичный
+    паттерн списков термин-двоеточие) резала бы слово надвое и вставляла
+    ложный пробел при ``" ".join(w.text for w in line)`` ВЕЗДЕ в документе, не
+    только в заголовках (регресс, найденный живым аудитом sg/IMDA). Поэтому
+    границы слов определяются БЕЗ fontname (``extra_attrs=["size"]``, как до
+    A1) — bold смотрим отдельно, по сырым символам через ``return_chars=True``.
+    """
+    if not word_chars:
+        return ""
+    fontnames = [c.get("fontname", "") or "" for c in word_chars]
+    if all(_BOLD_RE.search(f) for f in fontnames):
+        return fontnames[0]
+    return ""
+
+
 def load_words(page: Page) -> list[Word]:
-    raw = page.extract_words(extra_attrs=["size", "fontname"])
+    raw = page.extract_words(extra_attrs=["size"], return_chars=True)
     out = []
     for w in raw:
         text = DOT_LEADER_RE.sub("", w["text"]).strip()  # артефакт оглавления, в т.ч. приклеенный к слову
         if not text:
             continue
-        out.append(Word(text, w["x0"], w["x1"], w["top"], w["bottom"], round(w["size"], 1), w.get("fontname", "")))
+        out.append(Word(
+            text, w["x0"], w["x1"], w["top"], w["bottom"], round(w["size"], 1), _word_fontname(w["chars"]),
+        ))
     return out
 
 
@@ -242,20 +264,61 @@ def _is_bold(fontname: str) -> bool:
     return bool(_BOLD_RE.search(fontname))
 
 
-def _bold_heading_level(line: list[Word], dominant_size: float, stats: DocStats) -> int | None:
+def _median_line_gap(lines: list[list[Word]]) -> float:
+    gaps = [lines[i][0].top - lines[i - 1][0].bottom for i in range(1, len(lines))]
+    return sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+
+
+def _bold_run(lines: list[list[Word]], start: int, med_gap: float) -> list[list[Word]] | None:
+    """Максимальный прогон СМЕЖНЫХ строк (тот же визуальный абзац — разрыв не
+    шире ``med_gap * PARA_GAP_RATIO``), где КАЖДАЯ строка целиком bold.
+
+    Ловит регресс, найденный живым аудитом (sg, IMDA Agentic AI): bold как
+    стилистическое ВЫДЕЛЕНИЕ (lead-in первых строк абзаца, перенос заголовка
+    на вторую строку колонки) — не то же самое, что bold как признак
+    ОТДЕЛЬНОГО заголовка. Прогон обрывается на первой НЕ-bold строке того же
+    абзаца; различаем ДВА случая такого обрыва по первому символу этой
+    НЕ-bold строки: строчная буква -> грамматическое продолжение ТОГО ЖЕ
+    предложения (лид-ин длинного абзаца, sg: "These greater capabilities...
+    new" + "risks.") -> прогон дисквалифицируется ЦЕЛИКОМ; что угодно другое
+    (буллет/цифра/заглавная — новый пункт списка/таблицы, ee: "Tugevused
+    Nõrkused" + "• Digitaalselt...") -> прогон изолирован как есть, не
+    дисквалифицируется (короткий bold-ярлык физически «приклеен» к телу без
+    вертикального разрыва, но грамматически НЕ продолжает его).
+    """
+    if not all(_is_bold(w.fontname) for w in lines[start]):
+        return None
+    run = [lines[start]]
+    i = start + 1
+    while i < len(lines):
+        gap = lines[i][0].top - lines[i - 1][0].bottom
+        if med_gap > 0 and gap > med_gap * PARA_GAP_RATIO:
+            break  # новый абзац — дальше уже не наш прогон
+        if all(_is_bold(w.fontname) for w in lines[i]):
+            run.append(lines[i])
+            i += 1
+            continue
+        continuation = " ".join(w.text for w in lines[i]).lstrip()
+        if continuation[:1].islower():
+            return None  # bold обрывается серединой предложения -> не заголовок целиком
+        break  # bold обрывается новым пунктом/абзацем -> прогон изолирован как есть
+    return run
+
+
+def _bold_heading_level(run: list[list[Word]], stats: DocStats) -> int | None:
     """A1-фолбэк: срабатывает ТОЛЬКО когда размерная кластеризация молчит
     (``heading_level`` вернул None) — документ с одинаковым кеглем заголовка и
     тела (CLAUDE.md, известное ограничение) иначе пропускался бы целиком.
     Уровень — всегда НИЖЕ всех размерных уровней документа (bold — более слабый
-    сигнал, чем явно больший кегль); precision-first guard'ы: строка целиком
-    bold, кегль не мельче тела, короткая, без хвостовой пунктуации/маркера
-    списка — при любом непрохождении строка остаётся прозой (чартер §2.5).
+    сигнал, чем явно больший кегль); ``run`` уже подтверждён целиком-bold и
+    визуально изолированным (``_bold_run``) — здесь только guard'ы кегля/длины/
+    пунктуации по объединённому тексту; при любом непрохождении прогон
+    остаётся прозой (чартер §2.5).
     """
-    if not line or not all(_is_bold(w.fontname) for w in line):
-        return None
+    dominant_size = Counter(w.size for line in run for w in line).most_common(1)[0][0]
     if dominant_size < stats.body_size:
         return None
-    text = " ".join(w.text for w in line)
+    text = " ".join(" ".join(w.text for w in line) for line in run)
     if len(text) > BOLD_HEADING_MAX_CHARS:
         return None
     if text.endswith((".", ";", ":")) or _LIST_MARKER_RE.match(text):
@@ -266,8 +329,7 @@ def _bold_heading_level(line: list[Word], dominant_size: float, stats: DocStats)
 def render_lines_as_paragraphs(lines: list[list[Word]]) -> str:
     if not lines:
         return ""
-    gaps = [lines[i][0].top - lines[i - 1][0].bottom for i in range(1, len(lines))]
-    med_gap = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+    med_gap = _median_line_gap(lines)
     out: list[str] = []
     buf: list[str] = [" ".join(w.text for w in lines[0])]
     for i in range(1, len(lines)):
@@ -306,18 +368,44 @@ def _render_column_with_blocks(
             return
         segments: list[str] = []
         para_buf: list[list[Word]] = []
-        for line in prose_buf:
+        med_gap = _median_line_gap(prose_buf)  # локальный масштаб «тот же абзац» для bold-прогонов
+        i = 0
+        n = len(prose_buf)
+        while i < n:
+            line = prose_buf[i]
             dominant_size = Counter(w.size for w in line).most_common(1)[0][0]
             level = heading_level(dominant_size, stats)
-            if level is None:
-                level = _bold_heading_level(line, dominant_size, stats)
             if level is not None:
                 if para_buf:
                     segments.append(render_lines_as_paragraphs(para_buf))
                     para_buf = []
                 segments.append(f"{'#' * min(level, 6)} {' '.join(w.text for w in line)}")
-            else:
-                para_buf.append(line)
+                i += 1
+                continue
+
+            run = _bold_run(prose_buf, i, med_gap)
+            if run is not None:
+                level = _bold_heading_level(run, stats)
+                if level is not None:
+                    if para_buf:
+                        segments.append(render_lines_as_paragraphs(para_buf))
+                        para_buf = []
+                    text = " ".join(" ".join(w.text for w in ln) for ln in run)
+                    segments.append(f"{'#' * min(level, 6)} {text}")
+                    i += len(run)
+                    continue
+                # прогон целиком-bold и изолирован, но не прошёл guard (длина/
+                # пунктуация) — весь прогон СРАЗУ уходит в прозу; иначе «хвост»
+                # переоценивался бы САМ ПО СЕБЕ со следующей итерации и мог бы
+                # ложно спромоутиться в одиночный заголовок (регресс, найденный
+                # живым аудитом sg: «...third-party» + «ecosystem boundaries»
+                # длиннее 80 симв. вместе, но «ecosystem boundaries» одна короче).
+                para_buf.extend(run)
+                i += len(run)
+                continue
+
+            para_buf.append(line)
+            i += 1
         if para_buf:
             segments.append(render_lines_as_paragraphs(para_buf))
         rendered.append("\n\n".join(s for s in segments if s.strip()))
