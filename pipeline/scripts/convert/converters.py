@@ -304,7 +304,7 @@ def _convert_html(
 
 
 _CONVERTERS: dict[str, Converter] = {
-    "pdf": Converter("pdf", "4", _convert_pdf),  # v4: bold-фолбэк заголовков + таблицы (convert-hardening)
+    "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
     "html": Converter("html", "1", _convert_html),
 }
 

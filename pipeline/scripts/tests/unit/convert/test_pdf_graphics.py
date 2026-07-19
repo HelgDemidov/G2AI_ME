@@ -14,6 +14,7 @@ from convert.pdf_graphics import (
     detect_regions,
     document_hash_counts,
     filter_elements,
+    image_id,
     region_guards_ok,
     region_hash,
     region_id,
@@ -448,7 +449,37 @@ def test_classify_images_excludes_image_already_inside_a_region() -> None:
 
 
 def test_render_raster_marker_matches_grammar() -> None:
-    assert render_raster_marker(page=2) == "> [Image, p. 2 — raster content not analyzed]"
+    img = _image(0.0, 0.0, 10.0, 10.0, "unique-chart")
+    marker = render_raster_marker(page=2, image=img)
+    assert marker == f"> [Image, p. 2, image {image_id(img, page=2)} — raster content not analyzed]"
+
+
+def test_image_id_from_content_hash_is_first_12_hex_chars() -> None:
+    img = _image(0.0, 0.0, 10.0, 10.0, "a" * 64)  # sha256-shaped hex string
+    assert image_id(img, page=1) == "a" * 12
+
+
+def test_image_id_stable_across_calls_same_content_hash() -> None:
+    """Стабильность между прогонами (spec §5: figures_vlm матчит по этому id) —
+    ЧИСТАЯ функция от content_hash, не зависит от вызова/порядка."""
+    img = _image(0.0, 0.0, 10.0, 10.0, "unique-chart-hash")
+    assert image_id(img, page=1) == image_id(img, page=1)
+
+
+def test_image_id_fallback_when_content_hash_missing() -> None:
+    """Битый/зашифрованный поток (content_hash=None) — детерминированный
+    fallback по (page, bbox), маркер никогда не остаётся без адреса."""
+    img = _image(10.0, 20.0, 30.0, 40.0, None)
+    rid = image_id(img, page=3)
+    assert len(rid) == 12
+    assert rid == image_id(img, page=3)  # детерминизм
+
+
+def test_image_id_fallback_differs_by_page() -> None:
+    """Fallback-id различает страницы — иначе два одинаковых по bbox изображения
+    на разных страницах молча схлопнулись бы в один id."""
+    img = _image(10.0, 20.0, 30.0, 40.0, None)
+    assert image_id(img, page=1) != image_id(img, page=2)
 
 
 def test_detect_regions_excludes_elements_inside_table_bbox() -> None:

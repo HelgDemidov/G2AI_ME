@@ -560,7 +560,7 @@ def convert(pdf_path: str, out_path: str) -> None:
                 *render_tables(real_tables),
                 *((r.bbox, pdf_graphics.render_region_block(r, page_num)) for r in regions),
                 *(
-                    ((img.x0, img.top, img.x1, img.bottom), pdf_graphics.render_raster_marker(page_num))
+                    ((img.x0, img.top, img.x1, img.bottom), pdf_graphics.render_raster_marker(page_num, img))
                     for img in raster_targets
                 ),
             ]
