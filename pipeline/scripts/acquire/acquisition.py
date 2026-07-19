@@ -149,8 +149,8 @@ def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> C
 def _classify_docx(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
     """spec convert-docx §3. Zip-магия (``DOCX_MAGIC``) — необходимое, НЕ достаточное
     условие (любой zip пройдёт эту проверку) — терминальная страховка на
-    неразличимость от честного docx здесь: markitdown поднимет ``ConversionError``
-    при конвертации не-docx zip'а (см. ``convert/converters._convert_docx``)."""
+    неразличимость от честного docx здесь: mammoth/markdownify поднимут
+    ``ConversionError`` при конвертации не-docx zip'а (см. ``convert/converters._convert_docx``)."""
     if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 

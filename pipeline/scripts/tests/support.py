@@ -51,6 +51,89 @@ def build_minimal_docx(paragraphs: list[str], *, media: dict[str, bytes] | None 
     return buf.getvalue()
 
 
+_DOCX_CONTENT_TYPES_IMG = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+
+_OOXML_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_OOXML_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+_OOXML_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_OOXML_PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+_OOXML_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_OOXML_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _docx_para(text: str) -> str:
+    return f'<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+
+
+def _docx_drawing(rid: str) -> str:
+    return (
+        f'<w:drawing xmlns:wp="{_OOXML_WP}"><wp:inline>'
+        f'<wp:docPr id="1" name="Picture"/>'
+        f'<a:graphic xmlns:a="{_OOXML_A}"><a:graphicData uri="{_OOXML_PIC}">'
+        f'<pic:pic xmlns:pic="{_OOXML_PIC}"><pic:blipFill>'
+        f'<a:blip r:embed="{rid}" xmlns:r="{_OOXML_R}"/></pic:blipFill></pic:pic>'
+        f'</a:graphicData></a:graphic></wp:inline></w:drawing>'
+    )
+
+
+def _docx_zip(body: str, images: dict[str, bytes]) -> bytes:
+    """Собрать docx, где каждый файл images ПОДКЛЮЧЁН relationship'ом rId100+i
+    (в отличие от build_minimal_docx(media=...), чьи файлы — сироты по построению)."""
+    rels_items = "".join(
+        f'<Relationship Id="rId{100 + i}" Type="{_OOXML_R}/image" Target="media/{name}"/>'
+        for i, name in enumerate(images)
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f"{rels_items}</Relationships>"
+    )
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_OOXML_W}"><w:body>{body}</w:body></w:document>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES_IMG)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+        for name, data in images.items():
+            z.writestr(f"word/media/{name}", data)
+    return buf.getvalue()
+
+
+def build_docx_with_inline_image(
+    before: list[str], image: bytes, after: list[str], image_name: str = "image1.png"
+) -> bytes:
+    """Картинка, по-настоящему вписанная в поток (DrawingML wp:inline + a:blip
+    r:embed + rels) — mammoth инлайнит её на месте (позиционный путь v2)."""
+    body = "".join(_docx_para(p) for p in before)
+    body += f"<w:p><w:r>{_docx_drawing('rId100')}</w:r></w:p>"
+    body += "".join(_docx_para(p) for p in after)
+    return _docx_zip(body, {image_name: image})
+
+
+def build_docx_with_choice_only_images(paragraphs: list[str], images: dict[str, bytes]) -> bytes:
+    """Каждая картинка — ТОЛЬКО в mc:Choice при пустом mc:Fallback: mammoth
+    (читающий Fallback) её НЕ инлайнит, но ссылка в document.xml есть —
+    ровно класс «referenced-but-not-walked», который держит фолбэк-секцию."""
+    body = "".join(_docx_para(p) for p in paragraphs)
+    for i, _name in enumerate(images):
+        body += (
+            f'<w:p><w:r><mc:AlternateContent xmlns:mc="{_OOXML_MC}">'
+            f'<mc:Choice Requires="wpg">{_docx_drawing(f"rId{100 + i}")}</mc:Choice>'
+            f"<mc:Fallback/></mc:AlternateContent></w:r></w:p>"
+        )
+    return _docx_zip(body, images)
+
+
 def valid_record() -> dict[str, Any]:
     """Минимально валидная запись (термины — из реальных словарей pipeline/vocab/)."""
     return {

@@ -22,13 +22,19 @@ from convert.converters import (
     _convert_pdf,
     _detect_scan,
     _docx_image_markers,
+    _docx_referenced_media_ids,
     _ocr_normalize,
     _tesseract_langs,
     _was_ocr_normalized,
     resolve_converter,
 )
 from core.schema import SourceRecord
-from tests.support import build_minimal_docx, valid_record
+from tests.support import (
+    build_docx_with_choice_only_images,
+    build_docx_with_inline_image,
+    build_minimal_docx,
+    valid_record,
+)
 
 
 def test_resolve_converter_pdf(tmp_path: Path) -> None:
@@ -127,8 +133,9 @@ def test_convert_html_empty_content_raises(tmp_path: Path) -> None:
         _convert_html(raw, out, "en")
 
 
-# --- _convert_docx: markitdown на минимальном OOXML (spec convert-docx §Тестовое
-# покрытие) — ни сети, ни бинарников в git: фикстура рождается в тесте заново ---
+# --- _convert_docx: mammoth+markdownify напрямую на минимальном OOXML (spec
+# convert-docx §2-bis.3) — ни сети, ни бинарников в git: фикстура рождается в
+# тесте заново ---
 
 
 def test_convert_docx_extracts_paragraph_text(tmp_path: Path) -> None:
@@ -145,7 +152,7 @@ def test_convert_docx_empty_document_raises(tmp_path: Path) -> None:
     raw = tmp_path / "raw.docx"
     raw.write_bytes(build_minimal_docx([]))
     out = tmp_path / "out.md"
-    with pytest.raises(ConversionError, match="markitdown не извлёк"):
+    with pytest.raises(ConversionError, match="mammoth/markdownify не извлекли"):
         _convert_docx(raw, out, "en")
 
 
@@ -155,67 +162,18 @@ def test_convert_docx_whitespace_only_document_raises(tmp_path: Path) -> None:
     raw = tmp_path / "raw.docx"
     raw.write_bytes(build_minimal_docx(["   ", "\t"]))
     out = tmp_path / "out.md"
-    with pytest.raises(ConversionError, match="markitdown не извлёк"):
+    with pytest.raises(ConversionError, match="mammoth/markdownify не извлекли"):
         _convert_docx(raw, out, "en")
 
 
-# --- _docx_image_markers / §2-bis: маркеры растров под figures-VLM ---
-
-
-def test_docx_image_markers_large_image_produces_marker(tmp_path: Path) -> None:
-    raw = tmp_path / "raw.docx"
-    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
-    raw.write_bytes(build_minimal_docx(["Body."], media={"image1.png": big}))
-    markers = _docx_image_markers(raw)
-    expected_id = hashlib.sha256(big).hexdigest()[:12]
-    assert f"> [Image, docx media {expected_id} — raster content not analyzed]" in markers
-    assert "## Figures (position unknown)" in markers
-
-
-def test_docx_image_markers_small_image_silent(tmp_path: Path) -> None:
-    raw = tmp_path / "raw.docx"
-    tiny = b"x" * (DOCX_IMAGE_MIN_BYTES - 1)
-    raw.write_bytes(build_minimal_docx(["Body."], media={"icon.png": tiny}))
-    assert _docx_image_markers(raw) == ""
-
-
-def test_docx_image_markers_exact_threshold_boundary(tmp_path: Path) -> None:
-    """Ровно порог (len == DOCX_IMAGE_MIN_BYTES) не должен считаться маленьким
-    (строгое '<', тот же принцип, что SCAN_MIN_TEXTPAGE_FRACTION)."""
-    raw = tmp_path / "raw.docx"
-    exact = b"x" * DOCX_IMAGE_MIN_BYTES
-    raw.write_bytes(build_minimal_docx(["Body."], media={"chart.png": exact}))
-    assert _docx_image_markers(raw) != ""
+# --- _docx_image_markers / §2-bis.3: маркеры растров под figures-VLM, только
+# для media, реально референсированных документом (orphan-фильтр) ---
 
 
 def test_docx_image_markers_no_media_at_all(tmp_path: Path) -> None:
     raw = tmp_path / "raw.docx"
     raw.write_bytes(build_minimal_docx(["Body, no images."]))
     assert _docx_image_markers(raw) == ""
-
-
-def test_docx_image_markers_identical_bytes_get_same_id(tmp_path: Path) -> None:
-    """Два файла с одинаковыми байтами (Word иногда сохраняет один логотип дважды
-    под разными именами) -> одинаковый id — та же content-hash-логика, что raster
-    region-id в pdf_graphics; апстрим (figures_vlm) естественно дедуплицирует по кэшу."""
-    raw = tmp_path / "raw.docx"
-    same = b"y" * (DOCX_IMAGE_MIN_BYTES + 100)
-    raw.write_bytes(build_minimal_docx(["Body."], media={"a.png": same, "b.jpg": same}))
-    markers = _docx_image_markers(raw)
-    expected_id = hashlib.sha256(same).hexdigest()[:12]
-    assert markers.count(expected_id) == 2
-
-
-def test_convert_docx_appends_figures_section_when_large_image_present(tmp_path: Path) -> None:
-    raw = tmp_path / "raw.docx"
-    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
-    raw.write_bytes(build_minimal_docx(["Main body text."], media={"chart.png": big}))
-    out = tmp_path / "out.md"
-    _convert_docx(raw, out, "en")
-    text = out.read_text(encoding="utf-8")
-    assert "Main body text." in text
-    assert "## Figures (position unknown)" in text
-    assert "raster content not analyzed" in text
 
 
 def test_convert_docx_no_figures_section_without_large_images(tmp_path: Path) -> None:
@@ -225,6 +183,95 @@ def test_convert_docx_no_figures_section_without_large_images(tmp_path: Path) ->
     _convert_docx(raw, out, "en")
     text = out.read_text(encoding="utf-8")
     assert "## Figures" not in text
+
+
+def test_convert_docx_inline_image_marker_positioned(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_inline_image(["Before."], big, ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert text.find("Before.") < text.find(id12) < text.find("After.")
+    assert "## Figures" not in text
+
+
+def test_convert_docx_choice_only_image_falls_back_to_figures(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"c.png": big}))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert "## Figures (position unknown)" in text
+    assert id12 in text
+
+
+def test_convert_docx_orphan_media_gets_no_marker(tmp_path: Path) -> None:
+    """build_minimal_docx(media=...) кладёt файл в word/media/ БЕЗ единой
+    ссылки в document.xml.rels — сирота, orphan-фильтр не даёт ей маркера
+    (живой кейс: тестовая вырезка отчёта, 21/28 больших media — сироты)."""
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_minimal_docx(["Main body text."], media={"chart.png": big}))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert "## Figures" not in text
+    assert id12 not in text
+
+
+def test_docx_referenced_media_ids_wired_vs_orphan(tmp_path: Path) -> None:
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+
+    wired = tmp_path / "wired.docx"
+    wired.write_bytes(build_docx_with_inline_image(["Before."], big, ["After."]))
+    assert id12 in _docx_referenced_media_ids(wired)
+
+    orphan = tmp_path / "orphan.docx"
+    orphan.write_bytes(build_minimal_docx(["Body."], media={"chart.png": big}))
+    assert _docx_referenced_media_ids(orphan) == frozenset()
+
+
+def test_docx_image_markers_orphan_silent(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_minimal_docx(["Body."], media={"chart.png": big}))
+    assert _docx_image_markers(raw) == ""
+
+
+def test_docx_image_markers_duplicate_bytes_single_marker(tmp_path: Path) -> None:
+    """Два файла с одинаковыми байтами (Word иногда сохраняет один логотип дважды
+    под разными именами), оба референсированы -> ОДИН маркер (дедуп по id12,
+    в отличие от v1, где каждое вхождение давало свою строку)."""
+    raw = tmp_path / "raw.docx"
+    same = b"y" * (DOCX_IMAGE_MIN_BYTES + 100)
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"a.png": same, "b.png": same}))
+    markers = _docx_image_markers(raw)
+    expected_id = hashlib.sha256(same).hexdigest()[:12]
+    assert markers.count(expected_id) == 1
+
+
+def test_docx_image_markers_exact_threshold_referenced(tmp_path: Path) -> None:
+    """Ровно порог (len == DOCX_IMAGE_MIN_BYTES) не должен считаться маленьким
+    (строгое '<', тот же принцип, что SCAN_MIN_TEXTPAGE_FRACTION)."""
+    raw = tmp_path / "raw.docx"
+    exact = b"x" * DOCX_IMAGE_MIN_BYTES
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"chart.png": exact}))
+    assert _docx_image_markers(raw) != ""
+
+
+def test_docx_image_markers_placed_excluded(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"c.png": big}))
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert _docx_image_markers(raw, placed=frozenset({id12})) == ""
+    assert id12 in _docx_image_markers(raw)
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---

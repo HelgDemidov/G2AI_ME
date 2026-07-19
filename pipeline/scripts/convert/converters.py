@@ -9,13 +9,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
+from xml.etree import ElementTree
 
 import pdfplumber
 
@@ -313,15 +315,59 @@ DOCX_IMAGE_MIN_BYTES = 5000
 # численные пороги проекта — подлежит пересмотру по факту живой приёмки.
 
 
-def _docx_image_markers(raw: Path) -> str:
-    """§2-bis (гармонизация с convert-cloud-tier): маркеры растровых изображений
-    docx под будущий figures-VLM-пасс. Листинг ``word/media/*`` НАПРЯМУЮ, без
-    сверки с ``document.xml.rels`` (сознательное упрощение спека — v1 без
-    позиционности, "ноль вмешательства в markitdown-путь"): id = 12 hex sha256
-    байт файла — та же схема, что raster region-id в ``pdf_graphics``. Мелкие
-    (< ``DOCX_IMAGE_MIN_BYTES``) — молча (иконки/линии, см. калибровку выше).
-    Пустой результат ("" ) — валиден, документ без крупных растров."""
+_DOCX_MARKER_SRC_PREFIX = "docx-marker:"
+
+
+def _docx_referenced_media_ids(raw: Path) -> frozenset[str]:
+    """id12-множество media-файлов, реально референсированных хоть одной XML-частью
+    документа (document.xml/headers/footers/notes/charts — любая часть с собственным
+    .rels). Файл в word/media/ БЕЗ единой ссылки — сирота: Word его не отображает,
+    это не контент документа (реальный кейс — тестовая вырезка: слайсинг оставил
+    media/rels полного отчёта, 21 из 28 больших изображений оказались сиротами,
+    включая 4 фото людей; маркер для сироты — мусор в doc.md и лишний VLM-расход).
+
+    Детекция ссылки — подстрока '"rIdN"' в байтах части: кавычки исключают
+    префикс-коллизию (rId3 не матчится внутри rId30); недобор невозможен, возможный
+    перебор (rId в видимом тексте) безопасен — лишний честный маркер, ровно
+    поведение v1."""
+    referenced: set[str] = set()
+    with zipfile.ZipFile(raw) as z:
+        names = set(z.namelist())
+        for part in sorted(names):
+            if not (part.startswith("word/") and part.endswith(".xml")) or "/_rels/" in part:
+                continue
+            rels_name = f"{posixpath.dirname(part)}/_rels/{posixpath.basename(part)}.rels"
+            if rels_name not in names:
+                continue
+            try:
+                rels_root = ElementTree.fromstring(z.read(rels_name))
+            except ElementTree.ParseError:
+                continue
+            part_bytes = z.read(part)
+            for rel in rels_root:
+                if not rel.get("Type", "").endswith("/image"):
+                    continue
+                rid = rel.get("Id")
+                target = rel.get("Target", "")
+                if not rid or f'"{rid}"'.encode() not in part_bytes:
+                    continue
+                media = posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
+                if media.startswith("word/media/") and media in names:
+                    referenced.add(hashlib.sha256(z.read(media)).hexdigest()[:12])
+    return frozenset(referenced)
+
+
+def _docx_image_markers(raw: Path, *, placed: frozenset[str] = frozenset()) -> str:
+    """§2-bis фолбэк-проход (v2): маркеры под ``## Figures (position unknown)``
+    ТОЛЬКО для media, которые (а) реально референсированы документом
+    (``_docx_referenced_media_ids`` — orphan-фильтр), (б) не мельче
+    ``DOCX_IMAGE_MIN_BYTES``, (в) не размещены инлайн mammoth-проходом
+    (``placed``). Дедуп по id12: одинаковые байты под двумя именами
+    (jpg/jpeg-двойники Word) дают один маркер. Пустой результат ("") валиден
+    и ОЖИДАЕМ: на чистом документе весь реальный растр ложится инлайн."""
+    referenced = _docx_referenced_media_ids(raw)
     lines: list[str] = []
+    seen: set[str] = set()
     with zipfile.ZipFile(raw) as z:
         for name in sorted(z.namelist()):
             if not name.startswith("word/media/"):
@@ -330,6 +376,9 @@ def _docx_image_markers(raw: Path) -> str:
             if len(data) < DOCX_IMAGE_MIN_BYTES:
                 continue
             id12 = hashlib.sha256(data).hexdigest()[:12]
+            if id12 in placed or id12 in seen or id12 not in referenced:
+                continue
+            seen.add(id12)
             lines.append(f"> [Image, docx media {id12} — raster content not analyzed]")
     if not lines:
         return ""
@@ -339,19 +388,49 @@ def _docx_image_markers(raw: Path) -> str:
 def _convert_docx(
     raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
 ) -> None:
-    from markitdown import MarkItDown  # ленивый импорт: pdf/html-пути не платят за docx-зависимость
+    """v2 (§2-bis.2/§2-bis.3): прямой mammoth + свой markdownify-сабкласс, без
+    markitdown. Custom image-handler инлайнит маркер РОВНО в месте вхождения
+    картинки в поток документа (живая вырезка: 7/7 реальных изображений на
+    местах, включая v:imagedata внутри VML-fallback композитных групп);
+    ``_docx_image_markers`` — страховка для referenced-but-not-walked случаев
+    (класс: картинка только в mc:Choice при пустом mc:Fallback) — zero-loss
+    для реального контента по построению, сироты отфильтрованы."""
+    import mammoth  # ленивые импорты: pdf/html-пути не платят за docx-зависимости
+    from markdownify import ATX, MarkdownConverter
+    from mammoth import html as mammoth_html
 
-    result = MarkItDown().convert(str(raw))
-    text = (result.text_content or "").strip()
+    class _DocxMarkdownify(MarkdownConverter):
+        def convert_img(self, el: Any, text: str, parent_tags: Any) -> str:
+            # Единственный источник <img> в этом HTML — convert_image ниже,
+            # поэтому src всегда несёт префикс-сентинел.
+            id12 = (el.attrs.get("src") or "")[len(_DOCX_MARKER_SRC_PREFIX) :]
+            return f"\n\n> [Image, docx media {id12} — raster content not analyzed]\n\n"
+
+    placed_ids: set[str] = set()
+
+    def convert_image(image: Any) -> list[Any]:
+        with image.open() as f:
+            data = f.read()
+        if len(data) < DOCX_IMAGE_MIN_BYTES:
+            return []
+        id12 = hashlib.sha256(data).hexdigest()[:12]
+        placed_ids.add(id12)
+        return [mammoth_html.element("img", {"src": f"{_DOCX_MARKER_SRC_PREFIX}{id12}"})]
+
+    with raw.open("rb") as f:
+        converted = mammoth.convert_to_html(f, convert_image=convert_image)
+
+    text = _DocxMarkdownify(heading_style=ATX).convert(converted.value).strip()
     if not text:
-        raise ConversionError(f"{raw.name}: markitdown не извлёк контента")
-    out.write_text(text + "\n" + _docx_image_markers(raw), encoding="utf-8")
+        raise ConversionError(f"{raw.name}: mammoth/markdownify не извлекли контента")
+    fallback = _docx_image_markers(raw, placed=frozenset(placed_ids))
+    out.write_text(text + "\n" + fallback, encoding="utf-8")
 
 
 _CONVERTERS: dict[str, Converter] = {
     "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
     "html": Converter("html", "1", _convert_html),
-    "docx": Converter("docx", "1", _convert_docx),
+    "docx": Converter("docx", "2", _convert_docx),  # v2: позиционная вставка изображений (§2-bis.2)
 }
 
 
