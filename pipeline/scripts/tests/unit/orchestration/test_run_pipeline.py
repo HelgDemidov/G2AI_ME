@@ -242,6 +242,37 @@ def test_do_convert_passes_record_language_to_converter(tmp_path: Path, monkeypa
     assert seen == ["et"]
 
 
+def test_do_convert_writes_lint_defects_to_state(tmp_path: Path, monkeypatch: Any) -> None:
+    """C1 (spec convert-hardening): дефектный вывод конвертера (без единого
+    заголовка) фиксируется в .state.yaml — машиночитаемо для worksheet'а
+    батч-триажа (spec discovery-manual), НЕ роняет конвертацию."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("Just plain prose, no headings at all.", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    _do_convert(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert "no-headings" in state.lint_defects
+
+
+def test_do_convert_clean_output_has_no_lint_defects(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+
+    def fake_convert(raw: Path, dst: Path, language: str | None) -> None:
+        dst.write_text("# Title\n\nClean body text.", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    _do_convert(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.lint_defects == []
+
+
 def test_do_convert_unsupported_format_raises(tmp_path: Path) -> None:
     rec = make()
     d = schema.doc_dir(rec, tmp_path)

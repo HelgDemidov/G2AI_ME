@@ -137,12 +137,20 @@ def _wrap_body_in_article(tree: lhtml.HtmlElement) -> None:
     body.append(article)
 
 
+def matches(html: bytes) -> bool:
+    """Дешёвая проверка маркера-подстроки ДО полного парсинга — используется и
+    здесь (быстрый ранний выход), и реестром ``convert/html_preprocess.py``
+    (spec convert-hardening B1) для диспетчеризации без парсинга каждого
+    кандидата HTML."""
+    return any(marker in html for marker in _ELI_MARKERS)
+
+
 def promote_eli_headings(html: bytes) -> bytes:
     """Продвинуть ELI-структурные маркеры (CHAPTER/SECTION/Article/ANNEX) в
     настоящие <hN> внутри HTML-дерева. Не-ELI документы возвращаются байт-в-байт
     неизменными (дешёвая проверка маркера-подстроки до полного парсинга).
     """
-    if not any(marker in html for marker in _ELI_MARKERS):
+    if not matches(html):
         return html
     tree = lhtml.fromstring(html)
     _promote_chapters_and_sections(tree)

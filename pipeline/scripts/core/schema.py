@@ -226,6 +226,11 @@ class OperationalState(BaseModel):
     translation_status: TranslationStatus = TranslationStatus.not_started
     converter_name: str | None = None     # какой конвертер породил текущий doc.md
     converter_version: str | None = None  # его версия (реконсиляция реконверсии)
+    # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
+    # список строк-дефектов convert/lint.py (пустой = чисто); машиночитаемость нужна
+    # worksheet'у батч-триажа (spec discovery-manual), флагованные документы видны
+    # при Стадии 2. Старые .state.yaml без поля валидны (Field с default).
+    lint_defects: list[str] = Field(default_factory=list)
 
 
 class SourceRecord(BaseModel):

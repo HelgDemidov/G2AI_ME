@@ -370,6 +370,14 @@ def test_operational_state_default() -> None:
     assert st.sha256 is None
     assert st.acquisition_method is None
     assert st.translation_status == TranslationStatus.not_started
+    assert st.lint_defects == []
+
+
+def test_operational_state_legacy_yaml_without_lint_defects_still_valid() -> None:
+    """C1 (spec convert-hardening): старые .state.yaml, записанные ДО появления
+    поля, остаются валидны — Field с default, не required."""
+    st = OperationalState.model_validate({"sha256": "a" * 64, "acquisition_method": "direct"})
+    assert st.lint_defects == []
 
 
 def test_operational_state_parse() -> None:
