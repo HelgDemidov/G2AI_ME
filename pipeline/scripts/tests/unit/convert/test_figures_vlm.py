@@ -43,7 +43,13 @@ def _doc_graphics(
 
 
 class _FakePage:
+    bbox = (0.0, 0.0, 612.0, 792.0)
+
+    def __init__(self) -> None:
+        self.cropped_bboxes: list[Any] = []
+
     def crop(self, bbox: Any) -> "_FakePage":
+        self.cropped_bboxes.append(bbox)
         return self
 
     def to_image(self, resolution: int) -> "_FakePage":
@@ -286,3 +292,25 @@ def test_prompt_requires_quoted_mermaid_labels_and_visible_edges_only() -> None:
     assert "visually present" in FIG_PROMPT
     assert "never infer or guess" in FIG_PROMPT
     assert "verbatim" in FIG_PROMPT
+
+
+def test_render_crop_clamps_bbox_to_page_bounds(tmp_path: Path, monkeypatch: Any) -> None:
+    """Живой случай приёмки чекпоинта 2 (обложка sg): bbox изображения выходит за
+    MediaBox — без клампа pdfplumber.crop поднимает ValueError, и маркер честно, но
+    НАВСЕГДА оставался бы необработанным. Кламп к границам страницы чинит класс."""
+    md, raw = _write_doc(tmp_path, IMAGE_MD)
+    _patch_key(monkeypatch)
+    fake_pdf = _FakePdf(n_pages=20)
+    monkeypatch.setattr("convert.figures_vlm.pdfplumber.open", lambda raw_: fake_pdf)
+    oob = _image("bbde82b91e13" + "0" * 52, bbox=(-1.25, -0.65, 611.74, 806.45))
+    monkeypatch.setattr(
+        "convert.figures_vlm.pdf_to_markdown.compute_page_graphics",
+        lambda raw_: _doc_graphics(20, raster=[(20, oob)]),
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Cover art."}}]},
+    )
+
+    assert apply_figures_pass(md, raw, model="m") is True
+    assert fake_pdf.pages[19].cropped_bboxes == [(0.0, 0.0, 611.74, 792.0)]

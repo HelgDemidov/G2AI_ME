@@ -105,8 +105,15 @@ def _save_cache(raw: Path, cache: dict[str, dict[str, Any]]) -> None:
 
 def _render_crop(page: Any, bbox: pdf_graphics.BBox) -> str:
     """bbox региона -> data-URI JPEG. RGB (не grayscale, в отличие от cloud_ocr):
-    фигуры несут смысловой цвет (SWOT-квадранты, статусные цвета флоучартов)."""
-    img = page.crop(bbox).to_image(resolution=FIGURE_RENDER_DPI).original.convert("RGB")
+    фигуры несут смысловой цвет (SWOT-квадранты, статусные цвета флоучартов).
+
+    bbox КЛАМПИТСЯ к границам страницы: реальные PDF несут изображения, чей bbox
+    выходит за MediaBox на доли пункта или больше (живой случай — обложка sg,
+    (-1.25, -0.65, 611.74, 806.45) на странице 612x792), а ``pdfplumber.crop``
+    на таком bbox поднимает ValueError."""
+    px0, ptop, px1, pbottom = page.bbox
+    clamped = (max(bbox[0], px0), max(bbox[1], ptop), min(bbox[2], px1), min(bbox[3], pbottom))
+    img = page.crop(clamped).to_image(resolution=FIGURE_RENDER_DPI).original.convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=FIGURE_JPEG_QUALITY)
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
