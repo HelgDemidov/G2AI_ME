@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from lxml import html as lhtml
 
-from convert.eli import promote_eli_headings
+from convert.eli import matches, promote_eli_headings
 
 _HEAD = b'<head><meta charset="utf-8"></head>'  # явный charset — как в реальном EUR-Lex
 
@@ -70,6 +70,14 @@ _CHAPTER_WITHOUT_TITLE = b"""<html>""" + _HEAD + b"""<body>
   <p class="oj-normal">Body text directly, no eli-title wrapper.</p>
 </div>
 </body></html>"""
+
+
+def test_matches_true_when_marker_present() -> None:
+    assert matches(_CHAPTER_WITH_ARTICLE) is True
+
+
+def test_matches_false_when_no_marker() -> None:
+    assert matches(_NON_ELI_HTML) is False
 
 
 def test_non_eli_html_returned_unchanged() -> None:

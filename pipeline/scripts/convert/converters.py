@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -15,11 +16,13 @@ from pathlib import Path
 
 import pdfplumber
 
-from convert import eli, ocr_headings
+from convert import html_preprocess, ocr_headings
 from convert.pdf_to_markdown import convert as pdf_convert
 from core import fsio
 
 logger = logging.getLogger(__name__)
+
+_HTML_HEADING_RE = re.compile(rb"<h[1-6][\s>]", re.I)  # B2: детект <hN> в исходном HTML
 
 
 class ConversionError(RuntimeError):
@@ -190,7 +193,8 @@ def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
 def _convert_html(raw: Path, out: Path, language: str | None) -> None:
     import trafilatura  # ленивый импорт: pdf-путь не платит за html-зависимость
 
-    html = eli.promote_eli_headings(raw.read_bytes())  # ELI (EUR-Lex/CELLAR) -> <hN>, иначе no-op
+    raw_bytes = raw.read_bytes()
+    html = html_preprocess.apply(raw_bytes)  # первый сматчившийся препроцессор (ELI и т.д.), иначе no-op
     text = trafilatura.extract(
         html,                            # bytes: charset определяет trafilatura
         output_format="markdown",
@@ -202,6 +206,14 @@ def _convert_html(raw: Path, out: Path, language: str | None) -> None:
     )
     if not text or not text.strip():
         raise ConversionError(f"{raw.name}: trafilatura не извлекла контента")
+    if _HTML_HEADING_RE.search(raw_bytes) and not any(line.startswith("#") for line in text.splitlines()):
+        # B2: генерическая ловушка trafilatura «главный контент без <article> теряет <hN>»
+        # (эмпирика convert-html) — не отказ (favor recall: текст выжил), сигнал в лог.
+        logger.warning(
+            "%s: исходный HTML содержит <hN>, но в выходе ни одного markdown-заголовка — "
+            "вероятна потеря структуры, кандидат на препроцессор (convert/html_preprocess.py)",
+            raw.name,
+        )
     out.write_text(text, encoding="utf-8")
 
 

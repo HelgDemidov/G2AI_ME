@@ -77,6 +77,32 @@ def test_convert_html_extracts_article_and_table(tmp_path: Path) -> None:
     assert "Copyright footer" not in text
 
 
+def test_html_heading_loss_guard_warns(monkeypatch: Any, tmp_path: Path, caplog: Any) -> None:
+    """B2: исходный HTML несёт <h2>, но trafilatura (замокана) отдала выход без
+    единого markdown-заголовка — генерическая ловушка «главный контент без
+    <article> теряет <hN>» (эмпирика convert-html); НЕ отказ, только warning."""
+    raw = tmp_path / "raw.html"
+    raw.write_text(
+        "<html><body><h2>Some Heading</h2><p>Body text long enough to survive.</p></body></html>",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.md"
+    monkeypatch.setattr("trafilatura.extract", lambda *a, **kw: "Some Heading\n\nBody text long enough to survive.")
+    with caplog.at_level(logging.WARNING):
+        _convert_html(raw, out, "en")
+    assert "вероятна потеря структуры" in caplog.text
+
+
+def test_html_heading_preserved_no_warning(monkeypatch: Any, tmp_path: Path, caplog: Any) -> None:
+    raw = tmp_path / "raw.html"
+    raw.write_text("<html><body><h2>Some Heading</h2><p>Body text.</p></body></html>", encoding="utf-8")
+    out = tmp_path / "out.md"
+    monkeypatch.setattr("trafilatura.extract", lambda *a, **kw: "## Some Heading\n\nBody text.")
+    with caplog.at_level(logging.WARNING):
+        _convert_html(raw, out, "en")
+    assert caplog.text == ""
+
+
 def test_convert_html_empty_content_raises(tmp_path: Path) -> None:
     """С favor_recall=True даже голая nav-строка выживет как fallback-контент (боязнь
     потерь > боязнь шума, см. spec §design rationale) — по-настоящему пустой ConversionError
