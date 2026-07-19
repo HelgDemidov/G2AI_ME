@@ -284,3 +284,18 @@ def test_merge_idempotent_double_pass() -> None:
     twice = merge_missing_headings(once)
     assert once == twice
     assert "## VIII. PRELAZNE I ZAVRŠNE ODREDBE\n" in once
+
+def test_tier2_identifier_line_acronym_number_roman_not_promoted() -> None:
+    """«EPA 616 XXVIII» (номер акта Скупштины в подписном блоке КАЖДОГО закона ME) —
+    живой false positive приёмки чекпоинта 1: акроним + число + римская цифра, ни
+    одного «настоящего» слова >=4 букв — не заголовок ни в одном из режимов."""
+    text = "EPA 616 XXVIII\n\nPodgorica, 31. jul 2025. godine\n"
+    assert promote_flat_headings(text) == text
+    assert merge_missing_headings(text) == text
+
+
+def test_tier2_real_chapter_with_roman_prefix_still_promoted() -> None:
+    """Guard не должен зацепить настоящие главы «римская цифра + CAPS-фраза» —
+    у них всегда есть «настоящее» слово (NADZOR, ODREDBE...)."""
+    out = merge_missing_headings("VI. NADZOR\n\nNadzor nad sprovođenjem zakona.\n")
+    assert out.startswith("## VI. NADZOR\n")

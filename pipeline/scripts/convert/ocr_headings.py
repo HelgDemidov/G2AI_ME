@@ -56,6 +56,9 @@ _GLUED_NUMBER_RE = re.compile(r"^([^\W\d_]+)(\d{1,3})(?:\s+(\d))?\s*(.*)$", re.D
 
 _TIER3_NUMBERING = re.compile(r"^(\d+)(\.(\d+))?\.?\s+(.+)$")
 
+# Токен из одних римских цифр («XXVIII») — не «настоящее» слово для Тир 2 (см. guard ниже).
+_ROMAN_ONLY_RE = re.compile(r"^[IVXLCDM]+$")
+
 _EXISTING_HEADING_RE = re.compile(r"^#{1,6}\s+")
 
 
@@ -112,6 +115,13 @@ def _tier2_heading(stripped: str, next_line: str) -> str | None:
         return None  # одно слово (акроним/обломок таблицы) — не заголовок
     if not any(sum(1 for c in w if c.isalpha()) >= 2 for w in words):
         return None  # ни одного «настоящего» слова — только цифры/символы/одиночные буквы
+    alphas = ("".join(c for c in w if c.isalpha()) for w in words)
+    if not any(len(a) >= 4 and not _ROMAN_ONLY_RE.match(a) for a in alphas):
+        # Ид-строки из акронимов/чисел/римских цифр («EPA 616 XXVIII» — номер акта
+        # Скупштины в подписном блоке КАЖДОГО закона ME; живой false positive приёмки
+        # чекпоинта 1 convert-cloud-tier) — настоящий CAPS-заголовок на любом языке
+        # корпуса несёт хотя бы одно слово >=4 букв, не являющееся римской цифрой.
+        return None
     return f"## {stripped}"
 
 
