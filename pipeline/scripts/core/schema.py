@@ -54,10 +54,27 @@ class GeoScope(str, Enum):
 
 
 class Track(str, Enum):
-    """Верхний аналитический раскол корпуса (== верхняя папка под ``sources/``; corpus-layout-v2)."""
+    """Верхний аналитический раскол корпуса (== верхняя папка под ``sources/``; corpus-layout-v2).
+
+    ``research_papers`` (2026-07-19): третья, ГЕОГРАФИЧЕСКИ-НЕЙТРАЛЬНАЯ линия — вторичная
+    аналитическая литература (think tank/university research hub отчёты: WEF, CNAS, UNIDIR
+    и т.п.), а не практика конкретного государства. Отличие от intl_xperience/montenegro:
+    те — ПЕРВОИСТОЧНИКИ (что государство реально сделало/приняло), это — АНАЛИЗ О практиках
+    (что исследователи ДУМАЮТ о них); классическое разделение primary/secondary sources.
+    entity_id для этого трека — слаг ИЗДАТЕЛЯ (`wef`/`unidir`/`cnas`, не iso2 — geo_scope
+    здесь typically global/international, гейт `geo_scope=national ⇒ entity_id==iso2`
+    (`validate_sources.py`) не применяется). Суб-иерархия — по издателю (см. entity_id),
+    НЕ по теме: `topics`/`g2ai_pattern` уже дают полную, многозначную тематическую
+    классификацию через слой знаний (`doc_facets`/`topics_map`) — дублировать её жёсткой
+    (одна тема на папку) файловой иерархией значило бы проиграть многотемным отчётам
+    ничего не давая взамен (тот же вывод независимо подтверждён обзором практик
+    коммерческих RAG-систем 2025-2026: иерархия retrieval живёт в метаданных документа/
+    секции/чанка, а не в файловой системе — она там для провенанса и уникальности id).
+    """
 
     intl_xperience = "intl-xperience"
     montenegro = "montenegro"
+    research_papers = "research-papers"
 
 
 class SourceFormat(str, Enum):
