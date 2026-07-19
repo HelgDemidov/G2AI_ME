@@ -191,6 +191,51 @@ def test_classify_response_default_expected_is_pdf_regression() -> None:
     assert result.outcome == AcquisitionOutcome.ok
 
 
+# --- expected=docx: мультиформатная классификация (convert-docx spec §3) ---
+
+OK_DOCX_HEADERS = (
+    "HTTP/1.1 200 OK\ncontent-type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\n"
+)
+REAL_DOCX_BODY = b"PK\x03\x04" + b"x" * 4100  # больше MIN_EXPECTED_DOCX_SIZE
+
+
+def test_classify_docx_ok() -> None:
+    result = classify_response(REAL_DOCX_BODY, OK_DOCX_HEADERS, schema.SourceFormat.docx)
+    assert result.outcome == AcquisitionOutcome.ok
+    assert result.http_status == 200
+
+
+def test_classify_docx_challenge_page_blocked_despite_200() -> None:
+    """Тот же порядок, что html: WAF-челлендж — тоже 200-тело, проверяется ДО магии."""
+    result = classify_response(CLOUDFLARE_BLOCK_BODY, CLOUDFLARE_BLOCK_HEADERS, schema.SourceFormat.docx)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_docx_not_zip_blocked() -> None:
+    result = classify_response(b"<html>not a docx</html>x" * 300, OK_DOCX_HEADERS, schema.SourceFormat.docx)
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "not the expected DOCX" in result.reason
+
+
+def test_classify_docx_any_zip_passes_magic_check() -> None:
+    """Zip-магия — НЕОБХОДИМОЕ, не ДОСТАТОЧНОЕ условие (spec §3): любой zip
+    ПРОЙДЁТ классификацию (терминальная страховка — markitdown упадёт
+    ConversionError на не-docx zip при реальной конвертации, не здесь)."""
+    not_really_docx_but_a_zip = b"PK\x03\x04" + b"\x00" * 4100
+    result = classify_response(not_really_docx_but_a_zip, OK_DOCX_HEADERS, schema.SourceFormat.docx)
+    assert result.outcome == AcquisitionOutcome.ok
+
+
+def test_classify_docx_too_small_blocked() -> None:
+    result = classify_response(b"PK\x03\x04" + b"x" * 10, OK_DOCX_HEADERS, schema.SourceFormat.docx)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_docx_dead_404() -> None:
+    result = classify_response(b"<html>not found</html>", DEAD_404_HEADERS, schema.SourceFormat.docx)
+    assert result.outcome == AcquisitionOutcome.dead
+
+
 class _FakeProc:
     """Минимальная подмена ``subprocess.CompletedProcess`` — только ``returncode``."""
 
@@ -710,6 +755,30 @@ def test_fetch_from_archive_html_record_queries_html_mimetype(tmp_path: Path, mo
 
     assert result.method == ARCHIVE
     assert "filter=mimetype:text/html" in cdx_calls[-1]
+
+
+def test_fetch_from_archive_docx_record_queries_docx_mimetype(tmp_path: Path, monkeypatch: Any) -> None:
+    cdx_calls: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
+        cdx_calls.extend(cmd)
+        return _FakeCompletedProcess(
+            "urlkey 20220806004506 https://example.org/doc.docx "
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document 200 X 123\n"
+        )
+
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
+    ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid DOCX (zip magic)")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([ok]))
+
+    rec = _rec(source_format="docx")
+    result = fetch_from_archive(rec, tmp_path / "doc.docx", user_agent="test-ua")
+
+    assert result.method == ARCHIVE
+    assert (
+        "filter=mimetype:application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        in cdx_calls[-1]
+    )
 
 
 def test_find_wayback_snapshot_malformed_line_returns_none(monkeypatch: Any) -> None:
