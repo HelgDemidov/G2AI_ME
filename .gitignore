@@ -22,6 +22,10 @@ htmlcov/
 # OS / editor
 .DS_Store
 
+# Локальные бинарные фикстуры для живой (не CI) отладки конвертеров — реальные документы
+# сторонних владельцев, НЕ тела корпуса; синтетические CI-фикстуры остаются в самих тестах
+/pipeline/scripts/tests/fixtures/local/
+
 # corpus-layout-v2: документы локально (raw/doc.md/.state.yaml), курируемая meta.yaml — в git
 /sources/**
 !/sources/**/
