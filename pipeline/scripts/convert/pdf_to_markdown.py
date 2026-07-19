@@ -354,6 +354,20 @@ def render_page(
     return "\n\n".join(t for t in column_texts if t.strip())
 
 
+def _drop_empty_columns(rows: list[list[str]]) -> list[list[str]]:
+    """A3: колонки, пустые во ВСЕХ строках (включая шапку), удаляются — обломки
+    объединённых ячеек pdfplumber часто оставляют такие колонки-призраки.
+    Вырожденный случай (все колонки пусты) уже отсечён guard'ом непустоты в
+    ``render_tables`` (``any(any(cell for cell in row) for row in raw_rows)``)."""
+    if not rows:
+        return rows
+    n_cols = len(rows[0])
+    keep = [any(row[i].strip() for row in rows) for i in range(n_cols)]
+    if all(keep):
+        return rows
+    return [[cell for cell, k in zip(row, keep, strict=True) if k] for row in rows]
+
+
 def render_tables(real_tables: list[Table]) -> list[tuple[pdf_graphics.BBox, str]]:
     """(bbox, markdown) на таблицу — bbox нужен для позиционной вставки в
     поток колонки (render_page), не только для рендера."""
@@ -363,12 +377,46 @@ def render_tables(real_tables: list[Table]) -> list[tuple[pdf_graphics.BBox, str
         if not any(any(cell for cell in row) for row in raw_rows):
             continue
         clean_rows = [[(cell or "").strip().replace("\n", " ") for cell in row] for row in raw_rows]
+        clean_rows = _drop_empty_columns(clean_rows)
         header, *body = clean_rows
         md = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
         for row in body:
             md.append("| " + " | ".join(row) + " |")
         out.append((table.bbox, "\n".join(md)))
     return out
+
+
+_TABLE_LINE_RE = re.compile(r"^\|.*\|$")
+
+
+def _is_table_block(block: str) -> bool:
+    lines = [line for line in block.split("\n") if line.strip()]
+    return bool(lines) and all(_TABLE_LINE_RE.match(line) for line in lines)
+
+
+def merge_split_tables(md: str) -> str:
+    """A2: сливает многостраничные таблицы, раздробленные на соседние блоки с
+    повторяющейся шапкой (наблюдённый паттерн Эстонии) — markdown-пост-проход
+    поверх УЖЕ готового текста (страницы соединены ``"\\n\\n"``, колонтитулы уже
+    сняты), не bbox-уровень: правка изолирована от самой хрупкой части
+    конвертера — позиционной вставки. Продолжения БЕЗ повторной шапки
+    сознательно НЕ сливаются (precision-first: нет надёжного предиката отличить
+    продолжение от соседней независимой таблицы, повтор шапки — наблюдённый
+    паттерн, не гипотеза)."""
+    blocks = md.split("\n\n")
+    merged: list[str] = []
+    for block in blocks:
+        if merged and _is_table_block(block) and _is_table_block(merged[-1]):
+            prev_lines = merged[-1].split("\n")
+            cur_lines = block.split("\n")
+            if len(prev_lines) >= 2 and len(cur_lines) >= 2:
+                prev_header, cur_header = prev_lines[0].strip(), cur_lines[0].strip()
+                same_cols = prev_header.count("|") == cur_header.count("|")
+                if same_cols and prev_header == cur_header:
+                    merged[-1] = "\n".join([*prev_lines, *cur_lines[2:]])  # без шапки+разделителя 2-го блока
+                    continue
+        merged.append(block)
+    return "\n\n".join(merged)
 
 
 def convert(pdf_path: str, out_path: str) -> None:
@@ -439,6 +487,7 @@ def convert(pdf_path: str, out_path: str) -> None:
         )
 
         full_text = "\n\n".join(p for p in out_parts if p.strip())
+        full_text = merge_split_tables(full_text)  # A2: склейка многостраничных таблиц
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(full_text)
 

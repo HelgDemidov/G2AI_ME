@@ -206,7 +206,7 @@ def _convert_html(raw: Path, out: Path, language: str | None) -> None:
 
 
 _CONVERTERS: dict[str, Converter] = {
-    "pdf": Converter("pdf", "3", _convert_pdf),  # v3: OCR-нормализация сканов (spec convert-ocr)
+    "pdf": Converter("pdf", "4", _convert_pdf),  # v4: bold-фолбэк заголовков + таблицы (convert-hardening)
     "html": Converter("html", "1", _convert_html),
 }
 

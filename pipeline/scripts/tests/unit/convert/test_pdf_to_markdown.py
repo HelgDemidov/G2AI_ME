@@ -11,10 +11,12 @@ from convert import pdf_graphics
 from convert.pdf_to_markdown import (
     DocStats,
     Word,
+    _drop_empty_columns,
     _is_bold,
     _render_column_with_blocks,
     compute_doc_stats,
     convert,
+    merge_split_tables,
 )
 
 
@@ -214,3 +216,74 @@ def test_bold_fallback_rejects_list_marker() -> None:
     out = _render_column_with_blocks([line], [], stats)
     assert "#" not in out
     assert "- item" in out
+
+
+# --- A3: _drop_empty_columns ---
+
+
+def test_drop_empty_columns_removes_column_empty_in_all_rows() -> None:
+    rows = [["Name", "", "Value"], ["a", "", "1"], ["b", "", "2"]]
+    assert _drop_empty_columns(rows) == [["Name", "Value"], ["a", "1"], ["b", "2"]]
+
+
+def test_drop_empty_columns_keeps_column_empty_only_in_data() -> None:
+    """Пусто только в данных (шапка непуста) — колонка остаётся: это может быть
+    легитимно разреженная колонка (не обломок)."""
+    rows = [["Name", "Note"], ["a", ""], ["b", ""]]
+    assert _drop_empty_columns(rows) == rows
+
+
+def test_drop_empty_columns_noop_when_all_nonempty() -> None:
+    rows = [["Name", "Value"], ["a", "1"]]
+    assert _drop_empty_columns(rows) == rows
+
+
+# --- A2: merge_split_tables ---
+
+
+def test_merge_split_tables_identical_header_across_blank_line() -> None:
+    md = (
+        "| A | B |\n| --- | --- |\n| 1 | 2 |"
+        "\n\n"
+        "| A | B |\n| --- | --- |\n| 3 | 4 |"
+    )
+    out = merge_split_tables(md)
+    assert out == "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    assert out.count("| A | B |") == 1  # шапка не повторена
+
+
+def test_merge_split_tables_different_headers_not_merged() -> None:
+    md = (
+        "| A | B |\n| --- | --- |\n| 1 | 2 |"
+        "\n\n"
+        "| X | Y |\n| --- | --- |\n| 3 | 4 |"
+    )
+    assert merge_split_tables(md) == md
+
+
+def test_merge_split_tables_different_column_count_not_merged() -> None:
+    md = (
+        "| A | B |\n| --- | --- |\n| 1 | 2 |"
+        "\n\n"
+        "| A | B | C |\n| --- | --- | --- |\n| 3 | 4 | 5 |"
+    )
+    assert merge_split_tables(md) == md
+
+
+def test_merge_split_tables_prose_between_tables_not_merged() -> None:
+    md = (
+        "| A | B |\n| --- | --- |\n| 1 | 2 |"
+        "\n\nSome prose paragraph in between.\n\n"
+        "| A | B |\n| --- | --- |\n| 3 | 4 |"
+    )
+    assert merge_split_tables(md) == md
+
+
+def test_merge_split_tables_idempotent() -> None:
+    md = (
+        "| A | B |\n| --- | --- |\n| 1 | 2 |"
+        "\n\n"
+        "| A | B |\n| --- | --- |\n| 3 | 4 |"
+    )
+    once = merge_split_tables(md)
+    assert merge_split_tables(once) == once
