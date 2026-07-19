@@ -7,18 +7,20 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import pdfplumber
 
-from convert import html_preprocess, ocr_headings
+from convert import cloud_ocr, html_preprocess, ocr_headings
 from convert.pdf_to_markdown import convert as pdf_convert
-from core import fsio
+from core import fsio, schema
+from core.env import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +39,21 @@ class NeedsOCR(ConversionError):
     """PDF без текстового слоя — нужен OCR-путь (спек convert-ocr)."""
 
 
+class ConvertFn(Protocol):
+    """(raw, out, language, *, record) — ``record`` нужен облачным веткам (pdf):
+    sensitivity-гейт (spec convert-cloud-tier §6). HTML/будущие не-облачные
+    конвертеры параметр игнорируют — сигнатура едина для всех записей реестра."""
+
+    def __call__(
+        self, raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class Converter:
     name: str      # стабильный id пути конвертации ("pdf")
     version: str   # бамп => авто-реконверсия всех документов формата (needed_stages)
-    convert: Callable[[Path, Path, str | None], None]  # (raw, out, language)
+    convert: ConvertFn
 
 
 SCAN_MIN_CHARS_PER_PAGE = 50      # страница «с текстом», если извлечено >= стольких символов
@@ -175,14 +187,83 @@ def _ocr_normalize(raw: Path, language: str | None) -> None:
     staging.replace(raw)
 
 
-def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
+_CLOUD_DISABLED = False   # spec convert-cloud-tier §6.3 — settable через set_cloud_disabled (--no-cloud)
+_CLOUD_KEY_WARNED = False  # warning про отсутствующий ключ — один раз за прогон, не на документ
+
+
+def set_cloud_disabled(disabled: bool) -> None:
+    """Единая точка для ``--no-cloud`` (run_pipeline.main()) — полностью отключает
+    scan-OCR/figures-VLM пути, поведение = статус-кво до convert-cloud-tier."""
+    global _CLOUD_DISABLED
+    _CLOUD_DISABLED = disabled
+
+
+def _cloud_allowed(record: schema.SourceRecord | None) -> bool:
+    """Гейты §6 спека convert-cloud-tier — единый предикат для scan-OCR и (позже)
+    figures-VLM: --no-cloud -> sensitivity (ЛАТЕНТНЫЙ режим, один предикат) ->
+    ключ. Порядок — от дешёвой проверки к дорогой (файл .env)."""
+    global _CLOUD_KEY_WARNED
+    if _CLOUD_DISABLED:
+        return False
+    if record is not None and record.sensitivity is schema.Sensitivity.confidential:
+        return False
+    load_dotenv()
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        if not _CLOUD_KEY_WARNED:
+            logger.warning("нет OPENROUTER_API_KEY — облачный OCR/figures отключены, локальный путь")
+            _CLOUD_KEY_WARNED = True
+        return False
+    return True
+
+
+def _cached_or_call_cloud(raw: Path, language: str | None, *, model: str) -> str | None:
+    """Кэш-реконсиляция §2.2: валиден (файл существует ∧ sha256 ∧ модель совпадают)
+    -> сеть не трогается. Модель разошлась, но raw тот же -> авто-перевызов
+    ЗАПРЕЩЁН (сюрприз-биллинг) — используем кэш, сигнализируем warning'ом.
+    Иначе (сайдкара нет ИЛИ raw изменился) -> облачный вызов; отказ после
+    ретраев -> None + warning (локальный фолбэк, документ не падает)."""
+    cache_path = raw.parent / ".cloudocr.md"
+    state_path = raw.parent / ".state.yaml"
+    state = schema.load_state(state_path)
+    raw_sha256 = fsio.sha256_file(raw)
+
+    if cache_path.exists() and state.cloud_ocr_raw_sha256 == raw_sha256:
+        if state.cloud_ocr_model != model:
+            logger.warning(
+                "%s: .cloudocr.md от модели %r, активна %r — используется кэш; "
+                "для перевызова удалите .cloudocr.md",
+                raw.name, state.cloud_ocr_model, model,
+            )
+        return cache_path.read_text(encoding="utf-8")
+
+    try:
+        text = cloud_ocr.convert_scan(raw, language, model=model)
+    except Exception as exc:  # noqa: BLE001 — отказ облака после ретраев -> локальный фолбэк, не крах
+        logger.warning("%s: облачный OCR не удался (%s) — локальный путь", raw.name, exc)
+        return None
+
+    fsio.atomic_write_text(cache_path, text)
+    state.cloud_ocr_model = model
+    state.cloud_ocr_raw_sha256 = raw_sha256
+    schema.save_state(state_path, state)
+    return text
+
+
+def _convert_pdf(
+    raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
+) -> None:
     try:
         _detect_scan(raw)
         scanned = _was_ocr_normalized(raw)  # текст есть — но, может, уже был нормализован раньше
     except NeedsOCR:
-        _ocr_normalize(raw, language)   # мутирует raw IN-PLACE (текст-слой встроен)
+        _ocr_normalize(raw, language)   # мутирует raw IN-PLACE (текст-слой встроен) — witness ВСЕГДА
         scanned = True
-    pdf_convert(str(raw), str(out))  # существующий конвертер, без изменений
+    if scanned and _cloud_allowed(record):
+        text = _cached_or_call_cloud(raw, language, model=cloud_ocr.ACTIVE_MODEL)
+        if text is not None:
+            out.write_text(text, encoding="utf-8")
+            return  # облачный вывод: ocr_headings НЕ применяется (иерархия уже есть и лучше)
+    pdf_convert(str(raw), str(out))  # существующий конвертер, без изменений (локальный путь)
     if scanned:  # только OCR-ветка: цифровой путь не трогаем (размер-кластеризация там чище)
         out.write_text(
             ocr_headings.promote_flat_headings(out.read_text(encoding="utf-8")),
@@ -190,7 +271,9 @@ def _convert_pdf(raw: Path, out: Path, language: str | None) -> None:
         )
 
 
-def _convert_html(raw: Path, out: Path, language: str | None) -> None:
+def _convert_html(
+    raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
+) -> None:
     import trafilatura  # ленивый импорт: pdf-путь не платит за html-зависимость
 
     raw_bytes = raw.read_bytes()

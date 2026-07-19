@@ -266,7 +266,7 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     conv = converters.resolve_converter(raw)
     md.parent.mkdir(parents=True, exist_ok=True)
     tmp = fsio.staging_path(md)
-    conv.convert(raw, tmp, rec.language)
+    conv.convert(raw, tmp, rec.language, record=rec)
     if not tmp.exists() or tmp.stat().st_size == 0:
         raise RuntimeError("конвертация дала пустой файл")
     tmp.replace(md)

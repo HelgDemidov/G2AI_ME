@@ -149,8 +149,12 @@ def test_do_frontmatter_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any)
 
 
 def _fake_converter(fn: Any, *, name: str = "pdf", version: str = "test") -> Any:
-    """Подменить реестр реестра одним fake-конвертером: fn(raw, out, language) -> None."""
-    return converters.Converter(name, version, fn)
+    """Подменить реестр реестра одним fake-конвертером: fn(raw, out, language) -> None.
+    Адаптер поглощает ``record=`` (ConvertFn Protocol, spec convert-cloud-tier) —
+    большинство тестов не о record, писать его в каждый fake было бы шумом."""
+    def adapter(raw: Path, out: Path, language: str | None, *, record: Any = None) -> None:
+        fn(raw, out, language)
+    return converters.Converter(name, version, adapter)
 
 
 def test_do_convert_staging_uses_dot_prefix_on_failure(tmp_path: Path, monkeypatch: Any) -> None:
