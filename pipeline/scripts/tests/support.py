@@ -26,13 +26,18 @@ _DOCX_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 </Relationships>"""
 
 
-def build_minimal_docx(paragraphs: list[str]) -> bytes:
+def build_minimal_docx(paragraphs: list[str], *, media: dict[str, bytes] | None = None) -> bytes:
     """Минимальный валидный OOXML (spec convert-docx §Тестовое покрытие): ровно три
     члена zip-архива (``[Content_Types].xml``/``_rels/.rels``/``word/document.xml``) —
     без ``styles.xml``/``fontTable.xml``/``docProps`` и т.п., которые Word пишет, но
     markitdown/mammoth для чтения не требуют (проверено эмпирически: минимальный
     3-member docx парсится безошибочно). Ни одного бинарника в git — фикстура рождается
-    в тесте каждый раз заново."""
+    в тесте каждый раз заново.
+
+    ``media`` (spec §2-bis) — произвольные ``{имя: байты}`` под ``word/media/`` —
+    маркер-код листингует эту папку НАПРЯМУЮ, без сверки с relationships (§2-bis
+    design), поэтому синтетические байты не обязаны декодироваться как настоящая
+    картинка."""
     w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     body = "".join(f'<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>' for p in paragraphs)
     document = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{w}"><w:body>{body}</w:body></w:document>'
@@ -41,6 +46,8 @@ def build_minimal_docx(paragraphs: list[str]) -> bytes:
         z.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES)
         z.writestr("_rels/.rels", _DOCX_RELS)
         z.writestr("word/document.xml", document)
+        for name, data in (media or {}).items():
+            z.writestr(f"word/media/{name}", data)
     return buf.getvalue()
 
 

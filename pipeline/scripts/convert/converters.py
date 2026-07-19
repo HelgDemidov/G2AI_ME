@@ -6,11 +6,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 import shutil
 import subprocess
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -303,6 +305,37 @@ def _convert_html(
     out.write_text(text, encoding="utf-8")
 
 
+DOCX_IMAGE_MIN_BYTES = 5000
+# Калибровка на живой фикстуре (tests/fixtures/local/, 2026-07-19, 167 файлов
+# word/media/*): чёткий естественный разрыв — 101 файл < 5000 байт (кластер
+# мелких иконок/флагов легенды, медиана по всему набору — 2012 байт), дальше
+# редкие крупные диаграммы (17 файлов > 100 КБ). Начальное значение, как и все
+# численные пороги проекта — подлежит пересмотру по факту живой приёмки.
+
+
+def _docx_image_markers(raw: Path) -> str:
+    """§2-bis (гармонизация с convert-cloud-tier): маркеры растровых изображений
+    docx под будущий figures-VLM-пасс. Листинг ``word/media/*`` НАПРЯМУЮ, без
+    сверки с ``document.xml.rels`` (сознательное упрощение спека — v1 без
+    позиционности, "ноль вмешательства в markitdown-путь"): id = 12 hex sha256
+    байт файла — та же схема, что raster region-id в ``pdf_graphics``. Мелкие
+    (< ``DOCX_IMAGE_MIN_BYTES``) — молча (иконки/линии, см. калибровку выше).
+    Пустой результат ("" ) — валиден, документ без крупных растров."""
+    lines: list[str] = []
+    with zipfile.ZipFile(raw) as z:
+        for name in sorted(z.namelist()):
+            if not name.startswith("word/media/"):
+                continue
+            data = z.read(name)
+            if len(data) < DOCX_IMAGE_MIN_BYTES:
+                continue
+            id12 = hashlib.sha256(data).hexdigest()[:12]
+            lines.append(f"> [Image, docx media {id12} — raster content not analyzed]")
+    if not lines:
+        return ""
+    return "\n## Figures (position unknown)\n\n" + "\n".join(lines) + "\n"
+
+
 def _convert_docx(
     raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
 ) -> None:
@@ -312,7 +345,7 @@ def _convert_docx(
     text = (result.text_content or "").strip()
     if not text:
         raise ConversionError(f"{raw.name}: markitdown не извлёк контента")
-    out.write_text(text + "\n", encoding="utf-8")
+    out.write_text(text + "\n" + _docx_image_markers(raw), encoding="utf-8")
 
 
 _CONVERTERS: dict[str, Converter] = {

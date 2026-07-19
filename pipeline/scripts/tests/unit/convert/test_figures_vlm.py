@@ -3,6 +3,7 @@
 рендер — мокнуты (сеть — только @cloud, в CI пропускается)."""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +13,11 @@ import yaml
 from convert import pdf_graphics, pdf_to_markdown
 from convert.figures_vlm import (
     FIG_PROMPT,
+    _docx_media_uri,
     apply_figures_pass,
+    has_bare_markers,
 )
+from tests.support import build_minimal_docx
 
 
 def _region(rid: str, bbox: pdf_graphics.BBox = (0.0, 0.0, 10.0, 10.0), kind: str = "opaque") -> pdf_graphics.Region:
@@ -331,3 +335,179 @@ def test_warm_cache_injection_works_offline_without_key(tmp_path: Path, monkeypa
     )
     assert apply_figures_pass(md, raw, model="m") is True
     assert "Cached." in md.read_text(encoding="utf-8")
+
+
+# --- docx-ветка (spec convert-docx §2-bis): маркер без номера страницы, рендер =
+# извлечение из zip по id (без кропа), мимо-тип по расширению ---
+
+
+def _docx_image_md(marker_id: str) -> str:
+    return (
+        "# Title\n\nBody prose.\n\n"
+        "## Figures (position unknown)\n\n"
+        f"> [Image, docx media {marker_id} — raster content not analyzed]\n"
+    )
+
+
+def _write_docx_doc(tmp_path: Path, text: str, *, media: dict[str, bytes] | None = None) -> tuple[Path, Path]:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["placeholder"], media=media or {}))
+    md = tmp_path / "doc.md"
+    md.write_text(text, encoding="utf-8")
+    return md, raw
+
+
+def test_docx_image_marker_detected_by_has_bare_markers() -> None:
+    marker_id = hashlib.sha256(b"x" * 6000).hexdigest()[:12]
+    assert has_bare_markers(_docx_image_md(marker_id)) is True
+
+
+def test_docx_media_uri_finds_by_id_and_encodes_png_mime(tmp_path: Path) -> None:
+    data = b"z" * 6000
+    marker_id = hashlib.sha256(data).hexdigest()[:12]
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Body."], media={"chart.png": data}))
+    uri = _docx_media_uri(raw, marker_id)
+    assert uri is not None
+    assert uri.startswith("data:image/png;base64,")
+
+
+def test_docx_media_uri_jpeg_mime(tmp_path: Path) -> None:
+    data = b"j" * 6000
+    marker_id = hashlib.sha256(data).hexdigest()[:12]
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Body."], media={"photo.jpg": data}))
+    uri = _docx_media_uri(raw, marker_id)
+    assert uri is not None
+    assert uri.startswith("data:image/jpeg;base64,")
+
+
+def test_docx_media_uri_non_raster_format_returns_none_and_warns(tmp_path: Path, monkeypatch: Any, caplog: Any) -> None:
+    import logging
+
+    data = b"s" * 6000
+    marker_id = hashlib.sha256(data).hexdigest()[:12]
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Body."], media={"vector.svg": data}))
+    with caplog.at_level(logging.WARNING):
+        uri = _docx_media_uri(raw, marker_id)
+    assert uri is None
+    assert "не растр" in caplog.text
+
+
+def test_docx_media_uri_not_found_returns_none_and_warns(tmp_path: Path, caplog: Any) -> None:
+    import logging
+
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Body."]))
+    with caplog.at_level(logging.WARNING):
+        uri = _docx_media_uri(raw, "0" * 12)
+    assert uri is None
+    assert "не найдено" in caplog.text
+
+
+def test_apply_figures_pass_docx_cache_miss_calls_vlm_with_media_bytes(tmp_path: Path, monkeypatch: Any) -> None:
+    data = b"c" * 6000
+    marker_id = hashlib.sha256(data).hexdigest()[:12]
+    md, raw = _write_docx_doc(tmp_path, _docx_image_md(marker_id), media={"chart.png": data})
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    calls: list[dict[str, Any]] = []
+
+    def fake_chat(payload: dict[str, Any], *, api_key: str, timeout: float = 1800.0) -> dict[str, Any]:
+        calls.append(payload)
+        return {"choices": [{"message": {"content": "Docx chart description."}}]}
+
+    monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert len(calls) == 1
+    img_parts = [p for p in calls[0]["messages"][0]["content"] if p["type"] == "image_url"]
+    assert len(img_parts) == 1
+    assert img_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    text = md.read_text(encoding="utf-8")
+    assert (
+        f"> [Image, docx media {marker_id} — VLM interpretation (m); "
+        "reconstruction, verify against original]" in text
+    )
+    assert "Docx chart description." in text
+    assert "raster content not analyzed" not in text
+
+
+def test_apply_figures_pass_docx_cache_hit_skips_network(tmp_path: Path, monkeypatch: Any) -> None:
+    data = b"h" * 6000
+    marker_id = hashlib.sha256(data).hexdigest()[:12]
+    md, raw = _write_docx_doc(tmp_path, _docx_image_md(marker_id), media={"chart.png": data})
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({marker_id: {"model": "cached", "markdown": "Cached docx figure.", "requested": "2026-01-01"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("сеть не должна была вызываться")),
+    )
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert "Cached docx figure." in md.read_text(encoding="utf-8")
+
+
+def test_apply_figures_pass_docx_media_not_found_warns_and_skips(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import logging
+
+    marker_id = "0" * 12
+    text = _docx_image_md(marker_id)
+    md, raw = _write_docx_doc(tmp_path, text)  # media вовсе нет
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("VLM не должен был вызываться")),
+    )
+    with caplog.at_level(logging.WARNING):
+        changed = apply_figures_pass(md, raw, model="m")
+    assert changed is False
+    assert md.read_text(encoding="utf-8") == text
+    assert "не найдено" in caplog.text
+
+
+def test_apply_figures_pass_docx_idempotent_second_run(tmp_path: Path, monkeypatch: Any) -> None:
+    data = b"i" * 6000
+    marker_id = hashlib.sha256(data).hexdigest()[:12]
+    md, raw = _write_docx_doc(tmp_path, _docx_image_md(marker_id), media={"chart.png": data})
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Prose."}}]},
+    )
+    assert apply_figures_pass(md, raw, model="m") is True
+    once = md.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("двойной прогон не должен звать сеть")),
+    )
+    assert apply_figures_pass(md, raw, model="m") is False
+    assert md.read_text(encoding="utf-8") == once
+
+
+def test_apply_figures_pass_docx_duplicate_id_single_vlm_call(tmp_path: Path, monkeypatch: Any) -> None:
+    """Два media-файла с одинаковыми байтами -> одинаковый id, ДВА вхождения
+    маркера в тексте -> ОДИН вызов VLM (кэш заполняется на первом вхождении,
+    второе — из кэша в рамках того же прогона; та же логика, что pdf-путь)."""
+    data = b"d" * 6000
+    marker_id = hashlib.sha256(data).hexdigest()[:12]
+    text = _docx_image_md(marker_id) + f"\n> [Image, docx media {marker_id} — raster content not analyzed]\n"
+    md, raw = _write_docx_doc(tmp_path, text, media={"a.png": data, "b.jpg": data})
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    calls: list[dict[str, Any]] = []
+
+    def fake_chat(payload: dict[str, Any], *, api_key: str, timeout: float = 1800.0) -> dict[str, Any]:
+        calls.append(payload)
+        return {"choices": [{"message": {"content": "Shared figure."}}]}
+
+    monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert len(calls) == 1
+    assert md.read_text(encoding="utf-8").count("Shared figure.") == 2

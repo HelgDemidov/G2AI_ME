@@ -1,6 +1,7 @@
 """Тесты реестра конвертеров: resolve_converter, детекция скана (_detect_scan)."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import subprocess
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 
 from convert.converters import (
+    DOCX_IMAGE_MIN_BYTES,
     ConversionError,
     NeedsOCR,
     UnsupportedFormat,
@@ -19,6 +21,7 @@ from convert.converters import (
     _convert_html,
     _convert_pdf,
     _detect_scan,
+    _docx_image_markers,
     _ocr_normalize,
     _tesseract_langs,
     _was_ocr_normalized,
@@ -154,6 +157,74 @@ def test_convert_docx_whitespace_only_document_raises(tmp_path: Path) -> None:
     out = tmp_path / "out.md"
     with pytest.raises(ConversionError, match="markitdown не извлёк"):
         _convert_docx(raw, out, "en")
+
+
+# --- _docx_image_markers / §2-bis: маркеры растров под figures-VLM ---
+
+
+def test_docx_image_markers_large_image_produces_marker(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_minimal_docx(["Body."], media={"image1.png": big}))
+    markers = _docx_image_markers(raw)
+    expected_id = hashlib.sha256(big).hexdigest()[:12]
+    assert f"> [Image, docx media {expected_id} — raster content not analyzed]" in markers
+    assert "## Figures (position unknown)" in markers
+
+
+def test_docx_image_markers_small_image_silent(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    tiny = b"x" * (DOCX_IMAGE_MIN_BYTES - 1)
+    raw.write_bytes(build_minimal_docx(["Body."], media={"icon.png": tiny}))
+    assert _docx_image_markers(raw) == ""
+
+
+def test_docx_image_markers_exact_threshold_boundary(tmp_path: Path) -> None:
+    """Ровно порог (len == DOCX_IMAGE_MIN_BYTES) не должен считаться маленьким
+    (строгое '<', тот же принцип, что SCAN_MIN_TEXTPAGE_FRACTION)."""
+    raw = tmp_path / "raw.docx"
+    exact = b"x" * DOCX_IMAGE_MIN_BYTES
+    raw.write_bytes(build_minimal_docx(["Body."], media={"chart.png": exact}))
+    assert _docx_image_markers(raw) != ""
+
+
+def test_docx_image_markers_no_media_at_all(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Body, no images."]))
+    assert _docx_image_markers(raw) == ""
+
+
+def test_docx_image_markers_identical_bytes_get_same_id(tmp_path: Path) -> None:
+    """Два файла с одинаковыми байтами (Word иногда сохраняет один логотип дважды
+    под разными именами) -> одинаковый id — та же content-hash-логика, что raster
+    region-id в pdf_graphics; апстрим (figures_vlm) естественно дедуплицирует по кэшу."""
+    raw = tmp_path / "raw.docx"
+    same = b"y" * (DOCX_IMAGE_MIN_BYTES + 100)
+    raw.write_bytes(build_minimal_docx(["Body."], media={"a.png": same, "b.jpg": same}))
+    markers = _docx_image_markers(raw)
+    expected_id = hashlib.sha256(same).hexdigest()[:12]
+    assert markers.count(expected_id) == 2
+
+
+def test_convert_docx_appends_figures_section_when_large_image_present(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_minimal_docx(["Main body text."], media={"chart.png": big}))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "Main body text." in text
+    assert "## Figures (position unknown)" in text
+    assert "raster content not analyzed" in text
+
+
+def test_convert_docx_no_figures_section_without_large_images(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Main body text."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "## Figures" not in text
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---

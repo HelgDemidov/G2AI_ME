@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import hashlib
 import io
 import logging
 import os
 import re
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,21 @@ _IMAGE_MARKER_RE = re.compile(
     r"^> \[Image, p\. (?P<page>\d+), image (?P<id>[0-9a-f]{12}) — raster content not analyzed\]$",
     re.MULTILINE,
 )
+# docx (spec convert-docx §2-bis): зеркало converters._docx_image_markers — БЕЗ
+# номера страницы (docx reflowable, надёжного понятия страницы нет).
+_DOCX_IMAGE_MARKER_RE = re.compile(
+    r"^> \[Image, docx media (?P<id>[0-9a-f]{12}) — raster content not analyzed\]$",
+    re.MULTILINE,
+)
+
+# Мимо-типы растровых форматов, которые word/media/* реально несёт (spec §2-bis:
+# "картинка уже отдельный файл" — рендер не нужен, только определить content-type
+# для data-URI). Легаси-векторные OLE-превью (wmf/emf) и svg — НЕ растр, VLM как
+# vision-input их не примет; такой маркер честно пропускается (см. _docx_media_uri).
+_DOCX_IMAGE_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "bmp": "image/bmp", "tif": "image/tiff", "tiff": "image/tiff",
+}
 
 # Рендер региона (spec §5: "кроп pypdfium2, scale 2.0") — через pdfplumber.Page.crop().
 # to_image() (обёртка над pypdfium2, уже транзитивной зависимостью pdfplumber), тот же
@@ -81,7 +98,11 @@ def has_bare_markers(text: str) -> bool:
     spec §6: свежая конвертация ВСЕГДА регенерирует голые маркеры, а уже
     существующий, ещё не обработанный документ должен самовосстановиться без
     форсированной полной реконверсии — desired-state, не in-run флаг)."""
-    return bool(_FIGURE_MARKER_RE.search(text) or _IMAGE_MARKER_RE.search(text))
+    return bool(
+        _FIGURE_MARKER_RE.search(text)
+        or _IMAGE_MARKER_RE.search(text)
+        or _DOCX_IMAGE_MARKER_RE.search(text)
+    )
 
 
 def _cache_path(raw: Path) -> Path:
@@ -133,17 +154,57 @@ def _build_payload(model: str, data_uri: str) -> dict[str, Any]:
     }
 
 
-def _call_vlm(page: Any, bbox: pdf_graphics.BBox, *, model: str, api_key: str, raw_name: str) -> str | None:
-    """Отказ ОДНОГО региона (после ретраев core.openrouter.chat_request) НЕ должен
-    ронять весь пасс/документ — маркер остаётся честным «не реконструировано»,
-    как если бы этот пасс вообще не запускался (принцип чартера §2.6)."""
+def _call_vlm_uri(data_uri: str, *, model: str, api_key: str, raw_name: str) -> str | None:
+    """Общий payload+chat_request+обработка отказа — используется и pdf-кроп-путём
+    (``_call_vlm`` сперва рендерит ``data_uri`` из bbox), и docx-путём (``data_uri``
+    уже готов, извлечён из zip без рендера, см. ``_docx_media_uri``). Отказ ОДНОГО
+    региона (после ретраев ``core.openrouter.chat_request``) НЕ должен ронять весь
+    пасс/документ — маркер остаётся честным «не реконструировано» (чартер §2.6)."""
     try:
-        data_uri = _render_crop(page, bbox)
         response = openrouter.chat_request(_build_payload(model, data_uri), api_key=api_key)
         return response["choices"][0]["message"]["content"]  # type: ignore[no-any-return]
     except Exception as exc:  # noqa: BLE001 — см. docstring
         logger.warning("%s: VLM-вызов для региона не удался (%s) — маркер оставлен как есть", raw_name, exc)
         return None
+
+
+def _call_vlm(page: Any, bbox: pdf_graphics.BBox, *, model: str, api_key: str, raw_name: str) -> str | None:
+    try:
+        data_uri = _render_crop(page, bbox)
+    except Exception as exc:  # noqa: BLE001 — рендер тоже может отказать (битый bbox/страница)
+        logger.warning("%s: рендер региона не удался (%s) — маркер оставлен как есть", raw_name, exc)
+        return None
+    return _call_vlm_uri(data_uri, model=model, api_key=api_key, raw_name=raw_name)
+
+
+def _docx_media_uri(raw: Path, marker_id: str) -> str | None:
+    """Найти в ``word/media/*`` файл с данным id (spec §2-bis: id = 12 hex sha256
+    байт файла — та же схема, что ``converters._docx_image_markers``) и вернуть
+    его как data-URI. Кроп/рендер НЕ нужен — файл уже отдельное растровое
+    изображение (в отличие от pdf-пути, где кропается регион страницы). Нерастровый
+    формат (не в ``_DOCX_IMAGE_MIME`` — svg/wmf/emf, легаси-векторные OLE-превью)
+    -> None + warning: VLM как vision-input принимает только растр."""
+    with zipfile.ZipFile(raw) as z:
+        for name in z.namelist():
+            if not name.startswith("word/media/"):
+                continue
+            data = z.read(name)
+            if hashlib.sha256(data).hexdigest()[:12] != marker_id:
+                continue
+            ext = name.rsplit(".", 1)[-1].lower()
+            mime = _DOCX_IMAGE_MIME.get(ext)
+            if mime is None:
+                logger.warning(
+                    "%s: media %s — формат .%s не растр (VLM не примет), маркер пропущен",
+                    raw.name, marker_id, ext,
+                )
+                return None
+            return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    logger.warning(
+        "%s: media %s не найдено в word/media/* при пере-детекции (raw изменился?) — маркер пропущен",
+        raw.name, marker_id,
+    )
+    return None
 
 
 def _find_region(doc: pdf_to_markdown.DocGraphics, page_num: int, region_id: str) -> pdf_graphics.Region | None:
@@ -175,6 +236,13 @@ def _render_injected_image(page: int, marker_id: str, model: str, markdown: str)
     )
 
 
+def _render_injected_docx_image(marker_id: str, model: str, markdown: str) -> str:
+    return (
+        f"> [Image, docx media {marker_id} — VLM interpretation ({model}); "
+        f"reconstruction, verify against original]\n\n{markdown}"
+    )
+
+
 def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     """Сканирует ``md_path`` на голые маркеры pdf_graphics, инъецирует VLM-
     интерпретацию (кэш-хит — офлайн; кэш-мисс — рендер+вызов+кэш). Возвращает
@@ -183,7 +251,8 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     text = md_path.read_text(encoding="utf-8")
     figure_matches = list(_FIGURE_MARKER_RE.finditer(text))
     image_matches = list(_IMAGE_MARKER_RE.finditer(text))
-    if not figure_matches and not image_matches:
+    docx_image_matches = list(_DOCX_IMAGE_MARKER_RE.finditer(text))
+    if not figure_matches and not image_matches and not docx_image_matches:
         return False
 
     # Ключ требуется ЛЕНИВО — только когда реально нужен облачный вызов (cache-miss,
@@ -253,6 +322,24 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 cache_dirty = True
             replacements.append(
                 (m.start(), m.end(), _render_injected_image(page_num, iid, entry["model"], entry["markdown"]))
+            )
+
+        for m in docx_image_matches:
+            did = m.group("id")
+            entry = cache.get(did)
+            if entry is None:
+                key = _require_key()
+                data_uri = _docx_media_uri(raw, did)  # None -> уже залогировано (не найден/не растр)
+                if data_uri is None:
+                    continue
+                markdown = _call_vlm_uri(data_uri, model=model, api_key=key, raw_name=raw.name)
+                if markdown is None:
+                    continue
+                entry = {"model": model, "markdown": markdown, "requested": _dt.date.today().isoformat()}
+                cache[did] = entry
+                cache_dirty = True
+            replacements.append(
+                (m.start(), m.end(), _render_injected_docx_image(did, entry["model"], entry["markdown"]))
             )
     finally:
         if pdf_doc is not None:
