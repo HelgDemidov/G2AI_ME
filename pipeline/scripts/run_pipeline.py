@@ -33,8 +33,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+import pdfplumber
+
 from acquire import acquisition
-from convert import converters
+from convert import converters, lint
 from graph import build_graph
 from index import corpus_index
 from core import fsio
@@ -237,6 +239,25 @@ def _do_download(
         time.sleep(pause)
 
 
+def _raw_text_chars(raw: Path, fmt: str) -> int | None:
+    """Дешёвый pdfplumber-проход для C1-линта (паттерн ``converters._detect_scan``) —
+    конвертация редка (раз на документ), секунды приемлемы. html -> None:
+    trafilatura срезает boilerplate, ratio raw-vs-md было бы неинформативно
+    (spec convert-hardening §5). Диагностический проход — падение на нём (напр.
+    edge-case pdfminer-флуктуация) не должно ронять УЖЕ успешную конвертацию,
+    поэтому отказ тихо даёт None (text-loss просто не проверяется на этом
+    документе), а не пропагирует исключение (§6: lint никогда не роняет конвертацию).
+    """
+    if fmt != "pdf":
+        return None
+    try:
+        with pdfplumber.open(raw) as pdf:
+            return sum(len(p.extract_text() or "") for p in pdf.pages)
+    except Exception:  # noqa: BLE001 — диагностический проход, см. docstring
+        logger.debug("не удалось посчитать raw_text_chars для C1-линта: %s", raw, exc_info=True)
+        return None
+
+
 def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     raw = schema.raw_file(rec, root)
     md = schema.md_file(rec, root)
@@ -249,9 +270,21 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     if not tmp.exists() or tmp.stat().st_size == 0:
         raise RuntimeError("конвертация дала пустой файл")
     tmp.replace(md)
+
+    # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
+    # никогда не роняет конвертацию, только сигналит (лог + машиночитаемый state).
+    defects = lint.lint_conversion(
+        md.read_text(encoding="utf-8"),
+        raw_text_chars=_raw_text_chars(raw, conv.name),
+        fmt=conv.name,
+    )
+    for defect in defects:
+        logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
+
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     state.converter_name, state.converter_version = conv.name, conv.version
+    state.lint_defects = defects
     # OCR-путь (convert-ocr) мутирует raw IN-PLACE (один PDF-файл на документ, без
     # сайдкара .ocr.pdf) — sha256/размер/mtime обязаны обновиться здесь, иначе
     # следующий stat-guard (needed_stages) увидит расхождение со старой записью и
