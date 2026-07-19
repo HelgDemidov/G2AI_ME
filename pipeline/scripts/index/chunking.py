@@ -47,7 +47,41 @@ def strip_frontmatter(md: str) -> str:
 
 
 def _paragraphs(text: str) -> list[str]:
-    return [p.strip() for p in _PARA_RE.split(text) if p.strip()]
+    """Абзацы текста; fenced-блок (```...```) — ОДИН атомарный абзац.
+
+    Без фенс-осознанности пустые строки ВНУТРИ code-фенса рвали блок на несколько
+    «абзацев», и packing мог развести половинки по разным чанкам (живой дефект
+    приёмки convert-cloud-tier чекпоинт 2: mermaid-блок VLM-фигуры sg p.6 разрезан
+    посередине — открытый вопрос спека подтвердился). Бонус: строка `# comment`
+    внутри фенса больше не может быть принята _sections за markdown-заголовок.
+    Фенс крупнее max_tokens по-прежнему деградирует в нарезку (_split_long_paragraph)
+    — целостность гарантируется только в пределах бюджета чанка."""
+    out: list[str] = []
+    fence: list[str] | None = None
+    plain: list[str] = []
+
+    def flush_plain() -> None:
+        nonlocal plain
+        if plain:
+            block = "\n".join(plain)
+            out.extend(p.strip() for p in _PARA_RE.split(block) if p.strip())
+            plain = []
+
+    for line in text.split("\n"):
+        if fence is None and line.lstrip().startswith("```"):
+            flush_plain()
+            fence = [line]
+        elif fence is not None:
+            fence.append(line)
+            if line.strip().startswith("```"):
+                out.append("\n".join(fence).strip())
+                fence = None
+        else:
+            plain.append(line)
+    if fence is not None:
+        out.append("\n".join(fence).strip())  # незакрытый фенс — честно до конца текста
+    flush_plain()
+    return out
 
 
 def _sentences(text: str) -> list[str]:
