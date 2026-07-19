@@ -108,6 +108,18 @@ def test_load_parts_header_mismatch_discards_everything(tmp_path: Path) -> None:
     assert _load_parts(raw, model="model-a", raw_sha256="b" * 64) == {}  # другой sha
 
 
+def test_load_parts_batch_ceiling_recalibration_discards_checkpoint(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Потолки батчей — часть header (находка приёмки чекпоинта 1): чекпоинт, снятый
+    при иной нарезке (рекалибровка §2.1 после обрыва), несовместим с новым планом —
+    без инвалидации финальная склейка _ordered_texts тихо задублировала бы страницы."""
+    raw = tmp_path / "raw.pdf"
+    _save_parts(raw, model="m", raw_sha256="a" * 64, parts={"1-20": "text"})
+    monkeypatch.setattr("convert.cloud_ocr.OCR_BATCH_PAGES", 18)
+    assert _load_parts(raw, model="m", raw_sha256="a" * 64) == {}
+
+
 def test_parts_path_is_dot_prefixed(tmp_path: Path) -> None:
     raw = tmp_path / "raw.pdf"
     assert _parts_path(raw).name == ".cloudocr.parts.yaml"

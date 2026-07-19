@@ -128,7 +128,17 @@ def _parts_path(raw: Path) -> Path:
 
 
 def _header(model: str, raw_sha256: str) -> dict[str, Any]:
-    return {"model": model, "raw_sha256": raw_sha256, "dpi": OCR_RENDER_DPI, "quality": OCR_JPEG_QUALITY}
+    """Заголовок совместимости чекпоинта: ВСЕ параметры, влияющие на содержимое И
+    нарезку батчей. Потолки батчей обязаны входить (находка приёмки чекпоинта 1):
+    без них чекпоинт, оставшийся от прогона с ИНОЙ нарезкой (рекалибровка §2.1 после
+    обрыва), прошёл бы header-сверку, его диапазоны не совпали бы с новым планом —
+    и финальная склейка _ordered_texts тихо ЗАДУБЛИРОВАЛА бы страницы (старый
+    «1-20» + новые «1-18»/«19-36» отсортировались бы вместе)."""
+    return {
+        "model": model, "raw_sha256": raw_sha256,
+        "dpi": OCR_RENDER_DPI, "quality": OCR_JPEG_QUALITY,
+        "batch_pages": OCR_BATCH_PAGES, "batch_max_mb": OCR_BATCH_MAX_MB,
+    }
 
 
 def _load_parts(raw: Path, *, model: str, raw_sha256: str) -> dict[str, str]:
