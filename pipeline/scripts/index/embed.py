@@ -2,7 +2,7 @@
 
 Бэкенды (API-first, spec embed-api-first §4):
   - OpenRouterEmbedder — PRODUCTION-путь (DEFAULT_CLOUD_MODEL, выбран A/B-чекпоинтом §1):
-    корпус эмбеддится облаком за минуты и центы вместо ~100 часов локально.
+    корпус эмбеддится облаком за минуты вместо ~100 часов локально.
   - OnnxBgeEmbedder — локальный bge-m3 int8 ONNX (CPU, приватно, бесплатно) — ФОЛБЭК
     (офлайн/confidential): CLS-pooling (last_hidden_state[:, 0]) + L2-нормализация
     -> 1024-мерный вектор.

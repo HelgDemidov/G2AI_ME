@@ -43,7 +43,7 @@ def test_ocr_path_extracts_text_and_restores_annex_heading(tmp_path: Path, monke
 
     Облако (spec convert-cloud-tier) явно отключено: этот тест — про локальный
     tesseract-путь конкретно, а живой ``.env``-ключ на машине разработчика иначе
-    увёл бы синтетический скан в реальный (пусть и грошовый) облачный вызов.
+    увёл бы синтетический скан в реальный облачный вызов.
     """
     monkeypatch.setattr("convert.converters.cloud_allowed", lambda record: False)
     raw = tmp_path / "raw.pdf"
