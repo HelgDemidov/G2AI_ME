@@ -11,6 +11,7 @@ from convert import pdf_graphics
 from convert.pdf_to_markdown import (
     DocStats,
     Word,
+    _is_bold,
     _render_column_with_blocks,
     compute_doc_stats,
     convert,
@@ -136,3 +137,80 @@ def test_scattered_short_lines_render_as_prose_without_diagram_markers() -> None
     out = _render_column_with_blocks(lines, [], _FLAT_STATS)
     assert "> [" not in out
     assert "Alpha" in out and "Beta" in out and "Gamma" in out
+
+
+# --- A1: bold-фолбэк заголовков (документ с одинаковым кеглем заголовка/тела) ---
+
+
+@pytest.mark.parametrize(
+    ("fontname", "expected"),
+    [
+        ("Arial-BoldMT", True),
+        ("DejaVuSans-Bold", True),
+        ("Helvetica-Black", True),
+        ("Roboto-Heavy", True),
+        ("ABCDEF+Arial-Bold", True),  # subset-префикс
+        ("Arial-Regular", False),
+        ("Times-Italic", False),
+        ("", False),
+    ],
+)
+def test_is_bold(fontname: str, expected: bool) -> None:
+    assert _is_bold(fontname) is expected
+
+
+def _bold_line(text: str, size: float = 10.0) -> list[Word]:
+    return [Word(w, x0=0.0, x1=10.0, top=0.0, bottom=10.0, size=size, fontname="Arial-Bold") for w in text.split()]
+
+
+def test_bold_fallback_promotes_body_size_bold_line_below_all_sizes() -> None:
+    """Документ с реальными размерными заголовками: bold-строка кегля тела не
+    конкурирует с ними — уходит на уровень СРАЗУ ПОД последним размерным."""
+    stats = DocStats(body_size=10.0, heading_sizes=[16.0, 13.0], tiny_marker_max=6.5, boilerplate_norms=set())
+    line = _bold_line("Bold Heading")
+    out = _render_column_with_blocks([line], [], stats)
+    assert out == "### Bold Heading"  # len(heading_sizes)+1 = 3
+
+
+def test_bold_fallback_gives_h1_when_document_has_no_size_headings() -> None:
+    """Кейс, ради которого фикс: документ без единого размерного заголовка
+    (одинаковый кегль заголовка/тела) — bold-строка не пропадает, а даёт #."""
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    line = _bold_line("Bold Heading")
+    out = _render_column_with_blocks([line], [], stats)
+    assert out == "# Bold Heading"
+
+
+def test_bold_fallback_rejects_trailing_period() -> None:
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    line = _bold_line("Bold sentence.")
+    out = _render_column_with_blocks([line], [], stats)
+    assert "#" not in out
+    assert "Bold sentence." in out
+
+
+def test_bold_fallback_rejects_line_over_max_chars() -> None:
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    long_text = "Word " * 20  # far over BOLD_HEADING_MAX_CHARS=80
+    line = _bold_line(long_text.strip())
+    out = _render_column_with_blocks([line], [], stats)
+    assert not out.startswith("#")
+
+
+def test_bold_fallback_rejects_size_below_body() -> None:
+    """Bold-сноски/подписи мельче тела не промоутятся в заголовки."""
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    line = _bold_line("Tiny bold caption", size=8.0)
+    out = _render_column_with_blocks([line], [], stats)
+    assert "#" not in out
+
+
+def test_bold_fallback_rejects_list_marker() -> None:
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    line = [
+        Word("-", x0=0.0, x1=5.0, top=0.0, bottom=10.0, size=10.0, fontname="Arial-Bold"),
+        Word("item", x0=6.0, x1=20.0, top=0.0, bottom=10.0, size=10.0, fontname="Arial-Bold"),
+    ]
+    out = _render_column_with_blocks([line], [], stats)
+    assert "#" not in out
+    assert "- item" in out
