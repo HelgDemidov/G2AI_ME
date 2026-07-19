@@ -53,7 +53,7 @@ jobs:
   # без сети/модели/локального корпуса, зеркалят слоевую структуру pipeline/scripts/.
   # ---------------------------------------------------------------------------
   test-unit:
-    name: Unit tests + coverage
+    name: Unit tests + coverage (≥85%)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -78,7 +78,7 @@ jobs:
         # не влияет на exit pytest без CLI-флага — проверено эмпирически 2026-07-16).
         run: >
           python -m pytest pipeline/scripts/tests/unit -m "not model and not corpus"
-          --cov --cov-report=term-missing --cov-fail-under=70
+          --cov --cov-report=term-missing --cov-fail-under=85
 
   # ---------------------------------------------------------------------------
   # Интеграционные тесты (pipeline/scripts/tests/integration/) — @model/@corpus,
