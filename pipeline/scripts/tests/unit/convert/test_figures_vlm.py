@@ -314,3 +314,20 @@ def test_render_crop_clamps_bbox_to_page_bounds(tmp_path: Path, monkeypatch: Any
 
     assert apply_figures_pass(md, raw, model="m") is True
     assert fake_pdf.pages[19].cropped_bboxes == [(0.0, 0.0, 611.74, 792.0)]
+
+
+def test_warm_cache_injection_works_offline_without_key(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ключ требуется ЛЕНИВО (только на cache-miss): реинъекция с тёплым кэшем —
+    полностью офлайн и без ключа. На этом стоит golden-самосверка @corpus."""
+    md, raw = _write_doc(tmp_path, FIGURE_MD)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({"6eb947f5358b": {"model": "m", "markdown": "Cached.", "requested": "2026-01-01"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("сеть недопустима")),
+    )
+    assert apply_figures_pass(md, raw, model="m") is True
+    assert "Cached." in md.read_text(encoding="utf-8")

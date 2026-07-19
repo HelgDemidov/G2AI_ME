@@ -186,9 +186,16 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     if not figure_matches and not image_matches:
         return False
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if api_key is None:
-        raise RuntimeError("нет OPENROUTER_API_KEY (см. .env / .env.example)")
+    # Ключ требуется ЛЕНИВО — только когда реально нужен облачный вызов (cache-miss,
+    # см. _require_key ниже): реинъекция с тёплым кэшем полностью офлайн и работает
+    # без ключа вовсе — на этом стоит golden-самосверка (@corpus): свежая конвертация
+    # + офлайн-реинъекция обязаны воспроизводить doc.md без единого касания сети.
+    api_key = os.environ.get("OPENROUTER_API_KEY") or None
+
+    def _require_key() -> str:
+        if api_key is None:
+            raise RuntimeError("нет OPENROUTER_API_KEY (см. .env / .env.example)")
+        return api_key
 
     cache = _load_cache(raw)
     cache_dirty = False
@@ -201,6 +208,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
             page_num, rid = int(m.group("page")), m.group("id")
             entry = cache.get(rid)
             if entry is None:
+                key = _require_key()
                 doc = doc or pdf_to_markdown.compute_page_graphics(str(raw))
                 region = _find_region(doc, page_num, rid)
                 if region is None:
@@ -211,7 +219,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                     continue
                 pdf_doc = pdf_doc or pdfplumber.open(raw)
                 markdown = _call_vlm(
-                    pdf_doc.pages[page_num - 1], region.bbox, model=model, api_key=api_key, raw_name=raw.name
+                    pdf_doc.pages[page_num - 1], region.bbox, model=model, api_key=key, raw_name=raw.name
                 )
                 if markdown is None:
                     continue
@@ -226,6 +234,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
             page_num, iid = int(m.group("page")), m.group("id")
             entry = cache.get(iid)
             if entry is None:
+                key = _require_key()
                 doc = doc or pdf_to_markdown.compute_page_graphics(str(raw))
                 image = _find_raster_image(doc, page_num, iid)
                 if image is None:
@@ -236,7 +245,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                     continue
                 pdf_doc = pdf_doc or pdfplumber.open(raw)
                 bbox = (image.x0, image.top, image.x1, image.bottom)
-                markdown = _call_vlm(pdf_doc.pages[page_num - 1], bbox, model=model, api_key=api_key, raw_name=raw.name)
+                markdown = _call_vlm(pdf_doc.pages[page_num - 1], bbox, model=model, api_key=key, raw_name=raw.name)
                 if markdown is None:
                     continue
                 entry = {"model": model, "markdown": markdown, "requested": _dt.date.today().isoformat()}
