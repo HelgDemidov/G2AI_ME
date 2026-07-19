@@ -75,6 +75,15 @@ Output ONLY the prose description, optionally followed by a ```mermaid code
 fence — no other commentary."""
 
 
+def has_bare_markers(text: str) -> bool:
+    """Есть ли в doc.md хотя бы один необработанный (не инъецированный) маркер —
+    дешёвая проверка для реконсиляции стадии (``run_pipeline.needed_stages``,
+    spec §6: свежая конвертация ВСЕГДА регенерирует голые маркеры, а уже
+    существующий, ещё не обработанный документ должен самовосстановиться без
+    форсированной полной реконверсии — desired-state, не in-run флаг)."""
+    return bool(_FIGURE_MARKER_RE.search(text) or _IMAGE_MARKER_RE.search(text))
+
+
 def _cache_path(raw: Path) -> Path:
     return raw.parent / ".figures.yaml"
 

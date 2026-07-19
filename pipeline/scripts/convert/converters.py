@@ -198,7 +198,7 @@ def set_cloud_disabled(disabled: bool) -> None:
     _CLOUD_DISABLED = disabled
 
 
-def _cloud_allowed(record: schema.SourceRecord | None) -> bool:
+def cloud_allowed(record: schema.SourceRecord | None) -> bool:
     """Гейты §6 спека convert-cloud-tier — единый предикат для scan-OCR и (позже)
     figures-VLM: --no-cloud -> sensitivity (ЛАТЕНТНЫЙ режим, один предикат) ->
     ключ. Порядок — от дешёвой проверки к дорогой (файл .env)."""
@@ -222,7 +222,7 @@ def _cached_or_call_cloud(raw: Path, language: str | None, *, model: str) -> str
     ЗАПРЕЩЁН (сюрприз-биллинг) — используем кэш, сигнализируем warning'ом.
     Иначе (сайдкара нет ИЛИ raw изменился) -> облачный вызов; отказ после
     ретраев -> None + warning (локальный фолбэк, документ не падает)."""
-    cache_path = raw.parent / ".cloudocr.md"
+    cache_path = cloud_ocr.cache_path(raw)
     state_path = raw.parent / ".state.yaml"
     state = schema.load_state(state_path)
     raw_sha256 = fsio.sha256_file(raw)
@@ -258,7 +258,7 @@ def _convert_pdf(
     except NeedsOCR:
         _ocr_normalize(raw, language)   # мутирует raw IN-PLACE (текст-слой встроен) — witness ВСЕГДА
         scanned = True
-    if scanned and _cloud_allowed(record):
+    if scanned and cloud_allowed(record):
         text = _cached_or_call_cloud(raw, language, model=cloud_ocr.ACTIVE_MODEL)
         if text is not None:
             # Additive-режим (§2.5, v2.1): облачная иерархия — главный производитель,

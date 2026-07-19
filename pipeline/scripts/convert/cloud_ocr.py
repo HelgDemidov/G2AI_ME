@@ -73,6 +73,14 @@ _OUTLINE_PREAMBLE = (
 )
 
 
+def cache_path(raw: Path) -> Path:
+    """Путь `.cloudocr.md`-сайдкара — единая точка правды на имя файла: нужна
+    ``converters._cached_or_call_cloud`` (валидность) И ``run_pipeline.
+    needed_stages`` (ФС-реконсиляция §6.4: удаление сайдкара -> следующий прогон
+    планирует Stage.convert -> новый облачный вызов, отдельного флага нет)."""
+    return raw.parent / ".cloudocr.md"
+
+
 def _lang_name(language: str | None) -> str:
     if language is None:
         return "English"

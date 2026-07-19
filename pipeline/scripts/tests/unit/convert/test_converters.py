@@ -14,7 +14,7 @@ from convert.converters import (
     UnsupportedFormat,
     _cached_or_call_cloud,
     _check_langs_available,
-    _cloud_allowed,
+    cloud_allowed,
     _convert_html,
     _convert_pdf,
     _detect_scan,
@@ -241,7 +241,7 @@ def test_convert_pdf_routes_scan_through_ocr_normalize(monkeypatch: Any, tmp_pat
     затем вызывается на ТОМ ЖЕ raw, и вывод проходит post-проход ocr_headings
     (только OCR-ветка)."""
     _patch_open(monkeypatch, [_FakePage(""), _FakePage("")])
-    monkeypatch.setattr("convert.converters._cloud_allowed", lambda record: False)  # локальный путь явно
+    monkeypatch.setattr("convert.converters.cloud_allowed", lambda record: False)  # локальный путь явно
     raw = tmp_path / "raw.pdf"
     raw.write_bytes(b"fake scanned pdf")
 
@@ -293,7 +293,7 @@ def test_convert_pdf_reapplies_ocr_headings_on_already_normalized_raw(
         monkeypatch, [_FakePage("x" * 60)],
         metadata={"Creator": "ocrmypdf 15.2.0+dfsg1 / Tesseract OCR-PDF 5.3.4"},
     )
-    monkeypatch.setattr("convert.converters._cloud_allowed", lambda record: False)  # локальный путь явно
+    monkeypatch.setattr("convert.converters.cloud_allowed", lambda record: False)  # локальный путь явно
 
     def fake_pdf_convert(src: str, dst: str) -> None:
         Path(dst).write_text("ANNEX I\nSome body text.\n", encoding="utf-8")
@@ -418,7 +418,7 @@ def test_ocr_normalize_warns_on_large_page_count(
     assert "250" in caplog.text
 
 
-# --- _cloud_allowed / _cached_or_call_cloud / _convert_pdf облачная маршрутизация
+# --- cloud_allowed / _cached_or_call_cloud / _convert_pdf облачная маршрутизация
 # (spec convert-cloud-tier §6) ---
 
 
@@ -437,28 +437,28 @@ def test_cloud_allowed_false_when_disabled_flag_set(monkeypatch: Any) -> None:
     _reset_cloud_module_state(monkeypatch)
     monkeypatch.setattr("convert.converters._CLOUD_DISABLED", True)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    assert _cloud_allowed(None) is False
+    assert cloud_allowed(None) is False
 
 
 def test_cloud_allowed_false_for_confidential_record(monkeypatch: Any) -> None:
     _reset_cloud_module_state(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     rec = _record(sensitivity="confidential")
-    assert _cloud_allowed(rec) is False
+    assert cloud_allowed(rec) is False
 
 
 def test_cloud_allowed_false_without_key(monkeypatch: Any) -> None:
     _reset_cloud_module_state(monkeypatch)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr("convert.converters.load_dotenv", lambda: None)  # не подхватить реальный .env
-    assert _cloud_allowed(None) is False
+    assert cloud_allowed(None) is False
 
 
 def test_cloud_allowed_true_for_normal_record_with_key(monkeypatch: Any) -> None:
     _reset_cloud_module_state(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     rec = _record(sensitivity="normal")
-    assert _cloud_allowed(rec) is True
+    assert cloud_allowed(rec) is True
 
 
 def test_cached_or_call_cloud_hit_skips_network(monkeypatch: Any, tmp_path: Path) -> None:
