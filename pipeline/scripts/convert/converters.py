@@ -303,9 +303,22 @@ def _convert_html(
     out.write_text(text, encoding="utf-8")
 
 
+def _convert_docx(
+    raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
+) -> None:
+    from markitdown import MarkItDown  # ленивый импорт: pdf/html-пути не платят за docx-зависимость
+
+    result = MarkItDown().convert(str(raw))
+    text = (result.text_content or "").strip()
+    if not text:
+        raise ConversionError(f"{raw.name}: markitdown не извлёк контента")
+    out.write_text(text + "\n", encoding="utf-8")
+
+
 _CONVERTERS: dict[str, Converter] = {
     "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
     "html": Converter("html", "1", _convert_html),
+    "docx": Converter("docx", "1", _convert_docx),
 }
 
 

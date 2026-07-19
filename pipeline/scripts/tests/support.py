@@ -6,10 +6,42 @@
 """
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+_DOCX_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+
+_DOCX_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+
+
+def build_minimal_docx(paragraphs: list[str]) -> bytes:
+    """Минимальный валидный OOXML (spec convert-docx §Тестовое покрытие): ровно три
+    члена zip-архива (``[Content_Types].xml``/``_rels/.rels``/``word/document.xml``) —
+    без ``styles.xml``/``fontTable.xml``/``docProps`` и т.п., которые Word пишет, но
+    markitdown/mammoth для чтения не требуют (проверено эмпирически: минимальный
+    3-member docx парсится безошибочно). Ни одного бинарника в git — фикстура рождается
+    в тесте каждый раз заново."""
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = "".join(f'<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>' for p in paragraphs)
+    document = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{w}"><w:body>{body}</w:body></w:document>'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", document)
+    return buf.getvalue()
 
 
 def valid_record() -> dict[str, Any]:

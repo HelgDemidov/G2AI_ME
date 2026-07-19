@@ -11,7 +11,7 @@ explicit_package_bases = true
 
 # networkx/tokenizers/onnxruntime/lxml не поставляют полноценные типы -> не флагать как «нет стабов».
 [[tool.mypy.overrides]]
-module = ["networkx.*", "tokenizers.*", "onnxruntime.*", "lxml.*"]
+module = ["networkx.*", "tokenizers.*", "onnxruntime.*", "lxml.*", "markitdown.*"]
 ignore_missing_imports = true
 
 [tool.ruff]

@@ -15,6 +15,7 @@ from convert.converters import (
     _cached_or_call_cloud,
     _check_langs_available,
     cloud_allowed,
+    _convert_docx,
     _convert_html,
     _convert_pdf,
     _detect_scan,
@@ -24,7 +25,7 @@ from convert.converters import (
     resolve_converter,
 )
 from core.schema import SourceRecord
-from tests.support import valid_record
+from tests.support import build_minimal_docx, valid_record
 
 
 def test_resolve_converter_pdf(tmp_path: Path) -> None:
@@ -45,6 +46,11 @@ def test_resolve_converter_uppercase_extension(tmp_path: Path) -> None:
 def test_resolve_converter_html(tmp_path: Path) -> None:
     conv = resolve_converter(tmp_path / "raw.html")
     assert conv.name == "html"
+
+
+def test_resolve_converter_docx(tmp_path: Path) -> None:
+    conv = resolve_converter(tmp_path / "raw.docx")
+    assert conv.name == "docx"
 
 
 # --- _convert_html: реальная trafilatura на инлайн-фикстуре (ни сети, ни модели) ---
@@ -116,6 +122,38 @@ def test_convert_html_empty_content_raises(tmp_path: Path) -> None:
     out = tmp_path / "out.md"
     with pytest.raises(ConversionError, match="не извлекла"):
         _convert_html(raw, out, "en")
+
+
+# --- _convert_docx: markitdown на минимальном OOXML (spec convert-docx §Тестовое
+# покрытие) — ни сети, ни бинарников в git: фикстура рождается в тесте заново ---
+
+
+def test_convert_docx_extracts_paragraph_text(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Prvi pasus dokumenta.", "Drugi pasus, sa detaljima."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "cnr")
+    text = out.read_text(encoding="utf-8")
+    assert "Prvi pasus dokumenta." in text
+    assert "Drugi pasus, sa detaljima." in text
+
+
+def test_convert_docx_empty_document_raises(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx([]))
+    out = tmp_path / "out.md"
+    with pytest.raises(ConversionError, match="markitdown не извлёк"):
+        _convert_docx(raw, out, "en")
+
+
+def test_convert_docx_whitespace_only_document_raises(tmp_path: Path) -> None:
+    """Параграфы есть, но текст — сплошные пробелы: .strip() должен считать
+    это пустым результатом, а не «успешной» конвертацией в пустой файл."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["   ", "\t"]))
+    out = tmp_path / "out.md"
+    with pytest.raises(ConversionError, match="markitdown не извлёк"):
+        _convert_docx(raw, out, "en")
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---
