@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Генератор инвентаризационной секции ROADMAP.md (guides/ROADMAP.md).
+"""Генератор инвентаризационной секции ROADMAP.md (roadmap/ROADMAP.md).
 
 Сканирует docs/pipeline/**/{charters/*.md,tech_specs/*/spec.md}, извлекает первую
 `Статус:`-строку каждого документа и перегенерирует таблицы между маркерами
 AUTO-INVENTORY в целевом файле. Ручное (порядок блоков, колонка «Очередь»,
-JIT-строки без файла) приходит из оверлея guides/roadmap.yaml — статусы там не
+JIT-строки без файла) приходит из оверлея roadmap/roadmap.yaml — статусы там не
 хранятся никогда (единственный источник статуса — сам документ). Таблица —
 производный артефакт: перегенерация идемпотентна, `--check` сверяет без записи.
 """
@@ -22,8 +22,8 @@ import yaml
 from core.env import REPO_ROOT
 
 DOCS_ROOT = REPO_ROOT / "docs" / "pipeline"
-DEFAULT_TARGET = DOCS_ROOT / "guides" / "ROADMAP.md"
-DEFAULT_OVERLAY = DOCS_ROOT / "guides" / "roadmap.yaml"
+DEFAULT_TARGET = DOCS_ROOT / "roadmap" / "ROADMAP.md"
+DEFAULT_OVERLAY = DOCS_ROOT / "roadmap" / "roadmap.yaml"
 BEGIN_MARK = "<!-- AUTO-INVENTORY:BEGIN -->"
 END_MARK = "<!-- AUTO-INVENTORY:END -->"
 NO_STATUS = "(нет Статус-строки)"
