@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import io
 import logging
@@ -437,10 +438,80 @@ def _convert_docx(
     out.write_text(text + "\n" + fallback, encoding="utf-8")
 
 
+def _xlsx_cell_str(value: Any) -> str:
+    """Значение ячейки -> текст ячейки GFM-таблицы (spec convert-xlsx §2).
+
+    Даты/datetime (openpyxl авто-конвертирует дата-форматированные числовые
+    ячейки, без доп. кода) -> ISO; целый float -> без ``.0``; остальное ->
+    ``str()``. Переносы строк -> пробел (то же соглашение, что
+    ``pdf_to_markdown.render_tables``: pipe-символы НЕ экранируются, тот же
+    принятый и уже задокументированный компромисс, не новая проблема).
+    Проценты/валюта/прочие ``number_format`` НЕ интерпретируются — сырое
+    значение (Design rationale: «сомнение ⇒ сырое число»)."""
+    if value is None:
+        return ""
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        text = value.isoformat()
+    elif isinstance(value, float) and value.is_integer():
+        text = str(int(value))
+    else:
+        text = str(value)
+    return text.strip().replace("\n", " ")
+
+
+def _sheet_is_empty(ws: Any) -> bool:
+    return all(cell.value is None for row in ws.iter_rows() for cell in row)
+
+
+def _sheet_table(ws: Any) -> str:
+    """Лист -> GFM-таблица: первая строка используемого диапазона —
+    структурный заголовок (не семантический — зеркалит уже принятое и
+    проверенное на реальных документах поведение markdownify-таблиц docx без
+    ``<thead>``, см. Design rationale), разделитель, остальные строки —
+    данные. Слитые диапазоны: openpyxl в НЕ-read_only режиме уже отдаёт
+    значение только якорной (верхней левой) ячейке — прочие ячейки диапазона
+    ``MergedCell`` с ``value=None`` (эмпирически подтверждено, без
+    дополнительного кода по ``merged_cells.ranges``)."""
+    rows = [[_xlsx_cell_str(c.value) for c in row] for row in ws.iter_rows()]
+    header, *body = rows
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return "\n".join(lines)
+
+
+def _convert_xlsx(
+    raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
+) -> None:
+    """v1 (spec convert-xlsx §2): один лист = одна GFM-таблица под заголовком
+    ``## {sheet}``, в порядке ``wb.sheetnames`` (workbook, не алфавитный).
+    Скрытые листы остаются частью документа с суффиксом «(hidden)» — НЕ
+    orphan-фильтр docx (лист — часть документа автора, просто визуально
+    свёрнута, см. Design rationale, честность vs privacy-фильтрация). Пустой
+    лист -> честный маркер, без пустой таблицы. Встроенные чарты — вне
+    scope этого коммита (см. ``xlsx_charts.py``)."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(raw, data_only=True, read_only=False)
+    sections: list[str] = []
+    any_content = False
+    for name in wb.sheetnames:
+        ws = wb[name]
+        heading = f"## {name}" if ws.sheet_state == "visible" else f"## {name} (hidden)"
+        if _sheet_is_empty(ws):
+            sections.append(f'{heading}\n\n> [Sheet "{name}" — empty, skipped]')
+            continue
+        any_content = True
+        sections.append(f"{heading}\n\n{_sheet_table(ws)}")
+    if not any_content:
+        raise ConversionError(f"{raw.name}: ни один лист workbook не содержит данных")
+    out.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
+
+
 _CONVERTERS: dict[str, Converter] = {
     "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
     "html": Converter("html", "1", _convert_html),
     "docx": Converter("docx", "3", _convert_docx),  # v3: composite-группы (§2-ter)
+    "xlsx": Converter("xlsx", "1", _convert_xlsx),
 }
 
 

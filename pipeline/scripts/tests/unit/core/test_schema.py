@@ -136,6 +136,13 @@ def test_source_format_docx_parse() -> None:
     assert rec.source_format == SourceFormat.docx
 
 
+def test_source_format_xlsx_parse() -> None:
+    data = valid_record()
+    data["source_format"] = "xlsx"
+    rec = SourceRecord.model_validate(data)
+    assert rec.source_format == SourceFormat.xlsx
+
+
 def test_source_format_bad_rejected() -> None:
     data = valid_record()
     data["source_format"] = "odt"  # не в enum (legacy-формат — сознательно вне скоупа)

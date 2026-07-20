@@ -1,12 +1,14 @@
 """Тесты реестра конвертеров: resolve_converter, детекция скана (_detect_scan)."""
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import logging
 import subprocess
 from pathlib import Path
 from typing import Any
 
+import openpyxl
 import pytest
 
 from convert.converters import (
@@ -20,6 +22,7 @@ from convert.converters import (
     _convert_docx,
     _convert_html,
     _convert_pdf,
+    _convert_xlsx,
     _detect_scan,
     _docx_image_markers,
     _docx_referenced_media_ids,
@@ -63,6 +66,11 @@ def test_resolve_converter_html(tmp_path: Path) -> None:
 def test_resolve_converter_docx(tmp_path: Path) -> None:
     conv = resolve_converter(tmp_path / "raw.docx")
     assert conv.name == "docx"
+
+
+def test_resolve_converter_xlsx(tmp_path: Path) -> None:
+    conv = resolve_converter(tmp_path / "raw.xlsx")
+    assert conv.name == "xlsx"
 
 
 # --- _convert_html: реальная trafilatura на инлайн-фикстуре (ни сети, ни модели) ---
@@ -365,6 +373,151 @@ def test_convert_docx_group_alongside_standalone_image(tmp_path: Path) -> None:
     assert "## Figures" not in text  # ни один из двух не улетел во фолбэк
     assert group_image_id12 not in text  # байтовый id картинки ГРУППЫ нигде не всплывает
     assert text.count(standalone_id) == 1
+
+
+# --- _convert_xlsx: openpyxl.Workbook() in-memory фикстуры (spec convert-xlsx
+# §2, тестовое покрытие) — ни сети, ни бинарников в git ---
+
+
+def _active(wb: Any) -> Any:
+    """``wb.active`` типизирован как ``Worksheet | None`` в стабах — свежий
+    ``Workbook()`` всегда несёт активный лист, узкий helper вместо ``assert``
+    в каждом тесте."""
+    ws = wb.active
+    assert ws is not None
+    return ws
+
+
+def _save_wb(tmp_path: Path, wb: Any, name: str = "raw.xlsx") -> Path:
+    raw = tmp_path / name
+    wb.save(raw)
+    return raw
+
+
+def _xlsx_with_cached_formula(tmp_path: Path, header: str, formula: str, cached: str) -> Path:
+    """Ручной патч сохранённого openpyxl-файла: вписывает закэшированное
+    значение формулы (``<v>``) — сам openpyxl формулы не считает, а живой
+    xlsx несёт кэш от Excel/LibreOffice (data_only=True его и читает)."""
+    import io
+    import zipfile
+
+    wb = openpyxl.Workbook()
+    ws = _active(wb)
+    ws.append([header])
+    ws.append([formula])
+    buf = io.BytesIO()
+    wb.save(buf)
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as z:
+        names = z.namelist()
+        sheet_xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    patched = sheet_xml.replace("<v></v>", f"<v>{cached}</v>")
+    raw = tmp_path / "raw.xlsx"
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as z, zipfile.ZipFile(raw, "w") as zo:
+        for n in names:
+            zo.writestr(n, patched if n == "xl/worksheets/sheet1.xml" else z.read(n))
+    return raw
+
+
+def test_convert_xlsx_single_sheet_simple_values_preserve_order(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = _active(wb)
+    ws.title = "Data"
+    ws.append(["Name", "Count"])
+    ws.append(["Alpha", 1])
+    ws.append(["Beta", 2])
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "## Data" in text
+    assert "| Name | Count |" in text
+    assert "| --- | --- |" in text
+    assert "| Alpha | 1 |" in text
+    assert "| Beta | 2 |" in text
+    assert text.index("| Name | Count |") < text.index("| Alpha | 1 |") < text.index("| Beta | 2 |")
+
+
+def test_convert_xlsx_merged_cell_value_only_in_anchor(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = _active(wb)
+    ws.append(["Header1", "Header2"])
+    ws.append(["Merged Value", None])
+    ws.merge_cells("A2:B2")
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "| Merged Value |  |" in text  # соседняя ячейка диапазона пуста
+
+
+def test_convert_xlsx_hidden_sheet_marked_but_content_kept(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws1 = _active(wb)
+    ws1.title = "Visible"
+    ws1.append(["A"])
+    ws2 = wb.create_sheet("Calc")
+    ws2.append(["secret helper value"])
+    ws2.sheet_state = "hidden"
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "## Calc (hidden)" in text
+    assert "secret helper value" in text  # честность: контент не теряется, не orphan-фильтр
+
+
+def test_convert_xlsx_empty_sheet_gets_marker_not_empty_table(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws1 = _active(wb)
+    ws1.title = "Data"
+    ws1.append(["x"])
+    wb.create_sheet("Blank")
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert '## Blank\n\n> [Sheet "Blank" — empty, skipped]' in text
+    assert "| --- |" not in text.split('> [Sheet "Blank"')[1]  # ни одной таблицы после маркера
+
+
+def test_convert_xlsx_date_cell_renders_iso(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = _active(wb)
+    ws.append(["Date"])
+    ws.append([_dt.date(2026, 7, 20)])
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    assert "2026-07-20" in out.read_text(encoding="utf-8")
+
+
+def test_convert_xlsx_formula_with_cached_value_used_not_formula_text(tmp_path: Path) -> None:
+    raw = _xlsx_with_cached_formula(tmp_path, "Header", "=1+1", "4")
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "| 4 |" in text
+    assert "1+1" not in text
+
+
+def test_convert_xlsx_formula_without_cache_renders_empty_not_crash(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = _active(wb)
+    ws.append(["Header"])
+    ws.append(["=1+1"])
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")  # не должно упасть на None-значении формулы без кэша
+    text = out.read_text(encoding="utf-8")
+    assert "| Header |" in text
+
+
+def test_convert_xlsx_all_sheets_empty_raises(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()  # дефолтный лист без единой записанной ячейки
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    with pytest.raises(ConversionError):
+        _convert_xlsx(raw, out, "en")
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---

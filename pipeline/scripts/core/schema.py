@@ -84,6 +84,7 @@ class SourceFormat(str, Enum):
     pdf = "pdf"
     html = "html"
     docx = "docx"
+    xlsx = "xlsx"
 
 
 class TranslationStatus(str, Enum):
