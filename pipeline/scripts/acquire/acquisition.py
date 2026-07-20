@@ -73,6 +73,8 @@ MIN_EXPECTED_PDF_SIZE = 2048
 MIN_EXPECTED_HTML_SIZE = 1024
 DOCX_MAGIC = b"PK\x03\x04"  # docx = zip-контейнер (OOXML), сигнатура ZIP local-file-header
 MIN_EXPECTED_DOCX_SIZE = 4096
+XLSX_MAGIC = DOCX_MAGIC  # xlsx — тот же OOXML/zip-контейнер, та же сигнатура
+MIN_EXPECTED_XLSX_SIZE = 4096  # тот же порядок величины: пустая .xlsx тоже несёт zip+styles+theme overhead
 CHALLENGE_BODY_MARKERS = (b"Attention Required", b"cf-chl", b"Just a moment", b"cf_captcha", b"turnstile")
 DEAD_STATUS_CODES = {404, 410}
 
@@ -130,6 +132,8 @@ def classify_response(
         return _classify_html(body, headers, status)
     if expected is schema.SourceFormat.docx:
         return _classify_docx(body, headers, status)
+    if expected is schema.SourceFormat.xlsx:
+        return _classify_xlsx(body, headers, status)
     return _classify_pdf(body, headers, status)
 
 
@@ -159,6 +163,22 @@ def _classify_docx(body: bytes, headers: dict[str, str], status: int | None) -> 
 
     return ClassifiedResponse(
         AcquisitionOutcome.blocked, status, "unexpected content (not the expected DOCX document)"
+    )
+
+
+def _classify_xlsx(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
+    """spec convert-xlsx §5. Дословное зеркало ``_classify_docx`` — тот же
+    контейнер OOXML/zip, та же терминальная страховка (zip-магия — необходимое,
+    НЕ достаточное условие; ``openpyxl`` поднимет ``ConversionError`` при
+    конвертации не-xlsx zip'а, см. ``convert/converters._convert_xlsx``)."""
+    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+        return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
+
+    if status == 200 and body.startswith(XLSX_MAGIC) and len(body) >= MIN_EXPECTED_XLSX_SIZE:
+        return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid XLSX (zip magic)")
+
+    return ClassifiedResponse(
+        AcquisitionOutcome.blocked, status, "unexpected content (not the expected XLSX document)"
     )
 
 
@@ -558,6 +578,7 @@ def find_wayback_snapshot(
 _CDX_MIMETYPE_BY_FORMAT = {
     schema.SourceFormat.html: "text/html",
     schema.SourceFormat.docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    schema.SourceFormat.xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }  # SourceFormat.pdf (и любой будущий формат без записи) -> дефолт "application/pdf" ниже
 
 
