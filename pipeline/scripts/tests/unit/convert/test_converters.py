@@ -520,6 +520,57 @@ def test_convert_xlsx_all_sheets_empty_raises(tmp_path: Path) -> None:
         _convert_xlsx(raw, out, "en")
 
 
+# --- _convert_xlsx / встроенные чарты (spec convert-xlsx §3): маркер сразу
+# после таблицы своего листа, chart-only лист не теряется как «пустой» ---
+
+
+def test_convert_xlsx_chart_marker_positioned_after_sheet_table(tmp_path: Path) -> None:
+    from openpyxl.chart import BarChart, Reference
+
+    wb = openpyxl.Workbook()
+    ws = _active(wb)
+    ws.title = "Data"
+    ws.append(["Cat", "Val"])
+    ws.append(["A", 1])
+    chart = BarChart()
+    chart.title = "My Chart"
+    chart.add_data(Reference(ws, min_col=2, min_row=1, max_row=2), titles_from_data=True)
+    ws.add_chart(chart, "D2")
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "| Cat | Val |" in text
+    assert "> [Figure, xlsx chart " in text
+    assert "on Data!D2 — chart content not analyzed" in text
+    assert "> captions: My Chart" in text
+    assert text.index("| A | 1 |") < text.index("[Figure, xlsx chart")
+
+
+def test_convert_xlsx_chart_only_sheet_not_marked_empty(tmp_path: Path) -> None:
+    """Лист без единой заполненной ячейки, но с висящим на нём чартом —
+    честный chart-маркер, НЕ «[Sheet ... — empty, skipped]» (иначе чарт
+    молча теряется)."""
+    from openpyxl.chart import BarChart, Reference
+
+    wb = openpyxl.Workbook()
+    ws1 = _active(wb)
+    ws1.title = "Data"
+    ws1.append(["Cat", "Val"])
+    ws1.append(["A", 1])
+    ws2 = wb.create_sheet("ChartOnly")
+    chart = BarChart()
+    chart.title = "Orphan Chart"
+    chart.add_data(Reference(ws1, min_col=2, min_row=1, max_row=2), titles_from_data=True)
+    ws2.add_chart(chart, "A1")
+    raw = _save_wb(tmp_path, wb)
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert '> [Sheet "ChartOnly" — empty, skipped]' not in text
+    assert "on ChartOnly!A1" in text
+
+
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---
 
 

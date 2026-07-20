@@ -482,26 +482,43 @@ def _sheet_table(ws: Any) -> str:
 def _convert_xlsx(
     raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
 ) -> None:
-    """v1 (spec convert-xlsx §2): один лист = одна GFM-таблица под заголовком
-    ``## {sheet}``, в порядке ``wb.sheetnames`` (workbook, не алфавитный).
-    Скрытые листы остаются частью документа с суффиксом «(hidden)» — НЕ
-    orphan-фильтр docx (лист — часть документа автора, просто визуально
-    свёрнута, см. Design rationale, честность vs privacy-фильтрация). Пустой
-    лист -> честный маркер, без пустой таблицы. Встроенные чарты — вне
-    scope этого коммита (см. ``xlsx_charts.py``)."""
+    """v1 (spec convert-xlsx §2/§3): один лист = одна GFM-таблица под
+    заголовком ``## {sheet}``, в порядке ``wb.sheetnames`` (workbook, не
+    алфавитный). Скрытые листы остаются частью документа с суффиксом
+    «(hidden)» — НЕ orphan-фильтр docx (лист — часть документа автора, просто
+    визуально свёрнута, см. Design rationale, честность vs privacy-фильтрация).
+    Пустой лист -> честный маркер, без пустой таблицы — КРОМЕ случая, когда на
+    нём всё же висит чарт без единой ячейки данных (chart-only лист): тогда
+    маркер листа не эмитится, а чарт-маркер(ы) не теряются молча. Маркеры
+    чартов данного листа — сразу после его таблицы, топ-лефт первым."""
     import openpyxl
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    from convert import xlsx_charts
 
     wb = openpyxl.load_workbook(raw, data_only=True, read_only=False)
+    charts_by_sheet: dict[str, list[xlsx_charts.XlsxChart]] = {}
+    for chart in xlsx_charts.extract_charts(raw):
+        charts_by_sheet.setdefault(chart.sheet, []).append(chart)
+    for charts in charts_by_sheet.values():
+        charts.sort(key=lambda c: coordinate_to_tuple(c.anchor_cell))
+
     sections: list[str] = []
     any_content = False
     for name in wb.sheetnames:
         ws = wb[name]
         heading = f"## {name}" if ws.sheet_state == "visible" else f"## {name} (hidden)"
-        if _sheet_is_empty(ws):
+        sheet_charts = charts_by_sheet.get(name, [])
+        if _sheet_is_empty(ws) and not sheet_charts:
             sections.append(f'{heading}\n\n> [Sheet "{name}" — empty, skipped]')
             continue
         any_content = True
-        sections.append(f"{heading}\n\n{_sheet_table(ws)}")
+        parts = [heading]
+        if not _sheet_is_empty(ws):
+            parts.append(_sheet_table(ws))
+        if sheet_charts:
+            parts.append("\n\n".join(xlsx_charts.render_chart_marker(c) for c in sheet_charts))
+        sections.append("\n\n".join(parts))
     if not any_content:
         raise ConversionError(f"{raw.name}: ни один лист workbook не содержит данных")
     out.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
