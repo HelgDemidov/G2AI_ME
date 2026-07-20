@@ -6,10 +6,247 @@
 """
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+_DOCX_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+
+_DOCX_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+
+
+def build_minimal_docx(paragraphs: list[str], *, media: dict[str, bytes] | None = None) -> bytes:
+    """Минимальный валидный OOXML (spec convert-docx §Тестовое покрытие): ровно три
+    члена zip-архива (``[Content_Types].xml``/``_rels/.rels``/``word/document.xml``) —
+    без ``styles.xml``/``fontTable.xml``/``docProps`` и т.п., которые Word пишет, но
+    markitdown/mammoth для чтения не требуют (проверено эмпирически: минимальный
+    3-member docx парсится безошибочно). Ни одного бинарника в git — фикстура рождается
+    в тесте каждый раз заново.
+
+    ``media`` (spec §2-bis) — произвольные ``{имя: байты}`` под ``word/media/`` —
+    маркер-код листингует эту папку НАПРЯМУЮ, без сверки с relationships (§2-bis
+    design), поэтому синтетические байты не обязаны декодироваться как настоящая
+    картинка."""
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = "".join(f'<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>' for p in paragraphs)
+    document = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{w}"><w:body>{body}</w:body></w:document>'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", document)
+        for name, data in (media or {}).items():
+            z.writestr(f"word/media/{name}", data)
+    return buf.getvalue()
+
+
+_DOCX_CONTENT_TYPES_IMG = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+
+_OOXML_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_OOXML_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+_OOXML_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_OOXML_PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+_OOXML_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_OOXML_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _docx_para(text: str) -> str:
+    return f'<w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+
+
+def _docx_drawing(rid: str) -> str:
+    return (
+        f'<w:drawing xmlns:wp="{_OOXML_WP}"><wp:inline>'
+        f'<wp:docPr id="1" name="Picture"/>'
+        f'<a:graphic xmlns:a="{_OOXML_A}"><a:graphicData uri="{_OOXML_PIC}">'
+        f'<pic:pic xmlns:pic="{_OOXML_PIC}"><pic:blipFill>'
+        f'<a:blip r:embed="{rid}" xmlns:r="{_OOXML_R}"/></pic:blipFill></pic:pic>'
+        f'</a:graphicData></a:graphic></wp:inline></w:drawing>'
+    )
+
+
+def _docx_zip(body: str, images: dict[str, bytes]) -> bytes:
+    """Собрать docx, где каждый файл images ПОДКЛЮЧЁН relationship'ом rId100+i
+    (в отличие от build_minimal_docx(media=...), чьи файлы — сироты по построению)."""
+    rels_items = "".join(
+        f'<Relationship Id="rId{100 + i}" Type="{_OOXML_R}/image" Target="media/{name}"/>'
+        for i, name in enumerate(images)
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f"{rels_items}</Relationships>"
+    )
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_OOXML_W}"><w:body>{body}</w:body></w:document>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES_IMG)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+        for name, data in images.items():
+            z.writestr(f"word/media/{name}", data)
+    return buf.getvalue()
+
+
+def build_docx_with_inline_image(
+    before: list[str], image: bytes, after: list[str], image_name: str = "image1.png"
+) -> bytes:
+    """Картинка, по-настоящему вписанная в поток (DrawingML wp:inline + a:blip
+    r:embed + rels) — mammoth инлайнит её на месте (позиционный путь v2)."""
+    body = "".join(_docx_para(p) for p in before)
+    body += f"<w:p><w:r>{_docx_drawing('rId100')}</w:r></w:p>"
+    body += "".join(_docx_para(p) for p in after)
+    return _docx_zip(body, {image_name: image})
+
+
+def build_docx_with_choice_only_images(paragraphs: list[str], images: dict[str, bytes]) -> bytes:
+    """Каждая картинка — ТОЛЬКО в mc:Choice при пустом mc:Fallback: mammoth
+    (читающий Fallback) её НЕ инлайнит, но ссылка в document.xml есть —
+    ровно класс «referenced-but-not-walked», который держит фолбэк-секцию."""
+    body = "".join(_docx_para(p) for p in paragraphs)
+    for i, _name in enumerate(images):
+        body += (
+            f'<w:p><w:r><mc:AlternateContent xmlns:mc="{_OOXML_MC}">'
+            f'<mc:Choice Requires="wpg">{_docx_drawing(f"rId{100 + i}")}</mc:Choice>'
+            f"<mc:Fallback/></mc:AlternateContent></w:r></w:p>"
+        )
+    return _docx_zip(body, images)
+
+
+_OOXML_WPG = "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
+
+
+def _docx_group_ac(captions: list[str], n_images: int, *, rid_offset: int = 100) -> str:
+    """mc:AlternateContent, чей mc:Choice содержит wpg:wgp (детект docx_groups
+    смотрит РОВНО на это) — внутри вольные текстовые узлы (captions) и
+    pic-элементы с r:embed=rId{rid_offset+i} (media_ids); mc:Fallback пуст
+    (детект не смотрит туда). Не претендует на подлинность реальной
+    wpg-разметки Word — минимум, достаточный для extract_and_strip_groups."""
+    pics = "".join(
+        f'<pic:pic xmlns:pic="{_OOXML_PIC}"><pic:blipFill>'
+        f'<a:blip r:embed="rId{rid_offset + i}" xmlns:r="{_OOXML_R}"/></pic:blipFill></pic:pic>'
+        for i in range(n_images)
+    )
+    caption_nodes = "".join(f"<a:t>{c}</a:t>" for c in captions)
+    return (
+        f'<mc:AlternateContent xmlns:mc="{_OOXML_MC}"><mc:Choice Requires="wpg">'
+        f'<w:drawing xmlns:wp="{_OOXML_WP}"><wp:inline><wp:docPr id="1" name="Group"/>'
+        f'<a:graphic xmlns:a="{_OOXML_A}"><a:graphicData uri="{_OOXML_WPG}">'
+        f'<wpg:wgp xmlns:wpg="{_OOXML_WPG}">{caption_nodes}{pics}</wpg:wgp>'
+        f"</a:graphicData></a:graphic></wp:inline></w:drawing>"
+        f"</mc:Choice><mc:Fallback/></mc:AlternateContent>"
+    )
+
+
+def build_docx_with_shape_group(
+    before: list[str], captions: list[str], images: dict[str, bytes], after: list[str]
+) -> bytes:
+    """docx с ОДНОЙ composite-группой (spec convert-docx §2-ter) — см.
+    ``_docx_group_ac``."""
+    group_ac = _docx_group_ac(captions, len(images))
+    body = "".join(_docx_para(p) for p in before)
+    body += f"<w:p><w:r>{group_ac}</w:r></w:p>"
+    body += "".join(_docx_para(p) for p in after)
+    return _docx_zip(body, images)
+
+
+_OOXML_C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+
+
+def _docx_chart_drawing(rid: str) -> str:
+    """Голый w:drawing с c:chart-анкером (kind="chart" в docx_groups): нативный
+    Word-чарт БЕЗ AlternateContent/Fallback — класс «mammoth молча теряет»."""
+    return (
+        f'<w:drawing xmlns:wp="{_OOXML_WP}"><wp:inline>'
+        f'<wp:docPr id="2" name="Chart"/>'
+        f'<a:graphic xmlns:a="{_OOXML_A}"><a:graphicData uri="{_OOXML_C}">'
+        f'<c:chart xmlns:c="{_OOXML_C}" r:id="{rid}" xmlns:r="{_OOXML_R}"/>'
+        f"</a:graphicData></a:graphic></wp:inline></w:drawing>"
+    )
+
+
+def _docx_chart_part(title_texts: list[str]) -> str:
+    """Минимальный chart-парт: c:title с rich-текстом (источник captions
+    маркера) — плюс пустой plotArea для структурной правдоподобности."""
+    runs = "".join(f'<a:r xmlns:a="{_OOXML_A}"><a:t>{t}</a:t></a:r>' for t in title_texts)
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<c:chartSpace xmlns:c="{_OOXML_C}"><c:chart>'
+        f'<c:title><c:tx><c:rich><a:p xmlns:a="{_OOXML_A}">{runs}</a:p></c:rich></c:tx></c:title>'
+        f"<c:plotArea/></c:chart></c:chartSpace>"
+    )
+
+
+def build_docx_with_inline_chart(
+    before: list[str], title_texts: list[str], after: list[str]
+) -> bytes:
+    """docx с ОДНИМ нативным c:chart (spec convert-docx §2-ter, kind="chart"):
+    drawing-анкер в body + chart-парт с заголовком + rels/[Content_Types]."""
+    body = "".join(_docx_para(p) for p in before)
+    body += f"<w:p><w:r>{_docx_chart_drawing('rId200')}</w:r></w:p>"
+    body += "".join(_docx_para(p) for p in after)
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_OOXML_W}"><w:body>{body}</w:body></w:document>'
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId200" Type="{_OOXML_R}/chart" Target="charts/chart1.xml"/>'
+        "</Relationships>"
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
+        "</Types>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+        z.writestr("word/charts/chart1.xml", _docx_chart_part(title_texts))
+    return buf.getvalue()
+
+
+def build_docx_with_group_and_standalone_image(
+    group_captions: list[str], group_image: bytes, standalone_image: bytes
+) -> bytes:
+    """Композит: одна composite-группа (§2-ter) + одна ОБЫЧНАЯ инлайн-картинка
+    вне группы (§2-bis/v2, DrawingML wp:inline вне AlternateContent) — под
+    регресс-guard на отсутствие перекрёстного заражения между двумя
+    механизмами позиционирования в одном документе."""
+    images = {"group.png": group_image, "standalone.png": standalone_image}
+    group_ac = _docx_group_ac(group_captions, 1, rid_offset=100)
+    body = f"<w:p><w:r>{group_ac}</w:r></w:p>"
+    body += f"<w:p><w:r>{_docx_drawing('rId101')}</w:r></w:p>"
+    return _docx_zip(body, images)
 
 
 def valid_record() -> dict[str, Any]:

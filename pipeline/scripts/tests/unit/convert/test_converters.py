@@ -1,6 +1,7 @@
 """Тесты реестра конвертеров: resolve_converter, детекция скана (_detect_scan)."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import subprocess
 from pathlib import Path
@@ -9,22 +10,34 @@ from typing import Any
 import pytest
 
 from convert.converters import (
+    DOCX_IMAGE_MIN_BYTES,
     ConversionError,
     NeedsOCR,
     UnsupportedFormat,
     _cached_or_call_cloud,
     _check_langs_available,
     cloud_allowed,
+    _convert_docx,
     _convert_html,
     _convert_pdf,
     _detect_scan,
+    _docx_image_markers,
+    _docx_referenced_media_ids,
     _ocr_normalize,
     _tesseract_langs,
     _was_ocr_normalized,
     resolve_converter,
 )
 from core.schema import SourceRecord
-from tests.support import valid_record
+from tests.support import (
+    build_docx_with_choice_only_images,
+    build_docx_with_group_and_standalone_image,
+    build_docx_with_inline_chart,
+    build_docx_with_inline_image,
+    build_docx_with_shape_group,
+    build_minimal_docx,
+    valid_record,
+)
 
 
 def test_resolve_converter_pdf(tmp_path: Path) -> None:
@@ -45,6 +58,11 @@ def test_resolve_converter_uppercase_extension(tmp_path: Path) -> None:
 def test_resolve_converter_html(tmp_path: Path) -> None:
     conv = resolve_converter(tmp_path / "raw.html")
     assert conv.name == "html"
+
+
+def test_resolve_converter_docx(tmp_path: Path) -> None:
+    conv = resolve_converter(tmp_path / "raw.docx")
+    assert conv.name == "docx"
 
 
 # --- _convert_html: реальная trafilatura на инлайн-фикстуре (ни сети, ни модели) ---
@@ -116,6 +134,237 @@ def test_convert_html_empty_content_raises(tmp_path: Path) -> None:
     out = tmp_path / "out.md"
     with pytest.raises(ConversionError, match="не извлекла"):
         _convert_html(raw, out, "en")
+
+
+# --- _convert_docx: mammoth+markdownify напрямую на минимальном OOXML (spec
+# convert-docx §2-bis.3) — ни сети, ни бинарников в git: фикстура рождается в
+# тесте заново ---
+
+
+def test_convert_docx_extracts_paragraph_text(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Prvi pasus dokumenta.", "Drugi pasus, sa detaljima."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "cnr")
+    text = out.read_text(encoding="utf-8")
+    assert "Prvi pasus dokumenta." in text
+    assert "Drugi pasus, sa detaljima." in text
+
+
+def test_convert_docx_empty_document_raises(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx([]))
+    out = tmp_path / "out.md"
+    with pytest.raises(ConversionError, match="mammoth/markdownify не извлекли"):
+        _convert_docx(raw, out, "en")
+
+
+def test_convert_docx_whitespace_only_document_raises(tmp_path: Path) -> None:
+    """Параграфы есть, но текст — сплошные пробелы: .strip() должен считать
+    это пустым результатом, а не «успешной» конвертацией в пустой файл."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["   ", "\t"]))
+    out = tmp_path / "out.md"
+    with pytest.raises(ConversionError, match="mammoth/markdownify не извлекли"):
+        _convert_docx(raw, out, "en")
+
+
+# --- _docx_image_markers / §2-bis.3: маркеры растров под figures-VLM, только
+# для media, реально референсированных документом (orphan-фильтр) ---
+
+
+def test_docx_image_markers_no_media_at_all(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Body, no images."]))
+    assert _docx_image_markers(raw) == ""
+
+
+def test_convert_docx_no_figures_section_without_large_images(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_minimal_docx(["Main body text."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "## Figures" not in text
+
+
+def test_convert_docx_inline_image_marker_positioned(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_inline_image(["Before."], big, ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert text.find("Before.") < text.find(id12) < text.find("After.")
+    assert "## Figures" not in text
+
+
+def test_convert_docx_choice_only_image_falls_back_to_figures(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"c.png": big}))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert "## Figures (position unknown)" in text
+    assert id12 in text
+
+
+def test_convert_docx_orphan_media_gets_no_marker(tmp_path: Path) -> None:
+    """build_minimal_docx(media=...) кладёt файл в word/media/ БЕЗ единой
+    ссылки в document.xml.rels — сирота, orphan-фильтр не даёт ей маркера
+    (живой кейс: тестовая вырезка отчёта, 21/28 больших media — сироты)."""
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_minimal_docx(["Main body text."], media={"chart.png": big}))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert "## Figures" not in text
+    assert id12 not in text
+
+
+def test_docx_referenced_media_ids_wired_vs_orphan(tmp_path: Path) -> None:
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+
+    wired = tmp_path / "wired.docx"
+    wired.write_bytes(build_docx_with_inline_image(["Before."], big, ["After."]))
+    assert id12 in _docx_referenced_media_ids(wired)
+
+    orphan = tmp_path / "orphan.docx"
+    orphan.write_bytes(build_minimal_docx(["Body."], media={"chart.png": big}))
+    assert _docx_referenced_media_ids(orphan) == frozenset()
+
+
+def test_docx_image_markers_orphan_silent(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_minimal_docx(["Body."], media={"chart.png": big}))
+    assert _docx_image_markers(raw) == ""
+
+
+def test_docx_image_markers_duplicate_bytes_single_marker(tmp_path: Path) -> None:
+    """Два файла с одинаковыми байтами (Word иногда сохраняет один логотип дважды
+    под разными именами), оба референсированы -> ОДИН маркер (дедуп по id12,
+    в отличие от v1, где каждое вхождение давало свою строку)."""
+    raw = tmp_path / "raw.docx"
+    same = b"y" * (DOCX_IMAGE_MIN_BYTES + 100)
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"a.png": same, "b.png": same}))
+    markers = _docx_image_markers(raw)
+    expected_id = hashlib.sha256(same).hexdigest()[:12]
+    assert markers.count(expected_id) == 1
+
+
+def test_docx_image_markers_exact_threshold_referenced(tmp_path: Path) -> None:
+    """Ровно порог (len == DOCX_IMAGE_MIN_BYTES) не должен считаться маленьким
+    (строгое '<', тот же принцип, что SCAN_MIN_TEXTPAGE_FRACTION)."""
+    raw = tmp_path / "raw.docx"
+    exact = b"x" * DOCX_IMAGE_MIN_BYTES
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"chart.png": exact}))
+    assert _docx_image_markers(raw) != ""
+
+
+def test_docx_image_markers_placed_excluded(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_choice_only_images(["Body."], {"c.png": big}))
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert _docx_image_markers(raw, placed=frozenset({id12})) == ""
+    assert id12 in _docx_image_markers(raw)
+
+
+# --- _convert_docx / composite-группы (spec convert-docx §2-ter): Word рисует
+# сложную инфографику группой фигур (mc:AlternateContent/wpg:wgp) — вырезается
+# ЦЕЛИКОМ pre-проходом docx_groups ДО mammoth, заменяется маркером с captions ---
+
+
+def test_convert_docx_group_marker_positioned_with_captions(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(
+        build_docx_with_shape_group(["Before."], ["Caption A", "Caption B"], {"a.png": big}, ["After."])
+    )
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "[Figure, docx group " in text
+    assert "> captions: Caption A; Caption B" in text
+    assert text.find("Before.") < text.find("[Figure, docx group") < text.find("After.")
+    assert "DOCXGROUPSENTINEL" not in text
+
+
+def test_convert_docx_chart_marker_positioned_with_title(tmp_path: Path) -> None:
+    """Нативный c:chart (kind="chart"): до расширения §2-ter mammoth терял его
+    МОЛЧА (ни маркера, ни текста) — теперь маркер с заголовком из chart-парта
+    стоит на месте чарта в потоке."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_docx_with_inline_chart(["Before."], ["Costs of LTE and 5G"], ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "[Figure, docx chart " in text
+    assert "chart content not analyzed" in text
+    assert "> captions: Costs of LTE and 5G" in text
+    assert text.find("Before.") < text.find("[Figure, docx chart") < text.find("After.")
+    assert "DOCXGROUPSENTINEL" not in text
+
+
+def test_convert_docx_group_media_absorbed_no_individual_markers(tmp_path: Path) -> None:
+    """Картинки ВНУТРИ группы не должны всплыть ни инлайн (mammoth их не видит
+    — поддерево вырезано ДО неё), ни во фолбэк-секции (поглощены через
+    placed=all_media_ids(groups)). id12 маркера группы — хэш XML-поддерева
+    (см. docx_groups.extract_and_strip_groups), НЕ хэш байт картинки — байтовый
+    id картинки нигде в выводе не печатается, используется только внутри для
+    исключения из фолбэка."""
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_shape_group(["Before."], ["Cap"], {"a.png": big}, ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    image_id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert "docx media" not in text  # ни одного индивидуального image-маркера
+    assert "## Figures" not in text  # и во фолбэк не улетело
+    assert image_id12 not in text  # байтовый id картинки нигде не всплывает
+    assert "[Figure, docx group " in text  # групповой маркер (свой id12) есть
+
+
+def test_convert_docx_no_groups_behaves_like_v2(tmp_path: Path) -> None:
+    """Документ без composite-групп — поведение v2 не изменилось (регресс-guard)."""
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_inline_image(["Before."], big, ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert f"> [Image, docx media {id12} — raster content not analyzed]" in text
+    assert "docx group" not in text
+
+
+def test_convert_docx_group_alongside_standalone_image(tmp_path: Path) -> None:
+    """Смешанный документ: composite-группа + ОДИНОЧНАЯ картинка вне группы —
+    оба пути (§2-bis инлайн + §2-ter групповой маркер) работают одновременно,
+    без перекрёстного заражения (группа не проглатывает чужую картинку,
+    одиночная картинка не всплывает как ещё один групповой маркер)."""
+    raw = tmp_path / "raw.docx"
+    group_img = b"g" * (DOCX_IMAGE_MIN_BYTES + 1)
+    standalone_img = b"s" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_group_and_standalone_image(["Cap"], group_img, standalone_img))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    group_image_id12 = hashlib.sha256(group_img).hexdigest()[:12]
+    standalone_id = hashlib.sha256(standalone_img).hexdigest()[:12]
+    assert "[Figure, docx group " in text  # групповой маркер (свой id12 = хэш AC-поддерева)
+    assert f"> [Image, docx media {standalone_id} — raster content not analyzed]" in text
+    assert "## Figures" not in text  # ни один из двух не улетел во фолбэк
+    assert group_image_id12 not in text  # байтовый id картинки ГРУППЫ нигде не всплывает
+    assert text.count(standalone_id) == 1
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---

@@ -11,7 +11,7 @@ explicit_package_bases = true
 
 # networkx/tokenizers/onnxruntime/lxml не поставляют полноценные типы -> не флагать как «нет стабов».
 [[tool.mypy.overrides]]
-module = ["networkx.*", "tokenizers.*", "onnxruntime.*", "lxml.*"]
+module = ["networkx.*", "tokenizers.*", "onnxruntime.*", "lxml.*", "mammoth.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
@@ -24,6 +24,7 @@ markers = [
     "model: тест требует локально скачанную модель bge-m3 (в CI пропускается: -m 'not model')",
     "corpus: тест требует локальный корпус sources/ (в CI пропускается: -m 'not corpus')",
     "ocr: тест требует установленный ocrmypdf (в CI пропускается через skipif — бинарника нет)",
+    "libreoffice: тест требует установленный soffice (в CI пропускается через skipif — бинарника нет)",
 ]
 
 [tool.coverage.run]

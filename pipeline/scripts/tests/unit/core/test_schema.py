@@ -129,9 +129,16 @@ def test_source_format_html_parse() -> None:
     assert rec.source_format == SourceFormat.html
 
 
+def test_source_format_docx_parse() -> None:
+    data = valid_record()
+    data["source_format"] = "docx"
+    rec = SourceRecord.model_validate(data)
+    assert rec.source_format == SourceFormat.docx
+
+
 def test_source_format_bad_rejected() -> None:
     data = valid_record()
-    data["source_format"] = "docx"  # ещё не в enum
+    data["source_format"] = "odt"  # не в enum (legacy-формат — сознательно вне скоупа)
     with pytest.raises(ValidationError):
         SourceRecord.model_validate(data)
 

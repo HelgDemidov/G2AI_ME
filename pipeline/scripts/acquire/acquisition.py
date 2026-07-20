@@ -71,6 +71,8 @@ class ManualAcquisitionConflict(RuntimeError):
 # Challenge pages we've observed (ai.gov.ae/Cloudflare) are small HTML, well under this.
 MIN_EXPECTED_PDF_SIZE = 2048
 MIN_EXPECTED_HTML_SIZE = 1024
+DOCX_MAGIC = b"PK\x03\x04"  # docx = zip-контейнер (OOXML), сигнатура ZIP local-file-header
+MIN_EXPECTED_DOCX_SIZE = 4096
 CHALLENGE_BODY_MARKERS = (b"Attention Required", b"cf-chl", b"Just a moment", b"cf_captcha", b"turnstile")
 DEAD_STATUS_CODES = {404, 410}
 
@@ -126,6 +128,8 @@ def classify_response(
 
     if expected is schema.SourceFormat.html:
         return _classify_html(body, headers, status)
+    if expected is schema.SourceFormat.docx:
+        return _classify_docx(body, headers, status)
     return _classify_pdf(body, headers, status)
 
 
@@ -140,6 +144,22 @@ def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> C
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "response too small to be the expected document")
 
     return ClassifiedResponse(AcquisitionOutcome.blocked, status, "unexpected content (not a valid PDF)")
+
+
+def _classify_docx(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
+    """spec convert-docx §3. Zip-магия (``DOCX_MAGIC``) — необходимое, НЕ достаточное
+    условие (любой zip пройдёт эту проверку) — терминальная страховка на
+    неразличимость от честного docx здесь: mammoth/markdownify поднимут
+    ``ConversionError`` при конвертации не-docx zip'а (см. ``convert/converters._convert_docx``)."""
+    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+        return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
+
+    if status == 200 and body.startswith(DOCX_MAGIC) and len(body) >= MIN_EXPECTED_DOCX_SIZE:
+        return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid DOCX (zip magic)")
+
+    return ClassifiedResponse(
+        AcquisitionOutcome.blocked, status, "unexpected content (not the expected DOCX document)"
+    )
 
 
 def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
@@ -535,12 +555,18 @@ def find_wayback_snapshot(
     return ArchiveSnapshot(timestamp, f"https://web.archive.org/web/{timestamp}id_/{original_url}")
 
 
+_CDX_MIMETYPE_BY_FORMAT = {
+    schema.SourceFormat.html: "text/html",
+    schema.SourceFormat.docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}  # SourceFormat.pdf (и любой будущий формат без записи) -> дефолт "application/pdf" ниже
+
+
 def fetch_from_archive(rec: schema.SourceRecord, dest: Path, *, user_agent: str, timeout: int = 30) -> LadderResult:
     """Last rung of the ladder: only ever reached for a confirmed-dead source_url
     (never for a block — see §2/§9; sensitivity=confidential never reaches here,
     ``next_rung`` routes those to manual instead).
     """
-    mimetype = "text/html" if rec.source_format is schema.SourceFormat.html else "application/pdf"
+    mimetype = _CDX_MIMETYPE_BY_FORMAT.get(rec.source_format, "application/pdf")
     snapshot = find_wayback_snapshot(rec.source_url, mimetype=mimetype, timeout=timeout)
     if snapshot is None:
         raise ArchiveUnavailable(f"нет снимка Wayback для {rec.source_url}")
