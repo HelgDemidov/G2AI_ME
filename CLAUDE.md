@@ -10,7 +10,7 @@
 
 ## Структура репозитория
 ```
-sources/{track}/{entity}/{doc-id}/      # ПАПКА-НА-ДОКУМЕНТ (corpus-layout-v2): track=intl-xperience|montenegro; entity=слаг (sg/ee/oecd…)
+sources/{track}/{entity}/{doc-id}/      # ПАПКА-НА-ДОКУМЕНТ (corpus-layout-v2): track=intl-xperience|montenegro|research-papers; entity=слаг (sg/ee/oecd…; для research-papers — издатель: wef/unidir/cnas…, НЕ iso2)
 #   ├─ meta.yaml    — курируемая запись (Dublin Core + topics/g2ai_pattern/summary/relevance); ТРЕКАЕТСЯ в git
 #   └─ raw.* (pdf|html — SourceFormat) / doc.md / .state.yaml — оригинал / конвертация / операц.состояние (sha256/acquisition); НЕ в git
 sources/candidates.yaml             # слой кандидатов (CandidateRecord) ДО допуска триажем (НЕ в git)
