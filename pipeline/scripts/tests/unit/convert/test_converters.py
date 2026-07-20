@@ -32,6 +32,7 @@ from core.schema import SourceRecord
 from tests.support import (
     build_docx_with_choice_only_images,
     build_docx_with_group_and_standalone_image,
+    build_docx_with_inline_chart,
     build_docx_with_inline_image,
     build_docx_with_shape_group,
     build_minimal_docx,
@@ -293,6 +294,22 @@ def test_convert_docx_group_marker_positioned_with_captions(tmp_path: Path) -> N
     assert "[Figure, docx group " in text
     assert "> captions: Caption A; Caption B" in text
     assert text.find("Before.") < text.find("[Figure, docx group") < text.find("After.")
+    assert "DOCXGROUPSENTINEL" not in text
+
+
+def test_convert_docx_chart_marker_positioned_with_title(tmp_path: Path) -> None:
+    """Нативный c:chart (kind="chart"): до расширения §2-ter mammoth терял его
+    МОЛЧА (ни маркера, ни текста) — теперь маркер с заголовком из chart-парта
+    стоит на месте чарта в потоке."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_docx_with_inline_chart(["Before."], ["Costs of LTE and 5G"], ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "[Figure, docx chart " in text
+    assert "chart content not analyzed" in text
+    assert "> captions: Costs of LTE and 5G" in text
+    assert text.find("Before.") < text.find("[Figure, docx chart") < text.find("After.")
     assert "DOCXGROUPSENTINEL" not in text
 
 

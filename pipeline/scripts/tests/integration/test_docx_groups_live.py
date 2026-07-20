@@ -25,10 +25,19 @@ pytestmark = [
     pytest.mark.skipif(not _FIXTURE.exists(), reason="тестовая фикстура fixtures/local отсутствует (gitignored)"),
 ]
 
-# Известные id трёх composite-групп фикстуры (spec §2-ter.2, живой прогон 2026-07-20):
-# «Программа European Large-Scale IoT Pilots», EU Data Act flow, «Матрица
-# приоритетных секторов IoT в Бразилии».
-_KNOWN_GROUP_IDS = ["31cb26ede622", "863b94a50ac0", "5fef7b6067d0"]
+# Известные id renderable-объектов фикстуры (spec §2-ter.2 + ultimate-тест
+# 2026-07-20, после трансплантации 5 объектов из полного отчёта):
+# группы — «Программа European Large-Scale IoT Pilots», EU Data Act flow,
+# «Матрица приоритетных секторов IoT в Бразилии», «5G/IMT-2020 сценарии»,
+# «Карта Wi-Fi 6E»; chart — bar-график CAPEX/OPEX частных сетей LTE/5G.
+_KNOWN_GROUP_IDS = [
+    "31cb26ede622",
+    "863b94a50ac0",
+    "5fef7b6067d0",
+    "cf269e703022",
+    "33be0a31a485",
+    "34d4b5014cb4",
+]
 
 
 @pytest.mark.parametrize("group_id", _KNOWN_GROUP_IDS)

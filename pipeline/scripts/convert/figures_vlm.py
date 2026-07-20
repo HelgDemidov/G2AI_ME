@@ -56,10 +56,12 @@ _DOCX_IMAGE_MARKER_RE = re.compile(
     r"^> \[Image, docx media (?P<id>[0-9a-f]{12}) — raster content not analyzed\]$",
     re.MULTILINE,
 )
-# docx composite-группа (spec convert-docx §2-ter): зеркало docx_groups._render_group_marker
-# — 2 строки (маркер + сохранённые captions, zero-loss без VLM).
+# docx composite-группа ИЛИ нативный c:chart (spec convert-docx §2-ter): зеркало
+# docx_groups._render_group_marker — 2 строки (маркер + сохранённые captions,
+# zero-loss без VLM); kind различает существительное («composite»/«chart»),
+# обработка обоих идентична (рендер по id через extract_group_docx).
 _DOCX_GROUP_MARKER_RE = re.compile(
-    r"^> \[Figure, docx group (?P<id>[0-9a-f]{12}) — composite content not analyzed\]\n"
+    r"^> \[Figure, docx (?P<kind>group|chart) (?P<id>[0-9a-f]{12}) — (?:composite|chart) content not analyzed\]\n"
     r"> captions: .*$",
     re.MULTILINE,
 )
@@ -229,7 +231,13 @@ def _content_bbox(page: Any) -> pdf_graphics.BBox | None:
     """Плотный bbox видимого контента страницы (объединение rects/curves/images/
     chars) — вся страница мини-docx несёт много пустых полей вокруг самой
     группы (spec §2-ter.3: «кроп bbox контента страницы»). None — пустая
-    страница (не должно случаться для непустой группы, но не падаем)."""
+    страница (не должно случаться для непустой группы, но не падаем).
+
+    Объединение КЛЭМПИТСЯ к bbox страницы: LO при рендере мини-docx может
+    выложить объект частично ЗА край страницы (живой кейс ultimate-теста —
+    фантомный элемент чарта с top=-57pt); заэкранное не видно и в самом PDF
+    (обрезано страницей), а ``page.crop()`` с выходящим за страницу bbox
+    падает — клэмп ничего видимого не теряет (подтверждено пикселями)."""
     xs0: list[float] = []
     tops: list[float] = []
     xs1: list[float] = []
@@ -242,7 +250,12 @@ def _content_bbox(page: Any) -> pdf_graphics.BBox | None:
             bottoms.append(el["bottom"])
     if not xs0:
         return None
-    return (min(xs0), min(tops), max(xs1), max(bottoms))
+    px0, ptop, px1, pbottom = page.bbox
+    x0, top = max(min(xs0), px0), max(min(tops), ptop)
+    x1, bottom = min(max(xs1), px1), min(max(bottoms), pbottom)
+    if x0 >= x1 or top >= bottom:
+        return None
+    return (x0, top, x1, bottom)
 
 
 def _render_docx_group(raw: Path, id12: str) -> str | None:
@@ -336,9 +349,9 @@ def _render_injected_docx_image(marker_id: str, model: str, markdown: str) -> st
     )
 
 
-def _render_injected_docx_group(id12: str, model: str, markdown: str) -> str:
+def _render_injected_docx_group(id12: str, model: str, markdown: str, kind: str = "group") -> str:
     return (
-        f"> [Figure, docx group {id12} — VLM interpretation ({model}); "
+        f"> [Figure, docx {kind} {id12} — VLM interpretation ({model}); "
         f"reconstruction, verify against original]\n\n{markdown}"
     )
 
@@ -458,7 +471,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 cache[gid] = entry
                 cache_dirty = True
             replacements.append(
-                (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"]))
+                (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"], m.group("kind")))
             )
     finally:
         if pdf_doc is not None:

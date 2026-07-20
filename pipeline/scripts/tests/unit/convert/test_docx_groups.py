@@ -12,9 +12,14 @@ from convert.docx_groups import (
     SENTINEL_PREFIX,
     all_media_ids,
     extract_and_strip_groups,
+    extract_group_docx,
     inject_group_markers,
 )
-from tests.support import build_docx_with_shape_group, build_minimal_docx
+from tests.support import (
+    build_docx_with_inline_chart,
+    build_docx_with_shape_group,
+    build_minimal_docx,
+)
 
 
 def test_no_groups_returns_original_bytes_unchanged(tmp_path: Path) -> None:
@@ -138,6 +143,69 @@ def test_inject_group_markers_empty_captions_says_no_text() -> None:
 def test_inject_group_markers_no_groups_is_noop() -> None:
     text = "Nothing to replace here."
     assert inject_group_markers(text, []) == text
+
+
+def test_detects_native_chart_with_title_captions(tmp_path: Path) -> None:
+    """Голый c:chart (kind="chart", §2-ter ultimate-тест): анкер без Fallback,
+    заголовок берётся из chart-парта (c:title), а не из document.xml."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_docx_with_inline_chart(["Before."], ["Costs of LTE", "and 5G"], ["After."]))
+    rewritten, groups = extract_and_strip_groups(raw)
+    assert len(groups) == 1
+    chart = groups[0]
+    assert chart.kind == "chart"
+    assert chart.media_ids == frozenset()
+    assert chart.captions == ("Costs of LTE", "and 5G")
+    with zipfile.ZipFile(BytesIO(rewritten)) as z:
+        doc_xml = z.read("word/document.xml").decode("utf-8")
+    assert "c:chart" not in doc_xml
+    assert f"{SENTINEL_PREFIX}{chart.id12}" in doc_xml
+
+
+def test_chart_inside_alternate_content_not_detected(tmp_path: Path) -> None:
+    """Чарт, обёрнутый в mc:AlternateContent (класс chartEx: Choice несёт
+    диаграмму, Fallback — готовую PNG от Word), детектом СОЗНАТЕЛЬНО
+    пропускается — его забирает mammoth-путь инлайн-картинок через Fallback
+    (см. докстроку модуля). Билдер build_docx_with_choice_only_images кладёт
+    drawing именно внутрь AC — дополняем его якорем чарта вручную."""
+    from tests.support import _OOXML_MC, _docx_chart_drawing, _docx_para, _docx_zip
+
+    body = _docx_para("Before.")
+    body += (
+        f'<w:p><w:r><mc:AlternateContent xmlns:mc="{_OOXML_MC}">'
+        f'<mc:Choice Requires="cx1">{_docx_chart_drawing("rId300")}</mc:Choice>'
+        f"<mc:Fallback/></mc:AlternateContent></w:r></w:p>"
+    )
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(_docx_zip(body, {}))
+    rewritten, groups = extract_and_strip_groups(raw)
+    assert groups == []
+    assert rewritten == raw.read_bytes()
+
+
+def test_inject_chart_marker_uses_chart_noun() -> None:
+    from convert.docx_groups import DocxGroup
+
+    chart = DocxGroup(id12="abc123def456", media_ids=frozenset(), captions=("Title",), kind="chart")
+    result = inject_group_markers(f"{SENTINEL_PREFIX}abc123def456", [chart])
+    assert "> [Figure, docx chart abc123def456 — chart content not analyzed]" in result
+    assert "> captions: Title" in result
+
+
+def test_extract_group_docx_finds_chart_and_keeps_chart_part(tmp_path: Path) -> None:
+    """Мини-docx чарта: body сжат до одного блока, chart-парт (и его rels)
+    доезжают автоматически — extract_group_docx копирует ВЕСЬ zip."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_docx_with_inline_chart(["Before."], ["Title"], ["After."]))
+    _rewritten, groups = extract_and_strip_groups(raw)
+    mini = extract_group_docx(raw, groups[0].id12)
+    assert mini is not None
+    with zipfile.ZipFile(BytesIO(mini)) as z:
+        assert "word/charts/chart1.xml" in z.namelist()
+        doc_xml = z.read("word/document.xml").decode("utf-8")
+    assert "c:chart" in doc_xml or "chart" in doc_xml
+    assert "Before." not in doc_xml
+    assert "After." not in doc_xml
 
 
 def test_all_media_ids_unions_across_groups() -> None:

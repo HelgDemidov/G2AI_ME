@@ -171,6 +171,70 @@ def build_docx_with_shape_group(
     return _docx_zip(body, images)
 
 
+_OOXML_C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+
+
+def _docx_chart_drawing(rid: str) -> str:
+    """Голый w:drawing с c:chart-анкером (kind="chart" в docx_groups): нативный
+    Word-чарт БЕЗ AlternateContent/Fallback — класс «mammoth молча теряет»."""
+    return (
+        f'<w:drawing xmlns:wp="{_OOXML_WP}"><wp:inline>'
+        f'<wp:docPr id="2" name="Chart"/>'
+        f'<a:graphic xmlns:a="{_OOXML_A}"><a:graphicData uri="{_OOXML_C}">'
+        f'<c:chart xmlns:c="{_OOXML_C}" r:id="{rid}" xmlns:r="{_OOXML_R}"/>'
+        f"</a:graphicData></a:graphic></wp:inline></w:drawing>"
+    )
+
+
+def _docx_chart_part(title_texts: list[str]) -> str:
+    """Минимальный chart-парт: c:title с rich-текстом (источник captions
+    маркера) — плюс пустой plotArea для структурной правдоподобности."""
+    runs = "".join(f'<a:r xmlns:a="{_OOXML_A}"><a:t>{t}</a:t></a:r>' for t in title_texts)
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<c:chartSpace xmlns:c="{_OOXML_C}"><c:chart>'
+        f'<c:title><c:tx><c:rich><a:p xmlns:a="{_OOXML_A}">{runs}</a:p></c:rich></c:tx></c:title>'
+        f"<c:plotArea/></c:chart></c:chartSpace>"
+    )
+
+
+def build_docx_with_inline_chart(
+    before: list[str], title_texts: list[str], after: list[str]
+) -> bytes:
+    """docx с ОДНИМ нативным c:chart (spec convert-docx §2-ter, kind="chart"):
+    drawing-анкер в body + chart-парт с заголовком + rels/[Content_Types]."""
+    body = "".join(_docx_para(p) for p in before)
+    body += f"<w:p><w:r>{_docx_chart_drawing('rId200')}</w:r></w:p>"
+    body += "".join(_docx_para(p) for p in after)
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_OOXML_W}"><w:body>{body}</w:body></w:document>'
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId200" Type="{_OOXML_R}/chart" Target="charts/chart1.xml"/>'
+        "</Relationships>"
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
+        "</Types>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+        z.writestr("word/charts/chart1.xml", _docx_chart_part(title_texts))
+    return buf.getvalue()
+
+
 def build_docx_with_group_and_standalone_image(
     group_captions: list[str], group_image: bytes, standalone_image: bytes
 ) -> bytes:

@@ -544,6 +544,7 @@ class _FakeGroupPage:
     curves: list[Any] = []
     images: list[Any] = []
     chars: list[Any] = []
+    bbox = (0.0, 0.0, 595.0, 842.0)
 
     def crop(self, bbox: Any) -> "_FakeGroupPage":
         return self
@@ -590,9 +591,37 @@ def test_content_bbox_unions_elements() -> None:
         curves: list[Any] = []
         images = [{"x0": 0.0, "x1": 30.0, "top": 2.0, "bottom": 8.0}]
         chars: list[Any] = []
+        bbox = (0.0, 0.0, 595.0, 842.0)
 
     bbox = _content_bbox(_Page())
     assert bbox == (0.0, 2.0, 30.0, 15.0)
+
+
+def test_content_bbox_clamped_to_page_box() -> None:
+    """LO может выложить фантомный элемент мини-docx частично за край страницы
+    (живой кейс ultimate-теста: top=-57pt у чарта) — объединение клэмпится к
+    bbox страницы, иначе page.crop() падает; видимого контента за страницей
+    нет по построению (PDF обрезает)."""
+
+    class _Page:
+        rects = [{"x0": 79.0, "x1": 559.0, "top": -57.3, "bottom": 422.6}]
+        curves: list[Any] = []
+        images: list[Any] = []
+        chars: list[Any] = []
+        bbox = (0.0, 0.0, 595.3, 841.9)
+
+    assert _content_bbox(_Page()) == (79.0, 0.0, 559.0, 422.6)
+
+
+def test_content_bbox_fully_offpage_returns_none() -> None:
+    class _Page:
+        rects = [{"x0": -50.0, "x1": -10.0, "top": 5.0, "bottom": 15.0}]
+        curves: list[Any] = []
+        images: list[Any] = []
+        chars: list[Any] = []
+        bbox = (0.0, 0.0, 595.0, 842.0)
+
+    assert _content_bbox(_Page()) is None
 
 
 def test_render_docx_group_no_soffice_returns_none_and_warns(tmp_path: Path, monkeypatch: Any, caplog: Any) -> None:
@@ -702,6 +731,51 @@ def test_apply_figures_pass_docx_group_cache_miss_calls_render_and_vlm(tmp_path:
     )
     assert "Group description." in text
     assert "composite content not analyzed" not in text
+
+
+def _docx_chart_md(chart_id: str, captions: str = "Chart title") -> str:
+    return (
+        "# Title\n\nBody prose.\n\n"
+        f"> [Figure, docx chart {chart_id} — chart content not analyzed]\n"
+        f"> captions: {captions}\n"
+    )
+
+
+def test_docx_chart_marker_detected_by_has_bare_markers() -> None:
+    assert has_bare_markers(_docx_chart_md("b" * 12)) is True
+
+
+def test_apply_figures_pass_docx_chart_injects_chart_noun(tmp_path: Path, monkeypatch: Any) -> None:
+    """kind="chart" (§2-ter, нативный c:chart): единый цикл обработки с
+    группами, но существительное маркера сохраняется и в инъецированном виде."""
+    from convert import docx_groups
+    from tests.support import build_docx_with_inline_chart
+
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_docx_with_inline_chart([], ["Chart title"], []))
+    _rewritten, groups = docx_groups.extract_and_strip_groups(raw)
+    cid = groups[0].id12
+    md = tmp_path / "doc.md"
+    md.write_text(_docx_chart_md(cid), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "convert.figures_vlm._render_docx_group", lambda raw_, id12: "data:image/jpeg;base64,AAA"
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda payload, *, api_key, timeout=1800.0: {
+            "choices": [{"message": {"content": "Chart description."}}]
+        },
+    )
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    text = md.read_text(encoding="utf-8")
+    assert (
+        f"> [Figure, docx chart {cid} — VLM interpretation (m); "
+        "reconstruction, verify against original]" in text
+    )
+    assert "Chart description." in text
+    assert "chart content not analyzed" not in text
 
 
 def test_apply_figures_pass_docx_group_cache_hit_skips_render(tmp_path: Path, monkeypatch: Any) -> None:
