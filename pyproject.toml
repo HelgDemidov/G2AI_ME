@@ -24,6 +24,7 @@ markers = [
     "model: тест требует локально скачанную модель bge-m3 (в CI пропускается: -m 'not model')",
     "corpus: тест требует локальный корпус sources/ (в CI пропускается: -m 'not corpus')",
     "ocr: тест требует установленный ocrmypdf (в CI пропускается через skipif — бинарника нет)",
+    "libreoffice: тест требует установленный soffice (в CI пропускается через skipif — бинарника нет)",
 ]
 
 [tool.coverage.run]

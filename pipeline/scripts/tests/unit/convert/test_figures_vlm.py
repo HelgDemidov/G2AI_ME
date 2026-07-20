@@ -13,11 +13,14 @@ import yaml
 from convert import pdf_graphics, pdf_to_markdown
 from convert.figures_vlm import (
     FIG_PROMPT,
+    _content_bbox,
     _docx_media_uri,
+    _render_docx_group,
+    _soffice_available,
     apply_figures_pass,
     has_bare_markers,
 )
-from tests.support import build_minimal_docx
+from tests.support import build_docx_with_shape_group, build_minimal_docx
 
 
 def _region(rid: str, bbox: pdf_graphics.BBox = (0.0, 0.0, 10.0, 10.0), kind: str = "opaque") -> pdf_graphics.Region:
@@ -511,3 +514,250 @@ def test_apply_figures_pass_docx_duplicate_id_single_vlm_call(tmp_path: Path, mo
     assert changed is True
     assert len(calls) == 1
     assert md.read_text(encoding="utf-8").count("Shared figure.") == 2
+
+
+# --- docx composite-группы (spec convert-docx §2-ter): маркер + captions,
+# рендер = изолированный мини-docx -> soffice -> PDF -> кроп bbox -> data-URI.
+# soffice/pdfplumber — мокнуты; реальный рендер — integration-тест отдельным
+# файлом (tests/integration/test_docx_groups_live.py, требует системный soffice) ---
+
+
+def _docx_group_md(group_id: str, captions: str = "Cap A; Cap B") -> str:
+    return (
+        "# Title\n\nBody prose.\n\n"
+        f"> [Figure, docx group {group_id} — composite content not analyzed]\n"
+        f"> captions: {captions}\n"
+    )
+
+
+def _build_group_raw(tmp_path: Path, captions: list[str], images: dict[str, bytes]) -> tuple[Path, str]:
+    from convert import docx_groups
+
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_docx_with_shape_group([], captions, images, []))
+    _rewritten, groups = docx_groups.extract_and_strip_groups(raw)
+    return raw, groups[0].id12
+
+
+class _FakeGroupPage:
+    rects: list[Any] = []
+    curves: list[Any] = []
+    images: list[Any] = []
+    chars: list[Any] = []
+
+    def crop(self, bbox: Any) -> "_FakeGroupPage":
+        return self
+
+    def to_image(self, resolution: int) -> "_FakeGroupPage":
+        return self
+
+    @property
+    def original(self) -> Any:
+        from PIL import Image
+
+        return Image.new("RGB", (4, 4), color="white")
+
+
+class _FakeGroupPdf:
+    def __init__(self) -> None:
+        self.pages = [_FakeGroupPage()]
+
+    def __enter__(self) -> "_FakeGroupPdf":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        pass
+
+
+def test_docx_group_marker_detected_by_has_bare_markers() -> None:
+    assert has_bare_markers(_docx_group_md("a" * 12)) is True
+
+
+def test_soffice_available_reflects_shutil_which(monkeypatch: Any) -> None:
+    monkeypatch.setattr("convert.figures_vlm.shutil.which", lambda name: "/usr/bin/soffice")
+    assert _soffice_available() is True
+    monkeypatch.setattr("convert.figures_vlm.shutil.which", lambda name: None)
+    assert _soffice_available() is False
+
+
+def test_content_bbox_empty_page_returns_none() -> None:
+    assert _content_bbox(_FakeGroupPage()) is None
+
+
+def test_content_bbox_unions_elements() -> None:
+    class _Page:
+        rects = [{"x0": 10.0, "x1": 20.0, "top": 5.0, "bottom": 15.0}]
+        curves: list[Any] = []
+        images = [{"x0": 0.0, "x1": 30.0, "top": 2.0, "bottom": 8.0}]
+        chars: list[Any] = []
+
+    bbox = _content_bbox(_Page())
+    assert bbox == (0.0, 2.0, 30.0, 15.0)
+
+
+def test_render_docx_group_no_soffice_returns_none_and_warns(tmp_path: Path, monkeypatch: Any, caplog: Any) -> None:
+    import logging
+
+    raw, gid = _build_group_raw(tmp_path, ["Cap"], {})
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: False)
+    with caplog.at_level(logging.WARNING):
+        result = _render_docx_group(raw, gid)
+    assert result is None
+    assert "soffice не установлен" in caplog.text
+
+
+def test_render_docx_group_extraction_miss_returns_none_and_warns(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import logging
+
+    raw, _gid = _build_group_raw(tmp_path, ["Cap"], {})
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+    with caplog.at_level(logging.WARNING):
+        result = _render_docx_group(raw, "0" * 12)  # такого id в документе нет
+    assert result is None
+    assert "не найдена при пере-детекции" in caplog.text
+
+
+def test_render_docx_group_soffice_nonzero_exit_returns_none_and_warns(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import logging
+
+    raw, gid = _build_group_raw(tmp_path, ["Cap"], {})
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+
+    class _Result:
+        returncode = 1
+        stderr = "boom"
+
+    monkeypatch.setattr("convert.figures_vlm.subprocess.run", lambda *a, **kw: _Result())
+    with caplog.at_level(logging.WARNING):
+        result = _render_docx_group(raw, gid)
+    assert result is None
+    assert "не смог отрендерить" in caplog.text
+
+
+def test_render_docx_group_soffice_timeout_returns_none_and_warns(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import logging
+    import subprocess as sp
+
+    raw, gid = _build_group_raw(tmp_path, ["Cap"], {})
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+
+    def fake_run(*a: Any, **kw: Any) -> Any:
+        raise sp.TimeoutExpired(cmd="soffice", timeout=60)
+
+    monkeypatch.setattr("convert.figures_vlm.subprocess.run", fake_run)
+    with caplog.at_level(logging.WARNING):
+        result = _render_docx_group(raw, gid)
+    assert result is None
+    assert "не уложился" in caplog.text
+
+
+def test_render_docx_group_success_returns_data_uri(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, gid = _build_group_raw(tmp_path, ["Cap"], {})
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd: list[str], *, check: bool, capture_output: bool, text: bool, timeout: float) -> Any:
+        outdir = Path(cmd[cmd.index("--outdir") + 1])
+        (outdir / "group.pdf").write_bytes(b"%PDF-fake")
+        return _Result()
+
+    monkeypatch.setattr("convert.figures_vlm.subprocess.run", fake_run)
+    monkeypatch.setattr("convert.figures_vlm.pdfplumber.open", lambda path: _FakeGroupPdf())
+    result = _render_docx_group(raw, gid)
+    assert result is not None
+    assert result.startswith("data:image/jpeg;base64,")
+
+
+def test_apply_figures_pass_docx_group_cache_miss_calls_render_and_vlm(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, gid = _build_group_raw(tmp_path, ["Cap A", "Cap B"], {})
+    md = tmp_path / "doc.md"
+    md.write_text(_docx_group_md(gid, "Cap A; Cap B"), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "convert.figures_vlm._render_docx_group", lambda raw_, id12: "data:image/jpeg;base64,AAA"
+    )
+    calls: list[dict[str, Any]] = []
+
+    def fake_chat(payload: dict[str, Any], *, api_key: str, timeout: float = 1800.0) -> dict[str, Any]:
+        calls.append(payload)
+        return {"choices": [{"message": {"content": "Group description."}}]}
+
+    monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert len(calls) == 1
+    text = md.read_text(encoding="utf-8")
+    assert (
+        f"> [Figure, docx group {gid} — VLM interpretation (m); "
+        "reconstruction, verify against original]" in text
+    )
+    assert "Group description." in text
+    assert "composite content not analyzed" not in text
+
+
+def test_apply_figures_pass_docx_group_cache_hit_skips_render(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, gid = _build_group_raw(tmp_path, ["Cap"], {})
+    md = tmp_path / "doc.md"
+    md.write_text(_docx_group_md(gid), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({gid: {"model": "cached", "markdown": "Cached group.", "requested": "2026-01-01"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm._render_docx_group",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("рендер не должен был вызываться")),
+    )
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert "Cached group." in md.read_text(encoding="utf-8")
+
+
+def test_apply_figures_pass_docx_group_render_failure_leaves_marker_unchanged(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    raw, gid = _build_group_raw(tmp_path, ["Cap"], {})
+    text = _docx_group_md(gid)
+    md = tmp_path / "doc.md"
+    md.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr("convert.figures_vlm._render_docx_group", lambda raw_, id12: None)
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("VLM не должен был вызываться")),
+    )
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is False
+    assert md.read_text(encoding="utf-8") == text
+
+
+def test_apply_figures_pass_docx_group_idempotent_second_run(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, gid = _build_group_raw(tmp_path, ["Cap"], {})
+    md = tmp_path / "doc.md"
+    md.write_text(_docx_group_md(gid), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "convert.figures_vlm._render_docx_group", lambda raw_, id12: "data:image/jpeg;base64,AAA"
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Prose."}}]},
+    )
+    assert apply_figures_pass(md, raw, model="m") is True
+    once = md.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("двойной прогон не должен звать сеть")),
+    )
+    assert apply_figures_pass(md, raw, model="m") is False
+    assert md.read_text(encoding="utf-8") == once

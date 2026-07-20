@@ -94,6 +94,21 @@ def _group_captions(ac: Any) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _iter_group_acs(body: Any) -> list[tuple[Any, Any]]:
+    """Топ-level (block, ac) пары для всех composite-групп ``body`` — общая
+    точка детекта для ``extract_and_strip_groups``/``extract_group_docx``
+    (единственный критерий: ``mc:Choice`` несёт ``wpg:wgp``, см. докстроку
+    модуля)."""
+    pairs: list[tuple[Any, Any]] = []
+    for block in list(body):
+        for ac in block.findall(f".//{_q('mc', 'AlternateContent')}"):
+            choice = ac.find(_q("mc", "Choice"))
+            if choice is None or choice.find(f".//{_q('wpg', 'wgp')}") is None:
+                continue
+            pairs.append((block, ac))
+    return pairs
+
+
 def extract_and_strip_groups(raw: Path) -> tuple[bytes, list[DocxGroup]]:
     """Вернуть (переписанный zip docx, найденные группы). Ноль групп -> байты
     БАЙТ-В-БАЙТ идентичны ``raw.read_bytes()`` (документ без composite-групп —
@@ -108,21 +123,17 @@ def extract_and_strip_groups(raw: Path) -> tuple[bytes, list[DocxGroup]]:
         tree = etree.fromstring(z.read("word/document.xml"))
         body = tree.find(_q("w", "body"))
         groups: list[DocxGroup] = []
-        for block in list(body):
-            for ac in block.findall(f".//{_q('mc', 'AlternateContent')}"):
-                choice = ac.find(_q("mc", "Choice"))
-                if choice is None or choice.find(f".//{_q('wpg', 'wgp')}") is None:
-                    continue
-                media_ids = _group_media_ids(ac, rel_targets, z, names)
-                captions = _group_captions(ac)
-                id12 = hashlib.sha256(etree.tostring(ac)).hexdigest()[:12]
-                groups.append(DocxGroup(id12=id12, media_ids=media_ids, captions=captions))
+        for _block, ac in _iter_group_acs(body):
+            media_ids = _group_media_ids(ac, rel_targets, z, names)
+            captions = _group_captions(ac)
+            id12 = hashlib.sha256(etree.tostring(ac)).hexdigest()[:12]
+            groups.append(DocxGroup(id12=id12, media_ids=media_ids, captions=captions))
 
-                run = ac.getparent()
-                sentinel = etree.Element(_q("w", "t"))
-                sentinel.set(_XML_SPACE, "preserve")
-                sentinel.text = f"{SENTINEL_PREFIX}{id12}"
-                run.replace(ac, sentinel)
+            run = ac.getparent()
+            sentinel = etree.Element(_q("w", "t"))
+            sentinel.set(_XML_SPACE, "preserve")
+            sentinel.text = f"{SENTINEL_PREFIX}{id12}"
+            run.replace(ac, sentinel)
         if not groups:
             return orig, []
         new_doc_xml = etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
@@ -131,6 +142,37 @@ def extract_and_strip_groups(raw: Path) -> tuple[bytes, list[DocxGroup]]:
             for n in z.namelist():
                 zo.writestr(n, new_doc_xml if n == "word/document.xml" else z.read(n))
         return buf.getvalue(), groups
+
+
+def extract_group_docx(raw: Path, id12: str) -> bytes | None:
+    """Пересобрать мини-docx, содержащий ТОЛЬКО блок с данной группой (+
+    ``sectPr`` оригинала для геометрии страницы) — под изолированный рендер
+    через soffice (``figures_vlm._render_docx_group``). Прототип 2026-07-20:
+    все 3 диаграммы тестовой вырезки отрендерились этим способом ЦЕЛИКОМ.
+    None — группа с таким id12 не найдена при пере-детекции (raw изменился?)."""
+    with zipfile.ZipFile(raw) as z:
+        names = z.namelist()
+        tree = etree.fromstring(z.read("word/document.xml"))
+        body = tree.find(_q("w", "body"))
+        blocks = list(body)
+        target = next(
+            (block for block, ac in _iter_group_acs(body) if hashlib.sha256(etree.tostring(ac)).hexdigest()[:12] == id12),
+            None,
+        )
+        if target is None:
+            return None
+        sect = blocks[-1] if etree.QName(blocks[-1]).localname == "sectPr" else None
+        for block in blocks:
+            body.remove(block)
+        body.append(target)
+        if sect is not None and sect is not target:
+            body.append(sect)
+        new_doc_xml = etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zo:
+            for n in names:
+                zo.writestr(n, new_doc_xml if n == "word/document.xml" else z.read(n))
+        return buf.getvalue()
 
 
 def _render_group_marker(id12: str, captions: tuple[str, ...]) -> str:

@@ -25,6 +25,9 @@ import io
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -32,7 +35,7 @@ from typing import Any
 import pdfplumber
 import yaml
 
-from convert import pdf_graphics, pdf_to_markdown
+from convert import docx_groups, pdf_graphics, pdf_to_markdown
 from core import fsio, openrouter
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,13 @@ _IMAGE_MARKER_RE = re.compile(
 # номера страницы (docx reflowable, надёжного понятия страницы нет).
 _DOCX_IMAGE_MARKER_RE = re.compile(
     r"^> \[Image, docx media (?P<id>[0-9a-f]{12}) — raster content not analyzed\]$",
+    re.MULTILINE,
+)
+# docx composite-группа (spec convert-docx §2-ter): зеркало docx_groups._render_group_marker
+# — 2 строки (маркер + сохранённые captions, zero-loss без VLM).
+_DOCX_GROUP_MARKER_RE = re.compile(
+    r"^> \[Figure, docx group (?P<id>[0-9a-f]{12}) — composite content not analyzed\]\n"
+    r"> captions: .*$",
     re.MULTILINE,
 )
 
@@ -102,6 +112,7 @@ def has_bare_markers(text: str) -> bool:
         _FIGURE_MARKER_RE.search(text)
         or _IMAGE_MARKER_RE.search(text)
         or _DOCX_IMAGE_MARKER_RE.search(text)
+        or _DOCX_GROUP_MARKER_RE.search(text)
     )
 
 
@@ -207,6 +218,88 @@ def _docx_media_uri(raw: Path, marker_id: str) -> str | None:
     return None
 
 
+GROUP_RENDER_TIMEOUT = 60  # soffice headless на одну (~1-страничную) группу — секунды
+
+
+def _soffice_available() -> bool:
+    return shutil.which("soffice") is not None
+
+
+def _content_bbox(page: Any) -> pdf_graphics.BBox | None:
+    """Плотный bbox видимого контента страницы (объединение rects/curves/images/
+    chars) — вся страница мини-docx несёт много пустых полей вокруг самой
+    группы (spec §2-ter.3: «кроп bbox контента страницы»). None — пустая
+    страница (не должно случаться для непустой группы, но не падаем)."""
+    xs0: list[float] = []
+    tops: list[float] = []
+    xs1: list[float] = []
+    bottoms: list[float] = []
+    for collection in (page.rects, page.curves, page.images, page.chars):
+        for el in collection:
+            xs0.append(el["x0"])
+            xs1.append(el["x1"])
+            tops.append(el["top"])
+            bottoms.append(el["bottom"])
+    if not xs0:
+        return None
+    return (min(xs0), min(tops), max(xs1), max(bottoms))
+
+
+def _render_docx_group(raw: Path, id12: str) -> str | None:
+    """Композитная группа (spec §2-ter): изолированный мини-docx (см.
+    ``docx_groups.extract_group_docx``) -> ``soffice --headless`` -> PDF ->
+    кроп по bbox контента -> data-URI JPEG. Требует системный LibreOffice —
+    та же категория зависимости, что tesseract/ocrmypdf у OCR-пути (см.
+    ``_check_langs_available``); отсутствие/отказ -> None + warning, маркер+
+    captions остаются как честный fallback (zero-loss без VLM, §2-ter.3)."""
+    if not _soffice_available():
+        logger.warning(
+            "%s: soffice не установлен — группа %s пропущена (sudo apt install libreoffice)",
+            raw.name, id12,
+        )
+        return None
+    mini_docx = docx_groups.extract_group_docx(raw, id12)
+    if mini_docx is None:
+        logger.warning(
+            "%s: группа %s не найдена при пере-детекции (raw изменился?) — маркер пропущен",
+            raw.name, id12,
+        )
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        docx_path = tmp_dir / "group.docx"
+        docx_path.write_bytes(mini_docx)
+        try:
+            result = subprocess.run(
+                ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(tmp_dir), str(docx_path)],
+                check=False, capture_output=True, text=True, timeout=GROUP_RENDER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("%s: soffice не уложился в %ss на группе %s — маркер пропущен",
+                            raw.name, GROUP_RENDER_TIMEOUT, id12)
+            return None
+        pdf_path = tmp_dir / "group.pdf"
+        if result.returncode != 0 or not pdf_path.exists():
+            logger.warning(
+                "%s: soffice не смог отрендерить группу %s (%s) — маркер пропущен",
+                raw.name, id12, result.stderr[-300:],
+            )
+            return None
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                page = pdf.pages[0]
+                bbox = _content_bbox(page)
+                cropped = page.crop(bbox) if bbox is not None else page
+                img = cropped.to_image(resolution=FIGURE_RENDER_DPI).original.convert("RGB")
+        except Exception as exc:  # noqa: BLE001 — рендер PDF тоже может отказать
+            logger.warning("%s: рендер PDF группы %s не удался (%s) — маркер пропущен", raw.name, id12, exc)
+            return None
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=FIGURE_JPEG_QUALITY)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
 def _find_region(doc: pdf_to_markdown.DocGraphics, page_num: int, region_id: str) -> pdf_graphics.Region | None:
     if not 1 <= page_num <= len(doc.pages):
         return None
@@ -243,6 +336,13 @@ def _render_injected_docx_image(marker_id: str, model: str, markdown: str) -> st
     )
 
 
+def _render_injected_docx_group(id12: str, model: str, markdown: str) -> str:
+    return (
+        f"> [Figure, docx group {id12} — VLM interpretation ({model}); "
+        f"reconstruction, verify against original]\n\n{markdown}"
+    )
+
+
 def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     """Сканирует ``md_path`` на голые маркеры pdf_graphics, инъецирует VLM-
     интерпретацию (кэш-хит — офлайн; кэш-мисс — рендер+вызов+кэш). Возвращает
@@ -252,7 +352,8 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     figure_matches = list(_FIGURE_MARKER_RE.finditer(text))
     image_matches = list(_IMAGE_MARKER_RE.finditer(text))
     docx_image_matches = list(_DOCX_IMAGE_MARKER_RE.finditer(text))
-    if not figure_matches and not image_matches and not docx_image_matches:
+    docx_group_matches = list(_DOCX_GROUP_MARKER_RE.finditer(text))
+    if not figure_matches and not image_matches and not docx_image_matches and not docx_group_matches:
         return False
 
     # Ключ требуется ЛЕНИВО — только когда реально нужен облачный вызов (cache-miss,
@@ -340,6 +441,24 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 cache_dirty = True
             replacements.append(
                 (m.start(), m.end(), _render_injected_docx_image(did, entry["model"], entry["markdown"]))
+            )
+
+        for m in docx_group_matches:
+            gid = m.group("id")
+            entry = cache.get(gid)
+            if entry is None:
+                key = _require_key()
+                data_uri = _render_docx_group(raw, gid)  # None -> уже залогировано (см. _render_docx_group)
+                if data_uri is None:
+                    continue
+                markdown = _call_vlm_uri(data_uri, model=model, api_key=key, raw_name=raw.name)
+                if markdown is None:
+                    continue
+                entry = {"model": model, "markdown": markdown, "requested": _dt.date.today().isoformat()}
+                cache[gid] = entry
+                cache_dirty = True
+            replacements.append(
+                (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"]))
             )
     finally:
         if pdf_doc is not None:
