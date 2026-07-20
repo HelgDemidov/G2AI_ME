@@ -317,6 +317,26 @@ def test_prompt_covers_quantitative_mermaid_types_and_radar_id_syntax() -> None:
     assert "REQUIRED" in FIG_PROMPT  # bare-id перед ["Label"] в radar-beta
 
 
+def test_prompt_preserves_flowchart_color_grouping_safely() -> None:
+    """Живой эксперимент на реальном корпусном документе (sg, стр. 6,
+    8-компонентная схема агента): baseline-прогон проговаривал цветовую
+    группировку (pink/light-blue) в прозе, но mermaid-граф терял её полностью
+    — flowchart остаётся ЕДИНСТВЕННЫМ mermaid-типом с рабочей поддержкой
+    произвольного цвета (``classDef``/``style``; pie/xychart-beta/radar-beta
+    такого не умеют — сверено live). Правило намеренно НЕ навязывает
+    danger/success/warning-лексику (не подходит корпусу G2AI — группировка
+    обычно функциональная, не статусная) и требует `color` ВМЕСТЕ с `fill`
+    (иначе текст узла рискует стать нечитаемым под чужой темой хоста —
+    Obsidian/Claude Artifacts). Явное требование id у ``subgraph`` перед
+    стилизацией — фикс живого дефекта: голый многословный заголовок
+    subgraph в качестве id (пример из стороннего AI-текста, дословно
+    прогнан через mermaid.parse()) ломает парсер; с явным id — валиден."""
+    assert "classDef" in FIG_PROMPT
+    assert "never force a preset vocabulary" in FIG_PROMPT  # против danger/success как дефолта
+    assert "`color` (text) together with `fill`" in FIG_PROMPT
+    assert 'subgraph sg1["Title"]' in FIG_PROMPT
+
+
 def test_prompt_forbids_transcribing_the_accompanying_data_table() -> None:
     """Живой checkpoint xlsx: наш конвертер намеренно подтягивает в кроп
     'родную' таблицу-источник чарта как anti-hallucination страховку (см.

@@ -137,7 +137,24 @@ Output in English, in two parts:
      edges that are visually present (arrows/connectors you can actually
      see) — never infer or guess a connection that is not drawn. Wrap every
      node label in double quotes, e.g. A["Label"] (unquoted labels containing
-     punctuation break the mermaid parser).
+     punctuation break the mermaid parser). If fill color visually groups
+     nodes into categories (a shared background marking a functional
+     grouping, not just decoration), preserve that grouping via
+     `classDef`/`class` — never per-node `style` for a repeated category,
+     that's for a rare one-off only:
+     - At most 4-5 classes, one per distinct color you actually see — never
+       a unique hex per node, and never force a preset vocabulary like
+       danger/success/warning onto colors that don't represent that. Name
+       each class after what the group actually IS (its shared role/topic),
+       not a generic severity word.
+     - Always set `color` (text) together with `fill` in the same classDef,
+       e.g. `classDef components fill:#f4b8cf,color:#000` — never `fill`
+       alone; the node's text must stay readable regardless of viewer theme.
+     - Omit classDef entirely if color is purely decorative or uniform
+       across all nodes — do not invent grouping that isn't visually there.
+     - If you also style a `subgraph`, give it an explicit id separate from
+       its title (`subgraph sg1["Title"]`, then `style sg1 fill:...`) —
+       styling a bare multi-word subgraph title directly breaks the parser.
    - Pie / donut chart — ``pie``: `pie title "..."` then one `"Label" :
      value` line per slice.
    - Bar chart, line chart, or bar+line combo (including grouped bars or a
