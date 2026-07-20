@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from index.chunking import _hard_split, chunk_text, embed_input, strip_frontmatter
+from index.chunking import (
+    _hard_split,
+    _split_table_paragraph,
+    _table_header,
+    chunk_text,
+    embed_input,
+    strip_frontmatter,
+)
 
 
 def wc(text: str) -> int:
@@ -263,3 +270,112 @@ def test_oversized_fence_degrades_to_split_not_crash() -> None:
     big = "```mermaid\n" + "\n".join(f'X{i}["{i}"] --> Y{i}["{i}"]' for i in range(50)) + "\n```"
     chunks = chunk_text(big, wc, max_tokens=20)
     assert all(c.n_tokens <= 20 for c in chunks)
+
+
+# --- таблично-осознанная разрезка (_table_header/_split_table_paragraph):
+# оверсайз GFM-таблица не должна ломать синтаксис при разрезке (живой риск:
+# _split_long_paragraph резал таблицу «по предложениям» через bare \n, затем
+# склеивал результат ЧЕРЕЗ ПРОБЕЛ — строки таблицы съезжались в одну без
+# переносов). Реальная форма проверена на doc.md корпуса (PDF Эстонии,
+# DOCX-конвертер) — обе дают header+separator+rows. ---
+
+
+def test_table_header_detects_valid_gfm_table() -> None:
+    para = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    result = _table_header(para)
+    assert result == ("| a | b |", "| --- | --- |", ["| 1 | 2 |", "| 3 | 4 |"])
+
+
+def test_table_header_returns_none_for_plain_prose() -> None:
+    assert _table_header("one two three.\nfour five six.\nseven eight nine.") is None
+
+
+def test_table_header_returns_none_for_too_few_lines() -> None:
+    assert _table_header("| a | b |\n| --- | --- |") is None  # нет строк данных
+    assert _table_header("| a | b |") is None
+
+
+def test_table_header_returns_none_when_second_line_not_separator() -> None:
+    """Первая строка похожа на таблицу, но вторая — не разделитель: не таблица
+    (иначе ложное срабатывание на прозе, случайно начинающейся с '|')."""
+    para = "| not a real table |\njust some text here\nmore text"
+    assert _table_header(para) is None
+
+
+def test_split_table_paragraph_repeats_header_each_chunk() -> None:
+    header, sep, rows = "| a | b |", "| --- | --- |", ["| r1 |", "| r2 |", "| r3 |"]
+    chunks = _split_table_paragraph(header, sep, rows, wc, max_tokens=6)
+    assert len(chunks) > 1
+    assert all(c.startswith(f"{header}\n{sep}\n") for c in chunks)
+
+
+def test_split_table_paragraph_joins_with_newline_not_space() -> None:
+    """Регресс-guard на сам баг: результат должен парситься построчно как
+    таблица, НЕ содержать строк вида 'header sep row1 row2' через пробел."""
+    header, sep, rows = "| a |", "| --- |", ["| 1 |", "| 2 |", "| 3 |", "| 4 |"]
+    chunks = _split_table_paragraph(header, sep, rows, wc, max_tokens=3)
+    for chunk in chunks:
+        lines = chunk.split("\n")
+        assert lines[0] == header
+        assert lines[1] == sep
+        assert all(ln.startswith("|") for ln in lines[2:])
+
+
+def test_split_table_paragraph_no_row_loss() -> None:
+    header, sep = "| a |", "| --- |"
+    rows = [f"| row{i} |" for i in range(20)]
+    chunks = _split_table_paragraph(header, sep, rows, wc, max_tokens=5)
+    recovered = [ln for c in chunks for ln in c.split("\n")[2:]]
+    assert recovered == rows
+
+
+def test_split_table_paragraph_oversized_single_row_kept_whole() -> None:
+    """Одна строка данных крупнее лимита сама по себе — остаётся целой (как
+    оверсайз-предложение у _hard_split), не рвётся посреди ячейки."""
+    header, sep = "| a |", "| --- |"
+    huge_row = "| " + " ".join(f"w{i}" for i in range(10)) + " |"
+    chunks = _split_table_paragraph(header, sep, [huge_row], wc, max_tokens=3)
+    assert len(chunks) == 1
+    assert huge_row in chunks[0]
+
+
+def test_split_table_paragraph_no_data_rows_returns_header_only() -> None:
+    chunks = _split_table_paragraph("| a |", "| --- |", [], wc, max_tokens=10)
+    assert chunks == ["| a |\n| --- |"]
+
+
+def test_oversized_table_splits_into_valid_gfm_chunks_via_chunk_text() -> None:
+    """Интеграционный путь: большая таблица через chunk_text (не напрямую
+    _split_table_paragraph) — упирается в max_tokens, режется, каждый чанк —
+    самостоятельно валидная GFM-таблица."""
+    header = "| id | value |"
+    sep = "| --- | --- |"
+    rows = "\n".join(f"| {i} | value-{i} |" for i in range(30))
+    text = f"# Table\n\n{header}\n{sep}\n{rows}"
+    chunks = chunk_text(text, wc, max_tokens=15)
+    table_chunks = [c for c in chunks if c.text.startswith(header)]
+    assert len(table_chunks) > 1
+    for c in table_chunks:
+        lines = c.text.split("\n")
+        assert lines[0] == header
+        assert lines[1] == sep
+        assert all(ln.startswith("|") and ln.endswith("|") for ln in lines[2:])
+
+
+def test_oversized_table_no_row_loss_via_chunk_text() -> None:
+    header, sep = "| id |", "| --- |"
+    rows = [f"| {i} |" for i in range(25)]
+    text = f"{header}\n{sep}\n" + "\n".join(rows)
+    chunks = chunk_text(text, wc, max_tokens=8)
+    recovered = [ln for c in chunks for ln in c.text.split("\n")[2:] if c.text.startswith(header)]
+    assert recovered == rows
+
+
+def test_short_table_stays_intact_as_single_chunk() -> None:
+    """Таблица, уместившаяся в бюджет, НЕ проходит через табличный сплиттер
+    (packing-путь как для любого короткого абзаца) — регресс-guard, что фикс
+    не трогает уже рабочий случай."""
+    text = "| a | b |\n| --- | --- |\n| 1 | 2 |"
+    chunks = chunk_text(text, wc, max_tokens=50)
+    assert len(chunks) == 1
+    assert chunks[0].text == text
