@@ -236,6 +236,51 @@ def test_classify_docx_dead_404() -> None:
     assert result.outcome == AcquisitionOutcome.dead
 
 
+# --- expected=xlsx: мультиформатная классификация (convert-xlsx spec §5,
+# дословное зеркало docx — тот же OOXML/zip-контейнер) ---
+
+OK_XLSX_HEADERS = (
+    "HTTP/1.1 200 OK\ncontent-type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\n"
+)
+REAL_XLSX_BODY = b"PK\x03\x04" + b"x" * 4100  # больше MIN_EXPECTED_XLSX_SIZE
+
+
+def test_classify_xlsx_ok() -> None:
+    result = classify_response(REAL_XLSX_BODY, OK_XLSX_HEADERS, schema.SourceFormat.xlsx)
+    assert result.outcome == AcquisitionOutcome.ok
+    assert result.http_status == 200
+
+
+def test_classify_xlsx_challenge_page_blocked_despite_200() -> None:
+    result = classify_response(CLOUDFLARE_BLOCK_BODY, CLOUDFLARE_BLOCK_HEADERS, schema.SourceFormat.xlsx)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_xlsx_not_zip_blocked() -> None:
+    result = classify_response(b"<html>not an xlsx</html>x" * 300, OK_XLSX_HEADERS, schema.SourceFormat.xlsx)
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "not the expected XLSX" in result.reason
+
+
+def test_classify_xlsx_any_zip_passes_magic_check() -> None:
+    """Zip-магия — НЕОБХОДИМОЕ, не ДОСТАТОЧНОЕ условие (spec §5): любой zip
+    ПРОЙДЁТ классификацию (терминальная страховка — openpyxl упадёт
+    ConversionError на не-xlsx zip при реальной конвертации, не здесь)."""
+    not_really_xlsx_but_a_zip = b"PK\x03\x04" + b"\x00" * 4100
+    result = classify_response(not_really_xlsx_but_a_zip, OK_XLSX_HEADERS, schema.SourceFormat.xlsx)
+    assert result.outcome == AcquisitionOutcome.ok
+
+
+def test_classify_xlsx_too_small_blocked() -> None:
+    result = classify_response(b"PK\x03\x04" + b"x" * 10, OK_XLSX_HEADERS, schema.SourceFormat.xlsx)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_xlsx_dead_404() -> None:
+    result = classify_response(b"<html>not found</html>", DEAD_404_HEADERS, schema.SourceFormat.xlsx)
+    assert result.outcome == AcquisitionOutcome.dead
+
+
 class _FakeProc:
     """Минимальная подмена ``subprocess.CompletedProcess`` — только ``returncode``."""
 
@@ -429,6 +474,19 @@ def test_run_ladder_html_dead_confidential_also_raises_manual_only_pdf_message(
     rec = _rec(source_format="html", sensitivity="confidential")
     with pytest.raises(AcquisitionBlocked, match="только PDF"):
         run_ladder(rec, tmp_path / "doc.html", user_agent="test-ua")
+
+
+def test_run_ladder_xlsx_blocked_no_alt_raises_manual_only_pdf_message(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Тот же generic PDF-only guard (spec convert-xlsx §5: уже работает без
+    единой правки кода — guard блокирует ЛЮБОЙ non-PDF source_format, не
+    только html/docx) должен сработать и для xlsx."""
+    blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    rec = _rec(source_format="xlsx")
+    with pytest.raises(AcquisitionBlocked, match="только PDF"):
+        run_ladder(rec, tmp_path / "doc.xlsx", user_agent="test-ua")
 
 
 def test_looks_like_candidate_pdf_accepts_valid(tmp_path: Path) -> None:
@@ -777,6 +835,30 @@ def test_fetch_from_archive_docx_record_queries_docx_mimetype(tmp_path: Path, mo
     assert result.method == ARCHIVE
     assert (
         "filter=mimetype:application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        in cdx_calls[-1]
+    )
+
+
+def test_fetch_from_archive_xlsx_record_queries_xlsx_mimetype(tmp_path: Path, monkeypatch: Any) -> None:
+    cdx_calls: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> Any:
+        cdx_calls.extend(cmd)
+        return _FakeCompletedProcess(
+            "urlkey 20220806004506 https://example.org/doc.xlsx "
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet 200 X 123\n"
+        )
+
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
+    ok = ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid XLSX (zip magic)")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([ok]))
+
+    rec = _rec(source_format="xlsx")
+    result = fetch_from_archive(rec, tmp_path / "doc.xlsx", user_agent="test-ua")
+
+    assert result.method == ARCHIVE
+    assert (
+        "filter=mimetype:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         in cdx_calls[-1]
     )
 
