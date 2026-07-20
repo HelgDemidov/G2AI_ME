@@ -24,6 +24,8 @@ _FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
 _PARA_RE = re.compile(r"\n\s*\n")
 _SENT_RE = re.compile(r"(?<=[.!?;])\s+|\n")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
 
 
 @dataclass(frozen=True)
@@ -166,8 +168,57 @@ def _hard_split(text: str, count_tokens: TokenCounter, max_tokens: int) -> list[
     return out
 
 
+def _table_header(para: str) -> tuple[str, str, list[str]] | None:
+    """Если ``para`` — GFM-таблица (строка `|...|` + строка-разделитель `|---|---|`
+    следом), вернуть ``(header, separator, data_rows)``; иначе ``None`` (вызывающая
+    сторона деградирует в generic sentence-split). Все конвертеры проекта (PDF
+    ``pdf_graphics.py``, DOCX через ``markdownify``) эмитят именно эту форму —
+    проверено на реальных `doc.md` корпуса, не только на синтетике."""
+    lines = para.split("\n")
+    if len(lines) < 3:
+        return None
+    header, sep = lines[0], lines[1]
+    if not (_TABLE_ROW_RE.match(header) and _TABLE_SEP_RE.match(sep)):
+        return None
+    return header, sep, lines[2:]
+
+
+def _split_table_paragraph(
+    header: str, sep: str, rows: list[str], count_tokens: TokenCounter, max_tokens: int
+) -> list[str]:
+    """GFM-таблица больше лимита -> резать ПО СТРОКАМ, повторяя заголовок+
+    разделитель в каждом куске (row+header — практика RAG для табличных данных:
+    каждый чанк остаётся самодостаточной валидной таблицей). Раньше сюда попадал
+    ``_split_long_paragraph`` (режет по ``\\n`` как «предложения», затем склеивает
+    результат ЧЕРЕЗ ПРОБЕЛ) — валидный markdown таблицы ломался (строки съезжались
+    в одну без переносов). Одна строка данных крупнее лимита сама по себе (редкий
+    вырожденный случай — аномально широкая строка) — оставляется цельной поверх
+    бюджета, тот же принцип, что у ``_hard_split`` для оверсайз-предложений:
+    целостность строки важнее строгого лимита."""
+    prefix = f"{header}\n{sep}"
+    prefix_tokens = count_tokens(prefix)
+    out: list[str] = []
+    current: list[str] = []
+    current_tokens = prefix_tokens
+    for row in rows:
+        n = count_tokens(row)
+        if current and current_tokens + n > max_tokens:
+            out.append("\n".join([prefix, *current]))
+            current, current_tokens = [], prefix_tokens
+        current.append(row)
+        current_tokens += n
+    if current:
+        out.append("\n".join([prefix, *current]))
+    return out or [prefix]  # таблица без строк данных (вырожденный случай) — как есть
+
+
 def _split_long_paragraph(para: str, count_tokens: TokenCounter, max_tokens: int) -> list[str]:
-    """Абзац больше лимита -> нарезать по предложениям (с fallback на слова)."""
+    """Абзац больше лимита -> нарезать по предложениям (с fallback на слова);
+    GFM-таблица — по строкам с повторением заголовка (см. ``_split_table_paragraph``
+    выше)."""
+    table = _table_header(para)
+    if table is not None:
+        return _split_table_paragraph(*table, count_tokens, max_tokens)
     out: list[str] = []
     current: list[str] = []
     current_tokens = 0
