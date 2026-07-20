@@ -134,6 +134,57 @@ def build_docx_with_choice_only_images(paragraphs: list[str], images: dict[str, 
     return _docx_zip(body, images)
 
 
+_OOXML_WPG = "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
+
+
+def _docx_group_ac(captions: list[str], n_images: int, *, rid_offset: int = 100) -> str:
+    """mc:AlternateContent, чей mc:Choice содержит wpg:wgp (детект docx_groups
+    смотрит РОВНО на это) — внутри вольные текстовые узлы (captions) и
+    pic-элементы с r:embed=rId{rid_offset+i} (media_ids); mc:Fallback пуст
+    (детект не смотрит туда). Не претендует на подлинность реальной
+    wpg-разметки Word — минимум, достаточный для extract_and_strip_groups."""
+    pics = "".join(
+        f'<pic:pic xmlns:pic="{_OOXML_PIC}"><pic:blipFill>'
+        f'<a:blip r:embed="rId{rid_offset + i}" xmlns:r="{_OOXML_R}"/></pic:blipFill></pic:pic>'
+        for i in range(n_images)
+    )
+    caption_nodes = "".join(f"<a:t>{c}</a:t>" for c in captions)
+    return (
+        f'<mc:AlternateContent xmlns:mc="{_OOXML_MC}"><mc:Choice Requires="wpg">'
+        f'<w:drawing xmlns:wp="{_OOXML_WP}"><wp:inline><wp:docPr id="1" name="Group"/>'
+        f'<a:graphic xmlns:a="{_OOXML_A}"><a:graphicData uri="{_OOXML_WPG}">'
+        f'<wpg:wgp xmlns:wpg="{_OOXML_WPG}">{caption_nodes}{pics}</wpg:wgp>'
+        f"</a:graphicData></a:graphic></wp:inline></w:drawing>"
+        f"</mc:Choice><mc:Fallback/></mc:AlternateContent>"
+    )
+
+
+def build_docx_with_shape_group(
+    before: list[str], captions: list[str], images: dict[str, bytes], after: list[str]
+) -> bytes:
+    """docx с ОДНОЙ composite-группой (spec convert-docx §2-ter) — см.
+    ``_docx_group_ac``."""
+    group_ac = _docx_group_ac(captions, len(images))
+    body = "".join(_docx_para(p) for p in before)
+    body += f"<w:p><w:r>{group_ac}</w:r></w:p>"
+    body += "".join(_docx_para(p) for p in after)
+    return _docx_zip(body, images)
+
+
+def build_docx_with_group_and_standalone_image(
+    group_captions: list[str], group_image: bytes, standalone_image: bytes
+) -> bytes:
+    """Композит: одна composite-группа (§2-ter) + одна ОБЫЧНАЯ инлайн-картинка
+    вне группы (§2-bis/v2, DrawingML wp:inline вне AlternateContent) — под
+    регресс-guard на отсутствие перекрёстного заражения между двумя
+    механизмами позиционирования в одном документе."""
+    images = {"group.png": group_image, "standalone.png": standalone_image}
+    group_ac = _docx_group_ac(group_captions, 1, rid_offset=100)
+    body = f"<w:p><w:r>{group_ac}</w:r></w:p>"
+    body += f"<w:p><w:r>{_docx_drawing('rId101')}</w:r></w:p>"
+    return _docx_zip(body, images)
+
+
 def valid_record() -> dict[str, Any]:
     """Минимально валидная запись (термины — из реальных словарей pipeline/vocab/)."""
     return {

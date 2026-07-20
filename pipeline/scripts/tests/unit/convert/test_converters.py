@@ -31,7 +31,9 @@ from convert.converters import (
 from core.schema import SourceRecord
 from tests.support import (
     build_docx_with_choice_only_images,
+    build_docx_with_group_and_standalone_image,
     build_docx_with_inline_image,
+    build_docx_with_shape_group,
     build_minimal_docx,
     valid_record,
 )
@@ -272,6 +274,80 @@ def test_docx_image_markers_placed_excluded(tmp_path: Path) -> None:
     id12 = hashlib.sha256(big).hexdigest()[:12]
     assert _docx_image_markers(raw, placed=frozenset({id12})) == ""
     assert id12 in _docx_image_markers(raw)
+
+
+# --- _convert_docx / composite-группы (spec convert-docx §2-ter): Word рисует
+# сложную инфографику группой фигур (mc:AlternateContent/wpg:wgp) — вырезается
+# ЦЕЛИКОМ pre-проходом docx_groups ДО mammoth, заменяется маркером с captions ---
+
+
+def test_convert_docx_group_marker_positioned_with_captions(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(
+        build_docx_with_shape_group(["Before."], ["Caption A", "Caption B"], {"a.png": big}, ["After."])
+    )
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "[Figure, docx group " in text
+    assert "> captions: Caption A; Caption B" in text
+    assert text.find("Before.") < text.find("[Figure, docx group") < text.find("After.")
+    assert "DOCXGROUPSENTINEL" not in text
+
+
+def test_convert_docx_group_media_absorbed_no_individual_markers(tmp_path: Path) -> None:
+    """Картинки ВНУТРИ группы не должны всплыть ни инлайн (mammoth их не видит
+    — поддерево вырезано ДО неё), ни во фолбэк-секции (поглощены через
+    placed=all_media_ids(groups)). id12 маркера группы — хэш XML-поддерева
+    (см. docx_groups.extract_and_strip_groups), НЕ хэш байт картинки — байтовый
+    id картинки нигде в выводе не печатается, используется только внутри для
+    исключения из фолбэка."""
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_shape_group(["Before."], ["Cap"], {"a.png": big}, ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    image_id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert "docx media" not in text  # ни одного индивидуального image-маркера
+    assert "## Figures" not in text  # и во фолбэк не улетело
+    assert image_id12 not in text  # байтовый id картинки нигде не всплывает
+    assert "[Figure, docx group " in text  # групповой маркер (свой id12) есть
+
+
+def test_convert_docx_no_groups_behaves_like_v2(tmp_path: Path) -> None:
+    """Документ без composite-групп — поведение v2 не изменилось (регресс-guard)."""
+    raw = tmp_path / "raw.docx"
+    big = b"x" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_inline_image(["Before."], big, ["After."]))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    id12 = hashlib.sha256(big).hexdigest()[:12]
+    assert f"> [Image, docx media {id12} — raster content not analyzed]" in text
+    assert "docx group" not in text
+
+
+def test_convert_docx_group_alongside_standalone_image(tmp_path: Path) -> None:
+    """Смешанный документ: composite-группа + ОДИНОЧНАЯ картинка вне группы —
+    оба пути (§2-bis инлайн + §2-ter групповой маркер) работают одновременно,
+    без перекрёстного заражения (группа не проглатывает чужую картинку,
+    одиночная картинка не всплывает как ещё один групповой маркер)."""
+    raw = tmp_path / "raw.docx"
+    group_img = b"g" * (DOCX_IMAGE_MIN_BYTES + 1)
+    standalone_img = b"s" * (DOCX_IMAGE_MIN_BYTES + 1)
+    raw.write_bytes(build_docx_with_group_and_standalone_image(["Cap"], group_img, standalone_img))
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    group_image_id12 = hashlib.sha256(group_img).hexdigest()[:12]
+    standalone_id = hashlib.sha256(standalone_img).hexdigest()[:12]
+    assert "[Figure, docx group " in text  # групповой маркер (свой id12 = хэш AC-поддерева)
+    assert f"> [Image, docx media {standalone_id} — raster content not analyzed]" in text
+    assert "## Figures" not in text  # ни один из двух не улетел во фолбэк
+    assert group_image_id12 not in text  # байтовый id картинки ГРУППЫ нигде не всплывает
+    assert text.count(standalone_id) == 1
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---

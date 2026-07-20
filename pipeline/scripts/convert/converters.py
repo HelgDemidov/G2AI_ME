@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import os
 import posixpath
@@ -388,16 +389,25 @@ def _docx_image_markers(raw: Path, *, placed: frozenset[str] = frozenset()) -> s
 def _convert_docx(
     raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
 ) -> None:
-    """v2 (§2-bis.2/§2-bis.3): прямой mammoth + свой markdownify-сабкласс, без
-    markitdown. Custom image-handler инлайнит маркер РОВНО в месте вхождения
-    картинки в поток документа (живая вырезка: 7/7 реальных изображений на
-    местах, включая v:imagedata внутри VML-fallback композитных групп);
+    """v3 (§2-bis.2/§2-bis.3/§2-ter): прямой mammoth + свой markdownify-сабкласс,
+    без markitdown. Пре-проход ``docx_groups`` вырезает composite-группы
+    (``mc:AlternateContent``/``wpg:wgp`` — Word рисует сложную инфографику
+    группой фигур, mammoth обходит её поэлементно и распадает ОДНУ диаграмму
+    на россыпь фрагментов, живой кейс §2-ter.1) ДО mammoth, заменяя каждую на
+    текстовый сентинел; custom image-handler инлайнит маркер РОВНО в месте
+    вхождения ОДИНОЧНОЙ картинки (вне групп); пост-проход заменяет сентинелы
+    честным маркером группы с сохранёнными подписями (zero-loss без VLM).
     ``_docx_image_markers`` — страховка для referenced-but-not-walked случаев
-    (класс: картинка только в mc:Choice при пустом mc:Fallback) — zero-loss
-    для реального контента по построению, сироты отфильтрованы."""
+    (класс: картинка только в mc:Choice при пустом mc:Fallback), media
+    поглощённых групп исключены через ``placed`` — сироты по-прежнему
+    отфильтрованы."""
     import mammoth  # ленивые импорты: pdf/html-пути не платят за docx-зависимости
     from markdownify import ATX, MarkdownConverter
     from mammoth import html as mammoth_html
+
+    from convert import docx_groups
+
+    rewritten, groups = docx_groups.extract_and_strip_groups(raw)
 
     class _DocxMarkdownify(MarkdownConverter):
         def convert_img(self, el: Any, text: str, parent_tags: Any) -> str:
@@ -417,20 +427,20 @@ def _convert_docx(
         placed_ids.add(id12)
         return [mammoth_html.element("img", {"src": f"{_DOCX_MARKER_SRC_PREFIX}{id12}"})]
 
-    with raw.open("rb") as f:
-        converted = mammoth.convert_to_html(f, convert_image=convert_image)
+    converted = mammoth.convert_to_html(io.BytesIO(rewritten), convert_image=convert_image)
 
     text = _DocxMarkdownify(heading_style=ATX).convert(converted.value).strip()
     if not text:
         raise ConversionError(f"{raw.name}: mammoth/markdownify не извлекли контента")
-    fallback = _docx_image_markers(raw, placed=frozenset(placed_ids))
+    text = docx_groups.inject_group_markers(text, groups)
+    fallback = _docx_image_markers(raw, placed=frozenset(placed_ids) | docx_groups.all_media_ids(groups))
     out.write_text(text + "\n" + fallback, encoding="utf-8")
 
 
 _CONVERTERS: dict[str, Converter] = {
     "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
     "html": Converter("html", "1", _convert_html),
-    "docx": Converter("docx", "2", _convert_docx),  # v2: позиционная вставка изображений (§2-bis.2)
+    "docx": Converter("docx", "3", _convert_docx),  # v3: composite-группы (§2-ter)
 }
 
 
