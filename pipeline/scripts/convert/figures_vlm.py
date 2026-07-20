@@ -104,13 +104,56 @@ Output in English, in two parts:
    not translate or paraphrase). Describe spatial and logical relationships
    between elements (what connects to what, what contains what, ordering).
 
-2. Mermaid diagram — ONLY if and only if the figure is a flowchart, sequence,
-   or hierarchy (omit entirely for matrices, grids, photos, or anything without
-   a clear directional/hierarchical structure). Include ONLY edges that are
-   visually present in the figure (arrows/connectors you can actually see) —
-   never infer or guess a connection that is not drawn. Wrap every node label
-   in double quotes, e.g. A["Label"] (unquoted labels containing punctuation
-   break the mermaid parser).
+   CHART + DATA TABLE RULE: if a data table is visible in the same crop as a
+   chart, the chart is the ONLY subject of your description — never the
+   table. Read the table silently to get exact values right, then leave it
+   out of the output entirely: do not name its columns, do not state its row
+   count, do not restate its rows. Every number you write must be attached to
+   a chart element (a bar, a segment, a point, an axis tick) — never written
+   as a standalone transcription of a table cell. If a sentence you're about
+   to write only reports "the table says X" with no chart element attached,
+   drop that sentence.
+
+   CROSS-CHECK: when a chart element's own printed value (a data label, an
+   axis-anchored point) and a table cell clearly represent the SAME number
+   (not just a related statistic — e.g. a table of percentages next to a
+   chart of raw counts is related, not the same number), read both and use
+   whichever rendering is printed more clearly and unambiguously (table text
+   is usually cleaner-printed than small/rotated/overlapping in-chart data
+   labels, but not always — judge per number). This cross-check happens
+   entirely inside your own reasoning — never mention the comparison, never
+   flag a discrepancy, never say which source you used; only its effect
+   (the correct digits ending up in your chart description) should be
+   visible.
+
+2. Mermaid diagram — include a ```mermaid fence whenever the figure fits one
+   of the categories below (omit entirely otherwise — e.g. scatter plots,
+   matrices, grids, photos, or anything with no clean structural fit). Use
+   the chart's own printed/labeled values (axis labels, data labels, or a
+   silently-read source table) for every number — never a value you only
+   visually estimated from bar height or segment angle.
+
+   - Flowchart / sequence / hierarchy — ``flowchart``/``graph``. Include ONLY
+     edges that are visually present (arrows/connectors you can actually
+     see) — never infer or guess a connection that is not drawn. Wrap every
+     node label in double quotes, e.g. A["Label"] (unquoted labels containing
+     punctuation break the mermaid parser).
+   - Pie / donut chart — ``pie``: `pie title "..."` then one `"Label" :
+     value` line per slice.
+   - Bar chart, line chart, or bar+line combo (including grouped bars or a
+     constant reference/average line drawn across categories) —
+     ``xychart-beta``: first line exactly `xychart-beta`, then `x-axis
+     [cat1, cat2, ...]`, `y-axis "label" min --> max`, and one `bar [...]`
+     and/or `line [...]` array per series (same length as x-axis; a constant
+     reference line repeats one value across the array).
+   - Radar / spider chart — ``radar-beta``: `axis id1["Label1"],
+     id2["Label2"], ...` then one `curve id["Series"]{value1, value2, ...}`
+     line per series, values in the same order as the axes. The `id` before
+     each bracketed label is REQUIRED and must be a single bare word with no
+     spaces or quotes (invent a short slug for multi-word series, e.g. series
+     "Regional Avg" -> id `reg`) — `curve reg["Regional Avg"]{0.49, 0.51}` is
+     correct, `curve "Regional Avg"{0.49, 0.51}` (label alone, no id) is
+     invalid syntax and will fail to render.
 
 Output ONLY the prose description, optionally followed by a ```mermaid code
 fence — no other commentary."""

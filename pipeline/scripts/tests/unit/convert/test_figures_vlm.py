@@ -302,6 +302,35 @@ def test_prompt_requires_quoted_mermaid_labels_and_visible_edges_only() -> None:
     assert "verbatim" in FIG_PROMPT
 
 
+def test_prompt_covers_quantitative_mermaid_types_and_radar_id_syntax() -> None:
+    """Живой checkpoint xlsx (WBG GovTech, 5 калибровочных чартов): mermaid
+    исходно триггерился только на flowchart/sequence/hierarchy — все 5
+    пилотных чартов (doughnut/radar/bar/combo/scatter) были ЛОЖНО исключены.
+    ``pie``/``xychart-beta``/``radar-beta`` — реальные, стабильные типы
+    Mermaid (сверено live против mermaid.parse()), не выдумка. Явное
+    требование bare-``id`` перед ``["Label"]`` в radar-beta — фикс живого
+    дефекта: модель без него писала ``curve "Regional Avg"{...}`` (лейбл
+    вместо id), парсер честно ломался на этом (см. Design rationale спека)."""
+    assert "pie" in FIG_PROMPT
+    assert "xychart-beta" in FIG_PROMPT
+    assert "radar-beta" in FIG_PROMPT
+    assert "REQUIRED" in FIG_PROMPT  # bare-id перед ["Label"] в radar-beta
+
+
+def test_prompt_forbids_transcribing_the_accompanying_data_table() -> None:
+    """Живой checkpoint xlsx: наш конвертер намеренно подтягивает в кроп
+    'родную' таблицу-источник чарта как anti-hallucination страховку (см.
+    xlsx_charts._MAX_TABLE_SPAN/_is_compact) — но исходная мягкая формулировка
+    промпта ("use the table only as cross-check") проигрывала конкурирующей
+    инструкции "transcribe every text label", и модель дважды подробно
+    расписывала и таблицу, и график. Явный запрет + требование молчаливой
+    сверки (без упоминания самого факта сверки в выводе) — фикс, проверенный
+    живым VLM-прогоном на всех 5 калибровочных чартах."""
+    assert "the chart is the ONLY subject" in FIG_PROMPT
+    assert "CROSS-CHECK" in FIG_PROMPT
+    assert "never mention the comparison" in FIG_PROMPT
+
+
 def test_render_crop_clamps_bbox_to_page_bounds(tmp_path: Path, monkeypatch: Any) -> None:
     """Живой случай приёмки чекпоинта 2 (обложка sg): bbox изображения выходит за
     MediaBox — без клампа pdfplumber.crop поднимает ValueError, и маркер честно, но
