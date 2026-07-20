@@ -35,7 +35,7 @@ from typing import Any
 import pdfplumber
 import yaml
 
-from convert import docx_groups, pdf_graphics, pdf_to_markdown
+from convert import docx_groups, pdf_graphics, pdf_to_markdown, xlsx_charts
 from core import fsio, openrouter
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,18 @@ _DOCX_IMAGE_MARKER_RE = re.compile(
 # обработка обоих идентична (рендер по id через extract_group_docx).
 _DOCX_GROUP_MARKER_RE = re.compile(
     r"^> \[Figure, docx (?P<kind>group|chart) (?P<id>[0-9a-f]{12}) — (?:composite|chart) content not analyzed\]\n"
+    r"> captions: .*$",
+    re.MULTILINE,
+)
+# xlsx-чарт (spec convert-xlsx §3, 5-я грамматика маркера): зеркало
+# xlsx_charts.render_chart_marker — 2 строки (маркер + сохранённые captions,
+# zero-loss без VLM), сентинела в потоке нет (у xlsx нет потока), маркер стоит
+# сразу после таблицы своего листа. Sheet — жадный ``.+``: сплит по ПОСЛЕДНЕМУ
+# ``!`` перед якорной ячейкой (лист с «!» в имени — теоретически валиден в
+# OOXML, хоть Excel UI это и блокирует).
+_XLSX_CHART_MARKER_RE = re.compile(
+    r"^> \[Figure, xlsx chart (?P<id>[0-9a-f]{12}) on (?P<sheet>.+)!(?P<anchor>[A-Z]+\d+) — "
+    r"chart content not analyzed\]\n"
     r"> captions: .*$",
     re.MULTILINE,
 )
@@ -115,6 +127,7 @@ def has_bare_markers(text: str) -> bool:
         or _IMAGE_MARKER_RE.search(text)
         or _DOCX_IMAGE_MARKER_RE.search(text)
         or _DOCX_GROUP_MARKER_RE.search(text)
+        or _XLSX_CHART_MARKER_RE.search(text)
     )
 
 
@@ -220,7 +233,7 @@ def _docx_media_uri(raw: Path, marker_id: str) -> str | None:
     return None
 
 
-GROUP_RENDER_TIMEOUT = 60  # soffice headless на одну (~1-страничную) группу — секунды
+SOFFICE_RENDER_TIMEOUT = 60  # soffice headless на один (~1-страничный) объект — секунды
 
 
 def _soffice_available() -> bool:
@@ -258,13 +271,53 @@ def _content_bbox(page: Any) -> pdf_graphics.BBox | None:
     return (x0, top, x1, bottom)
 
 
-def _render_docx_group(raw: Path, id12: str) -> str | None:
-    """Композитная группа (spec §2-ter): изолированный мини-docx (см.
-    ``docx_groups.extract_group_docx``) -> ``soffice --headless`` -> PDF ->
-    кроп по bbox контента -> data-URI JPEG. Требует системный LibreOffice —
-    та же категория зависимости, что tesseract/ocrmypdf у OCR-пути (см.
+def _render_via_soffice(doc_bytes: bytes, *, suffix: str, raw_name: str, obj_id: str, obj_kind: str) -> str | None:
+    """Общий soffice-рендер изолированного мини-документа (docx-группа ИЛИ
+    xlsx-чарт — единственная разница между потребителями: расширение
+    временного файла и как получить ``doc_bytes``) -> PDF -> кроп по bbox
+    контента (``_content_bbox``, формат-агностичная pdfplumber-логика) ->
+    data-URI JPEG. Требует системный LibreOffice — та же категория
+    зависимости, что tesseract/ocrmypdf у OCR-пути (см.
     ``_check_langs_available``); отсутствие/отказ -> None + warning, маркер+
-    captions остаются как честный fallback (zero-loss без VLM, §2-ter.3)."""
+    captions остаются честным fallback (zero-loss без VLM)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        doc_path = tmp_dir / f"obj{suffix}"
+        doc_path.write_bytes(doc_bytes)
+        try:
+            result = subprocess.run(
+                ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(tmp_dir), str(doc_path)],
+                check=False, capture_output=True, text=True, timeout=SOFFICE_RENDER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("%s: soffice не уложился в %ss на %s %s — маркер пропущен",
+                            raw_name, SOFFICE_RENDER_TIMEOUT, obj_kind, obj_id)
+            return None
+        pdf_path = tmp_dir / "obj.pdf"
+        if result.returncode != 0 or not pdf_path.exists():
+            logger.warning(
+                "%s: soffice не смог отрендерить %s %s (%s) — маркер пропущен",
+                raw_name, obj_kind, obj_id, result.stderr[-300:],
+            )
+            return None
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                page = pdf.pages[0]
+                bbox = _content_bbox(page)
+                cropped = page.crop(bbox) if bbox is not None else page
+                img = cropped.to_image(resolution=FIGURE_RENDER_DPI).original.convert("RGB")
+        except Exception as exc:  # noqa: BLE001 — рендер PDF тоже может отказать
+            logger.warning("%s: рендер PDF %s %s не удался (%s) — маркер пропущен", raw_name, obj_kind, obj_id, exc)
+            return None
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=FIGURE_JPEG_QUALITY)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _render_docx_group(raw: Path, id12: str) -> str | None:
+    """Композитная группа (spec convert-docx §2-ter): изолированный мини-docx
+    (см. ``docx_groups.extract_group_docx``) -> ``_render_via_soffice``."""
     if not _soffice_available():
         logger.warning(
             "%s: soffice не установлен — группа %s пропущена (sudo apt install libreoffice)",
@@ -278,39 +331,31 @@ def _render_docx_group(raw: Path, id12: str) -> str | None:
             raw.name, id12,
         )
         return None
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        docx_path = tmp_dir / "group.docx"
-        docx_path.write_bytes(mini_docx)
-        try:
-            result = subprocess.run(
-                ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(tmp_dir), str(docx_path)],
-                check=False, capture_output=True, text=True, timeout=GROUP_RENDER_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning("%s: soffice не уложился в %ss на группе %s — маркер пропущен",
-                            raw.name, GROUP_RENDER_TIMEOUT, id12)
-            return None
-        pdf_path = tmp_dir / "group.pdf"
-        if result.returncode != 0 or not pdf_path.exists():
-            logger.warning(
-                "%s: soffice не смог отрендерить группу %s (%s) — маркер пропущен",
-                raw.name, id12, result.stderr[-300:],
-            )
-            return None
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                page = pdf.pages[0]
-                bbox = _content_bbox(page)
-                cropped = page.crop(bbox) if bbox is not None else page
-                img = cropped.to_image(resolution=FIGURE_RENDER_DPI).original.convert("RGB")
-        except Exception as exc:  # noqa: BLE001 — рендер PDF тоже может отказать
-            logger.warning("%s: рендер PDF группы %s не удался (%s) — маркер пропущен", raw.name, id12, exc)
-            return None
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=FIGURE_JPEG_QUALITY)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
+    return _render_via_soffice(mini_docx, suffix=".docx", raw_name=raw.name, obj_id=id12, obj_kind="группа")
+
+
+def _render_xlsx_chart(raw: Path, id12: str) -> str | None:
+    """Встроенный xlsx-чарт (spec convert-xlsx §3): изолированная мини-книга
+    (см. ``xlsx_charts.extract_chart_workbook`` — все листы, КРОМЕ
+    листа-хозяина, скрыты; drawing-парт листа-хозяина обрезан до ОДНОГО
+    целевого чарта) -> ``_render_via_soffice``. Известный неоткалиброванный
+    риск (spec §3): crop-геометрия и качество VLM-результата на xlsx НЕ
+    проверены живьём — первый реальный xlsx корпуса обязан пройти
+    adversarial-сверку (см. чек-лист спека, 🔶)."""
+    if not _soffice_available():
+        logger.warning(
+            "%s: soffice не установлен — чарт %s пропущен (sudo apt install libreoffice)",
+            raw.name, id12,
+        )
+        return None
+    mini_wb = xlsx_charts.extract_chart_workbook(raw, id12)
+    if mini_wb is None:
+        logger.warning(
+            "%s: чарт %s не найден при пере-детекции (raw изменился?) — маркер пропущен",
+            raw.name, id12,
+        )
+        return None
+    return _render_via_soffice(mini_wb, suffix=".xlsx", raw_name=raw.name, obj_id=id12, obj_kind="чарт")
 
 
 def _find_region(doc: pdf_to_markdown.DocGraphics, page_num: int, region_id: str) -> pdf_graphics.Region | None:
@@ -356,6 +401,13 @@ def _render_injected_docx_group(id12: str, model: str, markdown: str, kind: str 
     )
 
 
+def _render_injected_xlsx_chart(id12: str, sheet: str, anchor: str, model: str, markdown: str) -> str:
+    return (
+        f"> [Figure, xlsx chart {id12} on {sheet}!{anchor} — VLM interpretation ({model}); "
+        f"reconstruction, verify against original]\n\n{markdown}"
+    )
+
+
 def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     """Сканирует ``md_path`` на голые маркеры pdf_graphics, инъецирует VLM-
     интерпретацию (кэш-хит — офлайн; кэш-мисс — рендер+вызов+кэш). Возвращает
@@ -366,7 +418,8 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     image_matches = list(_IMAGE_MARKER_RE.finditer(text))
     docx_image_matches = list(_DOCX_IMAGE_MARKER_RE.finditer(text))
     docx_group_matches = list(_DOCX_GROUP_MARKER_RE.finditer(text))
-    if not figure_matches and not image_matches and not docx_image_matches and not docx_group_matches:
+    xlsx_chart_matches = list(_XLSX_CHART_MARKER_RE.finditer(text))
+    if not any((figure_matches, image_matches, docx_image_matches, docx_group_matches, xlsx_chart_matches)):
         return False
 
     # Ключ требуется ЛЕНИВО — только когда реально нужен облачный вызов (cache-miss,
@@ -472,6 +525,24 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 cache_dirty = True
             replacements.append(
                 (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"], m.group("kind")))
+            )
+
+        for m in xlsx_chart_matches:
+            cid, sheet, anchor = m.group("id"), m.group("sheet"), m.group("anchor")
+            entry = cache.get(cid)
+            if entry is None:
+                key = _require_key()
+                data_uri = _render_xlsx_chart(raw, cid)  # None -> уже залогировано (см. _render_xlsx_chart)
+                if data_uri is None:
+                    continue
+                markdown = _call_vlm_uri(data_uri, model=model, api_key=key, raw_name=raw.name)
+                if markdown is None:
+                    continue
+                entry = {"model": model, "markdown": markdown, "requested": _dt.date.today().isoformat()}
+                cache[cid] = entry
+                cache_dirty = True
+            replacements.append(
+                (m.start(), m.end(), _render_injected_xlsx_chart(cid, sheet, anchor, entry["model"], entry["markdown"]))
             )
     finally:
         if pdf_doc is not None:

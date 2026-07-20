@@ -16,6 +16,7 @@ from convert.figures_vlm import (
     _content_bbox,
     _docx_media_uri,
     _render_docx_group,
+    _render_xlsx_chart,
     _soffice_available,
     apply_figures_pass,
     has_bare_markers,
@@ -696,7 +697,7 @@ def test_render_docx_group_success_returns_data_uri(tmp_path: Path, monkeypatch:
 
     def fake_run(cmd: list[str], *, check: bool, capture_output: bool, text: bool, timeout: float) -> Any:
         outdir = Path(cmd[cmd.index("--outdir") + 1])
-        (outdir / "group.pdf").write_bytes(b"%PDF-fake")
+        (outdir / "obj.pdf").write_bytes(b"%PDF-fake")
         return _Result()
 
     monkeypatch.setattr("convert.figures_vlm.subprocess.run", fake_run)
@@ -821,6 +822,215 @@ def test_apply_figures_pass_docx_group_idempotent_second_run(tmp_path: Path, mon
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(
         "convert.figures_vlm._render_docx_group", lambda raw_, id12: "data:image/jpeg;base64,AAA"
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Prose."}}]},
+    )
+    assert apply_figures_pass(md, raw, model="m") is True
+    once = md.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("двойной прогон не должен звать сеть")),
+    )
+    assert apply_figures_pass(md, raw, model="m") is False
+    assert md.read_text(encoding="utf-8") == once
+
+
+# --- xlsx-чарты (spec convert-xlsx §3, 5-я грамматика маркера): рендер —
+# soffice/pdfplumber мокнуты (та же схема, что docx-группы, _render_via_soffice
+# общий); реальный рендер — integration-тест отдельным файлом
+# (tests/integration/test_xlsx_charts_live.py, требует системный soffice) ---
+
+
+def _xlsx_chart_md(chart_id: str, sheet: str = "Data", anchor: str = "D2", captions: str = "Chart Title") -> str:
+    return (
+        "## Data\n\n| Cat | Val |\n| --- | --- |\n| A | 1 |\n\n"
+        f"> [Figure, xlsx chart {chart_id} on {sheet}!{anchor} — chart content not analyzed]\n"
+        f"> captions: {captions}\n"
+    )
+
+
+def _build_chart_raw(
+    tmp_path: Path, *, title: str = "Chart Title", anchor: str = "D2", sheet_name: str = "Data"
+) -> tuple[Path, str]:
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference
+
+    from convert import xlsx_charts
+
+    wb = Workbook()
+    ws: Any = wb.active
+    assert ws is not None
+    ws.title = sheet_name
+    ws.append(["Cat", "Val"])
+    ws.append(["A", 1])
+    chart = BarChart()
+    chart.title = title
+    chart.add_data(Reference(ws, min_col=2, min_row=1, max_row=2), titles_from_data=True)
+    ws.add_chart(chart, anchor)
+    raw = tmp_path / "raw.xlsx"
+    wb.save(raw)
+    return raw, xlsx_charts.extract_charts(raw)[0].id12
+
+
+def test_xlsx_chart_marker_detected_by_has_bare_markers() -> None:
+    assert has_bare_markers(_xlsx_chart_md("a" * 12)) is True
+
+
+def test_render_xlsx_chart_no_soffice_returns_none_and_warns(tmp_path: Path, monkeypatch: Any, caplog: Any) -> None:
+    import logging
+
+    raw, cid = _build_chart_raw(tmp_path)
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: False)
+    with caplog.at_level(logging.WARNING):
+        result = _render_xlsx_chart(raw, cid)
+    assert result is None
+    assert "soffice не установлен" in caplog.text
+
+
+def test_render_xlsx_chart_extraction_miss_returns_none_and_warns(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import logging
+
+    raw, _cid = _build_chart_raw(tmp_path)
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+    with caplog.at_level(logging.WARNING):
+        result = _render_xlsx_chart(raw, "0" * 12)  # такого id в книге нет
+    assert result is None
+    assert "не найден при пере-детекции" in caplog.text
+
+
+def test_render_xlsx_chart_soffice_nonzero_exit_returns_none_and_warns(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import logging
+
+    raw, cid = _build_chart_raw(tmp_path)
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+
+    class _Result:
+        returncode = 1
+        stderr = "boom"
+
+    monkeypatch.setattr("convert.figures_vlm.subprocess.run", lambda *a, **kw: _Result())
+    with caplog.at_level(logging.WARNING):
+        result = _render_xlsx_chart(raw, cid)
+    assert result is None
+    assert "не смог отрендерить" in caplog.text
+
+
+def test_render_xlsx_chart_soffice_timeout_returns_none_and_warns(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import logging
+    import subprocess as sp
+
+    raw, cid = _build_chart_raw(tmp_path)
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+
+    def fake_run(*a: Any, **kw: Any) -> Any:
+        raise sp.TimeoutExpired(cmd="soffice", timeout=60)
+
+    monkeypatch.setattr("convert.figures_vlm.subprocess.run", fake_run)
+    with caplog.at_level(logging.WARNING):
+        result = _render_xlsx_chart(raw, cid)
+    assert result is None
+    assert "не уложился" in caplog.text
+
+
+def test_render_xlsx_chart_success_returns_data_uri(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, cid = _build_chart_raw(tmp_path)
+    monkeypatch.setattr("convert.figures_vlm._soffice_available", lambda: True)
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd: list[str], *, check: bool, capture_output: bool, text: bool, timeout: float) -> Any:
+        outdir = Path(cmd[cmd.index("--outdir") + 1])
+        (outdir / "obj.pdf").write_bytes(b"%PDF-fake")
+        return _Result()
+
+    monkeypatch.setattr("convert.figures_vlm.subprocess.run", fake_run)
+    monkeypatch.setattr("convert.figures_vlm.pdfplumber.open", lambda path: _FakeGroupPdf())
+    result = _render_xlsx_chart(raw, cid)
+    assert result is not None
+    assert result.startswith("data:image/jpeg;base64,")
+
+
+def test_apply_figures_pass_xlsx_chart_cache_miss_calls_render_and_vlm(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, cid = _build_chart_raw(tmp_path)
+    md = tmp_path / "doc.md"
+    md.write_text(_xlsx_chart_md(cid), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "convert.figures_vlm._render_xlsx_chart", lambda raw_, id12: "data:image/jpeg;base64,AAA"
+    )
+    calls: list[dict[str, Any]] = []
+
+    def fake_chat(payload: dict[str, Any], *, api_key: str, timeout: float = 1800.0) -> dict[str, Any]:
+        calls.append(payload)
+        return {"choices": [{"message": {"content": "Chart description."}}]}
+
+    monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert len(calls) == 1
+    text = md.read_text(encoding="utf-8")
+    assert (
+        f"> [Figure, xlsx chart {cid} on Data!D2 — VLM interpretation (m); "
+        "reconstruction, verify against original]" in text
+    )
+    assert "Chart description." in text
+    assert "chart content not analyzed" not in text
+
+
+def test_apply_figures_pass_xlsx_chart_cache_hit_skips_render(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, cid = _build_chart_raw(tmp_path)
+    md = tmp_path / "doc.md"
+    md.write_text(_xlsx_chart_md(cid), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({cid: {"model": "cached", "markdown": "Cached chart.", "requested": "2026-01-01"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm._render_xlsx_chart",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("рендер не должен был вызываться")),
+    )
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert "Cached chart." in md.read_text(encoding="utf-8")
+
+
+def test_apply_figures_pass_xlsx_chart_render_failure_leaves_marker_unchanged(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    raw, cid = _build_chart_raw(tmp_path)
+    text = _xlsx_chart_md(cid)
+    md = tmp_path / "doc.md"
+    md.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr("convert.figures_vlm._render_xlsx_chart", lambda raw_, id12: None)
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("VLM не должен был вызываться")),
+    )
+    changed = apply_figures_pass(md, raw, model="m")
+    assert changed is False
+    assert md.read_text(encoding="utf-8") == text
+
+
+def test_apply_figures_pass_xlsx_chart_idempotent_second_run(tmp_path: Path, monkeypatch: Any) -> None:
+    raw, cid = _build_chart_raw(tmp_path)
+    md = tmp_path / "doc.md"
+    md.write_text(_xlsx_chart_md(cid), encoding="utf-8")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "convert.figures_vlm._render_xlsx_chart", lambda raw_, id12: "data:image/jpeg;base64,AAA"
     )
     monkeypatch.setattr(
         "convert.figures_vlm.openrouter.chat_request",
