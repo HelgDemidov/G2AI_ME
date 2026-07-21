@@ -124,9 +124,40 @@ _WORKSHEET_HEADER = """\
 
 Инструкция: для каждой строки — решение в decisions.yaml (`discover.py apply decisions.yaml`),
 ключ — `raw_hash` (первые 12 символов ниже, либо полный хэш; должен быть уникальным префиксом
-среди ждущих). Формат decisions.yaml — spec discovery-manual §4.
+среди ждущих). Порядок ключей решения — конвенция читаемости (код к порядку безразличен):
+`id` первым (кем кандидат станет), `action` последним (итог отработки). Весь СОДЕРЖАТЕЛЬНЫЙ
+контент решений — АНГЛИЙСКИЙ (`rationale`/`summary`/`reason`; языковая унификация данных).
+
+```yaml
+- id: me-example-strategy-2026
+  raw_hash: "abc123def456"
+  entity_id: me
+  track: montenegro
+  issuer_type: government
+  geo_scope: national
+  doc_type: strategy
+  authority: soft_law
+  source_format: pdf
+  relevance:
+    target_fit: primary
+    axis: agentic_g2ai
+    assessed_stage: triage
+    rationale: "ONLY the relevance factors for this tier/axis — do NOT restate the summary"
+    assessed_date: 2026-07-21
+  topics: [ai-governance]
+  summary: "2-3 sentences EN — what the document IS"
+  relations:
+    - {type: implements, target: eu-ai-act-2024}
+  action: admit
+
+- raw_hash: "fed456abc789"
+  reason: "outside both axes: marketing overview"
+  action: reject
+```
 
 Заполняя `admit`:
+- `rationale` ≠ `summary`: summary описывает документ, rationale — ТОЛЬКО факторы релевантности
+  (почему этот тир по этой оси); не дублировать одно в другом.
 - `relations` — если связь с другим документом реестра видна уже сейчас (`implements`/`cites`/…),
   указать сразу: второго прохода по документу не будет (pre-wave требование graph-v2).
 - `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf` (дефолт); сверить с квотой

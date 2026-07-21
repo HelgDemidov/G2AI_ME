@@ -184,6 +184,16 @@ def test_render_worksheet_includes_header_and_row() -> None:
     assert "ai-governance" in text
 
 
+def test_render_worksheet_header_carries_decision_format_conventions() -> None:
+    """Шапка — самодостаточный формат решений: id первым, action последним, контент EN,
+    rationale = только факторы релевантности (не пересказ summary)."""
+    text = manual.render_worksheet([])
+    assert "- id: me-example-strategy-2026" in text  # id — первый ключ примера
+    assert "action: admit" in text and "action: reject" in text
+    assert "АНГЛИЙСКИЙ" in text
+    assert "rationale" in text and "summary" in text
+
+
 def test_render_worksheet_empty_pending_still_has_header() -> None:
     text = manual.render_worksheet([])
     assert "Триаж-worksheet" in text
@@ -203,7 +213,7 @@ def _admit_decision(raw_hash: str, **overrides: object) -> dict[str, object]:
         "issuer_type": "government",
         "geo_scope": "national",
         "doc_type": "strategy",
-        "authority": "official",
+        "authority": "soft_law",
         "relevance": {
             "target_fit": "primary",
             "axis": "agentic_g2ai",
