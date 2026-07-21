@@ -149,6 +149,24 @@ def _check_langs_available(langs: str) -> None:
         raise ConversionError(f"нет traineddata для {', '.join(missing)} — sudo apt install {apt_pkgs}")
 
 
+def _capture_original_sha256(raw: Path) -> None:
+    """Sha256 raw ДО OCR-мутации (spec ocr-eval-harness §8.1, S1) — `sha256` в
+    `.state.yaml` отражает файл ПОСЛЕ ocrmypdf, издательский оригинал иначе не
+    восстановим. Тот же паттерн, что `_cached_or_call_cloud` (read-modify-write
+    `.state.yaml` напрямую по `raw.parent`, без протаскивания через `ConvertFn` —
+    его сигнатура едина для всех форматов реестра, менять её ради одного поля
+    OCR-ветки не стоит). Пишет ТОЛЬКО если поле ещё `None`: повторная нормализация
+    (`--force`/бамп версии конвертера) уже мутированного raw не должна затереть
+    РАНЕЕ захваченный оригинальный хэш пересчитанным от файла, который сам уже
+    не оригинал."""
+    state_path = raw.parent / ".state.yaml"
+    state = schema.load_state(state_path)
+    if state.original_sha256 is not None:
+        return
+    state.original_sha256 = fsio.sha256_file(raw)
+    schema.save_state(state_path, state)
+
+
 def _ocr_normalize(raw: Path, language: str | None) -> None:
     """OCR-нормализовать скан IN-PLACE: `raw` заменяется версией с невидимым текст-слоем.
 
@@ -158,7 +176,9 @@ def _ocr_normalize(raw: Path, language: str | None) -> None:
     следующий `_detect_scan(raw)` больше не поднимет `NeedsOCR`, и `_ocr_normalize` не
     вызовется повторно без явного `--force`/бампа версии конвертера. Вызывающий
     (`_do_convert` в run_pipeline.py) ОБЯЗАН пересчитать sha256/размер/mtime в
-    `.state.yaml` после конвертации — raw физически изменился.
+    `.state.yaml` после конвертации — raw физически изменился (его собственный
+    `load_state`/`save_state`-раунд-трип идёт ПОСЛЕ этой функции и подхватит уже
+    записанный `_capture_original_sha256` результат с диска — гонки нет).
     """
     if shutil.which("ocrmypdf") is None:
         raise NeedsOCR(
@@ -177,6 +197,7 @@ def _ocr_normalize(raw: Path, language: str | None) -> None:
             raw.name, n, n * 20 // 60, n * 40 // 60,
         )
 
+    _capture_original_sha256(raw)  # ДО staging/subprocess — raw ещё не мутирован
     staging = fsio.staging_path(raw)
     result = subprocess.run(
         [

@@ -17,6 +17,7 @@ from convert.converters import (
     NeedsOCR,
     UnsupportedFormat,
     _cached_or_call_cloud,
+    _capture_original_sha256,
     _check_langs_available,
     cloud_allowed,
     _convert_docx,
@@ -31,6 +32,7 @@ from convert.converters import (
     _was_ocr_normalized,
     resolve_converter,
 )
+from core import fsio, schema
 from core.schema import SourceRecord
 from tests.support import (
     build_docx_with_choice_only_images,
@@ -869,6 +871,105 @@ def test_ocr_normalize_warns_on_large_page_count(
     with caplog.at_level(logging.WARNING):
         _ocr_normalize(raw, "en")
     assert "250" in caplog.text
+
+
+# --- _capture_original_sha256 (spec ocr-eval-harness §8.1, S1) ---
+
+
+def test_capture_original_sha256_stores_hash_of_current_file(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 pristine scan bytes")
+    expected = fsio.sha256_file(raw)
+
+    _capture_original_sha256(raw)
+
+    state = schema.load_state(raw.parent / ".state.yaml")
+    assert state.original_sha256 == expected
+
+
+def test_capture_original_sha256_does_not_overwrite_existing_value(tmp_path: Path) -> None:
+    """Второй прогон (--force/бамп версии) на УЖЕ мутированном raw не должен
+    затереть ранее захваченный оригинальный хэш пересчитанным от мутированного
+    файла — иначе original_sha256 перестаёт означать «издательский оригинал»."""
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"first content")
+    state_path = raw.parent / ".state.yaml"
+    schema.save_state(state_path, schema.OperationalState(original_sha256="f" * 64))
+
+    raw.write_bytes(b"different content entirely")  # симулирует уже-мутированный файл
+    _capture_original_sha256(raw)
+
+    assert schema.load_state(state_path).original_sha256 == "f" * 64  # не тронуто
+
+
+def test_ocr_normalize_captures_hash_before_ocrmypdf_mutates_raw(monkeypatch: Any, tmp_path: Path) -> None:
+    """Полный поток: захваченный original_sha256 — хэш ИСХОДНЫХ байт raw, не
+    результата ocrmypdf (мок subprocess.run переписывает raw другим содержимым)."""
+    raw = tmp_path / "raw.pdf"
+    original_bytes = b"%PDF-1.4 pristine scan"
+    raw.write_bytes(original_bytes)
+    expected = fsio.sha256_file(raw)
+
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    _patch_open(monkeypatch, [_FakePage("")])
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        Path(cmd[-1]).write_bytes(b"totally different ocr-mutated bytes")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+    _ocr_normalize(raw, "en")
+
+    assert raw.read_bytes() != original_bytes  # raw реально мутирован
+    state = schema.load_state(raw.parent / ".state.yaml")
+    assert state.original_sha256 == expected  # но захвачен хэш ДО мутации
+
+
+def test_ocr_normalize_second_call_keeps_first_captured_hash(monkeypatch: Any, tmp_path: Path) -> None:
+    """Регресс на --force повторную нормализацию: второй вызов _ocr_normalize
+    (уже на мутированном raw) не должен переписать original_sha256."""
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"pristine")
+    expected = fsio.sha256_file(raw)
+
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    _patch_open(monkeypatch, [_FakePage("")])
+
+    def fake_run_v1(cmd: list[str], **kw: Any) -> Any:
+        Path(cmd[-1]).write_bytes(b"ocr v1")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run_v1)
+    _ocr_normalize(raw, "en")  # первый прогон — захватывает expected
+
+    def fake_run_v2(cmd: list[str], **kw: Any) -> Any:
+        Path(cmd[-1]).write_bytes(b"ocr v2")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run_v2)
+    _ocr_normalize(raw, "en")  # второй прогон (--force) — raw уже не оригинал
+
+    state = schema.load_state(raw.parent / ".state.yaml")
+    assert state.original_sha256 == expected  # осталось от первого прогона
+
+
+def test_convert_pdf_digital_path_leaves_original_sha256_unset(monkeypatch: Any, tmp_path: Path) -> None:
+    """Born-digital документ никогда не проходит через _ocr_normalize ->
+    original_sha256 остаётся None — полю нечего означать без OCR-мутации."""
+    _patch_open(monkeypatch, [_FakePage("x" * 60)])  # текст есть — не скан
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"born digital pdf bytes")
+
+    def fake_pdf_convert(src: str, dst: str) -> None:
+        Path(dst).write_text("Body text.\n", encoding="utf-8")
+
+    monkeypatch.setattr("convert.converters.pdf_convert", fake_pdf_convert)
+    _convert_pdf(raw, tmp_path / "out.md", "en")
+
+    state = schema.load_state(raw.parent / ".state.yaml")
+    assert state.original_sha256 is None
 
 
 # --- cloud_allowed / _cached_or_call_cloud / _convert_pdf облачная маршрутизация
