@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from core.schema import VOCAB_DIR
 from tests.support import valid_record, write_doc
-from core.validate_sources import validate_sources
+from core.validate_sources import main, validate_sources
 
 
 def _errors(root: Path, vocab_dir: Path = VOCAB_DIR) -> list[str]:
@@ -48,6 +49,20 @@ def test_g2ai_pattern_not_in_vocab(tmp_path: Path) -> None:
     rec["g2ai_pattern"] = ["invented-pattern"]
     write_doc(tmp_path, rec)
     assert any("g2ai_pattern 'invented-pattern' вне словаря" in e for e in _errors(tmp_path))
+
+
+def test_doc_type_not_in_vocab(tmp_path: Path) -> None:
+    rec = valid_record()
+    rec["doc_type"] = "not-a-real-doc-type"
+    write_doc(tmp_path, rec)
+    assert any("doc_type 'not-a-real-doc-type' вне словаря" in e for e in _errors(tmp_path))
+
+
+def test_authority_not_in_vocab(tmp_path: Path) -> None:
+    rec = valid_record()
+    rec["authority"] = "not-a-real-authority"
+    write_doc(tmp_path, rec)
+    assert any("authority 'not-a-real-authority' вне словаря" in e for e in _errors(tmp_path))
 
 
 def test_dangling_relation(tmp_path: Path) -> None:
@@ -136,3 +151,62 @@ def test_validate_sources_records_present_even_with_errors(tmp_path: Path) -> No
     errors, records = validate_sources(tmp_path, VOCAB_DIR)
     assert errors  # структурно распарсилась, но relevance отсутствует
     assert len(records) == 1  # структурно валидная запись всё равно возвращается
+
+
+# --- YAML-синтаксическая ошибка (except yaml.YAMLError) ---
+
+
+def test_malformed_yaml_reported(tmp_path: Path) -> None:
+    d = tmp_path / "intl-xperience" / "sg" / "bad-doc-2026"
+    d.mkdir(parents=True)
+    (d / "meta.yaml").write_text("id: [unterminated flow sequence\n", encoding="utf-8")
+    errors = _errors(tmp_path)
+    assert any("YAML" in e for e in errors)
+
+
+def test_malformed_yaml_does_not_abort_scan_of_other_docs(tmp_path: Path) -> None:
+    """Одна битая meta.yaml не должна ронять валидацию остального корпуса (continue после
+    YAMLError, аналог изоляции отказа документа в run_pipeline)."""
+    bad_dir = tmp_path / "intl-xperience" / "sg" / "bad-doc-2026"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "meta.yaml").write_text("id: [unterminated\n", encoding="utf-8")
+    write_doc(tmp_path, valid_record())
+
+    errors, records = validate_sources(tmp_path, VOCAB_DIR)
+    assert any("YAML" in e for e in errors)
+    assert len(records) == 1  # валидный документ всё же распарсен и возвращён
+
+
+# --- main(): CLI (коды возврата, stdout/stderr) ---
+
+
+def test_main_valid_corpus_returns_zero_and_prints_ok(tmp_path: Path, capsys: Any) -> None:
+    write_doc(tmp_path, valid_record())
+    assert main([str(tmp_path)]) == 0
+    assert "OK" in capsys.readouterr().out
+
+
+def test_main_invalid_corpus_returns_one_and_prints_errors(tmp_path: Path, capsys: Any) -> None:
+    rec = valid_record()
+    rec["topics"] = ["not-a-real-topic"]
+    write_doc(tmp_path, rec)
+    assert main([str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "вне словаря" in err
+    assert "ошибок" in err
+
+
+def test_main_default_sources_arg_is_default_sources_constant(monkeypatch: Any) -> None:
+    """Без позиционного аргумента используется core.schema.DEFAULT_SOURCES (argparse default),
+    не хардкод CLI-обвязки."""
+    captured: dict[str, Any] = {}
+
+    def fake_validate(sources_path: Path, vocab_dir: Path) -> tuple[list[str], list[Any]]:
+        captured["sources_path"] = sources_path
+        return [], []
+
+    monkeypatch.setattr("core.validate_sources.validate_sources", fake_validate)
+    assert main([]) == 0
+    from core.schema import DEFAULT_SOURCES
+
+    assert captured["sources_path"] == DEFAULT_SOURCES
