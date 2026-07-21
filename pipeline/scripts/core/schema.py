@@ -441,6 +441,25 @@ def save_state(state_path: Path, state: OperationalState) -> None:
     fsio.atomic_write_text(state_path, text)
 
 
+def save_record(rec: SourceRecord, root: Path) -> Path:
+    """Записать курируемый ``meta.yaml`` в папку документа (создав её): ``doc_dir/meta.yaml``.
+
+    Атомарно (``fsio.atomic_write_text``, создаёт недостающие каталоги). Существующий
+    ``meta.yaml`` -> ``ValueError`` — перезапись курируемого файла запрещена (правки только
+    руками/явным решением куратора), тот же принцип, что у ``.state.yaml`` не применяется
+    (сравни с ``save_state``, машиннописаный sidecar перезаписывается свободно). Возвращает
+    путь ``meta.yaml``. Человек остаётся источником решений — этот писатель лишь материализует
+    аргументы ``promote_candidate`` на диск.
+    """
+    path = doc_dir(rec, root) / "meta.yaml"
+    if path.exists():
+        raise ValueError(f"{path}: meta.yaml уже существует — перезапись курируемого файла запрещена")
+    payload = rec.model_dump(mode="json", exclude_none=True)
+    text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    fsio.atomic_write_text(path, text)
+    return path
+
+
 def promote_candidate(
     cand: CandidateRecord,
     *,
@@ -453,6 +472,10 @@ def promote_candidate(
     authority: str,
     relevance: Relevance,
     source_format: SourceFormat = SourceFormat.pdf,
+    topics: list[str] | None = None,
+    g2ai_pattern: list[str] | None = None,
+    summary: str | None = None,
+    relations: list[Relation] | None = None,
 ) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
@@ -462,6 +485,14 @@ def promote_candidate(
     (``title``/``issuer``/``language``/``source_url``), берутся из кандидата и обязаны
     присутствовать — иначе ``ValueError``. Провенанс добычи остаётся в ``candidates.yaml``
     (в ``meta.yaml`` НЕ копируется — corpus-layout-v2).
+
+    ``topics``/``g2ai_pattern``/``summary``/``relations`` (v2, spec discovery-manual) — опциональная
+    аналитика в то же одно касание документа (нужно для manual-каналов, где Стадии триажа слиты,
+    второго прохода по документу не будет; ``relations`` дополнительно — pre-wave требование
+    graph-v2). ``None`` -> прежние пустые дефолты (обратная совместимость); для батч-каналов
+    опустить эти аргументы по-прежнему штатно — ленивая Стадия 2 доберёт (triage-channel-policy §2).
+    Словарную принадлежность ``topics``/``g2ai_pattern`` эта функция не проверяет — как и раньше,
+    это ``validate_sources.py`` (schema словарей не грузит).
     """
     title, issuer, language, source_url = cand.title, cand.issuer, cand.language, cand.source_url
     missing = [
@@ -499,6 +530,10 @@ def promote_candidate(
         rights=cand.rights or Rights.unknown,
         sensitivity=cand.sensitivity or Sensitivity.normal,
         relevance=relevance,
+        topics=topics or [],
+        g2ai_pattern=g2ai_pattern or [],
+        summary=summary,
+        relations=relations or [],
     )
 
 
