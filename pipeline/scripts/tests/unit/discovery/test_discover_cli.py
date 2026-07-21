@@ -24,9 +24,7 @@ class _StaticConnector:
         cand = schema.CandidateRecord.model_validate(
             {
                 "connector_id": self.id,
-                "connector_kind": schema.ConnectorKind.manual,
                 "retrieved_at": dt.date(2026, 7, 21),
-                "source_ref": f"doc-{self.id}",
                 "raw_hash": f"doc-{self.id}",
             }
         )

@@ -1,6 +1,6 @@
 Run a reproducible directed-search campaign: WebSearch sessions that feed source candidates into the discovery layer via `discover.py inject` (G2AI_ME).
 
-This is a PROTOCOL, not a code connector: the "heavy" part (query design, snippet judgement, publisher verification) is this Claude session; provenance lands in the existing `CandidateRecord` fields (`connector_kind: directed_search`, `connector_id: search:<campaign>`, `source_ref`/`matched_query` = the query). Invoke as `/directed-search <campaign-slug> [axis] [jurisdictions...]`.
+This is a PROTOCOL, not a code connector: the "heavy" part (query design, snippet judgement, publisher verification) is this Claude session; provenance lands in the existing `CandidateRecord` fields (`connector_id: search:<campaign>` — the id grammar IS the channel archetype — plus `matched_query` = the query as executed). Invoke as `/directed-search <campaign-slug> [axis] [jurisdictions...]`.
 
 ## Inputs (resolve before the first query)
 
@@ -40,6 +40,7 @@ The seed-list lesson (charter §8) is the reason this section exists: aggregator
 ```
 
 - `--language`: ISO 639-1; 639-3 only where no 639-1 code exists (Montenegrin `cnr`).
+- `--summary`: 2-3 sentences EN, hard cap 600 characters (schema rejects longer — shorten, don't fight it).
 - Re-injecting a known URL is a safe no-op (dedup; rejected candidates do not resurrect) — do not pre-filter against `candidates.yaml` manually, just inject.
 - A `кандидат уже присутствует (уже отклонён ранее: …)` response is a FINDING: record it in the summary, do not argue with it.
 

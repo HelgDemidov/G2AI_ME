@@ -10,9 +10,7 @@ from discovery.base import Connector, ConnectorCursor, DiscoverResult
 def _candidate(**overrides: object) -> schema.CandidateRecord:
     fields: dict[str, object] = {
         "connector_id": "manual",
-        "connector_kind": schema.ConnectorKind.manual,
         "retrieved_at": dt.date(2026, 7, 21),
-        "source_ref": "https://example.gov/doc",
         "raw_hash": "abc123",
     }
     fields.update(overrides)

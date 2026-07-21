@@ -296,6 +296,12 @@ class SourceRecord(BaseModel):
     in_force: bool | None = None             # действует ли «живой» документ (взвешивание свежести)
 
 
+# Жёсткий предел native_summary: ~2-3 предложения. Не «мягкая рекомендация» — pydantic
+# отказывает; ручной inject сокращает куратор, адаптер registry-коннектора обрезает
+# ДО валидации (обязательство его спека).
+CANDIDATE_SUMMARY_MAX = 600
+
+
 class CandidateRecord(BaseModel):
     """Кандидат-источник из DISCOVERY (живёт в candidates.yaml, до допуска в реестр).
 
@@ -303,33 +309,41 @@ class CandidateRecord(BaseModel):
     коннекторов разнородны и неполны. Не несёт ``relevance`` (discovery не оценивает)
     и не требует ``id`` (присваивается при промоушене). Контракт-розетка между
     DISCOVERY (writer) и триажем (reader); см. source-relevance-triage §3.
+
+    Порядок полей = порядок дампа в candidates.yaml (человекочитаемость: сначала
+    библиография во главе с ``title``, провенанс — внизу). Архетип коннектора НЕ
+    хранится отдельным полем (слим 2026-07-21: было write-only дублирование) —
+    он выводится из грамматики ``connector_id``: ``manual`` -> ручной канал,
+    ``search:<кампания>`` -> directed_search, прочие id -> кодовые коннекторы
+    (archetype — атрибут класса коннектора, см. ``discovery/base.py``). Указатель
+    на нативную запись источника у registry-коннекторов — ``native_id`` (их спеки
+    обязаны его заполнять; отдельного ``source_ref`` больше нет). Легаси-поля
+    старых файлов (``connector_kind``/``source_ref``/``reported_status``)
+    поглощаются ``extra="allow"`` без ошибок.
     """
 
     model_config = ConfigDict(extra="allow")
 
-    # провенанс добычи (обязательно)
-    connector_id: str = Field(min_length=1)
-    connector_kind: ConnectorKind
-    retrieved_at: _dt.date
-    source_ref: str = Field(min_length=1)
-    raw_hash: str = Field(min_length=1)
     # best-effort библиография (Optional — данные upstream неполны)
     title: str | None = None
     issuer: str | None = None
     jurisdiction: str | None = None
-    source_url: str | None = Field(default=None, pattern=r"^https?://")
     doc_date: _dt.date | None = None
-    reported_status: str | None = None
     language: str | None = None
+    source_url: str | None = Field(default=None, pattern=r"^https?://")
     rights: Rights | None = None  # best-effort от коннектора; финализирует триаж
     sensitivity: Sensitivity | None = None  # best-effort; несётся в acquisition-гейт
-    # passthrough-обогащение источника (Optional)
-    native_summary: str | None = None
+    # passthrough-обогащение источника (Optional; None -> не пишется в YAML вовсе)
+    native_summary: str | None = Field(default=None, max_length=CANDIDATE_SUMMARY_MAX)
     native_id: str | None = None
-    native_tags: list[str] = Field(default_factory=list)
+    native_tags: list[str] | None = None
     # дешёвый pre-signal (НЕ вердикт — target_fit присваивает только триаж)
     matched_query: str | None = None
-    matched_vocab_tags: list[str] = Field(default_factory=list)
+    matched_vocab_tags: list[str] | None = None
+    # провенанс добычи (обязательно)
+    connector_id: str = Field(min_length=1)
+    retrieved_at: _dt.date
+    raw_hash: str = Field(min_length=1)
     # dedup-ключи (заполняет discovery)
     normalized_url: str | None = None
     content_hash: str | None = None
@@ -506,8 +520,9 @@ def promote_candidate(
         if val is None
     ]
     if missing:
+        ident = cand.source_url or cand.title or cand.raw_hash[:12]
         raise ValueError(
-            f"кандидат ({cand.connector_id}/{cand.source_ref}): "
+            f"кандидат ({cand.connector_id}: {ident}): "
             f"нельзя промоутить без полей: {', '.join(missing)}"
         )
     assert title is not None and issuer is not None

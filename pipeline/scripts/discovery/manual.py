@@ -61,17 +61,15 @@ def inject(
         if not query:
             raise ValueError("directed_search: --query обязателен")
         connector_id = f"search:{campaign}"
-        source_ref = query
     else:
         connector_id = "manual"
-        source_ref = url
 
     normalized = dedup.normalize_url(url)
+    # архетип канала отдельным полем не хранится — он выводится из грамматики
+    # connector_id ("manual" | "search:<кампания>"), см. docstring CandidateRecord
     cand = schema.CandidateRecord(
         connector_id=connector_id,
-        connector_kind=kind,
         retrieved_at=dt.date.today(),
-        source_ref=source_ref,
         raw_hash=raw_hash_for_manual(normalized, title, date),
         title=title,
         issuer=issuer,

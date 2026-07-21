@@ -14,7 +14,6 @@ from core.schema import (
     AssessedStage,
     Axis,
     CandidateRecord,
-    ConnectorKind,
     Fidelity,
     GeoScope,
     IssuerType,
@@ -226,18 +225,40 @@ def valid_candidate() -> dict[str, Any]:
     """Минимально валидный CandidateRecord (только обязательные поля добычи)."""
     return {
         "connector_id": "agora",
-        "connector_kind": "registry",
         "retrieved_at": "2026-07-15",
-        "source_ref": "zenodo:10.5281/zenodo.13883066#row-42",
         "raw_hash": "deadbeef",
     }
 
 
 def test_candidate_minimal() -> None:
     cand = CandidateRecord.model_validate(valid_candidate())
-    assert cand.connector_kind == ConnectorKind.registry
+    assert cand.connector_id == "agora"
     assert cand.source_url is None  # best-effort библиография опускаема
-    assert cand.native_tags == []
+    assert cand.native_tags is None  # None, не [] — пустой список не пишется в YAML
+
+
+def test_candidate_legacy_fields_absorbed_as_extras() -> None:
+    """Слим 2026-07-21: connector_kind/source_ref/reported_status убраны из модели,
+    старые candidates.yaml с ними остаются загружаемыми (extra="allow")."""
+    data = valid_candidate()
+    data.update(
+        connector_kind="registry",
+        source_ref="zenodo:10.5281/zenodo.13883066#row-42",
+        reported_status="in_force",
+    )
+    cand = CandidateRecord.model_validate(data)
+    assert cand.connector_id == "agora"
+
+
+def test_candidate_native_summary_hard_cap() -> None:
+    from core.schema import CANDIDATE_SUMMARY_MAX
+
+    data = valid_candidate()
+    data["native_summary"] = "x" * (CANDIDATE_SUMMARY_MAX + 1)
+    with pytest.raises(ValidationError):
+        CandidateRecord.model_validate(data)
+    data["native_summary"] = "x" * CANDIDATE_SUMMARY_MAX
+    assert CandidateRecord.model_validate(data).native_summary is not None
 
 
 def test_candidate_permissive_extra_allowed() -> None:
@@ -267,7 +288,7 @@ def test_candidate_full_bibliography() -> None:
 
 @pytest.mark.parametrize(
     "field,bad",
-    [("connector_kind", "spider"), ("source_url", "ftp://x/y"), ("rights", "gpl")],
+    [("source_url", "ftp://x/y"), ("rights", "gpl"), ("sensitivity", "top_secret")],
 )
 def test_candidate_bad_field_rejected(field: str, bad: str) -> None:
     data = valid_candidate()

@@ -34,8 +34,7 @@ def test_inject_minimal_adds_candidate(tmp_path: Path) -> None:
         root=tmp_path,
     )
     assert is_new
-    assert cand.connector_kind == schema.ConnectorKind.manual
-    assert cand.connector_id == "manual"
+    assert cand.connector_id == "manual"  # архетип канала — грамматика id, отдельного поля нет
     loaded = store.load(tmp_path / "candidates.yaml")
     assert len(loaded) == 1
     assert loaded[0].raw_hash == cand.raw_hash
@@ -77,7 +76,6 @@ def test_inject_directed_search_sets_provenance(tmp_path: Path) -> None:
     )
     assert is_new
     assert cand.connector_id == "search:small-states-2026"
-    assert cand.source_ref == "national ai strategy small state"
     assert cand.matched_query == "national ai strategy small state"
 
 
@@ -131,9 +129,7 @@ def test_inject_normalizes_url_for_dedup(tmp_path: Path) -> None:
 def _candidate(**overrides: object) -> schema.CandidateRecord:
     data: dict[str, object] = {
         "connector_id": "manual",
-        "connector_kind": "manual",
         "retrieved_at": "2026-07-21",
-        "source_ref": "https://gov.example.org/a.pdf",
         "raw_hash": "a" * 64,
         "title": "T",
         "issuer": "I",
@@ -286,7 +282,7 @@ def test_apply_admit_v2_fields_reach_meta_yaml(tmp_path: Path) -> None:
 
 def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Path) -> None:
     good = _candidate(raw_hash="b" * 64)
-    bad = _candidate(raw_hash="c" * 64, source_ref="https://gov.example.org/bad.pdf")
+    bad = _candidate(raw_hash="c" * 64)
     store.save([good, bad], tmp_path / "candidates.yaml")
 
     incomplete = _admit_decision("c" * 64)
@@ -299,8 +295,8 @@ def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Pa
 
 
 def test_apply_ambiguous_raw_hash_prefix_reports_error(tmp_path: Path) -> None:
-    cand1 = _candidate(raw_hash="a" * 64, source_ref="https://gov.example.org/1.pdf")
-    cand2 = _candidate(raw_hash="a" * 63 + "b", source_ref="https://gov.example.org/2.pdf")
+    cand1 = _candidate(raw_hash="a" * 64)
+    cand2 = _candidate(raw_hash="a" * 63 + "b")
     store.save([cand1, cand2], tmp_path / "candidates.yaml")
 
     summary = manual.apply_decisions(
