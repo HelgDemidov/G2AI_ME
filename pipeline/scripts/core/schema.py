@@ -149,13 +149,6 @@ class TargetFit(str, Enum):
     background = "background"
 
 
-class Axis(str, Enum):
-    """Ось оценки target_fit (§2.3): узкая агентная vs широкий цифровой суверенитет."""
-
-    agentic_g2ai = "agentic_g2ai"
-    digital_sovereignty = "digital_sovereignty"
-
-
 class AssessedStage(str, Enum):
     """Докуда дошла оценка: дешёвый триаж по метаданным vs подтверждение по тексту."""
 
@@ -216,7 +209,7 @@ class Relevance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     target_fit: TargetFit
-    axis: Axis
+    axis: str = Field(min_length=1)  # словарь — validate_sources.py (vocab_axes)
     assessed_stage: AssessedStage
     rationale: str = Field(min_length=1)
     assessed_date: _dt.date

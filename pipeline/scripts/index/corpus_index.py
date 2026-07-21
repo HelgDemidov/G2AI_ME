@@ -249,7 +249,7 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
                 rec.doc_type,
                 rec.authority,
                 rec.language,
-                rec.relevance.axis.value if rec.relevance else None,
+                rec.relevance.axis if rec.relevance else None,
                 rec.relevance.target_fit.value if rec.relevance else None,
                 rec.relevance.assessed_stage.value if rec.relevance else None,
                 rec.sensitivity.value,

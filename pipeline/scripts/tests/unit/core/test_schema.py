@@ -12,7 +12,6 @@ from tests.support import valid_record, write_doc
 from core.schema import (
     AcquisitionMethod,
     AssessedStage,
-    Axis,
     CandidateRecord,
     Fidelity,
     GeoScope,
@@ -169,7 +168,7 @@ def test_relevance_parse() -> None:
     rec = SourceRecord.model_validate(valid_record())
     assert rec.relevance is not None
     assert rec.relevance.target_fit == TargetFit.primary
-    assert rec.relevance.axis == Axis.agentic_g2ai
+    assert rec.relevance.axis == "agentic_g2ai"
     assert rec.relevance.assessed_stage == AssessedStage.confirmed
 
 
@@ -192,11 +191,24 @@ def test_relevance_missing_required_rejected(drop: str) -> None:
 
 @pytest.mark.parametrize(
     "field,bad",
-    [("target_fit", "core"), ("axis", "economy"), ("assessed_stage", "final")],
+    [("target_fit", "core"), ("assessed_stage", "final")],
 )
 def test_relevance_bad_enum_rejected(field: str, bad: str) -> None:
     data = valid_record()
     data["relevance"][field] = bad
+    with pytest.raises(ValidationError):
+        SourceRecord.model_validate(data)
+
+
+def test_relevance_axis_accepts_any_nonempty_string() -> None:
+    """Ось — словарь (validate_sources.py), не enum: pydantic принимает любую непустую строку."""
+    data = valid_record()
+    data["relevance"]["axis"] = "economy"
+    rec = SourceRecord.model_validate(data)
+    assert rec.relevance is not None
+    assert rec.relevance.axis == "economy"
+
+    data["relevance"]["axis"] = ""
     with pytest.raises(ValidationError):
         SourceRecord.model_validate(data)
 
@@ -519,7 +531,7 @@ def test_save_state_uses_fsio_atomic_write(tmp_path: Path, monkeypatch: Any) -> 
 
 
 def test_load_real_vocab_nonempty() -> None:
-    for name in ("doc_types", "authority", "topics", "g2ai_patterns"):
+    for name in ("doc_types", "authority", "topics", "g2ai_patterns", "axes"):
         terms = load_vocab(name)
         assert terms, f"словарь {name} пуст"
         assert all(isinstance(t, str) for t in terms)

@@ -65,6 +65,32 @@ def test_authority_not_in_vocab(tmp_path: Path) -> None:
     assert any("authority 'not-a-real-authority' вне словаря" in e for e in _errors(tmp_path))
 
 
+def test_axis_not_in_vocab(tmp_path: Path) -> None:
+    rec = valid_record()
+    rec["relevance"]["axis"] = "economy"
+    write_doc(tmp_path, rec)
+    errors = _errors(tmp_path)
+    assert len(errors) == 1
+    assert "relevance.axis" in errors[0] and "вне словаря" in errors[0]
+
+
+def test_axis_valid_passes(tmp_path: Path) -> None:
+    for axis in ("agentic_g2ai", "digital_sovereignty"):
+        rec = valid_record()
+        rec["relevance"]["axis"] = axis
+        write_doc(tmp_path, rec)
+        assert _errors(tmp_path) == []
+
+
+def test_missing_relevance_does_not_crash_axis_check(tmp_path: Path) -> None:
+    rec = valid_record()
+    rec["relevance"] = None
+    write_doc(tmp_path, rec)
+    errors = _errors(tmp_path)
+    assert any("отсутствует relevance" in e for e in errors)
+    assert not any("axis" in e for e in errors)
+
+
 def test_dangling_relation(tmp_path: Path) -> None:
     rec = valid_record()
     rec["relations"] = [{"type": "implements", "target": "eu-ec-ai-act-2024"}]
