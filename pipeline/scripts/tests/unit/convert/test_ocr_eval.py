@@ -1,9 +1,19 @@
-"""Тесты харнесса качества OCR (spec ocr-eval-harness). Тир 1 полностью
-CI-safe (без сети/модели) — синтетические тексты, не реальный корпус."""
+"""Тесты харнесса качества OCR (spec ocr-eval-harness). Тир 1/2 полностью
+CI-safe (без сети/модели) — синтетические тексты, не реальный корпус.
+run_document/run_pages тестируются с мокнутым cloud_ocr.convert_scan
+(сеть запрещена в unit-тестах, spec §7); run_tesseract сети не требует
+вовсе — реальный многостраничный PDF через reportlab."""
 from __future__ import annotations
 
+import io
 from dataclasses import replace
+from pathlib import Path
 
+import pdfplumber
+import pytest
+from reportlab.pdfgen import canvas
+
+from convert import cloud_ocr
 from convert.ocr_eval import (
     CandidateResult,
     Divergence,
@@ -12,8 +22,27 @@ from convert.ocr_eval import (
     format_report,
     levenshtein,
     normalize_for_cer,
+    run_document,
+    run_pages,
+    run_tesseract,
     score_page,
 )
+
+
+def _multi_page_pdf(texts: list[str], *, creator: str | None = None) -> bytes:
+    """Реальный многостраничный PDF через reportlab — run_pages/run_tesseract
+    нуждаются в настоящих объектах pdfplumber/pypdfium2, не в моке (та же
+    дисциплина, что tests/support.py::build_pdf; своя копия здесь — build_pdf
+    однострочна и не поддерживает несколько страниц)."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(300, 300))
+    if creator is not None:
+        c.setCreator(creator)
+    for text in texts:
+        c.drawString(20, 250, text)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
 
 # --- normalize_for_cer ---
 
@@ -224,3 +253,125 @@ def test_format_report_tier1_header_lists_actual_pages() -> None:
     r = _result("gemini", {1: ("# T\n\nx", "# T\n\nx"), 7: ("# U\n\ny", "# U\n\ny")})
     out = format_report([r], [])
     assert "стр. 1, 7" in out.splitlines()[0]
+
+
+# --- run_document / run_pages: изоляция (§5) — сеть замокана, convert_scan не касается сети ---
+
+
+def test_run_document_calls_convert_scan_with_path_inside_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(_multi_page_pdf(["p1"]))
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    seen: list[Path] = []
+
+    def fake_convert_scan(path: Path, language: str | None, *, model: str) -> str:
+        seen.append(path)
+        return "cloud text"
+
+    monkeypatch.setattr(cloud_ocr, "convert_scan", fake_convert_scan)
+    result = run_document(raw, "cnr", "test-model", workdir)
+
+    assert result == "cloud text"
+    assert len(seen) == 1
+    assert seen[0].parent == workdir
+    assert seen[0] != raw
+
+
+def test_run_document_never_touches_original_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(_multi_page_pdf(["p1"]))
+    before = raw.stat()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    monkeypatch.setattr(cloud_ocr, "convert_scan", lambda path, language, *, model: "x")
+    run_document(raw, "cnr", "test-model", workdir)
+
+    after = raw.stat()
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
+
+
+def test_run_pages_calls_convert_scan_once_per_page_with_single_page_pdfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(_multi_page_pdf(["p1", "p2", "p3"]))
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    calls: list[Path] = []
+
+    def fake_convert_scan(path: Path, language: str | None, *, model: str) -> str:
+        calls.append(path)
+        with pdfplumber.open(path) as pdf:  # каждый вызов — валидный ОДНОСТРАНИЧНЫЙ PDF
+            assert len(pdf.pages) == 1
+        return f"text-for-{path.name}"
+
+    monkeypatch.setattr(cloud_ocr, "convert_scan", fake_convert_scan)
+    result = run_pages(raw, [1, 3], "cnr", "test-model", workdir)
+
+    assert len(calls) == 2  # ровно по одному вызову на страницу, не один на весь список
+    assert set(result.keys()) == {1, 3}
+    assert all(p.parent == workdir for p in calls)
+
+
+def test_run_pages_never_touches_original_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(_multi_page_pdf(["p1", "p2"]))
+    before = raw.stat()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    monkeypatch.setattr(cloud_ocr, "convert_scan", lambda path, language, *, model: "x")
+    run_pages(raw, [1, 2], "cnr", "test-model", workdir)
+
+    after = raw.stat()
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
+
+
+# --- run_tesseract: сети не требует, реальный текст-слой через reportlab ---
+
+
+def test_run_tesseract_extracts_all_pages_when_normalized(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(
+        _multi_page_pdf(
+            ["Clan 26 potpis", "Clan 7 broj"],
+            creator="ocrmypdf 15.2.0+dfsg1 / Tesseract OCR-PDF 5.3.4",
+        )
+    )
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    result = run_tesseract(raw, workdir)
+
+    assert result is not None
+    assert set(result) == {1, 2}
+    assert "Clan 26" in result[1]
+    assert "Clan 7" in result[2]
+
+
+def test_run_tesseract_returns_none_for_born_digital(tmp_path: Path) -> None:
+    """Нет метки ocrmypdf в Creator -> нет текст-слоя от OCR -> кандидат
+    пропускается с None, а не роняет прогон (spec §3)."""
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(_multi_page_pdf(["born digital text"], creator="Microsoft Word"))
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    assert run_tesseract(raw, workdir) is None
+
+
+def test_run_tesseract_never_touches_original_raw(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(_multi_page_pdf(["x"], creator="ocrmypdf 15.2.0"))
+    before = raw.stat()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    run_tesseract(raw, workdir)
+
+    after = raw.stat()
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)

@@ -1,8 +1,12 @@
 """A/B-харнесс качества OCR (spec ocr-eval-harness). Тир 1 — точность против
 вручную выверенного эталона (``score_page``); тир 2 — попарные расхождения
-кандидатов на всём документе (``diverge``, следующий коммит), эталона не
-требует. Оба тира — чистые функции, без сети; ``run_document``/``run_pages``
-(облачные вызовы) появляются отдельным коммитом.
+кандидатов на всём документе (``diverge``), эталона не требует. Оба тира —
+чистые функции, без сети. ``run_document``/``run_pages`` — единственные
+функции с сетевым вводом-выводом; обе работают ИСКЛЮЧИТЕЛЬНО через копию
+``raw`` в изолированном ``workdir`` (§5): ``cloud_ocr.convert_scan`` пишет
+кэш-сайдкары рядом с переданным путём (``cache_path``/``_parts_path`` берут
+``raw.parent``), прогон харнесса по оригиналу затёр бы оплаченный
+production-кэш документа.
 
 Число расходится с числом свидетеля-эталона через ``convert.lint.numeric_delta``
 (та же логика, что у витнесс-гейта, §4 спека) — не дублируется здесь.
@@ -10,11 +14,17 @@
 from __future__ import annotations
 
 import re
+import shutil
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
+from pathlib import Path
 
+import pdfplumber
+import pypdfium2 as pdfium
+
+from convert import cloud_ocr, converters
 from convert.lint import numeric_counter, numeric_delta
 
 _HEADING_HASH_RE = re.compile(r"^#{1,6}\s*", re.MULTILINE)  # только ведущие # строки
@@ -245,3 +255,68 @@ def format_report(results: list[CandidateResult], divergences: list[Divergence])
     согласия — уровень CLI (main), не этой функции: она только форматирует
     переданные данные."""
     return _format_tier1_block(results) + "\n\n" + _format_tier2_block(divergences)
+
+
+# --- run_document / run_pages / run_tesseract: единственные функции с сетевым
+# вводом-выводом (кроме tesseract — он локальный и бесплатный). Все три
+# работают ИСКЛЮЧИТЕЛЬНО через копию raw в workdir (§5) ---
+
+
+def _copy_raw(raw: Path, workdir: Path) -> Path:
+    """Копия ``raw`` внутри ``workdir`` — единая точка изоляции: все три
+    ``run_*`` функции читают/пишут только эту копию, оригинал в ``sources/``
+    не открывается на запись НИКЕМ (``cloud_ocr.convert_scan`` пишет
+    кэш-сайдкары рядом с переданным путём). Идемпотентна: повторный вызов на
+    том же ``workdir`` не копирует заново."""
+    copy = workdir / raw.name
+    if not copy.exists():
+        shutil.copy2(raw, copy)
+    return copy
+
+
+def run_document(raw: Path, language: str, model: str, workdir: Path) -> str:
+    """Тир 2: весь документ ОДНИМ вызовом ``convert_scan`` — ровно та
+    конфигурация, что работает в проде (13 стр. < ``OCR_BATCH_PAGES=20`` ->
+    один запрос, spec §3)."""
+    return cloud_ocr.convert_scan(_copy_raw(raw, workdir), language, model=model)
+
+
+def run_pages(raw: Path, pages: list[int], language: str, model: str, workdir: Path) -> dict[int, str]:
+    """Тир 1: КАЖДАЯ страница эталона — отдельный одностраничный PDF и
+    отдельный вызов ``convert_scan``. Только так получается однозначное
+    соответствие страница <-> текст: постраничных разделителей в общем
+    выводе ``convert_scan`` нет (§2). Честная оговорка (§3): одностраничный
+    прогон идёт БЕЗ ``_OUTLINE_PREAMBLE`` (тот добавляется только для батча
+    N>1 внутри ``convert_scan``) — контекст чуть отличается от
+    полнодокументного, для CER несущественно, для заголовков может дать
+    расхождение с тем же кандидатом в тире 2. Ожидаемо, не дефект."""
+    copy = _copy_raw(raw, workdir)
+    result: dict[int, str] = {}
+    for page in pages:
+        src = pdfium.PdfDocument(str(copy))
+        sliced = pdfium.PdfDocument.new()
+        sliced.import_pages(src, [page - 1])  # API 0-based, манифест/§1 — 1-based
+        page_path = workdir / f"p{page:02d}.pdf"
+        sliced.save(str(page_path))
+        result[page] = cloud_ocr.convert_scan(page_path, language, model=model)
+    return result
+
+
+def run_tesseract(raw: Path, workdir: Path) -> dict[int, str] | None:
+    """Кандидат ``tesseract``: ``pdfplumber.extract_text`` по КАЖДОЙ странице
+    копии — без сети, без вызова ``ocrmypdf`` (текст-слой уже вписан in-place
+    при первой конвертации документа, convert-ocr §2). Возвращает ``{стр:
+    текст}`` для ВСЕХ страниц документа (1-based) одним проходом — и тир 1
+    (эталонные страницы), и тир 2 (весь документ) берут срез из ОДНОГО
+    результата; в отличие от облачных ``run_document``/``run_pages``,
+    которым нужен раздельный сетевой вызов на каждую конфигурацию, здесь
+    текст уже физически лежит в PDF и резать на отдельные файлы незачем.
+
+    ``None``, если у документа нет текст-слоя (``converters._was_ocr_normalized``
+    вернул ``False``) — кандидат пропускается с сообщением, не роняет прогон
+    (spec §3)."""
+    copy = _copy_raw(raw, workdir)
+    if not converters._was_ocr_normalized(copy):
+        return None
+    with pdfplumber.open(copy) as pdf:
+        return {i: (page.extract_text() or "") for i, page in enumerate(pdf.pages, start=1)}
