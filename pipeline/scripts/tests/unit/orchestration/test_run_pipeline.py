@@ -1162,3 +1162,131 @@ def test_report_unembedded_silent_when_all_embedded(tmp_path: Path, caplog: Any)
     with caplog.at_level("INFO", logger="run_pipeline"):
         _report_unembedded(db, "openrouter")
     assert caplog.records == []
+
+
+# --- scan_fallback_counts / _report_scan_fallback: сводка фолбэк-OCR-пути
+# (spec ocr-eval-harness §8.3, S5) ---
+
+
+def test_scan_fallback_counts_counts_cloud_allowed_scan_without_model_as_fallback(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-scan-fallback-2026"}
+    write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
+    rec = SourceRecord.model_validate(rec_data)
+
+    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    assert scan_fallback_counts([rec], sources) == (1, 0)
+
+
+def test_scan_fallback_counts_counts_confidential_scan_separately(tmp_path: Path, monkeypatch: Any) -> None:
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-scan-conf-2026", "sensitivity": "confidential"}
+    write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
+    rec = SourceRecord.model_validate(rec_data)
+
+    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
+
+    assert scan_fallback_counts([rec], sources) == (0, 1)
+
+
+def test_scan_fallback_counts_ignores_scan_with_successful_cloud_ocr(tmp_path: Path, monkeypatch: Any) -> None:
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-scan-ok-2026"}
+    write_doc(
+        sources, rec_data, raw=b"%PDF fake scan",
+        state={"cloud_ocr_model": "google/gemini-3-flash-preview"},
+    )
+    rec = SourceRecord.model_validate(rec_data)
+
+    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+
+    assert scan_fallback_counts([rec], sources) == (0, 0)
+
+
+def test_scan_fallback_counts_ignores_born_digital(tmp_path: Path, monkeypatch: Any) -> None:
+    """Не-скан не считается ни в одном бакете, даже если бы cloud_ocr_model
+    случайно оказался None (у born-digital ему и неоткуда взяться)."""
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-digital-2026"}
+    write_doc(sources, rec_data, raw=b"%PDF fake digital", state={})
+    rec = SourceRecord.model_validate(rec_data)
+
+    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: False)
+
+    assert scan_fallback_counts([rec], sources) == (0, 0)
+
+
+def test_scan_fallback_counts_ignores_missing_raw(tmp_path: Path) -> None:
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-no-raw-2026"}
+    write_doc(sources, rec_data)  # без raw.pdf вовсе (--no-download, ещё не скачан)
+    rec = SourceRecord.model_validate(rec_data)
+
+    assert scan_fallback_counts([rec], sources) == (0, 0)
+
+
+def test_scan_fallback_counts_skips_non_pdf_source_format(tmp_path: Path) -> None:
+    """Регрессия на живой краш (реальный корпус, eu-ai-act-2024, raw.html):
+    OCR-путь существует только для PDF — без гейта по source_format
+    _was_ocr_normalized безусловно открывает файл через pdfplumber и падает
+    (PdfminerException) на не-PDF содержимом. write_doc пишет raw.* с
+    расширением .pdf независимо от переданных байт — html-файл дописан
+    вручную, чтобы честно воспроизвести форму реального документа."""
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-html-doc-2026", "source_format": "html"}
+    doc_dir = write_doc(sources, rec_data)
+    (doc_dir / "raw.html").write_bytes(b"<html><body>not a pdf</body></html>")
+    rec = SourceRecord.model_validate(rec_data)
+
+    assert scan_fallback_counts([rec], sources) == (0, 0)  # не падает, тихо пропускает
+
+
+def test_report_scan_fallback_logs_warning_for_fallback_and_info_for_confidential(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    from run_pipeline import _report_scan_fallback
+
+    sources = tmp_path / "sources"
+    fb_data = {**valid_record(), "id": "sg-fb-2026"}
+    conf_data = {**valid_record(), "id": "sg-conf-2026", "sensitivity": "confidential"}
+    write_doc(sources, fb_data, raw=b"%PDF fake", state={})
+    write_doc(sources, conf_data, raw=b"%PDF fake", state={})
+    records = [SourceRecord.model_validate(fb_data), SourceRecord.model_validate(conf_data)]
+
+    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        _report_scan_fallback(records, sources)
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    infos = [r for r in caplog.records if r.levelname == "INFO"]
+    assert any("1 скан" in r.message for r in warnings)
+    assert any("confidential" in r.message for r in infos)
+
+
+def test_report_scan_fallback_silent_when_nothing_to_report(tmp_path: Path, caplog: Any) -> None:
+    from run_pipeline import _report_scan_fallback
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        _report_scan_fallback([], tmp_path / "sources")
+    assert caplog.records == []

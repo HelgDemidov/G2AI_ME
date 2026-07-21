@@ -574,6 +574,65 @@ def _report_unembedded(db_path: Path, backend: str) -> None:
         )
 
 
+def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tuple[int, int]:
+    """``(n_fallback, n_confidential)`` среди ОТСКАНИРОВАННЫХ документов без
+    успешного облачного OCR (spec ocr-eval-harness §8.3, S5). Скан определяется
+    метаданными ocrmypdf (``converters._was_ocr_normalized`` — та же проверка,
+    что ветвит ``_convert_pdf``), не повторной детекцией ``NeedsOCR``. OCR-путь
+    существует только для PDF (``rec.source_format`` — курируемый источник
+    истины, не переоткрытие по расширению файла) — живой прогон на реальном
+    корпусе поймал `PdfminerException` на `eu-ai-act-2024` (raw.html) ДО того,
+    как этот гейт появился: `_was_ocr_normalized` безусловно открывает файл
+    через `pdfplumber`, что валится на не-PDF.
+
+    - ``fallback`` — ``cloud_allowed(rec)`` было True, но ``cloud_ocr_model`` в
+      ``.state.yaml`` так и не проставился: облако ДОЛЖНО было отработать и не
+      смогло (сеть/лимиты/ретраи исчерпаны) — неожиданный отказ.
+    - ``confidential`` — ``cloud_allowed(rec)`` False ИМЕННО из-за
+      ``sensitivity`` — намеренная политика, не сбой.
+
+    Остальные причины ``cloud_allowed=False`` (``--no-cloud`` этого прогона,
+    отсутствующий ключ) НЕ считаются здесь: ``--no-cloud`` — явный выбор
+    куратора текущего прогона, а отсутствие ключа уже даёт собственный warning
+    внутри ``cloud_allowed`` (один раз за прогон) — дублировать нечего.
+
+    Чистая функция: без сети, состояние читается с диска (``.state.yaml``)."""
+    fallback = confidential = 0
+    for rec in records:
+        if rec.source_format is not schema.SourceFormat.pdf:
+            continue  # OCR-путь существует только для PDF; _was_ocr_normalized падает на html/docx/xlsx
+        raw = schema.raw_file(rec, root)
+        if raw is None or not raw.exists() or not converters._was_ocr_normalized(raw):
+            continue  # born-digital либо ещё не сконвертирован — не скан
+        state = schema.load_state(schema.state_file(rec, root))
+        if state.cloud_ocr_model is not None:
+            continue  # облако отработало
+        if converters.cloud_allowed(rec):
+            fallback += 1
+        elif rec.sensitivity is schema.Sensitivity.confidential:
+            confidential += 1
+    return fallback, confidential
+
+
+def _report_scan_fallback(records: list[schema.SourceRecord], root: Path) -> None:
+    """Сводка фолбэк-OCR-пути — симметрично ``_report_unembedded`` (PR #25):
+    молчать об этом классе отставания нельзя, иначе единичный warning внутри
+    ``_cached_or_call_cloud`` прокрутится незамеченным в логе батч-прогона на
+    сотнях сканов."""
+    fallback, confidential = scan_fallback_counts(records, root)
+    if fallback:
+        logger.warning(
+            "OCR: %d скан(ов) на локальном пути из-за отказа облака (сеть/лимиты/ретраи исчерпаны) "
+            "— проверьте .state.yaml/lint_defects",
+            fallback,
+        )
+    if confidential:
+        logger.info(
+            "OCR: %d confidential-скан(ов) намеренно на локальном пути (sensitivity-гейт)",
+            confidential,
+        )
+
+
 def _report(results: list[DocResult]) -> int:
     up = sum(r.up_to_date for r in results)
     failed = [r for r in results if r.error]
@@ -647,6 +706,11 @@ def main(argv: list[str] | None = None) -> int:
         force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
         interactive=bool(args.only), watch_dir=args.watch_dir,
     )
+
+    # Сводка фолбэк-OCR-пути (S5, spec ocr-eval-harness §8.3) — читает ТОЛЬКО
+    # .state.yaml с диска, не зависит от индекса/сети; безусловно (в т.ч. dry-run,
+    # в отличие от _report_unembedded ниже, завязанной на corpus.db).
+    _report_scan_fallback(records, args.sources)
 
     # корпусный индекс: реконсилируется по fingerprint (не по in-run флагу —
     # краш/прерывание между конвертацией и пересборкой не должны оставлять индекс
