@@ -8,12 +8,13 @@ import time
 import urllib.error
 import urllib.request
 from email.message import Message
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 
-from index.embed import RETRY_SCHEDULE, OpenRouterEmbedder
+from index.embed import RETRY_SCHEDULE, OnnxBgeEmbedder, OpenRouterEmbedder, get_embedder
 
 
 def _make_embedder(monkeypatch: Any, **kwargs: Any) -> OpenRouterEmbedder:
@@ -183,3 +184,47 @@ def test_missing_api_key_raises(monkeypatch: Any) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
         OpenRouterEmbedder()
+
+
+# --- пустой ввод: короткое замыкание без сетевого вызова ---
+
+
+def test_embed_empty_list_returns_empty_array_without_request(monkeypatch: Any) -> None:
+    embedder = _make_embedder(monkeypatch, dims=None)
+
+    def tripwire(req: Any, timeout: int = 120) -> Any:
+        raise AssertionError("urlopen не должен вызываться на пустом списке текстов")
+
+    monkeypatch.setattr(urllib.request, "urlopen", tripwire)
+    out = embedder.embed([])
+    assert out.shape == (0, 0)
+
+
+# --- get_embedder: диспетчеризация backend -> Embedder ---
+
+
+def test_get_embedder_openrouter_returns_openrouter_embedder(monkeypatch: Any) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    embedder = get_embedder("openrouter")
+    assert isinstance(embedder, OpenRouterEmbedder)
+
+
+def test_get_embedder_bge_dispatches_to_onnx_bge_embedder(tmp_path: Path) -> None:
+    """Дошли до OnnxBgeEmbedder.__init__ (не какой-то другой класс) — подтверждается тем,
+    что заведомо несуществующий model_path даёт ИМЕННО её FileNotFoundError, без реальной
+    модели bge-m3."""
+    with pytest.raises(FileNotFoundError, match="модель не найдена"):
+        get_embedder("bge", model_path=tmp_path / "nonexistent.onnx")
+
+
+def test_get_embedder_unknown_backend_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="неизвестный бэкенд эмбеддера"):
+        get_embedder("nonexistent-backend")
+
+
+# --- OnnxBgeEmbedder: guard на отсутствующий файл модели (без реальной модели bge-m3) ---
+
+
+def test_onnx_bge_embedder_raises_when_model_file_missing(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="модель не найдена"):
+        OnnxBgeEmbedder(model_path=tmp_path / "nonexistent.onnx")
