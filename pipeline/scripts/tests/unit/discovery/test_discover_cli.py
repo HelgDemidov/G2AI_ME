@@ -348,3 +348,84 @@ def test_apply_subcommand_rejects_non_list_decisions_file(tmp_path: Path) -> Non
 
     code = main(["apply", str(decisions_path), "--root", str(tmp_path)])
     assert code == 1
+
+
+_DECISIONS_YAML_BAD_AXIS = """\
+- raw_hash: "{raw_hash}"
+  action: admit
+  id: me-example-strategy-2026
+  entity_id: me
+  track: montenegro
+  issuer_type: government
+  geo_scope: national
+  doc_type: national_strategy
+  authority: soft_law
+  relevance: {{target_fit: primary, axis: economy, assessed_stage: triage,
+              rationale: "matches axis", assessed_date: 2026-07-21}}
+"""
+
+
+def test_apply_subcommand_flags_invalid_axis_after_batch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Спек vocab-axes, rationale «слабое место свапа»: опечатка в словарном поле
+    (axis вне vocab_axes.yaml) ловится сразу после apply, не только следующим
+    отдельным запуском validate_sources/run_pipeline."""
+    main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/strategy.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+        ]
+    )
+    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    decisions_path = tmp_path / "decisions.yaml"
+    decisions_path.write_text(
+        _DECISIONS_YAML_BAD_AXIS.format(raw_hash=raw_hash), encoding="utf-8"
+    )
+
+    code = main(["apply", str(decisions_path), "--root", str(tmp_path)])
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "невалиден" in out
+    assert "relevance.axis" in out and "вне словаря" in out
+    # meta.yaml уже записан — гейт здесь постфактум, не блокирует запись (см. rationale)
+    assert (tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
+
+
+def test_apply_subcommand_dry_run_skips_post_batch_validation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """dry-run не пишет meta.yaml — постбатчевая валидация не запускается вовсе."""
+    main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/strategy.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+        ]
+    )
+    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    decisions_path = tmp_path / "decisions.yaml"
+    decisions_path.write_text(
+        _DECISIONS_YAML_BAD_AXIS.format(raw_hash=raw_hash), encoding="utf-8"
+    )
+
+    code = main(["apply", str(decisions_path), "--root", str(tmp_path), "--dry-run"])
+    assert code == 0
+    assert "невалиден" not in capsys.readouterr().out

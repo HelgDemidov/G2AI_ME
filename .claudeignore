@@ -2,6 +2,7 @@
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
 __pycache__/
 # производные артефакты покрытия
 .coverage

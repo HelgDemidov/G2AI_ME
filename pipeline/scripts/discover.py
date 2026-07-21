@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-from core import schema
+from core import schema, validate_sources
 from discovery import manual, store
 from discovery.orchestrate import DiscoverySummary, discover
 
@@ -90,8 +90,21 @@ def _cmd_apply(args: argparse.Namespace) -> int:
 
     mode = " (dry-run, ничего не записано)" if summary.dry_run else ""
     print(f"Итого: {len(summary.outcomes)} решени(й), {len(summary.errors)} ошибок{mode}")
-    if not summary.dry_run and any(o.ok and o.action == "admit" for o in summary.outcomes):
+
+    admitted = any(o.ok and o.action == "admit" for o in summary.outcomes)
+    if not summary.dry_run and admitted:
         print("Следующий шаг: pipeline/scripts/run_pipeline.py (скачивание/конвертация/индекс)")
+        # Слабое место apply (spec vocab-axes, rationale): опечатка в словарном поле
+        # (axis/doc_type/authority/...) материализуется в meta.yaml незамеченной до
+        # следующего запуска validate_sources (CI/run_pipeline). Гейт сразу после батча
+        # ловит её здесь, а не постфактум.
+        vocab_errors, _ = validate_sources.validate_sources(args.root)
+        if vocab_errors:
+            print(f"⚠ реестр после apply невалиден ({len(vocab_errors)}) — исправьте перед run_pipeline:")
+            for err in vocab_errors:
+                print(f"  {err}")
+            return 1
+
     return 1 if summary.errors else 0
 
 
