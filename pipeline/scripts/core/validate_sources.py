@@ -1,7 +1,7 @@
 """Валидатор корпуса G2AI — дерево ``sources/**/meta.yaml`` (corpus-layout-v2).
 
 Проверяет: (1) структуру каждой записи через pydantic-схему; (2) принадлежность
-``doc_type``/``authority``/``topics``/``g2ai_pattern`` контролируемым словарям;
+``doc_type``/``authority``/``topics``/``g2ai_pattern``/``relevance.axis`` контролируемым словарям;
 (3) уникальность ``id``; (4) ссылочную целостность ``relations`` (цель — существующий id);
 (5) наличие ``relevance`` (каждая запись корпуса — допущенная триажем; см.
 source-relevance-triage); (6) инварианты папок — ``schema.check_layout`` (папка
@@ -51,6 +51,7 @@ def validate_sources(
         "authority": load_vocab("authority", vocab_dir),
         "topics": load_vocab("topics", vocab_dir),
         "g2ai_pattern": load_vocab("g2ai_patterns", vocab_dir),
+        "axis": load_vocab("axes", vocab_dir),
     }
 
     records: list[SourceRecord] = []
@@ -83,6 +84,11 @@ def validate_sources(
         for pattern in rec.g2ai_pattern:
             if pattern not in vocabs["g2ai_pattern"]:
                 errors.append(f"запись '{rec.id}': g2ai_pattern '{pattern}' вне словаря")
+
+        if rec.relevance is not None and rec.relevance.axis not in vocabs["axis"]:
+            errors.append(
+                f"запись '{rec.id}': relevance.axis '{rec.relevance.axis}' вне словаря"
+            )
 
         if rec.geo_scope is GeoScope.national and not _ISO2_RE.fullmatch(rec.entity_id):
             errors.append(
