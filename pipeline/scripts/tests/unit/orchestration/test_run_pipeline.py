@@ -1017,3 +1017,80 @@ def test_main_vlm_model_flag_overrides_active_model(tmp_path: Path, monkeypatch:
 
     assert main([str(sources), "--vlm-model", "google/gemini-3-pro-preview"]) == 0
     assert cloud_ocr.ACTIVE_MODEL == "google/gemini-3-pro-preview"
+
+
+# --- guard-ветки исполнителей стадий (curl отсутствует / raw|md не существует) ---
+
+
+def test_do_download_raises_when_curl_missing(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make()
+    monkeypatch.setattr("run_pipeline.shutil.which", lambda name: None)
+    with pytest.raises(RuntimeError, match="curl не найден"):
+        _do_download(rec, tmp_path, pause=0)
+
+
+def test_do_convert_raises_when_raw_missing(tmp_path: Path) -> None:
+    rec = make()
+    with pytest.raises(RuntimeError, match="нет raw-файла для конвертации"):
+        _do_convert(rec, tmp_path)
+
+
+def test_do_figures_raises_when_raw_missing(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, md="body")  # md есть, raw нет
+    with pytest.raises(RuntimeError, match="нет raw-файла для фигурного пасса"):
+        _do_figures(rec, tmp_path)
+
+
+def test_do_figures_raises_when_md_missing(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")  # raw есть, md нет
+    with pytest.raises(RuntimeError, match="нет doc.md для фигурного пасса"):
+        _do_figures(rec, tmp_path)
+
+
+def test_do_frontmatter_raises_when_md_missing(tmp_path: Path) -> None:
+    rec = make()
+    with pytest.raises(RuntimeError, match="нет doc.md для синхронизации frontmatter"):
+        _do_frontmatter(rec, tmp_path)
+
+
+# --- main(): quality-gate / --only / --graphml / dry-run ветки ---
+
+
+def test_main_quality_gate_failure_returns_one(tmp_path: Path) -> None:
+    from run_pipeline import main
+
+    sources = tmp_path / "sources"
+    rec = valid_record()
+    rec["topics"] = ["not-a-real-topic"]
+    write_doc(sources, rec)
+    assert main([str(sources)]) == 1
+
+
+def test_main_only_flag_not_found_returns_two(tmp_path: Path) -> None:
+    from run_pipeline import main
+
+    sources = tmp_path / "sources"
+    write_doc(sources, valid_record())
+    assert main([str(sources), "--only", "does-not-exist-id"]) == 2
+
+
+def test_main_graphml_flag_exports_file(tmp_path: Path) -> None:
+    """Несуществующий sources — валидный пустой корпус (validate_sources.py), поэтому граф
+    экспортируется без единого документа — реальный build_graph/export_graphml, без моков."""
+    from run_pipeline import main
+
+    sources = tmp_path / "sources"
+    graphml_path = tmp_path / "out.graphml"
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--graphml", str(graphml_path)]) == 0
+    assert graphml_path.exists()
+
+
+def test_main_dry_run_logs_index_not_touched(tmp_path: Path, caplog: Any) -> None:
+    from run_pipeline import main
+
+    sources = tmp_path / "sources"
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        assert main([str(sources), "--dry-run"]) == 0
+    assert any("dry-run" in r.message for r in caplog.records)
