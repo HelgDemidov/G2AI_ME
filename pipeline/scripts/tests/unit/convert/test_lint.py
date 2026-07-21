@@ -2,7 +2,7 @@
 без сети/модели/pdfplumber."""
 from __future__ import annotations
 
-from convert.lint import lint_conversion, witness_checks
+from convert.lint import lint_conversion, numeric_delta, token_recall, witness_checks
 
 
 def test_no_headings_flagged() -> None:
@@ -59,6 +59,46 @@ def test_frontmatter_stripped_before_heading_check() -> None:
     md = "---\nid: test-doc\n---\n\nJust prose, no headings in the body."
     defects = lint_conversion(md, raw_text_chars=None, fmt="pdf")
     assert "no-headings" in defects
+
+# --- token_recall / numeric_delta: чистые функции, вынесенные из witness_checks (§4) ---
+
+
+def test_token_recall_identical_texts_is_one() -> None:
+    assert token_recall("Član 1 registar", "Član 1 registar") == 1.0
+
+
+def test_token_recall_partial_overlap() -> None:
+    assert token_recall("alpha beta gamma delta epsilon zeta eta theta iota kappa", "alpha beta") == 0.2
+
+
+def test_token_recall_reference_without_word_tokens_is_one() -> None:
+    """reference из одних чисел/пунктуации — терять нечего, тривиальный recall 1.0."""
+    assert token_recall("123 456", "completely different words") == 1.0
+
+
+def test_token_recall_case_insensitive() -> None:
+    assert token_recall("ČLAN Predmet Zakon", "član predmet zakon") == 1.0
+
+
+def test_token_recall_diacritics_preserved() -> None:
+    assert token_recall("vođenje registra Crne Gore", "vođenje registra Crne Gore") == 1.0
+
+
+def test_numeric_delta_identical_multisets_zero() -> None:
+    assert numeric_delta("broj 42 zakona broj 42", "zakona broj 42, opet broj 42") == (0, 0)
+
+
+def test_numeric_delta_missing_and_added() -> None:
+    """8124 (свидетель) распалось на 8/24 (облако) — 1 без пары слева, 2 без пары справа."""
+    assert numeric_delta("tač. 8124 ovog zakona", "tač. 8 i 24 ovog zakona") == (1, 2)
+
+
+def test_numeric_delta_symmetric_swap() -> None:
+    missing, added = numeric_delta("8124", "8 24")
+    assert (missing, added) == (1, 2)
+    added2, missing2 = numeric_delta("8 24", "8124")
+    assert (missing2, added2) == (1, 2)  # свап аргументов = свап направления
+
 
 # --- witness_checks: свидетель (tesseract) vs облачный doc.md (spec convert-cloud-tier §3) ---
 
