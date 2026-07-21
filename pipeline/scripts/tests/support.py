@@ -249,6 +249,42 @@ def build_docx_with_group_and_standalone_image(
     return _docx_zip(body, images)
 
 
+def build_pdf(
+    *,
+    lines: list[tuple[str, float, float, float]] | None = None,
+    table: tuple[list[list[str]], float, float, float, float] | None = None,
+    page_size: tuple[float, float] = (612.0, 792.0),
+) -> bytes:
+    """Синтетический однострочичный PDF через reportlab (test-coverage-hardening) — реальный
+    файл для тестов, которым нужны настоящие объекты ``pdfplumber.Page``/``Table``, не мок
+    (пере-реализация геометрии pdfplumber мокoм тестировала бы мок, не код).
+
+    ``lines`` — ``(text, x, y_from_top, font_size)``, ``y_from_top`` в системе координат
+    pdfplumber (0 у верхнего края страницы) — функция сама переводит в bottom-up систему
+    reportlab. ``table`` — ``(data, x, y_from_top, col_width, row_height)`` — таблица с
+    реальной сеткой линий (``GRID``), которую ``pdfplumber.find_tables()`` детектирует своей
+    штатной lines-стратегией (не наш код — сама библиотека)."""
+    from reportlab.lib import colors
+    from reportlab.pdfgen import canvas
+    from reportlab.platypus import Table, TableStyle
+
+    width, height = page_size
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=page_size)
+    for text, x, y_from_top, size in lines or []:
+        c.setFont("Helvetica", size)
+        c.drawString(x, height - y_from_top - size, text)
+    if table is not None:
+        data, tx, ty_from_top, col_width, row_height = table
+        t = Table(data, colWidths=col_width, rowHeights=row_height)
+        t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.75, colors.black)]))
+        _, th = t.wrap(0, 0)
+        t.drawOn(c, tx, height - ty_from_top - th)
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
 def valid_record() -> dict[str, Any]:
     """Минимально валидная запись (термины — из реальных словарей pipeline/vocab/)."""
     return {

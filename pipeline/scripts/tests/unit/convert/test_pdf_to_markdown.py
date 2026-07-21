@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pdfplumber
 import pytest
 
 from convert import pdf_graphics
@@ -18,10 +19,21 @@ from convert.pdf_to_markdown import (
     _render_column_with_blocks,
     _word_fontname,
     compute_doc_stats,
+    compute_page_graphics,
     convert,
+    detect_columns,
+    get_real_tables,
+    heading_level,
     load_words,
     merge_split_tables,
+    normalize_line,
+    render_lines_as_paragraphs,
+    render_page,
+    render_tables,
+    strip_boilerplate_and_page_numbers,
+    word_in_any_bbox,
 )
+from tests.support import build_pdf
 
 
 def test_compute_doc_stats_uses_own_height_per_page_for_boilerplate_band() -> None:
@@ -408,6 +420,17 @@ def test_bold_run_not_disqualified_by_bullet_continuation_same_paragraph() -> No
     assert _bold_run(lines, 0, med_gap=10.0) == [lines[0]]
 
 
+def test_flush_prose_flushes_paragraph_before_bold_fallback_heading() -> None:
+    """para_buf уже накопил прозу к моменту bold-фолбэк заголовка — флашится ПЕРЕД ним
+    (зеркало test_flush_prose_promotes_heading_by_size_after_prose_paragraph для
+    размерного пути)."""
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    prose = [Word("Intro", x0=0.0, x1=30.0, top=0.0, bottom=10.0, size=10.0, fontname="Arial")]
+    heading = [Word("Bold Heading", x0=0.0, x1=80.0, top=100.0, bottom=110.0, size=10.0, fontname="Arial-Bold")]
+    out = _render_column_with_blocks([prose, heading], [], stats)
+    assert out == "Intro\n\n# Bold Heading"
+
+
 def test_flush_prose_promotes_isolated_bold_label_but_not_lead_in_sentence() -> None:
     """Сквозной регресс-тест через _render_column_with_blocks: короткий
     изолированный bold-ярлык становится заголовком, а bold lead-in длинного
@@ -426,3 +449,298 @@ def test_flush_prose_promotes_isolated_bold_label_but_not_lead_in_sentence() -> 
     assert "# Tugevused Nõrkused" in out
     assert "bring forth new risks are severe indeed" in out  # цельный абзац, не разорван
     assert "# bring forth new" not in out
+
+
+# --- normalize_line: строка-таблицы с "|" (test-coverage-hardening) ---
+
+
+def test_normalize_line_strips_content_after_pipe() -> None:
+    assert normalize_line("Page 3 | extra junk") == "Page #"
+
+
+# --- load_words: слово, ставшее пустым после срезки DOT_LEADER_RE ---
+
+
+def test_load_words_skips_word_empty_after_dot_leader_strip() -> None:
+    page = _FakeWordsPage([
+        {"text": "...", "x0": 0.0, "x1": 10.0, "top": 0.0, "bottom": 10.0, "size": 10.0, "chars": []},
+        {"text": "Real", "x0": 20.0, "x1": 40.0, "top": 0.0, "bottom": 10.0, "size": 10.0, "chars": []},
+    ])
+    words = load_words(page)  # type: ignore[arg-type]
+    assert [w.text for w in words] == ["Real"]
+
+
+# --- heading_level / flush_prose: размерная (не bold-фолбэк) промоция заголовка — ни
+# один существующий тест не давал документу реальные heading_sizes И строку без bold ---
+
+
+def test_heading_level_no_match_returns_none() -> None:
+    stats = DocStats(body_size=10.0, heading_sizes=[16.0], tiny_marker_max=6.5, boilerplate_norms=set())
+    assert heading_level(10.0, stats) is None
+
+
+def test_flush_prose_promotes_heading_by_matching_font_size() -> None:
+    stats = DocStats(body_size=10.0, heading_sizes=[16.0], tiny_marker_max=6.5, boilerplate_norms=set())
+    line = [Word("Big Heading", x0=0.0, x1=80.0, top=0.0, bottom=16.0, size=16.0, fontname="Arial")]
+    out = _render_column_with_blocks([line], [], stats)
+    assert out == "# Big Heading"
+
+
+def test_flush_prose_promotes_heading_by_size_after_prose_paragraph() -> None:
+    """para_buf уже накопил прозу к моменту размерного заголовка — флашится ПЕРЕД ним."""
+    stats = DocStats(body_size=10.0, heading_sizes=[16.0], tiny_marker_max=6.5, boilerplate_norms=set())
+    prose = [Word("Intro", x0=0.0, x1=30.0, top=0.0, bottom=10.0, size=10.0, fontname="Arial")]
+    heading = [Word("Big Heading", x0=0.0, x1=80.0, top=20.0, bottom=36.0, size=16.0, fontname="Arial")]
+    out = _render_column_with_blocks([prose, heading], [], stats)
+    assert out == "Intro\n\n# Big Heading"
+
+
+# --- render_lines_as_paragraphs: пустой ввод + разбивка на абзацы по широкому разрыву ---
+
+
+def test_render_lines_as_paragraphs_empty_returns_empty_string() -> None:
+    assert render_lines_as_paragraphs([]) == ""
+
+
+def test_render_lines_as_paragraphs_splits_on_wide_gap() -> None:
+    """3 тесных разрыва (2pt) задают med_gap=2 -> порог 3.2pt; 4-й разрыв (116pt) намного
+    шире порога -> новый абзац."""
+    lines = [
+        [Word("A", x0=0.0, x1=10.0, top=0.0, bottom=10.0, size=10.0)],
+        [Word("B", x0=0.0, x1=10.0, top=12.0, bottom=22.0, size=10.0)],
+        [Word("C", x0=0.0, x1=10.0, top=24.0, bottom=34.0, size=10.0)],
+        [Word("D", x0=0.0, x1=10.0, top=150.0, bottom=160.0, size=10.0)],
+    ]
+    assert render_lines_as_paragraphs(lines) == "A B C\n\nD"
+
+
+# --- _drop_empty_columns: пустой ввод ---
+
+
+def test_drop_empty_columns_empty_rows_returns_as_is() -> None:
+    assert _drop_empty_columns([]) == []
+
+
+# --- word_in_any_bbox (test-coverage-hardening: чистая функция, была без единого теста) ---
+
+
+def test_word_in_any_bbox_true_when_center_inside() -> None:
+    w = Word("x", x0=10.0, x1=20.0, top=10.0, bottom=20.0, size=10.0)
+    assert word_in_any_bbox(w, [(0.0, 0.0, 30.0, 30.0)]) is True
+
+
+def test_word_in_any_bbox_false_when_outside_all_bboxes() -> None:
+    w = Word("x", x0=100.0, x1=110.0, top=100.0, bottom=110.0, size=10.0)
+    assert word_in_any_bbox(w, [(0.0, 0.0, 30.0, 30.0)]) is False
+
+
+def test_word_in_any_bbox_empty_bboxes_returns_false() -> None:
+    w = Word("x", x0=10.0, x1=20.0, top=10.0, bottom=20.0, size=10.0)
+    assert word_in_any_bbox(w, []) is False
+
+
+# --- strip_boilerplate_and_page_numbers (чистая функция, была без единого теста) ---
+
+
+def test_strip_boilerplate_drops_bare_page_number_in_footer_band() -> None:
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    page_number = Word("7", x0=300.0, x1=310.0, top=780.0, bottom=790.0, size=10.0)  # нижняя полоса
+    body = Word("Body", x0=50.0, x1=90.0, top=400.0, bottom=410.0, size=10.0)
+    out = strip_boilerplate_and_page_numbers([page_number, body], page_height=800.0, stats=stats)
+    assert [w.text for w in out] == ["Body"]
+
+
+def test_strip_boilerplate_drops_repeated_header_line() -> None:
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms={"HEADER"})
+    header = Word("HEADER", x0=50.0, x1=100.0, top=10.0, bottom=20.0, size=10.0)  # верхняя полоса
+    body = Word("Body", x0=50.0, x1=90.0, top=400.0, bottom=410.0, size=10.0)
+    out = strip_boilerplate_and_page_numbers([header, body], page_height=800.0, stats=stats)
+    assert [w.text for w in out] == ["Body"]
+
+
+def test_strip_boilerplate_keeps_in_band_text_not_matching_boilerplate() -> None:
+    """В полосе колонтитула, но не голый номер и не известный повтор — легитимный
+    контент (напр. заголовок раздела у самого верха страницы), не вычищается."""
+    stats = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+    heading = Word("Introduction", x0=50.0, x1=150.0, top=10.0, bottom=20.0, size=14.0)
+    out = strip_boilerplate_and_page_numbers([heading], page_height=800.0, stats=stats)
+    assert [w.text for w in out] == ["Introduction"]
+
+
+# --- detect_columns (чистая функция, флагманский геометрический детектор — был без единого теста) ---
+
+
+def test_detect_columns_no_gap_returns_full_width() -> None:
+    words = [Word("word", x0=10.0, x1=590.0, top=10.0, bottom=20.0, size=10.0)]
+    assert detect_columns(words, page_width=600.0) == [(0, 600.0)]
+
+
+def test_detect_columns_empty_words_returns_full_width() -> None:
+    assert detect_columns([], page_width=600.0) == [(0, 600.0)]
+
+
+def test_detect_columns_splits_on_wide_central_gap() -> None:
+    """Левая колонка x∈[50,250], правая [350,550] — разрыв [250,350]=100pt ≥ MIN_GAP_PT,
+    центр (300) внутри COLUMN_ZONE (180-420 при ширине 600), обе стороны — 5 строк
+    (span ≥ MIN_GAP_HEIGHT_FRAC контентной высоты)."""
+    left = [
+        Word(f"L{i}", x0=50.0, x1=250.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    right = [
+        Word(f"R{i}", x0=350.0, x1=550.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    columns = detect_columns([*left, *right], page_width=600.0)
+    assert len(columns) == 2
+    assert 250.0 <= columns[0][1] <= 350.0  # граница где-то внутри разрыва
+
+
+def test_detect_columns_ignores_gap_outside_column_zone() -> None:
+    """Разрыв [100,150] геометрически валиден (шире MIN_GAP_PT, вертикально протяжённый),
+    но его центр (125) вне COLUMN_ZONE (180-420) — не путать с полями страницы."""
+    left = [
+        Word("L", x0=0.0, x1=100.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    right = [
+        Word("R", x0=150.0, x1=600.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    assert detect_columns([*left, *right], page_width=600.0) == [(0, 600.0)]
+
+
+def test_detect_columns_ignores_short_vertical_gap() -> None:
+    """Разрыв в зоне, но обе стороны — одна строка на одной высоте: геометрический span
+    почти нулевой (не покрывает MIN_GAP_HEIGHT_FRAC контентной высоты) — вероятно короткая
+    надпись/строка таблицы, не двухколоночная вёрстка."""
+    left = Word("L", x0=50.0, x1=250.0, top=10.0, bottom=20.0, size=10.0)
+    right = Word("R", x0=350.0, x1=550.0, top=10.0, bottom=20.0, size=10.0)
+    assert detect_columns([left, right], page_width=600.0) == [(0, 600.0)]
+
+
+# --- render_page (чистая функция — оркестрирует detect_columns/group_into_lines/
+# _render_column_with_blocks; была без единого теста) ---
+
+
+_RP_STATS = DocStats(body_size=10.0, heading_sizes=[], tiny_marker_max=6.5, boilerplate_norms=set())
+
+
+def test_render_page_single_column_renders_prose() -> None:
+    words = [Word("Hello", x0=10.0, x1=60.0, top=10.0, bottom=20.0, size=10.0)]
+    assert render_page(words, page_width=600.0, stats=_RP_STATS, blocks=[]) == "Hello"
+
+
+def test_render_page_two_columns_orders_left_before_right() -> None:
+    left = [
+        Word("LeftWord", x0=50.0, x1=200.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    right = [
+        Word("RightWord", x0=350.0, x1=550.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    out = render_page([*left, *right], page_width=600.0, stats=_RP_STATS, blocks=[])
+    assert out.index("LeftWord") < out.index("RightWord")
+
+
+def test_render_page_places_block_in_matching_column() -> None:
+    left = [
+        Word("LeftWord", x0=50.0, x1=200.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    right = [
+        Word("RightWord", x0=350.0, x1=550.0, top=float(i * 20), bottom=float(i * 20 + 10), size=10.0)
+        for i in range(5)
+    ]
+    right_block_bbox = (350.0, 5.0, 550.0, 15.0)  # центр-x внутри правой колонки (>275)
+    out = render_page(
+        [*left, *right], page_width=600.0, stats=_RP_STATS, blocks=[(right_block_bbox, "> [block]")]
+    )
+    assert "> [block]" in out
+    assert out.index("LeftWord") < out.index("> [block]")
+
+
+# --- render_tables (нужен только shape объекта Table — .extract()/.bbox — лёгкий локальный
+# фейк, не reportlab: сама pdfplumber-геометрия здесь не участвует, только рендер) ---
+
+
+class _FakeTable:
+    def __init__(self, rows: list[list[str | None]], bbox: tuple[float, float, float, float]) -> None:
+        self._rows = rows
+        self.bbox = bbox
+
+    def extract(self) -> list[list[str | None]]:
+        return self._rows
+
+
+def test_render_tables_produces_markdown_with_bbox() -> None:
+    table = _FakeTable([["A", "B"], ["1", "2"]], bbox=(0.0, 0.0, 100.0, 40.0))
+    out = render_tables([table])  # type: ignore[list-item]
+    assert len(out) == 1
+    bbox, md = out[0]
+    assert bbox == (0.0, 0.0, 100.0, 40.0)
+    assert md == "| A | B |\n| --- | --- |\n| 1 | 2 |"
+
+
+def test_render_tables_skips_fully_empty_table() -> None:
+    table = _FakeTable([["", ""], ["", ""]], bbox=(0.0, 0.0, 100.0, 40.0))
+    assert render_tables([table]) == []  # type: ignore[list-item]
+
+
+def test_render_tables_normalizes_newlines_in_cells() -> None:
+    table = _FakeTable([["Head\n1", "Head 2"], ["a\nb", "c"]], bbox=(0.0, 0.0, 100.0, 40.0))
+    out = render_tables([table])  # type: ignore[list-item]
+    assert "Head 1" in out[0][1]
+
+
+# --- get_real_tables / compute_page_graphics: реальные объекты pdfplumber (test-coverage-
+# hardening §3.B.1) — синтетические PDF через reportlab (tests.support.build_pdf), не мок:
+# find_tables()/extract_words() — геометрия самой pdfplumber, тестировать мок было бы
+# тестированием мока, не нашего кода. ---
+
+
+def test_get_real_tables_finds_real_grid_table(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "table.pdf"
+    pdf_path.write_bytes(
+        build_pdf(table=([["A", "B"], ["1", "2"], ["3", "4"]], 50.0, 50.0, 80.0, 20.0))
+    )
+    with pdfplumber.open(pdf_path) as pdf:
+        tables = get_real_tables(pdf.pages[0])
+    assert len(tables) == 1
+    rows = tables[0].extract()
+    assert rows[0] == ["A", "B"]
+    assert rows[1] == ["1", "2"]
+    assert rows[2] == ["3", "4"]
+
+
+def test_get_real_tables_filters_sparse_fragment(tmp_path: Path) -> None:
+    """< MIN_TABLE_NONEMPTY_CELLS непустых ячеек — не считается настоящей таблицей
+    (реальный обломок диаграммы pdfplumber иногда детектирует как «таблицу»)."""
+    pdf_path = tmp_path / "sparse.pdf"
+    pdf_path.write_bytes(build_pdf(table=([["", ""], ["", "x"]], 50.0, 50.0, 80.0, 20.0)))
+    with pdfplumber.open(pdf_path) as pdf:
+        assert get_real_tables(pdf.pages[0]) == []
+
+
+def test_compute_page_graphics_extracts_text_and_table_from_real_pdf(tmp_path: Path) -> None:
+    """Заголовок/тело позиционированы НИЖЕ полосы колонтитула (top 9% страницы, ~71pt при
+    792pt высоте) — иначе на однострочичном (1-страничном) документе ЛЮБАЯ строка в этой
+    полосе классифицировалась бы как boilerplate (частота 1/1 страниц ≥ 25%-порога) —
+    ожидаемое поведение эвристики, не относящееся к цели этого теста."""
+    pdf_path = tmp_path / "doc.pdf"
+    pdf_path.write_bytes(
+        build_pdf(
+            lines=[("Document Title", 50.0, 120.0, 16.0), ("Some body prose here.", 50.0, 160.0, 10.0)],
+            table=([["Col A", "Col B"], ["1", "2"], ["3", "4"]], 50.0, 220.0, 80.0, 20.0),
+        )
+    )
+    doc = compute_page_graphics(str(pdf_path))
+    assert len(doc.pages) == 1
+    page = doc.pages[0]
+    assert len(page.real_tables) == 1
+    assert doc.stats.body_size > 0
+    all_text = " ".join(w.text for w in page.remaining_words)
+    assert "Document" in all_text
+    assert "prose" in all_text
+    assert not any("Col" in w.text for w in page.remaining_words)  # содержимое таблицы не в прозе
