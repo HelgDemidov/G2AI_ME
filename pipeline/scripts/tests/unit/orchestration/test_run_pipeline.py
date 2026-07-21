@@ -1005,7 +1005,9 @@ def test_main_no_cloud_flag_disables_cloud_path(tmp_path: Path) -> None:
     sources.mkdir()
     from run_pipeline import main
 
-    assert main([str(sources), "--no-cloud"]) == 0
+    # --db обязателен: без него argparse-дефолт указывает на РЕАЛЬНУЮ corpus.db,
+    # и пустой tmp-корпус вычищает боевой индекс (живой инцидент 2026-07-21, см. conftest)
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--no-cloud"]) == 0
     assert converters._CLOUD_DISABLED is True
 
 
@@ -1015,7 +1017,7 @@ def test_main_vlm_model_flag_overrides_active_model(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(cloud_ocr, "ACTIVE_MODEL", cloud_ocr.ACTIVE_MODEL)  # регистрируем авто-восстановление
     from run_pipeline import main
 
-    assert main([str(sources), "--vlm-model", "google/gemini-3-pro-preview"]) == 0
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--vlm-model", "google/gemini-3-pro-preview"]) == 0
     assert cloud_ocr.ACTIVE_MODEL == "google/gemini-3-pro-preview"
 
 
@@ -1094,3 +1096,69 @@ def test_main_dry_run_logs_index_not_touched(tmp_path: Path, caplog: Any) -> Non
     with caplog.at_level("INFO", logger="run_pipeline"):
         assert main([str(sources), "--dry-run"]) == 0
     assert any("dry-run" in r.message for r in caplog.records)
+
+
+# --- _embed_namespace / _report_unembedded: напоминание об отставании векторного слоя ---
+
+
+def test_embed_namespace_openrouter_matches_production_embedder_name() -> None:
+    from index.embed import DEFAULT_CLOUD_DIMS, DEFAULT_CLOUD_MODEL
+
+    from run_pipeline import _embed_namespace
+
+    assert _embed_namespace("openrouter") == f"{DEFAULT_CLOUD_MODEL}@{DEFAULT_CLOUD_DIMS}"
+
+
+def test_embed_namespace_bge_matches_local_embedder_name() -> None:
+    from index.embed import OnnxBgeEmbedder
+
+    from run_pipeline import _embed_namespace
+
+    assert _embed_namespace("bge") == OnnxBgeEmbedder.name
+
+
+def test_report_unembedded_missing_db_is_silent(tmp_path: Path, caplog: Any) -> None:
+    from run_pipeline import _report_unembedded
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        _report_unembedded(tmp_path / "nope.db", "openrouter")
+    assert caplog.records == []
+
+
+@pytest.mark.skipif(not corpus_index.fts5_available(), reason="sqlite без FTS5")
+def test_report_unembedded_logs_hint_when_vectors_missing(tmp_path: Path, caplog: Any) -> None:
+    from index.chunking import Chunk
+
+    from run_pipeline import _report_unembedded
+
+    db = tmp_path / "c.db"
+    conn = corpus_index.create_db(db)
+    corpus_index.index_chunks(conn, [Chunk("doc-a", 0, "first", 1), Chunk("doc-a", 1, "second", 1)])
+    conn.close()
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        _report_unembedded(db, "openrouter")
+    assert "Векторы: 2 чанков без эмбеддинга (google/gemini-embedding-001@1024)" in caplog.text
+
+
+@pytest.mark.skipif(not corpus_index.fts5_available(), reason="sqlite без FTS5")
+def test_report_unembedded_silent_when_all_embedded(tmp_path: Path, caplog: Any) -> None:
+    import numpy as np
+
+    from index import vector_store
+    from index.chunking import Chunk
+
+    from run_pipeline import _embed_namespace, _report_unembedded
+
+    db = tmp_path / "c.db"
+    conn = corpus_index.create_db(db)
+    corpus_index.index_chunks(conn, [Chunk("doc-a", 0, "first", 1)])
+    hashes, _ = vector_store.chunk_hashes(conn)
+    vector_store.store_vectors(
+        conn, hashes, np.ones((len(hashes), 4), dtype=np.float32), _embed_namespace("openrouter")
+    )
+    conn.close()
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        _report_unembedded(db, "openrouter")
+    assert caplog.records == []

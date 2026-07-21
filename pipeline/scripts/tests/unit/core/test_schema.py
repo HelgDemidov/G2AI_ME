@@ -14,11 +14,12 @@ from core.schema import (
     AssessedStage,
     Axis,
     CandidateRecord,
-    ConnectorKind,
     Fidelity,
     GeoScope,
     IssuerType,
     OperationalState,
+    Relation,
+    RelationType,
     Relevance,
     Rights,
     Sensitivity,
@@ -37,6 +38,7 @@ from core.schema import (
     raw_file,
     raw_target,
     render_frontmatter,
+    save_record,
     save_state,
 )
 
@@ -223,18 +225,40 @@ def valid_candidate() -> dict[str, Any]:
     """Минимально валидный CandidateRecord (только обязательные поля добычи)."""
     return {
         "connector_id": "agora",
-        "connector_kind": "registry",
         "retrieved_at": "2026-07-15",
-        "source_ref": "zenodo:10.5281/zenodo.13883066#row-42",
         "raw_hash": "deadbeef",
     }
 
 
 def test_candidate_minimal() -> None:
     cand = CandidateRecord.model_validate(valid_candidate())
-    assert cand.connector_kind == ConnectorKind.registry
+    assert cand.connector_id == "agora"
     assert cand.source_url is None  # best-effort библиография опускаема
-    assert cand.native_tags == []
+    assert cand.native_tags is None  # None, не [] — пустой список не пишется в YAML
+
+
+def test_candidate_legacy_fields_absorbed_as_extras() -> None:
+    """Слим 2026-07-21: connector_kind/source_ref/reported_status убраны из модели,
+    старые candidates.yaml с ними остаются загружаемыми (extra="allow")."""
+    data = valid_candidate()
+    data.update(
+        connector_kind="registry",
+        source_ref="zenodo:10.5281/zenodo.13883066#row-42",
+        reported_status="in_force",
+    )
+    cand = CandidateRecord.model_validate(data)
+    assert cand.connector_id == "agora"
+
+
+def test_candidate_native_summary_hard_cap() -> None:
+    from core.schema import CANDIDATE_SUMMARY_MAX
+
+    data = valid_candidate()
+    data["native_summary"] = "x" * (CANDIDATE_SUMMARY_MAX + 1)
+    with pytest.raises(ValidationError):
+        CandidateRecord.model_validate(data)
+    data["native_summary"] = "x" * CANDIDATE_SUMMARY_MAX
+    assert CandidateRecord.model_validate(data).native_summary is not None
 
 
 def test_candidate_permissive_extra_allowed() -> None:
@@ -264,7 +288,7 @@ def test_candidate_full_bibliography() -> None:
 
 @pytest.mark.parametrize(
     "field,bad",
-    [("connector_kind", "spider"), ("source_url", "ftp://x/y"), ("rights", "gpl")],
+    [("source_url", "ftp://x/y"), ("rights", "gpl"), ("sensitivity", "top_secret")],
 )
 def test_candidate_bad_field_rejected(field: str, bad: str) -> None:
     data = valid_candidate()
@@ -359,6 +383,53 @@ def test_promote_candidate_source_format_passthrough() -> None:
         source_format=SourceFormat.html,
     )
     assert rec.source_format == SourceFormat.html
+
+
+def test_promote_candidate_v2_analytics_fields_populated() -> None:
+    data = valid_candidate()
+    data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="me-example-strategy-2026",
+        entity_id="me",
+        track=Track.montenegro,
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="strategy",
+        authority="official",
+        relevance=_relevance(),
+        topics=["ai-governance"],
+        g2ai_pattern=["agent-governance-framework"],
+        summary="2-3 sentences EN",
+        relations=[Relation(type=RelationType.implements, target="eu-ai-act-2024")],
+    )
+    assert rec.topics == ["ai-governance"]
+    assert rec.g2ai_pattern == ["agent-governance-framework"]
+    assert rec.summary == "2-3 sentences EN"
+    assert rec.relations == [Relation(type=RelationType.implements, target="eu-ai-act-2024")]
+
+
+def test_promote_candidate_v2_fields_default_empty_when_omitted() -> None:
+    """Обратная совместимость: без v2-аргументов — прежние пустые дефолты (батч-каналы)."""
+    data = valid_candidate()
+    data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="me-example-strategy-2026",
+        entity_id="me",
+        track=Track.montenegro,
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="strategy",
+        authority="official",
+        relevance=_relevance(),
+    )
+    assert rec.topics == []
+    assert rec.g2ai_pattern == []
+    assert rec.summary is None
+    assert rec.relations == []
 
 
 def test_promote_candidate_missing_source_url_raises() -> None:
@@ -548,3 +619,41 @@ def test_load_records_raises_on_duplicate_id(tmp_path: Path) -> None:
     write_doc(tmp_path, b)
     with pytest.raises(ValueError, match="дубль id"):
         load_records(tmp_path)
+
+
+# --- save_record: писатель meta.yaml (spec discovery-manual §1) ---
+
+
+def test_save_record_writes_valid_meta_yaml_roundtrip(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    path = save_record(rec, tmp_path)
+    assert path == doc_dir(rec, tmp_path) / "meta.yaml"
+    assert path.exists()
+    loaded = load_records(tmp_path)
+    assert len(loaded) == 1
+    assert loaded[0] == rec
+
+
+def test_save_record_creates_missing_doc_dir(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    assert not doc_dir(rec, tmp_path).exists()
+    save_record(rec, tmp_path)
+    assert doc_dir(rec, tmp_path).is_dir()
+
+
+def test_save_record_existing_file_raises(tmp_path: Path) -> None:
+    rec = SourceRecord.model_validate(valid_record())
+    save_record(rec, tmp_path)
+    with pytest.raises(ValueError, match="уже существует"):
+        save_record(rec, tmp_path)
+
+
+def test_save_record_roundtrip_preserves_relations_and_analytics(tmp_path: Path) -> None:
+    data = valid_record()
+    data["relations"] = [{"type": "implements", "target": "eu-ai-act-2024"}]
+    rec = SourceRecord.model_validate(data)
+    save_record(rec, tmp_path)
+    loaded = load_records(tmp_path)[0]
+    assert loaded.relations == [Relation(type=RelationType.implements, target="eu-ai-act-2024")]
+    assert loaded.topics == rec.topics
+    assert loaded.g2ai_pattern == rec.g2ai_pattern

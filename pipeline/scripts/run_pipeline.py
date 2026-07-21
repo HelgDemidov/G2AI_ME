@@ -48,7 +48,13 @@ from core import validate_sources
 from core.env import load_dotenv
 from index import vector_store
 from index.chunking import strip_frontmatter
-from index.embed import DEFAULT_BACKEND, get_embedder
+from index.embed import (
+    DEFAULT_BACKEND,
+    DEFAULT_CLOUD_DIMS,
+    DEFAULT_CLOUD_MODEL,
+    OnnxBgeEmbedder,
+    get_embedder,
+)
 
 logger = logging.getLogger("run_pipeline")
 
@@ -534,6 +540,40 @@ def _needs_index_rebuild(sources_path: Path, db_path: Path, *, force: bool) -> t
     return (force or stored_fp != current_fp), current_fp
 
 
+def _embed_namespace(backend: str) -> str:
+    """Неймспейс векторов бэкенда БЕЗ конструирования эмбеддера: облачному нужен
+    API-ключ, локальному — скачанные файлы модели, а для ПОДСЧЁТА недостающих
+    векторов достаточно идентификатора (тот же, что ``embed_and_store`` пишет в
+    ``vectors.model``)."""
+    if backend == "openrouter":
+        return f"{DEFAULT_CLOUD_MODEL}@{DEFAULT_CLOUD_DIMS}"
+    return OnnxBgeEmbedder.name
+
+
+def _report_unembedded(db_path: Path, backend: str) -> None:
+    """Сводка отставания векторного слоя: сколько чанков не видны векторному каналу.
+
+    Дефолтный прогон сознательно НЕ эмбеддит (облако = кредиты + сеть, явное
+    действие куратора — spec embed-api-first §4), но молчать об отставании нельзя:
+    документ без векторов теряет кросс-язычный/перефразированный retrieval,
+    оставаясь видимым только FTS-каналу. Подсказка, не ошибка. Confidential-only
+    чанки облачный добор пропустит и отчитается сам (сегодня в корпусе их нет —
+    sensitivity латентна)."""
+    if not db_path.exists():
+        return
+    namespace = _embed_namespace(backend)
+    conn = sqlite3.connect(db_path)
+    try:
+        missing = vector_store.unembedded_count(conn, namespace)
+    finally:
+        conn.close()
+    if missing:
+        logger.info(
+            "Векторы: %d чанков без эмбеддинга (%s) — добор: vector_store.py embed-corpus либо --embed",
+            missing, namespace,
+        )
+
+
 def _report(results: list[DocResult]) -> int:
     up = sum(r.up_to_date for r in results)
     failed = [r for r in results if r.error]
@@ -634,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("  ✗ индекс: %s", index_error)
         else:
             logger.info("Индекс: актуален (fingerprint совпадает)")
+        _report_unembedded(args.db, args.embed_backend)
 
     if args.graphml is not None and not args.dry_run:
         graph = build_graph.build_graph(records, build_graph.load_jurisdictions())

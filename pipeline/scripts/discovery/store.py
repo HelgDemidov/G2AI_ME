@@ -26,10 +26,18 @@ def load(path: Path = CANDIDATES_PATH) -> list[schema.CandidateRecord]:
 
 
 def save(candidates: list[schema.CandidateRecord], path: Path = CANDIDATES_PATH) -> None:
-    """Атомарный полный перезапись store — не diff/append (список умещается в памяти)."""
-    payload = [c.model_dump(mode="json", exclude_none=True) for c in candidates]
-    text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
-    fsio.atomic_write_text(path, text)
+    """Атомарный полный перезапись store — не diff/append (список умещается в памяти).
+
+    Каждый кандидат дампится отдельно, записи разделяются пустой строкой (YAML к ней
+    безразличен, а человеку файл читать батчами при триаже) — порядок полей задаёт
+    модель (``title`` первым, провенанс внизу; sort_keys=False).
+    """
+    parts = [
+        yaml.safe_dump([c.model_dump(mode="json", exclude_none=True)],
+                       allow_unicode=True, sort_keys=False)
+        for c in candidates
+    ]
+    fsio.atomic_write_text(path, "\n".join(parts))
 
 
 def load_cursors(path: Path = CURSORS_PATH) -> dict[str, dict[str, Any]]:

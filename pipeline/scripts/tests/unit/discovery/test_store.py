@@ -12,9 +12,7 @@ from discovery import store
 def _candidate(**overrides: object) -> schema.CandidateRecord:
     fields: dict[str, object] = {
         "connector_id": "manual",
-        "connector_kind": schema.ConnectorKind.manual,
         "retrieved_at": dt.date(2026, 7, 21),
-        "source_ref": "https://example.gov/doc",
         "raw_hash": "h0",
         "title": "Example Document",
         "native_tags": ["ai-governance"],
@@ -39,7 +37,7 @@ def test_save_load_round_trip_preserves_all_fields(tmp_path: Path) -> None:
     loaded = store.load(path)
 
     assert len(loaded) == 1
-    assert loaded[0].source_ref == cand.source_ref
+    assert loaded[0].raw_hash == cand.raw_hash
     assert loaded[0].title == cand.title
     assert loaded[0].native_tags == ["ai-governance"]
     assert loaded[0].merged_connector_ids == ["agora"]  # type: ignore[attr-defined]
@@ -47,11 +45,11 @@ def test_save_load_round_trip_preserves_all_fields(tmp_path: Path) -> None:
 
 def test_save_overwrites_previous_content(tmp_path: Path) -> None:
     path = tmp_path / "candidates.yaml"
-    store.save([_candidate(source_ref="a", raw_hash="ha")], path)
-    store.save([_candidate(source_ref="b", raw_hash="hb")], path)
+    store.save([_candidate(raw_hash="ha")], path)
+    store.save([_candidate(raw_hash="hb")], path)
 
     loaded = store.load(path)
-    assert [c.source_ref for c in loaded] == ["b"]
+    assert [c.raw_hash for c in loaded] == ["hb"]
 
 
 def test_save_leaves_no_staging_file(tmp_path: Path) -> None:
@@ -90,3 +88,30 @@ def test_save_load_cursors_round_trip(tmp_path: Path) -> None:
 
 def test_default_cursors_path_is_dot_file_under_default_sources() -> None:
     assert store.CURSORS_PATH == schema.DEFAULT_SOURCES / ".discovery_cursors.yaml"
+
+
+# --- слим CandidateRecord + человекочитаемый дамп (2026-07-21) ---
+
+
+def test_save_separates_candidates_with_blank_line(tmp_path: Path) -> None:
+    path = tmp_path / "candidates.yaml"
+    store.save([_candidate(raw_hash="ha"), _candidate(raw_hash="hb")], path)
+    text = path.read_text(encoding="utf-8")
+    assert "\n\n- " in text  # пустая строка между записями
+    assert len(store.load(path)) == 2  # round-trip не страдает
+
+
+def test_save_puts_title_first(tmp_path: Path) -> None:
+    path = tmp_path / "candidates.yaml"
+    store.save([_candidate()], path)
+    assert path.read_text(encoding="utf-8").startswith("- title:")
+
+
+def test_save_omits_empty_list_fields(tmp_path: Path) -> None:
+    """native_tags/matched_vocab_tags дефолтятся None -> в YAML не пишутся вовсе
+    (раньше каждый ручной кандидат тащил шумную строку 'native_tags: []')."""
+    path = tmp_path / "candidates.yaml"
+    store.save([_candidate(native_tags=None)], path)
+    text = path.read_text(encoding="utf-8")
+    assert "native_tags" not in text
+    assert "matched_vocab_tags" not in text

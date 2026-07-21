@@ -1,0 +1,32 @@
+id: oxford-insights-gairi-2025
+entity_id: oxford-insights
+track: research-papers
+title: Government AI Readiness Index 2025
+issuer: Oxford Insights
+issuer_type: think_tank
+geo_scope: global
+language: en
+dates:
+  published: '2025-12-20'
+doc_type: report
+authority: report
+source_url: https://oxfordinsights.com/wp-content/uploads/2026/06/LATEST-GAIRI-Report-2025.pdf
+source_format: pdf
+sensitivity: normal
+rights: unknown
+topics:
+- ai-governance
+- public-sector-ai
+g2ai_pattern: []
+summary: Eighth annual Government AI Readiness Index by Oxford Insights, ranking 195
+  governments on their capacity to harness AI for public benefit across 69 indicators,
+  14 dimensions and 6 pillars. The 2025 edition shifts the research question from
+  implementation readiness to real-world public impact.
+relations: []
+relevance:
+  target_fit: context
+  axis: digital_sovereignty
+  assessed_stage: triage
+  rationale: Comparative frame for positioning Montenegro and small states on the
+    broad axis; not a primary source of transferable agentic patterns.
+  assessed_date: '2026-07-21'

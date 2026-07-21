@@ -16,9 +16,7 @@ from discovery.orchestrate import discover
 def _candidate(connector_id: str, ref: str, **overrides: object) -> schema.CandidateRecord:
     fields: dict[str, object] = {
         "connector_id": connector_id,
-        "connector_kind": schema.ConnectorKind.manual,
         "retrieved_at": dt.date(2026, 7, 21),
-        "source_ref": ref,
         "raw_hash": ref,
         "normalized_url": f"https://example.gov/{ref}",
     }
@@ -68,7 +66,7 @@ def test_discover_persists_fresh_candidates(tmp_path: Path) -> None:
     assert summary.failed == []
     loaded = store.load(tmp_path / "candidates.yaml")
     assert len(loaded) == 1
-    assert loaded[0].source_ref == "doc1"
+    assert loaded[0].raw_hash == "doc1"
 
 
 def test_discover_persists_cursor_returned_by_connector(tmp_path: Path) -> None:
