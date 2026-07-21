@@ -723,6 +723,41 @@ def test_get_real_tables_filters_sparse_fragment(tmp_path: Path) -> None:
         assert get_real_tables(pdf.pages[0]) == []
 
 
+def test_convert_end_to_end_multicolumn_document_with_heading_and_table(tmp_path: Path) -> None:
+    """Golden E2E (test-coverage-hardening §3.B.3): короткий заголовок (не пересекает зону
+    разрыва колонок — иначе накрыл бы центр страницы и column-detection не сработала бы),
+    двухколоночная проза, таблица — прогоняются через ПОЛНЫЙ convert(), не отдельные
+    функции. Автоматизирует то, что раньше держалось только на ручной практике «сверка
+    на каждом новом документе» (CLAUDE.md)."""
+    pdf_path = tmp_path / "doc.pdf"
+    out_path = tmp_path / "doc.md"
+    pdf_path.write_bytes(
+        build_pdf(
+            lines=[
+                ("Report", 50.0, 120.0, 18.0),
+                ("Left paragraph one.", 50.0, 160.0, 10.0),
+                ("Left paragraph two.", 50.0, 300.0, 10.0),
+                ("Right paragraph one.", 350.0, 160.0, 10.0),
+                ("Right paragraph two.", 350.0, 300.0, 10.0),
+            ],
+            table=([["H1", "H2"], ["a", "b"], ["c", "d"]], 50.0, 400.0, 80.0, 20.0),
+            page_size=(600.0, 800.0),
+        )
+    )
+    convert(str(pdf_path), str(out_path))
+    md = out_path.read_text(encoding="utf-8")
+
+    assert "# Report" in md
+    assert "Left paragraph one." in md
+    assert "Left paragraph two." in md
+    assert "Right paragraph one." in md
+    assert "Right paragraph two." in md
+    assert md.index("Left paragraph one.") < md.index("Right paragraph one.")  # порядок колонок восстановлен
+    assert "| H1 | H2 |" in md
+    assert "| --- | --- |" in md
+    assert "| a | b |" in md
+
+
 def test_compute_page_graphics_extracts_text_and_table_from_real_pdf(tmp_path: Path) -> None:
     """Заголовок/тело позиционированы НИЖЕ полосы колонтитула (top 9% страницы, ~71pt при
     792pt высоте) — иначе на однострочичном (1-страничном) документе ЛЮБАЯ строка в этой
