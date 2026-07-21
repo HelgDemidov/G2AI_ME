@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 
 from core import schema
-from discovery import manual
+from discovery import manual, store
 from discovery.orchestrate import DiscoverySummary, discover
 
 
@@ -60,6 +60,20 @@ def _cmd_inject(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_worksheet(args: argparse.Namespace) -> int:
+    candidates = store.load(args.root / "candidates.yaml")
+    records = schema.load_records(args.root)
+    pending = manual.pending_candidates(candidates, records)
+    text = manual.render_worksheet(pending)
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(text, encoding="utf-8")
+        print(f"worksheet: {len(pending)} ждущих кандидат(ов) -> {args.out}")
+    else:
+        print(text)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DISCOVERY: генератор кандидатов источников")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -93,6 +107,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_inject.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
     p_inject.set_defaults(func=_cmd_inject)
+
+    p_worksheet = sub.add_parser("worksheet", help="таблица ждущих кандидатов (реконсиляция)")
+    p_worksheet.add_argument("--out", type=Path, default=None, help="дефолт — stdout")
+    p_worksheet.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
+    p_worksheet.set_defaults(func=_cmd_worksheet)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")

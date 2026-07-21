@@ -199,3 +199,62 @@ def test_inject_subcommand_parses_optional_flags(tmp_path: Path) -> None:
     assert cand.native_summary == "short summary"
     assert cand.rights == schema.Rights.cc_by
     assert cand.sensitivity == schema.Sensitivity.confidential
+
+
+# --- worksheet (spec discovery-manual §3) ---
+
+
+def test_worksheet_subcommand_prints_to_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/a.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+        ]
+    )
+    code = main(["worksheet", "--root", str(tmp_path)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Триаж-worksheet" in out
+    assert "gov.example.org/a.pdf" in out
+
+
+def test_worksheet_subcommand_writes_to_out_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/a.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+        ]
+    )
+    out_path = tmp_path / "triage_worksheet.md"
+    code = main(["worksheet", "--root", str(tmp_path), "--out", str(out_path)])
+    assert code == 0
+    assert out_path.exists()
+    assert "Триаж-worksheet" in out_path.read_text(encoding="utf-8")
+    assert "1 ждущих" in capsys.readouterr().out
+
+
+def test_worksheet_subcommand_empty_root_no_candidates(tmp_path: Path) -> None:
+    code = main(["worksheet", "--root", str(tmp_path)])
+    assert code == 0
