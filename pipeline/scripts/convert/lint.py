@@ -108,7 +108,10 @@ def token_recall(reference: str, candidate: str) -> float:
     return len(reference_words & candidate_words) / len(reference_words)
 
 
-def _numeric_counter(text: str) -> Counter[str]:
+def numeric_counter(text: str) -> Counter[str]:
+    """Мультимножество числовых токенов (``\\d+``) текста. Публичная — переиспользуется
+    ocr_eval.py::diverge (spec ocr-eval-harness §8.2/§4): тот же инвариант, что в
+    numeric_delta/witness_checks, не задваивается вторым regex-проходом."""
     return Counter(_NUMBER_TOKEN_RE.findall(text))
 
 
@@ -116,7 +119,7 @@ def numeric_delta(reference: str, candidate: str) -> tuple[int, int]:
     """``(missing, added)`` — мультимножество числовых токенов (``\\d+``):
     вхождения ``reference`` без пары в ``candidate``, и наоборот. Порядок/
     позиция чисел в тексте не учитывается, только счёт по значению."""
-    reference_nums, candidate_nums = _numeric_counter(reference), _numeric_counter(candidate)
+    reference_nums, candidate_nums = numeric_counter(reference), numeric_counter(candidate)
     missing = sum((reference_nums - candidate_nums).values())
     added = sum((candidate_nums - reference_nums).values())
     return missing, added
@@ -163,7 +166,7 @@ def witness_checks(witness_text: str, cloud_text: str) -> list[str]:
     if recall < WITNESS_MIN_TOKEN_RECALL:
         defects.append(f"cloud-ocr-text-loss: {recall:.2f}")
 
-    witness_nums, cloud_nums = _numeric_counter(witness_text), _numeric_counter(cloud_text)
+    witness_nums, cloud_nums = numeric_counter(witness_text), numeric_counter(cloud_text)
     if witness_nums != cloud_nums:
         defects.append(
             "cloud-ocr-numeric-divergence: "

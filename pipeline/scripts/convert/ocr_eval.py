@@ -13,8 +13,9 @@ import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
+from itertools import combinations
 
-from convert.lint import numeric_delta
+from convert.lint import numeric_counter, numeric_delta
 
 _HEADING_HASH_RE = re.compile(r"^#{1,6}\s*", re.MULTILINE)  # только ведущие # строки
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -200,6 +201,41 @@ def _format_tier2_block(divergences: list[Divergence]) -> str:
                 f"{d.right}_only=[{_format_divergence_side(d.headings_only_right)}]"
             )
     return "\n".join(lines)
+
+
+def diverge(results: list[CandidateResult]) -> list[Divergence]:
+    """Тир 2: попарное расхождение ``document_text`` всех кандидатов, кроме
+    упавших (``failed is not None`` — сравнивать нечего). Порядок пар — по
+    порядку ``results`` (``itertools.combinations``), детерминирован входом.
+
+    **Согласие кандидатов не доказывает правильность** (spec §2): модели с
+    общей линией обучения ошибаются коррелированно. Расхождение — сильный
+    сигнал «здесь кто-то врёт»; пустой список расхождений НЕ значит «оба
+    правы», значит только «не разошлись в проверяемом».
+    """
+    candidates = [r for r in results if r.failed is None]
+    out: list[Divergence] = []
+    for left, right in combinations(candidates, 2):
+        left_nums = numeric_counter(left.document_text)
+        right_nums = numeric_counter(right.document_text)
+        left_headings = Counter(extract_headings(left.document_text))
+        right_headings = Counter(extract_headings(right.document_text))
+        out.append(
+            Divergence(
+                left=left.name,
+                right=right.name,
+                numeric_only_left=tuple(sorted((left_nums - right_nums).keys(), key=int)),
+                numeric_only_right=tuple(sorted((right_nums - left_nums).keys(), key=int)),
+                headings_only_left=tuple(f"{lv}:{t}" for lv, t in _sorted_headings(left_headings - right_headings)),
+                headings_only_right=tuple(f"{lv}:{t}" for lv, t in _sorted_headings(right_headings - left_headings)),
+            )
+        )
+    return out
+
+
+def _sorted_headings(counter: Counter[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Детерминированный порядок для отчёта: по уровню, затем по тексту."""
+    return sorted(counter.keys())
 
 
 def format_report(results: list[CandidateResult], divergences: list[Divergence]) -> str:

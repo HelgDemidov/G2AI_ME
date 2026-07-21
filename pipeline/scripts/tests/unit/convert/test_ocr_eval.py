@@ -7,6 +7,7 @@ from dataclasses import replace
 from convert.ocr_eval import (
     CandidateResult,
     Divergence,
+    diverge,
     extract_headings,
     format_report,
     levenshtein,
@@ -134,6 +135,51 @@ def test_score_page_duplicate_headings_use_multiset_matching() -> None:
     score = score_page(gold, candidate)
     assert score.headings_gold == 2
     assert score.headings_matched == 1  # только одна пара найдена, не обе
+
+
+# --- diverge ---
+
+
+def _candidate(name: str, document_text: str, failed: str | None = None) -> CandidateResult:
+    return CandidateResult(name=name, document_text=document_text, page_text={}, scores=[], failed=failed)
+
+
+def test_diverge_identical_documents_no_divergence() -> None:
+    text = "# Član 1\n\nOvim zakonom broj 42."
+    (d,) = diverge([_candidate("a", text), _candidate("b", text)])
+    assert not any((d.numeric_only_left, d.numeric_only_right, d.headings_only_left, d.headings_only_right))
+
+
+def test_diverge_swapped_digit_appears_on_both_sides() -> None:
+    """Тихая подмена 26 -> 25: «26» есть только у left, «25» — только у right
+    (симметрично тому же классу в witness_checks/numeric_delta)."""
+    (d,) = diverge([_candidate("gemini", "Član 26"), _candidate("tesseract", "Član 25")])
+    assert d.numeric_only_left == ("26",)
+    assert d.numeric_only_right == ("25",)
+
+
+def test_diverge_heading_only_on_one_side() -> None:
+    (d,) = diverge([_candidate("a", "# Glava I\n\nBody."), _candidate("b", "Glava I\n\nBody.")])
+    assert d.headings_only_left == ("1:Glava I",)
+    assert d.headings_only_right == ()
+
+
+def test_diverge_excludes_failed_candidates() -> None:
+    """Упавший кандидат не участвует ни в одной паре — сравнивать нечего."""
+    results = [_candidate("a", "text"), _candidate("b", "text", failed="429 rate limit")]
+    assert diverge(results) == []
+
+
+def test_diverge_three_candidates_builds_three_pairs() -> None:
+    results = [_candidate("a", "1"), _candidate("b", "2"), _candidate("c", "3")]
+    pairs = {(d.left, d.right) for d in diverge(results)}
+    assert pairs == {("a", "b"), ("a", "c"), ("b", "c")}
+
+
+def test_diverge_numeric_tokens_sorted_numerically_not_lexically() -> None:
+    """«2» перед «10» — численная сортировка, не строковая (иначе «10» < «2»)."""
+    (d,) = diverge([_candidate("a", "2 10 30"), _candidate("b", "")])
+    assert d.numeric_only_left == ("2", "10", "30")
 
 
 # --- format_report ---
