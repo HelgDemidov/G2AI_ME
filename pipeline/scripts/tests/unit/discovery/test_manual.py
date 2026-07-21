@@ -137,6 +137,7 @@ def _candidate(**overrides: object) -> schema.CandidateRecord:
         "raw_hash": "a" * 64,
         "title": "T",
         "issuer": "I",
+        "language": "en",
         "source_url": "https://gov.example.org/a.pdf",
     }
     data.update(overrides)
@@ -191,3 +192,153 @@ def test_render_worksheet_empty_pending_still_has_header() -> None:
     text = manual.render_worksheet([])
     assert "Триаж-worksheet" in text
     assert "raw_hash" in text
+
+
+# --- apply_decisions (spec §4) ---
+
+
+def _admit_decision(raw_hash: str, **overrides: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        "raw_hash": raw_hash,
+        "action": "admit",
+        "id": "me-example-strategy-2026",
+        "entity_id": "me",
+        "track": "montenegro",
+        "issuer_type": "government",
+        "geo_scope": "national",
+        "doc_type": "strategy",
+        "authority": "official",
+        "relevance": {
+            "target_fit": "primary",
+            "axis": "agentic_g2ai",
+            "assessed_stage": "triage",
+            "rationale": "matches axis",
+            "assessed_date": "2026-07-21",
+        },
+    }
+    data.update(overrides)
+    return data
+
+
+def test_apply_reject_sets_rejected_reason(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="a" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions(
+        [{"raw_hash": "a" * 64, "action": "reject", "reason": "вне обеих осей"}], root=tmp_path
+    )
+    assert summary.errors == []
+    reloaded = store.load(tmp_path / "candidates.yaml")
+    assert reloaded[0].rejected_reason == "вне обеих осей"
+
+
+def test_apply_reject_does_not_overwrite_existing_reason(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="a" * 64, rejected_reason="первая причина")
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions(
+        [{"raw_hash": "a" * 64, "action": "reject", "reason": "новая причина"}], root=tmp_path
+    )
+    assert summary.errors == []
+    reloaded = store.load(tmp_path / "candidates.yaml")
+    assert reloaded[0].rejected_reason == "первая причина"
+
+
+def test_apply_admit_creates_meta_yaml_at_correct_path(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert summary.errors == []
+    meta_path = tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml"
+    assert meta_path.exists()
+    records = schema.load_records(tmp_path)
+    assert len(records) == 1 and records[0].id == "me-example-strategy-2026"
+
+
+def test_apply_admit_does_not_touch_candidate_in_store(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    reloaded = store.load(tmp_path / "candidates.yaml")
+    assert len(reloaded) == 1
+    assert reloaded[0].rejected_reason is None  # кандидат — аудит-след, apply его не трогает
+
+
+def test_apply_admit_v2_fields_reach_meta_yaml(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_decision(
+        "b" * 64,
+        topics=["ai-governance"],
+        g2ai_pattern=["agent-governance-framework"],
+        summary="short EN summary",
+        relations=[{"type": "implements", "target": "eu-ai-act-2024"}],
+    )
+    manual.apply_decisions([decision], root=tmp_path)
+    rec = schema.load_records(tmp_path)[0]
+    assert rec.topics == ["ai-governance"]
+    assert rec.summary == "short EN summary"
+    assert rec.relations[0].target == "eu-ai-act-2024"
+
+
+def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Path) -> None:
+    good = _candidate(raw_hash="b" * 64)
+    bad = _candidate(raw_hash="c" * 64, source_ref="https://gov.example.org/bad.pdf")
+    store.save([good, bad], tmp_path / "candidates.yaml")
+
+    incomplete = _admit_decision("c" * 64)
+    del incomplete["relevance"]
+    summary = manual.apply_decisions([_admit_decision("b" * 64), incomplete], root=tmp_path)
+
+    assert len(summary.errors) == 1
+    assert summary.errors[0].raw_hash == "c" * 64
+    assert len(schema.load_records(tmp_path)) == 1  # хороший применился, плохой — нет
+
+
+def test_apply_ambiguous_raw_hash_prefix_reports_error(tmp_path: Path) -> None:
+    cand1 = _candidate(raw_hash="a" * 64, source_ref="https://gov.example.org/1.pdf")
+    cand2 = _candidate(raw_hash="a" * 63 + "b", source_ref="https://gov.example.org/2.pdf")
+    store.save([cand1, cand2], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions(
+        [{"raw_hash": "a" * 12, "action": "reject", "reason": "x"}], root=tmp_path
+    )
+    assert len(summary.errors) == 1
+    assert "неоднозначен" in summary.errors[0].detail
+
+
+def test_apply_unknown_raw_hash_reports_error(tmp_path: Path) -> None:
+    summary = manual.apply_decisions(
+        [{"raw_hash": "d" * 64, "action": "reject", "reason": "x"}], root=tmp_path
+    )
+    assert len(summary.errors) == 1
+
+
+def test_apply_dry_run_does_not_write(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path, dry_run=True)
+    assert summary.dry_run is True
+    assert summary.errors == []
+    assert schema.load_records(tmp_path) == []
+    meta_path = tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml"
+    assert not meta_path.exists()
+
+
+def test_apply_dry_run_reject_does_not_write(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="a" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    manual.apply_decisions(
+        [{"raw_hash": "a" * 64, "action": "reject", "reason": "x"}], root=tmp_path, dry_run=True
+    )
+    assert store.load(tmp_path / "candidates.yaml")[0].rejected_reason is None
+
+
+def test_resolve_candidate_rejects_short_prefix() -> None:
+    with pytest.raises(ValueError, match=">=12"):
+        manual._resolve_candidate("a" * 8, [_candidate(raw_hash="a" * 64)])

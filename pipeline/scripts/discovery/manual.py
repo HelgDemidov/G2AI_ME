@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from core import schema
 from discovery import dedup, store
@@ -157,3 +159,168 @@ def render_worksheet(pending: list[schema.CandidateRecord]) -> str:
             )
         )
     return "\n".join(lines) + "\n"
+
+
+_ADMIT_REQUIRED = (
+    "id",
+    "entity_id",
+    "track",
+    "issuer_type",
+    "geo_scope",
+    "doc_type",
+    "authority",
+    "relevance",
+)
+
+
+@dataclass(frozen=True)
+class ApplyOutcome:
+    """Итог применения одного решения (spec §4) — per-решение, не рвёт остальной батч."""
+
+    raw_hash: str
+    action: str
+    ok: bool
+    detail: str
+
+
+@dataclass
+class ApplySummary:
+    outcomes: list[ApplyOutcome] = field(default_factory=list)
+    dry_run: bool = False
+
+    @property
+    def errors(self) -> list[ApplyOutcome]:
+        return [o for o in self.outcomes if not o.ok]
+
+
+def _resolve_candidate(
+    raw_hash_prefix: str, candidates: list[schema.CandidateRecord]
+) -> schema.CandidateRecord:
+    """Найти кандидата по ``raw_hash`` (полный или уникальный префикс ``>=12`` символов)."""
+    if len(raw_hash_prefix) < 12:
+        raise ValueError(f"raw_hash слишком короткий префикс (нужно >=12 символов): {raw_hash_prefix!r}")
+    matches = [c for c in candidates if c.raw_hash.startswith(raw_hash_prefix)]
+    if not matches:
+        raise ValueError(f"raw_hash не найден среди кандидатов: {raw_hash_prefix!r}")
+    if len(matches) > 1:
+        raise ValueError(f"raw_hash неоднозначен ({len(matches)} совпадений): {raw_hash_prefix!r}")
+    return matches[0]
+
+
+def _build_admit_record(cand: schema.CandidateRecord, decision: dict[str, Any]) -> schema.SourceRecord:
+    """Построить ``SourceRecord`` из ``admit``-решения (промоушен, ничего не пишет на диск)."""
+    missing = [k for k in _ADMIT_REQUIRED if k not in decision]
+    if missing:
+        raise ValueError(f"admit: отсутствуют обязательные поля: {', '.join(missing)}")
+    relations_raw = decision.get("relations")
+    return schema.promote_candidate(
+        cand,
+        id=decision["id"],
+        entity_id=decision["entity_id"],
+        track=schema.Track(decision["track"]),
+        issuer_type=schema.IssuerType(decision["issuer_type"]),
+        geo_scope=schema.GeoScope(decision["geo_scope"]),
+        doc_type=decision["doc_type"],
+        authority=decision["authority"],
+        relevance=schema.Relevance.model_validate(decision["relevance"]),
+        source_format=schema.SourceFormat(decision.get("source_format", "pdf")),
+        topics=decision.get("topics"),
+        g2ai_pattern=decision.get("g2ai_pattern"),
+        summary=decision.get("summary"),
+        relations=[schema.Relation.model_validate(r) for r in relations_raw] if relations_raw else None,
+    )
+
+
+def apply_decisions(
+    decisions: list[dict[str, Any]],
+    *,
+    root: Path = schema.DEFAULT_SOURCES,
+    dry_run: bool = False,
+) -> ApplySummary:
+    """Применить batch решений triage (spec §4): ``reject`` -> ``rejected_reason``, ``admit`` ->
+    ``promote_candidate`` + ``save_record``.
+
+    Ошибка одного решения (не найден raw_hash, неполный admit, конфликт meta.yaml) не рвёт
+    батч — попадает в ``ApplySummary.errors``, остальные решения применяются. ``dry_run`` строит
+    план (валидирует admit-решения через ``promote_candidate`` целиком, включая enum/pydantic
+    ошибки) без записи store/meta.yaml.
+    """
+    candidates_path = root / "candidates.yaml"
+    candidates = store.load(candidates_path)
+    outcomes: list[ApplyOutcome] = []
+    store_changed = False
+
+    for decision in decisions:
+        raw_hash_key = str(decision.get("raw_hash") or "")
+        action = decision.get("action")
+
+        if not raw_hash_key or action not in ("admit", "reject"):
+            outcomes.append(
+                ApplyOutcome(
+                    raw_hash=raw_hash_key,
+                    action=str(action),
+                    ok=False,
+                    detail="raw_hash обязателен, action должен быть 'admit' или 'reject'",
+                )
+            )
+            continue
+
+        try:
+            cand = _resolve_candidate(raw_hash_key, candidates)
+        except ValueError as exc:
+            outcomes.append(ApplyOutcome(raw_hash=raw_hash_key, action=action, ok=False, detail=str(exc)))
+            continue
+
+        if action == "reject":
+            if cand.rejected_reason is not None:
+                outcomes.append(
+                    ApplyOutcome(
+                        raw_hash=cand.raw_hash,
+                        action=action,
+                        ok=True,
+                        detail=f"уже был отклонён ранее (без изменений): {cand.rejected_reason}",
+                    )
+                )
+                continue
+            reason = decision.get("reason") or "отклонено триажем (без указанной причины)"
+            if dry_run:
+                outcomes.append(
+                    ApplyOutcome(
+                        raw_hash=cand.raw_hash, action=action, ok=True, detail=f"план: отклонить ({reason})"
+                    )
+                )
+                continue
+            cand.rejected_reason = reason
+            store_changed = True
+            outcomes.append(ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=True, detail="отклонён"))
+            continue
+
+        # action == "admit"
+        try:
+            rec = _build_admit_record(cand, decision)
+        except ValueError as exc:
+            outcomes.append(ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=False, detail=str(exc)))
+            continue
+
+        if dry_run:
+            outcomes.append(
+                ApplyOutcome(
+                    raw_hash=cand.raw_hash, action=action, ok=True, detail=f"план: допустить как {rec.id}"
+                )
+            )
+            continue
+
+        try:
+            schema.save_record(rec, root)
+        except ValueError as exc:
+            outcomes.append(ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=False, detail=str(exc)))
+            continue
+
+        outcomes.append(
+            ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=True, detail=f"допущен как {rec.id}")
+        )
+
+    if not dry_run and store_changed:
+        store.save(candidates, candidates_path)
+
+    return ApplySummary(outcomes=outcomes, dry_run=dry_run)

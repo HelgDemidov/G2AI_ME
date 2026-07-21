@@ -258,3 +258,95 @@ def test_worksheet_subcommand_writes_to_out_file(
 def test_worksheet_subcommand_empty_root_no_candidates(tmp_path: Path) -> None:
     code = main(["worksheet", "--root", str(tmp_path)])
     assert code == 0
+
+
+# --- apply (spec discovery-manual §4) ---
+
+
+_DECISIONS_YAML = """\
+- raw_hash: "{raw_hash}"
+  action: admit
+  id: me-example-strategy-2026
+  entity_id: me
+  track: montenegro
+  issuer_type: government
+  geo_scope: national
+  doc_type: strategy
+  authority: official
+  relevance: {{target_fit: primary, axis: agentic_g2ai, assessed_stage: triage,
+              rationale: "matches axis", assessed_date: 2026-07-21}}
+"""
+
+
+def test_apply_subcommand_admits_and_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/strategy.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+        ]
+    )
+    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    decisions_path = tmp_path / "decisions.yaml"
+    decisions_path.write_text(_DECISIONS_YAML.format(raw_hash=raw_hash), encoding="utf-8")
+
+    code = main(["apply", str(decisions_path), "--root", str(tmp_path)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Следующий шаг" in out
+    assert (tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
+
+
+def test_apply_subcommand_error_exits_nonzero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    decisions_path = tmp_path / "decisions.yaml"
+    decisions_path.write_text("- raw_hash: 'unknownhash12'\n  action: reject\n", encoding="utf-8")
+
+    code = main(["apply", str(decisions_path), "--root", str(tmp_path)])
+    assert code == 1
+    assert "✗" in capsys.readouterr().out
+
+
+def test_apply_subcommand_dry_run_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/strategy.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+        ]
+    )
+    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    decisions_path = tmp_path / "decisions.yaml"
+    decisions_path.write_text(_DECISIONS_YAML.format(raw_hash=raw_hash), encoding="utf-8")
+
+    code = main(["apply", str(decisions_path), "--root", str(tmp_path), "--dry-run"])
+    assert code == 0
+    assert "dry-run" in capsys.readouterr().out
+    assert not (tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
+
+
+def test_apply_subcommand_rejects_non_list_decisions_file(tmp_path: Path) -> None:
+    decisions_path = tmp_path / "decisions.yaml"
+    decisions_path.write_text("not_a_list: true\n", encoding="utf-8")
+
+    code = main(["apply", str(decisions_path), "--root", str(tmp_path)])
+    assert code == 1

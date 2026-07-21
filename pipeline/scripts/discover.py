@@ -10,6 +10,9 @@ import argparse
 import datetime as dt
 import logging
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 from core import schema
 from discovery import manual, store
@@ -74,6 +77,24 @@ def _cmd_worksheet(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_apply(args: argparse.Namespace) -> int:
+    raw: Any = yaml.safe_load(args.decisions_file.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        print(f"✗ {args.decisions_file}: верхний уровень decisions-файла должен быть списком")
+        return 1
+
+    summary = manual.apply_decisions(raw, root=args.root, dry_run=args.dry_run)
+    for outcome in summary.outcomes:
+        mark = "✓" if outcome.ok else "✗"
+        print(f"  {mark} {outcome.raw_hash[:12]} [{outcome.action}]: {outcome.detail}")
+
+    mode = " (dry-run, ничего не записано)" if summary.dry_run else ""
+    print(f"Итого: {len(summary.outcomes)} решени(й), {len(summary.errors)} ошибок{mode}")
+    if not summary.dry_run and any(o.ok and o.action == "admit" for o in summary.outcomes):
+        print("Следующий шаг: pipeline/scripts/run_pipeline.py (скачивание/конвертация/индекс)")
+    return 1 if summary.errors else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DISCOVERY: генератор кандидатов источников")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -112,6 +133,12 @@ def main(argv: list[str] | None = None) -> int:
     p_worksheet.add_argument("--out", type=Path, default=None, help="дефолт — stdout")
     p_worksheet.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
     p_worksheet.set_defaults(func=_cmd_worksheet)
+
+    p_apply = sub.add_parser("apply", help="применить batch-решения triage (promote/reject)")
+    p_apply.add_argument("decisions_file", type=Path)
+    p_apply.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
+    p_apply.add_argument("--dry-run", action="store_true", help="план без записи store/meta.yaml")
+    p_apply.set_defaults(func=_cmd_apply)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
