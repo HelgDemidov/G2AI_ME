@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,81 @@ def test_reembed_upserts_not_duplicates(tmp_path: Path) -> None:
     store_vectors(conn, hashes, vecs, "m")
     store_vectors(conn, hashes, vecs, "m")  # повторно — upsert по (content_hash, model)
     assert _vec_count(conn, "m") == 3
+
+
+# --- load_vectors: потоковая сборка матрицы (бэклог §16) ---
+
+
+def _load_peak_ratio(conn: sqlite3.Connection, model: str) -> tuple[float, FloatArray]:
+    """Пик аллокаций внутри load_vectors, нормированный на размер итоговой матрицы."""
+    tracemalloc.start()
+    try:
+        _, mat = load_vectors(conn, model)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak / mat.nbytes, mat
+
+
+def test_load_vectors_does_not_hold_extra_full_copies(tmp_path: Path) -> None:
+    """Регрессия: прежняя форма (fetchall + vstack + избыточный astype) держала в пике
+    ТРИ копии данных — замерено 3.07x. Потоковая сборка даёт ~1x. Порог 2.0x ловит
+    возврат любой одной лишней полной копии, оставляя запас на служебные аллокации."""
+    conn = create_db(tmp_path / "c.db")
+    n, dim = 2000, 512
+    store_vectors(
+        conn,
+        [f"h{i:05d}" for i in range(n)],
+        l2_normalize(np.random.default_rng(0).random((n, dim), dtype=np.float32)),
+        "m",
+    )
+    ratio, mat = _load_peak_ratio(conn, "m")
+    assert mat.nbytes == n * dim * 4  # матрица действительно крупная — порог осмыслен
+    assert ratio < 2.0, f"пик {ratio:.2f}x от матрицы — вернулась лишняя полная копия"
+
+
+def test_load_vectors_roundtrip_preserves_values_dtype_and_hash_order(tmp_path: Path) -> None:
+    """Потоковая запись в предвыделенный буфер не меняет контракт: float32, writable,
+    строка i соответствует hashes[i], порядок — по content_hash (ORDER BY)."""
+    conn = create_db(tmp_path / "c.db")
+    vecs = l2_normalize(np.eye(4, dtype=np.float32))
+    stored = ["h-c", "h-a", "h-d", "h-b"]  # намеренно НЕ отсортированы при записи
+    store_vectors(conn, stored, vecs, "m")
+    hashes, mat = load_vectors(conn, "m")
+
+    assert hashes == sorted(stored)
+    assert mat.dtype == np.dtype(np.float32)
+    assert mat.flags.writeable
+    assert mat.shape == (4, 4)
+    for i, h in enumerate(hashes):
+        assert np.array_equal(mat[i], vecs[stored.index(h)])  # строка i <-> hashes[i]
+
+
+def test_load_vectors_single_row_allocates_from_first_row_width(tmp_path: Path) -> None:
+    """Ширина буфера берётся из ПЕРВОЙ строки — вырожденный случай n=1 не особый."""
+    conn = create_db(tmp_path / "c.db")
+    store_vectors(conn, ["only"], l2_normalize(np.ones((1, 7), dtype=np.float32)), "m")
+    hashes, mat = load_vectors(conn, "m")
+    assert hashes == ["only"] and mat.shape == (1, 7)
+
+
+def test_load_vectors_absent_model_returns_empty(tmp_path: Path) -> None:
+    """Модели нет -> COUNT=0 -> ранний выход без обращения к курсору."""
+    conn = create_db(tmp_path / "c.db")
+    store_vectors(conn, ["h1"], l2_normalize(np.ones((1, 3), dtype=np.float32)), "m")
+    hashes, mat = load_vectors(conn, "other-model")
+    assert hashes == [] and mat.shape == (0, 0)
+    assert mat.dtype == np.dtype(np.float32)
+
+
+def test_load_vectors_raises_on_mixed_dimensions(tmp_path: Path) -> None:
+    """Документированное поведение: вектор чужой размерности роняет загрузку, а не
+    просачивается молча (порядок по content_hash -> 'a' задаёт ширину, 'b' её ломает)."""
+    conn = create_db(tmp_path / "c.db")
+    store_vectors(conn, ["a"], l2_normalize(np.ones((1, 4), dtype=np.float32)), "m")
+    store_vectors(conn, ["b"], l2_normalize(np.ones((1, 8), dtype=np.float32)), "m")
+    with pytest.raises(ValueError):
+        load_vectors(conn, "m")
 
 
 def test_semantic_search_nearest(tmp_path: Path) -> None:

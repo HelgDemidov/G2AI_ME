@@ -1,7 +1,13 @@
 """Хранение эмбеддингов в corpus.db + семантический поиск (брутфорс-косинус, numpy).
 
-Векторы L2-нормализованы -> косинус = скалярное произведение. На масштабе корпуса
-(10-30 тыс. чанков) брутфорс в numpy — миллисекунды, отдельная векторная БД не нужна.
+Векторы L2-нормализованы -> косинус = скалярное произведение. Брутфорс в numpy —
+осознанный выбор, отдельная векторная БД не нужна; ограничение у него не в счёте, а
+в том, что ``load_vectors`` собирает ВСЮ матрицу модели на каждый поиск. Замеры
+2026-07-21: пик ~1x от размера матрицы (после перехода на потоковую сборку), время
+загрузки ~0.85 c на 50 тыс. чанков. Экстраполяция на целевые ~163 тыс. чанков
+(1000 док): ~640 МиБ и ~2.8 c на запрос — по памяти проходит на 8 ГБ машине, по
+латентности ощутимо. Порог пересмотра (ANN/квантизация/кэш матрицы в сессии) —
+~100 тыс. чанков ИЛИ когда задержка начнёт мешать в работе: бэклог §16.
 Таблица vectors живёт в той же БД, что и chunks/chunks_fts.
 
 Ключ вектора — ``content_hash`` чанка (sha256 текста), НЕ эфемерный ``chunk_id``:
@@ -134,14 +140,40 @@ def embed_and_store(
 
 
 def load_vectors(conn: sqlite3.Connection, model: str) -> tuple[list[str], FloatArray]:
+    """Все векторы модели одной матрицей (n, dim) + их content_hash в том же порядке.
+
+    Матрица заполняется ПОТОКОВО в заранее выделенный буфер, а не через
+    ``fetchall`` + ``vstack``: прежняя форма держала в пике три копии данных
+    сразу (список BLOB'ов + результат vstack + избыточный ``astype`` уже-float32
+    массива) — замерено ровно 3.07x от размера матрицы, на КАЖДЫЙ поиск.
+    Потоковая форма даёт ~1x: курсор sqlite3 не материализует весь результат,
+    живой BLOB в каждый момент один. На целевом масштабе корпуса (~163 тыс.
+    чанков = ~640 МиБ матрицы) это разница между ~1.9 ГиБ и ~700 МиБ пика на
+    машине с 8 ГБ RAM — см. `docs/pipeline/general/pipeline_improvements.md` §16.
+
+    Размерность берётся из первой строки; строка с иной длиной BLOB'а уронит
+    присваивание (broadcast) — это желаемое поведение: молча принять вектор
+    чужой размерности хуже, чем упасть.
+    """
     ensure_schema(conn)  # поиск может идти до первого эмбеддинга — таблицы может не быть
-    rows = conn.execute(
-        "SELECT content_hash, vec FROM vectors WHERE model = ? ORDER BY content_hash", (model,)
-    ).fetchall()
-    if not rows:
+    total = int(
+        conn.execute("SELECT COUNT(*) FROM vectors WHERE model = ?", (model,)).fetchone()[0]
+    )
+    if not total:
         return [], np.zeros((0, 0), dtype=np.float32)
-    hashes = [str(r[0]) for r in rows]
-    mat = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in rows]).astype(np.float32)
+    hashes: list[str] = []
+    mat: FloatArray | None = None
+    for i, (content_hash, blob) in enumerate(
+        conn.execute(
+            "SELECT content_hash, vec FROM vectors WHERE model = ? ORDER BY content_hash", (model,)
+        )
+    ):
+        vec = np.frombuffer(blob, dtype=np.float32)
+        if mat is None:
+            mat = np.empty((total, vec.shape[0]), dtype=np.float32)
+        mat[i] = vec
+        hashes.append(str(content_hash))
+    assert mat is not None  # total > 0 -> цикл выполнился хотя бы раз
     return hashes, mat
 
 
