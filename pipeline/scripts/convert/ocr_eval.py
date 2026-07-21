@@ -13,19 +13,26 @@ production-кэш документа.
 """
 from __future__ import annotations
 
+import argparse
 import re
 import shutil
+import sys
+import tempfile
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from pathlib import Path
 
 import pdfplumber
 import pypdfium2 as pdfium
+import yaml
 
 from convert import cloud_ocr, converters
 from convert.lint import numeric_counter, numeric_delta
+from core import fsio
+from core.env import REPO_ROOT, load_dotenv
+from core.schema import DEFAULT_SOURCES
 
 _HEADING_HASH_RE = re.compile(r"^#{1,6}\s*", re.MULTILINE)  # только ведущие # строки
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -320,3 +327,171 @@ def run_tesseract(raw: Path, workdir: Path) -> dict[int, str] | None:
         return None
     with pdfplumber.open(copy) as pdf:
         return {i: (page.extract_text() or "") for i, page in enumerate(pdf.pages, start=1)}
+
+
+# --- CLI: сборка кандидатов, эталон, отчёт (spec §6) ---
+
+DEFAULT_GOLD_DIR = REPO_ROOT / "pipeline" / "scripts" / "tests" / "fixtures" / "local" / "ocr_gold"
+
+
+@dataclass(frozen=True)
+class GoldManifest:
+    document: str
+    raw_sha256: str
+    language: str
+    pages: list[int]
+
+
+def _load_manifest(gold_dir: Path) -> GoldManifest:
+    data = yaml.safe_load((gold_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    return GoldManifest(
+        document=str(data["document"]),
+        raw_sha256=str(data["raw_sha256"]),
+        language=str(data["language"]),
+        pages=[int(p) for p in data["pages"]],
+    )
+
+
+def _load_gold_page(gold_dir: Path, page: int) -> str:
+    """Файл эталона страницы — по СУФФИКСУ ``-pNN.md``, не по вычисленному из
+    ``document`` имени: реальная раскладка (§1) использует короткий человеческий
+    префикс (``me-crps-p01.md`` для ``me-crps-registration-law-2025``), который
+    код не обязан угадывать."""
+    matches = list(gold_dir.glob(f"*-p{page:02d}.md"))
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"ожидался ровно один файл *-p{page:02d}.md в {gold_dir}, найдено {len(matches)}"
+        )
+    return matches[0].read_text(encoding="utf-8")
+
+
+def _resolve_raw(document: str) -> Path:
+    """``raw.*`` документа по id — glob по ``sources/``, без загрузки/валидации
+    всего реестра: харнесс инструмент курации, а не часть гейта validate_sources."""
+    matches = sorted(DEFAULT_SOURCES.rglob(f"{document}/raw.*"))
+    if not matches:
+        raise FileNotFoundError(f"raw.* не найден для документа {document!r} в {DEFAULT_SOURCES}")
+    return matches[0]
+
+
+def _tesseract_result(raw: Path, workdir: Path, pages: list[int]) -> CandidateResult:
+    pages_map = run_tesseract(raw, workdir)
+    if pages_map is None:
+        return CandidateResult(
+            name="tesseract", document_text="", page_text={}, scores=[],
+            failed="raw не нормализован OCR (нет текст-слоя, converters._was_ocr_normalized=False)",
+        )
+    document_text = "\n\n".join(pages_map[p] for p in sorted(pages_map))
+    page_text = {p: pages_map[p] for p in pages if p in pages_map}
+    return CandidateResult(name="tesseract", document_text=document_text, page_text=page_text, scores=[])
+
+
+def _build_candidates(
+    raw: Path, language: str, pages: list[int], models: list[str], *, include_tesseract: bool, workdir: Path
+) -> list[CandidateResult]:
+    """Прогнать все облачные модели (§3: каждая — независимая пара сетевых
+    вызовов run_document+run_pages) + опционально tesseract. Отказ ОДНОГО
+    кандидата не роняет прогон (``failed``), остальные продолжаются."""
+    results: list[CandidateResult] = []
+    for model in models:
+        try:
+            document_text = run_document(raw, language, model, workdir)
+            page_text = run_pages(raw, pages, language, model, workdir)
+        except Exception as exc:  # noqa: BLE001 — намеренно широкий catch: любой отказ кандидата
+            results.append(CandidateResult(name=model, document_text="", page_text={}, scores=[], failed=str(exc)))
+            continue
+        results.append(CandidateResult(name=model, document_text=document_text, page_text=page_text, scores=[]))
+    if include_tesseract:
+        results.append(_tesseract_result(raw, workdir, pages))
+    return results
+
+
+def _score_candidates(results: list[CandidateResult], gold_pages: dict[int, str]) -> list[CandidateResult]:
+    """Тир 1 постфактум: для НЕ упавших кандидатов — score_page по каждой
+    странице эталона, которую кандидат реально вернул (частичный отказ
+    run_pages на отдельную страницу не предусмотрен run_pages — либо все
+    страницы получены, либо весь кандидат упал раньше, на этапе _build_candidates)."""
+    scored: list[CandidateResult] = []
+    for r in results:
+        if r.failed is not None:
+            scored.append(r)
+            continue
+        scores = [
+            replace(score_page(gold_pages[p], r.page_text[p]), page=p)
+            for p in sorted(gold_pages)
+            if p in r.page_text
+        ]
+        scored.append(replace(r, scores=scores))
+    return scored
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="A/B-харнесс качества OCR: тир 1 (эталон) + тир 2 (расхождения кандидатов)"
+    )
+    parser.add_argument("--gold", type=Path, default=DEFAULT_GOLD_DIR)
+    parser.add_argument(
+        "--models", default=cloud_ocr.ACTIVE_MODEL,
+        help="comma-список слагов OpenRouter (дефолт — production-модель convert-cloud-tier)",
+    )
+    parser.add_argument("--no-tesseract", action="store_true", help="исключить бесплатный tesseract-кандидат")
+    parser.add_argument("--dry-run", action="store_true", help="напечатать план, без сетевых вызовов")
+    args = parser.parse_args(argv)
+
+    manifest_path = args.gold / "manifest.yaml"
+    if not args.gold.exists() or not manifest_path.exists():
+        print(f"нет эталона/манифеста в {args.gold} — см. spec ocr-eval-harness §1", file=sys.stderr)
+        return 2
+
+    manifest = _load_manifest(args.gold)
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    include_tesseract = not args.no_tesseract
+
+    try:
+        raw = _resolve_raw(manifest.document)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    n_requests = len(models) * (1 + len(manifest.pages))
+    if args.dry_run:
+        print(
+            f"План: {len(models)} облачных кандидата(ов) x (1 документ + {len(manifest.pages)} стр. эталона) "
+            f"= {n_requests} сетевых запросов" + (" + tesseract (бесплатно, без сети)" if include_tesseract else "")
+        )
+        print(f"Документ: {manifest.document} ({raw})")
+        print(f"Страницы эталона: {manifest.pages}")
+        return 0
+
+    load_dotenv()
+    gold_pages = {p: _load_gold_page(args.gold, p) for p in manifest.pages}
+    with tempfile.TemporaryDirectory() as workdir_str:
+        results = _build_candidates(
+            raw, manifest.language, manifest.pages, models,
+            include_tesseract=include_tesseract, workdir=Path(workdir_str),
+        )
+    results = _score_candidates(results, gold_pages)
+    divergences = diverge(results)
+
+    sections = []
+    current_sha = fsio.sha256_file(raw)
+    if current_sha != manifest.raw_sha256:
+        sections.append(
+            f"⚠ raw_sha256 разошёлся с манифестом ({manifest.raw_sha256[:12]}… -> {current_sha[:12]}…) "
+            "— эталон мог устареть относительно текущего raw (§1)"
+        )
+    sections.append(format_report(results, divergences))
+    sections.append(
+        "Примечание: постраничный прогон (тир 1) идёт БЕЗ _OUTLINE_PREAMBLE — контекст чуть "
+        "отличается от полнодокументного (§3), для структуры заголовков возможно расхождение с тиром 2."
+    )
+    sections.append(
+        "Напоминание: согласие кандидатов (тир 2) НЕ доказывает правильность — окончательный "
+        "источник истины только эталон (тир 1, §2)."
+    )
+    print("\n\n".join(sections))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

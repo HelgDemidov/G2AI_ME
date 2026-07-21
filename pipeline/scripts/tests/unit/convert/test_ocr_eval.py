@@ -13,7 +13,10 @@ import pdfplumber
 import pytest
 from reportlab.pdfgen import canvas
 
-from convert import cloud_ocr
+import yaml
+
+from convert import cloud_ocr, ocr_eval
+from core import fsio
 from convert.ocr_eval import (
     CandidateResult,
     Divergence,
@@ -21,6 +24,7 @@ from convert.ocr_eval import (
     extract_headings,
     format_report,
     levenshtein,
+    main,
     normalize_for_cer,
     run_document,
     run_pages,
@@ -375,3 +379,152 @@ def test_run_tesseract_never_touches_original_raw(tmp_path: Path) -> None:
 
     after = raw.stat()
     assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
+
+
+# --- _resolve_raw / _load_gold_page: helpers CLI (§6) ---
+
+
+def _fake_sources(tmp_path: Path, document: str, raw_bytes: bytes) -> Path:
+    """Минимальная sources/-раскладка (track/entity/doc-id/raw.pdf) — только
+    то, что нужно _resolve_raw, без валидного meta.yaml (харнесс не читает реестр)."""
+    root = tmp_path / "sources"
+    doc_dir = root / "track" / "entity" / document
+    doc_dir.mkdir(parents=True)
+    (doc_dir / "raw.pdf").write_bytes(raw_bytes)
+    return root
+
+
+def test_resolve_raw_finds_file_by_document_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sources_root = _fake_sources(tmp_path, "me-crps-registration-law-2025", b"%PDF-1.4 stub")
+    monkeypatch.setattr(ocr_eval, "DEFAULT_SOURCES", sources_root)
+
+    found = ocr_eval._resolve_raw("me-crps-registration-law-2025")
+    assert found == sources_root / "track" / "entity" / "me-crps-registration-law-2025" / "raw.pdf"
+
+
+def test_resolve_raw_raises_when_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ocr_eval, "DEFAULT_SOURCES", tmp_path / "sources")
+    with pytest.raises(FileNotFoundError):
+        ocr_eval._resolve_raw("does-not-exist")
+
+
+def test_load_gold_page_reads_matching_suffix_file(tmp_path: Path) -> None:
+    (tmp_path / "me-crps-p01.md").write_text("# Naslov\n\nBody.", encoding="utf-8")
+    assert ocr_eval._load_gold_page(tmp_path, 1) == "# Naslov\n\nBody."
+
+
+def test_load_gold_page_raises_on_ambiguous_match(tmp_path: Path) -> None:
+    (tmp_path / "a-p01.md").write_text("x", encoding="utf-8")
+    (tmp_path / "b-p01.md").write_text("y", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        ocr_eval._load_gold_page(tmp_path, 1)
+
+
+def test_load_gold_page_raises_when_missing(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        ocr_eval._load_gold_page(tmp_path, 99)
+
+
+# --- main: CLI (§6) — все вызовы с явными tmp-путями, сеть только мокнутая ---
+
+
+def _write_gold(gold_dir: Path, document: str, raw_sha256: str, pages: dict[int, str]) -> None:
+    gold_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "document": document, "raw_sha256": raw_sha256, "language": "cnr",
+        "pages": sorted(pages), "verified_by": "test", "verified_at": "2026-07-22",
+    }
+    (gold_dir / "manifest.yaml").write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
+    for page, text in pages.items():
+        (gold_dir / f"doc-p{page:02d}.md").write_text(text, encoding="utf-8")
+
+
+def test_main_missing_gold_dir_returns_2(tmp_path: Path) -> None:
+    assert main(["--gold", str(tmp_path / "nope")]) == 2
+
+
+def test_main_gold_dir_without_manifest_returns_2(tmp_path: Path) -> None:
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    assert main(["--gold", str(gold)]) == 2
+
+
+def test_main_dry_run_prints_request_count_and_makes_no_network_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources_root = _fake_sources(tmp_path, "doc-x", b"%PDF-1.4 stub")
+    monkeypatch.setattr(ocr_eval, "DEFAULT_SOURCES", sources_root)
+    gold = tmp_path / "gold"
+    _write_gold(gold, "doc-x", "irrelevant-in-dry-run", {1: "p1", 7: "p7"})
+
+    called = []
+    monkeypatch.setattr(ocr_eval, "run_document", lambda *a, **k: called.append("doc"))
+    monkeypatch.setattr(ocr_eval, "run_pages", lambda *a, **k: called.append("pages"))
+    monkeypatch.setattr(ocr_eval, "run_tesseract", lambda *a, **k: called.append("tesseract"))
+
+    code = main(["--gold", str(gold), "--models", "model-a,model-b", "--dry-run"])
+
+    assert code == 0
+    assert called == []  # ни одного сетевого/tesseract вызова
+    out = capsys.readouterr().out
+    assert "6 сетевых запросов" in out  # 2 модели x (1 документ + 2 стр.)
+    assert "tesseract (бесплатно" in out
+
+
+def test_main_dry_run_no_tesseract_flag_omits_tesseract_from_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources_root = _fake_sources(tmp_path, "doc-x", b"%PDF-1.4 stub")
+    monkeypatch.setattr(ocr_eval, "DEFAULT_SOURCES", sources_root)
+    gold = tmp_path / "gold"
+    _write_gold(gold, "doc-x", "irrelevant", {1: "p1"})
+
+    code = main(["--gold", str(gold), "--models", "model-a", "--no-tesseract", "--dry-run"])
+    assert code == 0
+    # узкая проверка фразы плана, не голого "tesseract": tmp_path пифтеста сам
+    # содержит "no_tesseract" (из имени теста) — блэкет-серч по подстроке ложно
+    # сработал бы на пути в выводе, не на логике кода.
+    assert "tesseract (бесплатно" not in capsys.readouterr().out
+
+
+def test_main_full_run_wires_report_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Полный прогон (без --dry-run), сеть замокана: проверяет склейку
+    _build_candidates -> _score_candidates -> diverge -> format_report -> print,
+    не только отдельные функции по отдельности."""
+    raw_bytes = _multi_page_pdf(["Član 1 broj 42", "Član 7 broj 100"], creator="ocrmypdf 15.2.0")
+    sources_root = _fake_sources(tmp_path, "doc-x", raw_bytes)
+    monkeypatch.setattr(ocr_eval, "DEFAULT_SOURCES", sources_root)
+    raw_path = sources_root / "track" / "entity" / "doc-x" / "raw.pdf"
+
+    gold = tmp_path / "gold"
+    _write_gold(
+        gold, "doc-x", fsio.sha256_file(raw_path),
+        {1: "Član 1 broj 42", 2: "Član 7 broj 100"},
+    )
+
+    monkeypatch.setattr(cloud_ocr, "convert_scan", lambda path, language, *, model: "# Cloud\n\nČlan 1 broj 42")
+
+    code = main(["--gold", str(gold), "--models", "cloud-model", "--no-tesseract"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "cloud-model" in out
+    assert "Против эталона" in out and "Расхождения кандидатов" in out
+    assert "⚠ raw_sha256" not in out  # sha256 совпал с манифестом
+
+
+def test_main_warns_on_raw_sha256_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources_root = _fake_sources(tmp_path, "doc-x", _multi_page_pdf(["x"], creator="ocrmypdf 15.2.0"))
+    monkeypatch.setattr(ocr_eval, "DEFAULT_SOURCES", sources_root)
+    gold = tmp_path / "gold"
+    _write_gold(gold, "doc-x", "0" * 64, {1: "x"})  # заведомо неверный sha256
+
+    monkeypatch.setattr(cloud_ocr, "convert_scan", lambda path, language, *, model: "x")
+
+    code = main(["--gold", str(gold), "--models", "cloud-model", "--no-tesseract"])
+    assert code == 0
+    assert "⚠ raw_sha256 разошёлся" in capsys.readouterr().out
