@@ -529,6 +529,145 @@ def test_embed_and_store_checkpoints_partial_progress_on_failure(tmp_path: Path)
     assert _vec_count(conn, "flaky") == 64  # ровно 1-й батч сохранён, ничего не потеряно
 
 
+# --- _make_embedder: реальная диспетчеризация backend -> Embedder (не мок) ---
+
+
+def test_make_embedder_openrouter_dispatches_to_openrouter_embedder(monkeypatch: Any) -> None:
+    from index.vector_store import _make_embedder
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    embedder = _make_embedder("openrouter", None)
+    assert embedder.name.startswith("google/gemini-embedding-001")
+
+
+def test_make_embedder_openrouter_passes_model_override(monkeypatch: Any) -> None:
+    from index.vector_store import _make_embedder
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    embedder = _make_embedder("openrouter", "custom/model")
+    assert embedder.name.startswith("custom/model")
+
+
+def test_make_embedder_bge_dispatches_to_get_embedder_bge(monkeypatch: Any) -> None:
+    """Диспетчеризация в get_embedder("bge") без конструирования реальной модели —
+    OnnxBgeEmbedder подменён, тест проверяет ТОЛЬКО маршрутизацию _make_embedder."""
+    from index import vector_store as vs_module
+
+    calls: list[str] = []
+
+    def fake_get_embedder(backend: str, **kw: Any) -> Any:
+        calls.append(backend)
+        return object()
+
+    monkeypatch.setattr(vs_module, "get_embedder", fake_get_embedder)
+    vs_module._make_embedder("bge", None)
+    assert calls == ["bge"]
+
+
+# --- _cmd_embed: no-db / no-chunks guards ---
+
+
+def test_cmd_embed_no_db_returns_error(tmp_path: Path, capsys: Any) -> None:
+    args = argparse.Namespace(db=tmp_path / "nope.db", backend="openrouter", model=None)
+    assert _cmd_embed(args) == 2
+    assert "нет БД" in capsys.readouterr().err
+
+
+def test_cmd_embed_no_chunks_returns_error(tmp_path: Path, capsys: Any) -> None:
+    db = tmp_path / "c.db"
+    create_db(db)  # таблица chunks создана, но пуста
+    args = argparse.Namespace(db=db, backend="openrouter", model=None)
+    assert _cmd_embed(args) == 2
+    assert "нет чанков" in capsys.readouterr().err
+
+
+# --- _cmd_vsearch: CLI (коды возврата, вывод) ---
+
+
+def test_cmd_vsearch_no_db_returns_error(tmp_path: Path, capsys: Any) -> None:
+    from index.vector_store import _cmd_vsearch
+
+    args = argparse.Namespace(db=tmp_path / "nope.db", backend="openrouter", model=None, query="q", limit=10)
+    assert _cmd_vsearch(args) == 2
+    assert "нет БД" in capsys.readouterr().err
+
+
+def test_cmd_vsearch_no_vectors_for_model_returns_error(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    from index.vector_store import _cmd_vsearch
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "text", 1)])
+    conn.close()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: _CloudFakeEmbedder())
+    args = argparse.Namespace(db=db, backend="openrouter", model=None, query="q", limit=10)
+    assert _cmd_vsearch(args) == 2
+    assert "векторы модели" in capsys.readouterr().err
+
+
+def test_cmd_vsearch_warns_when_chunks_unembedded_but_succeeds(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    from index.vector_store import _cmd_vsearch
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "first", 1), Chunk("doc-b", 0, "second", 1)])
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes[:1], l2_normalize(np.eye(1, dtype=np.float32)), "cloud-model")
+    conn.close()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: _CloudFakeEmbedder())
+    args = argparse.Namespace(db=db, backend="openrouter", model=None, query="q", limit=10)
+    assert _cmd_vsearch(args) == 0
+    assert "1 чанков ещё без векторов" in capsys.readouterr().err
+
+
+def test_cmd_vsearch_no_hits_with_orphaned_vectors_reports_nothing_found(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """has_vectors=True (таблица vectors непуста), но соответствующий чанк уже удалён из
+    chunks — semantic_search честно не находит носителей, CLI репортит "ничего не найдено"."""
+    from index.vector_store import _cmd_vsearch
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "text", 1)])
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes, l2_normalize(np.eye(1, dtype=np.float32)), "cloud-model")
+    conn.execute("DELETE FROM chunks")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: _CloudFakeEmbedder())
+    args = argparse.Namespace(db=db, backend="openrouter", model=None, query="q", limit=10)
+    assert _cmd_vsearch(args) == 0
+    assert "ничего не найдено" in capsys.readouterr().out
+
+
+def test_cmd_vsearch_prints_hits_with_score_and_preview(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    from index.vector_store import _cmd_vsearch
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "hello world", 2)])
+    hashes, _ = chunk_hashes(conn)
+    store_vectors(conn, hashes, l2_normalize(np.eye(1, dtype=np.float32)), "cloud-model")
+    conn.close()
+
+    monkeypatch.setattr("index.vector_store._make_embedder", lambda backend, model: _CloudFakeEmbedder())
+    args = argparse.Namespace(db=db, backend="openrouter", model=None, query="q", limit=10)
+    assert _cmd_vsearch(args) == 0
+    out = capsys.readouterr().out
+    assert "doc-a" in out
+    assert "hello world" in out
+
+
 def test_embed_and_store_restart_after_failure_completes_without_duplicates(tmp_path: Path) -> None:
     """Рестарт (новый процесс = новый экземпляр эмбеддера) добирает остаток через
     ``chunk_hashes(not_embedded_for=...)`` без повторного счёта/дублей."""
