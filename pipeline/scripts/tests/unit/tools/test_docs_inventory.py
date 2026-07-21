@@ -82,10 +82,33 @@ def test_render_order_queue_extra_and_escaping(tmp_path: Path) -> None:
     beta_pos, alpha_pos = out.index("## BETA"), out.index("## ALPHA")
     assert beta_pos < alpha_pos  # порядок блоков — из оверлея
     assert "| spec-a | спек |" in out and "| **1** · вперёд |" in out
-    assert "| spec-b | спек |" in out and f"| {di.NO_STATUS} | — |" in out  # дефолт очереди
+    assert "| spec-b | спек |" in out and f"| {di.NO_STATUS} | **3** |" in out  # автономер (нет статуса = не терминал)
     assert "| jit-x | спек | — (не написан) | JIT | **2** · после spec-a |" in out
-    assert "PR #1) \\| хвост" in out  # '|' в статусе экранирован
+    assert "| spec-pipe | спек |" in out and "PR #1) \\| хвост" in out  # '|' в статусе экранирован
     assert out.index("| spec-b") < out.index("| jit-x")  # extra после сканированных
+
+
+def test_render_terminal_status_forces_dash_even_with_stale_overlay(tmp_path: Path) -> None:
+    """Регрессия на живой баг (discovery-manual, roadmap.yaml): реализованный спек
+    больше не может показать протухший номер, даже если оверлей ещё его хранит."""
+    overlay = dict(OVERLAY) | {"queue": {"spec-a": "**1** · вперёд", "spec-pipe": "**5** · протух"}}
+    out = di.render(di.scan(make_docs(tmp_path)), overlay)
+    assert "| spec-pipe | спек | `beta/tech_specs/spec-pipe/spec.md` | реализовано (PR #1) \\| хвост с пайпом | — |" in out
+
+
+def test_render_auto_numbers_multiple_pending_specs_in_scan_order(tmp_path: Path) -> None:
+    """Спеки без явной очереди получают ПОСЛЕДОВАТЕЛЬНЫЕ автономера после уже занятых,
+    без дублей и без учёта оверлей-записей-сирот (имя, которого нет среди строк)."""
+    root = tmp_path / "docs"
+    for slug in ("existing", "pending-a", "pending-b"):
+        d = root / "gamma" / "tech_specs" / slug
+        d.mkdir(parents=True)
+        (d / "spec.md").write_text(f"# {slug}\n\nСтатус: черновик v1\n", encoding="utf-8")
+    overlay = {"blocks": [], "queue": {"existing": "**2** · занято", "orphan-name": "**9** · сирота"}}
+    out = di.render(di.scan(root), overlay)
+    assert "| existing | спек |" in out and "**2** · занято" in out
+    assert "| pending-a | спек |" in out and "**3**" in out
+    assert "| pending-b | спек |" in out and "**4**" in out
 
 
 def test_render_unknown_block_appended(tmp_path: Path) -> None:
@@ -99,6 +122,55 @@ def test_render_empty_block_skipped(tmp_path: Path) -> None:
               {"key": "ghost", "title": "GHOST"}]
     overlay = dict(OVERLAY) | {"blocks": blocks}
     assert "GHOST" not in di.render(di.scan(make_docs(tmp_path)), overlay)
+
+
+# --- is_terminal_status ---
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        ("реализовано (PR #1) · 2026-07-16", True),
+        ("❌ отменён (2026-07-18) — свап отклонён", True),
+        ("черновик v1 · 2026-07-17", False),
+        ("JIT — спек по готовности", False),
+        (di.NO_STATUS, False),
+    ],
+)
+def test_is_terminal_status(status: str, expected: bool) -> None:
+    assert di.is_terminal_status(status) is expected
+
+
+# --- render_queue_chain ---
+
+def test_render_queue_chain_sorted_by_number_with_and_without_description(tmp_path: Path) -> None:
+    out = di.render_queue_chain(di.scan(make_docs(tmp_path)), dict(OVERLAY))
+    lines = out.splitlines()
+    assert lines[0] == "1. spec-a — вперёд"
+    assert lines[1] == "2. jit-x — после spec-a"
+    assert lines[2] == "3. spec-b"  # автономер без описания -> без «— …»
+
+
+def test_render_queue_chain_empty_when_nothing_numbered(tmp_path: Path) -> None:
+    root = tmp_path / "docs"
+    d = root / "gamma" / "tech_specs" / "done-spec"
+    d.mkdir(parents=True)
+    (d / "spec.md").write_text("# Done\n\nСтатус: реализовано (PR #1)\n", encoding="utf-8")
+    out = di.render_queue_chain(di.scan(root), {"blocks": []})
+    assert out == "(пусто)"
+
+
+def test_render_and_render_queue_chain_never_disagree(tmp_path: Path) -> None:
+    """Таблица и сквозной список — производные ОДНОГО и того же _resolve_queue: у
+    каждого номера из списка должна найтись ровно та же строка с тем же номером в таблице."""
+    overlay = dict(OVERLAY) | {"queue": {"spec-a": "**1** · вперёд", "spec-pipe": "**5** · протух"}}
+    rows = di.scan(make_docs(tmp_path))
+    table = di.render(rows, overlay)
+    chain = di.render_queue_chain(rows, overlay)
+    for line in chain.splitlines():
+        n, _, rest = line.partition(". ")
+        name = rest.split(" — ")[0]
+        assert f"| {name} |" in table
+        assert f"| **{n}**" in table  # тот же номер, не пересчитанный заново
 
 
 # --- replace_auto_section ---
@@ -123,7 +195,11 @@ def _cli_env(tmp_path: Path) -> tuple[Path, Path, Path]:
     overlay = tmp_path / "roadmap.yaml"
     overlay.write_text(yaml.safe_dump(OVERLAY, allow_unicode=True), encoding="utf-8")
     target = tmp_path / "ROADMAP.md"
-    target.write_text(f"# R\n\n{di.BEGIN_MARK}\n{di.END_MARK}\n\nхвост\n", encoding="utf-8")
+    target.write_text(
+        f"# R\n\n{di.BEGIN_MARK}\n{di.END_MARK}\n\n"
+        f"{di.QUEUE_BEGIN_MARK}\n{di.QUEUE_END_MARK}\n\nхвост\n",
+        encoding="utf-8",
+    )
     return docs, overlay, target
 
 
@@ -136,6 +212,7 @@ def test_main_generates_then_idempotent(tmp_path: Path) -> None:
     assert di.main(_argv(docs, overlay, target)) == 0
     first = target.read_text(encoding="utf-8")
     assert "## BETA" in first and first.endswith("хвост\n")  # хвост цел
+    assert "1. spec-a — вперёд" in first  # вторая AUTO-QUEUE секция тоже заполнена
     assert di.main(_argv(docs, overlay, target)) == 0  # повтор — no-op
     assert target.read_text(encoding="utf-8") == first
 
