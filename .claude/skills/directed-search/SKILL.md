@@ -19,7 +19,7 @@ If your agent did not auto-discover this skill, point it at this file and instru
 ## Inputs (resolve before the first query)
 
 1. **Campaign slug** — kebab-case, stable for the whole campaign (it becomes `connector_id: search:<slug>` on every candidate; reuse the SAME slug when resuming a campaign across sessions).
-2. **Axis** — `agentic_g2ai` (narrow: agentic services, MCP-like protocols, agent governance) or `digital_sovereignty` (broad: national AI/digital policy capacity). Determines query vocabulary, NOT a triage verdict.
+2. **Axis** — pick one from `pipeline/vocab/vocab_axes.yaml` (currently: `agentic_g2ai` — narrow, agentic services/MCP-like protocols/agent governance; `digital_sovereignty` — broad, national AI/digital policy capacity; see the file for the canonical descriptions and any axes added since). Determines query vocabulary, NOT a triage verdict.
 3. **Jurisdiction map** — explicit list for this campaign. Small states are the charter's priority, not an exclusivity rule. Use ISO 3166-1 alpha-2 codes for `--jurisdiction`.
 4. **Vocabulary** — read `pipeline/vocab/vocab_topics.yaml` and `pipeline/vocab/vocab_g2ai_patterns.yaml`; query templates are built from these terms × jurisdictions. Read `frontier_year` in `pipeline/config/triage.yaml` — freshness is a SIGNAL (prefer recent; older foundational documents are still injectable), not a gate.
 
@@ -41,7 +41,7 @@ The seed-list lesson (charter §8) is the reason this section exists: aggregator
 1. **Publisher** — the URL must be the publisher's own domain (or its official CDN/uploads path). An aggregator/rehost link is not injectable; find the official page.
 2. **Title** — as the publisher states it, not as a news article paraphrases it.
 3. **Date** — from the publisher's page or official announcement. If only secondary reporting dates the document, use the best-supported date and say so in `--summary`.
-4. Fetching METADATA pages (landing pages, press releases) is allowed. **Never fetch the document body**  — it passes through a small model and is not verbatim (CLAUDE.md rule); body acquisition belongs to `run_pipeline.py`, after triage.
+4. Fetching METADATA pages (landing pages, press releases) is allowed. **Never fetch the document body**  — it passes through a small model and is not verbatim (CLAUDE.md rule); body acquisition belongs to `pipeline/scripts/run_pipeline.py`, after triage.
 5. Capture `--rights`/`--sensitivity` best-effort if the page states them; otherwise omit (triage finalizes).
 
 ## Inject (one command per candidate)
@@ -54,15 +54,15 @@ The seed-list lesson (charter §8) is the reason this section exists: aggregator
 ```
 
 - `--language`: ISO 639-1; 639-3 only where no 639-1 code exists (Montenegrin `cnr`).
-- `--summary`: 2-3 sentences EN, hard cap 600 characters (schema rejects longer — shorten, don't fight it).
-- Re-injecting a known URL is a safe no-op (dedup; rejected candidates do not resurrect) — do not pre-filter against `candidates.yaml` manually, just inject.
+- `--summary`: 2-3 sentences EN, hard cap 600 characters (`schema.CANDIDATE_SUMMARY_MAX` — check if it changed; schema rejects longer — shorten, don't fight it).
+- Re-injecting a known URL is a safe no-op (dedup; rejected candidates do not resurrect) — do not pre-filter against `sources/candidates.yaml` manually, just inject.
 - A `кандидат уже присутствует (уже отклонён ранее: …)` response is a FINDING: record it in the summary, do not argue with it.
 
 ## Explicit prohibitions
 
-- Do NOT download or fetch document bodies (acquisition is `run_pipeline.py`, post-triage).
+- Do NOT download or fetch document bodies (acquisition is `pipeline/scripts/run_pipeline.py`, post-triage).
 - Do NOT assign `target_fit`/axis verdicts or edit `relevance` — that is triage (`worksheet`/`apply`), a separate session.
-- Do NOT create candidates by editing `candidates.yaml` directly or via ad-hoc scripts — `inject` is the only entry (provenance + dedup by construction).
+- Do NOT create candidates by editing `sources/candidates.yaml` directly or via ad-hoc scripts — `inject` is the only entry (provenance + dedup by construction).
 - Do NOT copy seed-list (`sources/temporary/small_states_v01.md`) titles into injects without the full verification above — its entries are leads of the lowest tier.
 
 ## Session summary (end of every campaign session)
