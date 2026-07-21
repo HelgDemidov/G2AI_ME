@@ -132,11 +132,9 @@ _WORKSHEET_HEADER = """\
 - id: me-example-strategy-2026
   raw_hash: "abc123def456"
   entity_id: me
-  track: montenegro
   issuer_type: government
   geo_scope: national
-  doc_type: strategy
-  authority: soft_law
+  doc_type: national_strategy
   source_format: pdf
   relevance:
     target_fit: primary
@@ -148,6 +146,9 @@ _WORKSHEET_HEADER = """\
   summary: "2-3 sentences EN — what the document IS"
   relations:
     - {type: implements, target: eu-ai-act-2024}
+  hidden_fields: [authority, track]  # выведет apply (карта дефолтов ниже) и впишет в meta.yaml
+                                     # полными значениями; переопределить — добавить одноимённый
+                                     # ключ (authority:/track:) прямо в это решение
   action: admit
 
 - raw_hash: "fed456abc789"
@@ -158,6 +159,11 @@ _WORKSHEET_HEADER = """\
 Заполняя `admit`:
 - `rationale` ≠ `summary`: summary описывает документ, rationale — ТОЛЬКО факторы релевантности
   (почему этот тир по этой оси); не дублировать одно в другом.
+- Дефолты (сводка apply напечатает, во что развернулись; RAG/фасеты видят полные значения):
+  `authority` — из doc_type: legislation→binding_law, regulation→regulation,
+  report/academic_paper→report, guidance/framework/national_strategy→soft_law,
+  technical_standard/technical_spec→voluntary_standard. Исключения (draft!) — задавать явно.
+  `track` — jurisdiction=me→montenegro, think_tank/academia→research-papers, иначе intl-xperience.
 - `relations` — если связь с другим документом реестра видна уже сейчас (`implements`/`cites`/…),
   указать сразу: второго прохода по документу не будет (pre-wave требование graph-v2).
 - `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf` (дефолт); сверить с квотой
@@ -193,13 +199,45 @@ def render_worksheet(pending: list[schema.CandidateRecord]) -> str:
 _ADMIT_REQUIRED = (
     "id",
     "entity_id",
-    "track",
     "issuer_type",
     "geo_scope",
     "doc_type",
-    "authority",
     "relevance",
 )
+
+# Дефолты admit-решения (ревью 2026-07-21): куратор в типовом решении НЕ пишет
+# authority/track — apply выводит их и МАТЕРИАЛИЗУЕТ в meta.yaml полными значениями
+# (слой знаний/фасеты ничего не теряют — «скрытость» существует только во входном
+# файле решений). Явный ключ в решении всегда побеждает дефолт; исключения (draft!)
+# куратор задаёт явно. Ключ `hidden_fields` в решении — чистая аннотация для человека
+# (какие поля выведены дефолтом), apply его не читает.
+#
+# authority — из doc_type (жанр почти всегда определяет нормативную силу; полное
+# покрытие текущего vocab_doc_types — при органическом росте словаря дополнять карту,
+# иначе apply честно потребует явный authority):
+_AUTHORITY_BY_DOC_TYPE = {
+    "national_strategy": "soft_law",
+    "framework": "soft_law",
+    "guidance": "soft_law",
+    "legislation": "binding_law",
+    "regulation": "regulation",
+    "technical_standard": "voluntary_standard",
+    "technical_spec": "voluntary_standard",
+    "report": "report",
+    "academic_paper": "report",
+}
+
+
+def _default_track(jurisdiction: str | None, issuer_type: schema.IssuerType) -> schema.Track:
+    """track — из jurisdiction/issuer_type. Приоритет: jurisdiction=me -> montenegro
+    (прецедент me-undp-aila-2025: igo-доклад О Черногории живёт в треке montenegro),
+    затем think_tank/academia -> research-papers (вторичная аналитика), иначе
+    intl-xperience. На всех 6 документах текущего корпуса дефолт угадывает точно."""
+    if jurisdiction == "me":
+        return schema.Track.montenegro
+    if issuer_type in (schema.IssuerType.think_tank, schema.IssuerType.academia):
+        return schema.Track.research_papers
+    return schema.Track.intl_xperience
 
 
 @dataclass(frozen=True)
@@ -236,21 +274,47 @@ def _resolve_candidate(
     return matches[0]
 
 
-def _build_admit_record(cand: schema.CandidateRecord, decision: dict[str, Any]) -> schema.SourceRecord:
-    """Построить ``SourceRecord`` из ``admit``-решения (промоушен, ничего не пишет на диск)."""
+def _build_admit_record(
+    cand: schema.CandidateRecord, decision: dict[str, Any]
+) -> tuple[schema.SourceRecord, list[str]]:
+    """Построить ``SourceRecord`` из ``admit``-решения (промоушен, ничего не пишет на диск).
+
+    Возвращает ``(запись, применённые_дефолты)`` — второй элемент вида
+    ``["authority=soft_law", "track=montenegro"]`` для эха в сводке apply (куратор
+    видит, во что развернулись опущенные поля)."""
     missing = [k for k in _ADMIT_REQUIRED if k not in decision]
     if missing:
         raise ValueError(f"admit: отсутствуют обязательные поля: {', '.join(missing)}")
+
+    defaulted: list[str] = []
+    issuer_type = schema.IssuerType(decision["issuer_type"])
+
+    authority = decision.get("authority")
+    if authority is None:
+        authority = _AUTHORITY_BY_DOC_TYPE.get(decision["doc_type"])
+        if authority is None:
+            raise ValueError(
+                f"admit: authority не указан, а для doc_type '{decision['doc_type']}' "
+                "нет дефолта — задайте authority явно"
+            )
+        defaulted.append(f"authority={authority}")
+
+    if "track" in decision:
+        track = schema.Track(decision["track"])
+    else:
+        track = _default_track(cand.jurisdiction, issuer_type)
+        defaulted.append(f"track={track.value}")
+
     relations_raw = decision.get("relations")
-    return schema.promote_candidate(
+    rec = schema.promote_candidate(
         cand,
         id=decision["id"],
         entity_id=decision["entity_id"],
-        track=schema.Track(decision["track"]),
-        issuer_type=schema.IssuerType(decision["issuer_type"]),
+        track=track,
+        issuer_type=issuer_type,
         geo_scope=schema.GeoScope(decision["geo_scope"]),
         doc_type=decision["doc_type"],
-        authority=decision["authority"],
+        authority=authority,
         relevance=schema.Relevance.model_validate(decision["relevance"]),
         source_format=schema.SourceFormat(decision.get("source_format", "pdf")),
         topics=decision.get("topics"),
@@ -258,6 +322,7 @@ def _build_admit_record(cand: schema.CandidateRecord, decision: dict[str, Any]) 
         summary=decision.get("summary"),
         relations=[schema.Relation.model_validate(r) for r in relations_raw] if relations_raw else None,
     )
+    return rec, defaulted
 
 
 def apply_decisions(
@@ -326,15 +391,19 @@ def apply_decisions(
 
         # action == "admit"
         try:
-            rec = _build_admit_record(cand, decision)
+            rec, defaulted = _build_admit_record(cand, decision)
         except ValueError as exc:
             outcomes.append(ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=False, detail=str(exc)))
             continue
 
+        # эхо дефолтов: куратор видит, во что развернулись опущенные поля
+        suffix = f" (по дефолту: {', '.join(defaulted)})" if defaulted else ""
+
         if dry_run:
             outcomes.append(
                 ApplyOutcome(
-                    raw_hash=cand.raw_hash, action=action, ok=True, detail=f"план: допустить как {rec.id}"
+                    raw_hash=cand.raw_hash, action=action, ok=True,
+                    detail=f"план: допустить как {rec.id}{suffix}",
                 )
             )
             continue
@@ -346,7 +415,9 @@ def apply_decisions(
             continue
 
         outcomes.append(
-            ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=True, detail=f"допущен как {rec.id}")
+            ApplyOutcome(
+                raw_hash=cand.raw_hash, action=action, ok=True, detail=f"допущен как {rec.id}{suffix}"
+            )
         )
 
     if not dry_run and store_changed:

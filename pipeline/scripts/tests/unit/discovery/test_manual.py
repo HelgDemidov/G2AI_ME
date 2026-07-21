@@ -212,7 +212,7 @@ def _admit_decision(raw_hash: str, **overrides: object) -> dict[str, object]:
         "track": "montenegro",
         "issuer_type": "government",
         "geo_scope": "national",
-        "doc_type": "strategy",
+        "doc_type": "national_strategy",
         "authority": "soft_law",
         "relevance": {
             "target_fit": "primary",
@@ -348,3 +348,131 @@ def test_apply_dry_run_reject_does_not_write(tmp_path: Path) -> None:
 def test_resolve_candidate_rejects_short_prefix() -> None:
     with pytest.raises(ValueError, match=">=12"):
         manual._resolve_candidate("a" * 8, [_candidate(raw_hash="a" * 64)])
+
+
+# --- дефолты authority/track в admit-решении (ревью 2026-07-21) ---
+
+
+def _admit_no_defaults(raw_hash: str) -> dict[str, object]:
+    """admit-решение БЕЗ authority/track — оба должны вывестись дефолтами."""
+    d = _admit_decision(raw_hash)
+    del d["authority"]
+    del d["track"]
+    return d
+
+
+@pytest.mark.parametrize(
+    "doc_type,expected_authority",
+    [
+        ("legislation", "binding_law"),
+        ("regulation", "regulation"),
+        ("report", "report"),
+        ("academic_paper", "report"),
+        ("guidance", "soft_law"),
+        ("framework", "soft_law"),
+        ("national_strategy", "soft_law"),
+        ("technical_standard", "voluntary_standard"),
+    ],
+)
+def test_apply_admit_authority_defaults_from_doc_type(
+    tmp_path: Path, doc_type: str, expected_authority: str
+) -> None:
+    cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_no_defaults("b" * 64)
+    decision["doc_type"] = doc_type
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    rec = schema.load_records(tmp_path)[0]
+    assert rec.authority == expected_authority
+
+
+def test_apply_admit_track_defaults_me_jurisdiction_to_montenegro(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    manual.apply_decisions([_admit_no_defaults("b" * 64)], root=tmp_path)
+    assert schema.load_records(tmp_path)[0].track == schema.Track.montenegro
+
+
+def test_apply_admit_track_defaults_think_tank_to_research_papers(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, jurisdiction=None)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_no_defaults("b" * 64)
+    decision.update(id="oi-example-report-2026", entity_id="oi", issuer_type="think_tank",
+                    geo_scope="global", doc_type="report")
+    manual.apply_decisions([decision], root=tmp_path)
+    assert schema.load_records(tmp_path)[0].track == schema.Track.research_papers
+
+
+def test_apply_admit_track_defaults_otherwise_to_intl_xperience(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, jurisdiction="sg")
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_no_defaults("b" * 64)
+    decision.update(id="sg-example-framework-2026", entity_id="sg", doc_type="framework")
+    manual.apply_decisions([decision], root=tmp_path)
+    assert schema.load_records(tmp_path)[0].track == schema.Track.intl_xperience
+
+
+def test_apply_admit_explicit_values_override_defaults(tmp_path: Path) -> None:
+    """Явные authority/track всегда побеждают дефолт (кейс draft!)."""
+    cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_no_defaults("b" * 64)
+    decision["doc_type"] = "legislation"
+    decision["authority"] = "draft"  # проект закона: жанр legislation, силы ещё нет
+    manual.apply_decisions([decision], root=tmp_path)
+    rec = schema.load_records(tmp_path)[0]
+    assert rec.authority == "draft"
+
+
+def test_apply_admit_unknown_doc_type_without_authority_errors(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_no_defaults("b" * 64)
+    decision["doc_type"] = "novel_genre"  # органически новый термин, карты дефолтов ещё нет
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert len(summary.errors) == 1
+    assert "нет дефолта" in summary.errors[0].detail
+
+
+def test_apply_admit_hidden_fields_annotation_ignored(tmp_path: Path) -> None:
+    """hidden_fields — аннотация для человека, apply её не читает и не падает."""
+    cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_no_defaults("b" * 64)
+    decision["hidden_fields"] = ["authority", "track"]
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    assert len(schema.load_records(tmp_path)) == 1
+
+
+def test_apply_admit_outcome_echoes_defaults(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions([_admit_no_defaults("b" * 64)], root=tmp_path)
+    detail = summary.outcomes[0].detail
+    assert "по дефолту" in detail
+    assert "authority=soft_law" in detail
+    assert "track=montenegro" in detail
+
+
+def test_apply_admit_no_echo_when_all_explicit(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert "по дефолту" not in summary.outcomes[0].detail
+
+
+def test_render_worksheet_header_documents_hidden_fields() -> None:
+    text = manual.render_worksheet([])
+    assert "hidden_fields" in text
+    assert "binding_law" in text  # карта дефолтов authority видна куратору в шапке

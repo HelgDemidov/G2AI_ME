@@ -269,7 +269,7 @@ _DECISIONS_YAML = """\
   track: montenegro
   issuer_type: government
   geo_scope: national
-  doc_type: strategy
+  doc_type: national_strategy
   authority: soft_law
   relevance: {{target_fit: primary, axis: agentic_g2ai, assessed_stage: triage,
               rationale: "matches axis", assessed_date: 2026-07-21}}
