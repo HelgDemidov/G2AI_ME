@@ -91,3 +91,111 @@ def test_discover_subcommand_nonzero_exit_on_connector_failure(tmp_path: Path) -
 def test_requires_a_subcommand() -> None:
     with pytest.raises(SystemExit):
         main([])
+
+
+# --- inject (spec discovery-manual §2) ---
+
+
+def test_inject_subcommand_adds_candidate(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/strategy.pdf",
+            "--title",
+            "National AI Strategy",
+            "--issuer",
+            "Ministry",
+            "--language",
+            "en",
+        ]
+    )
+    assert code == 0
+    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert "добавлен кандидат" in capsys.readouterr().out
+
+
+def test_inject_subcommand_directed_search_missing_campaign_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/a.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+            "--kind",
+            "directed_search",
+            "--query",
+            "ai strategy",
+        ]
+    )
+    assert code == 1
+    assert "campaign" in capsys.readouterr().out
+
+
+def test_inject_subcommand_duplicate_is_noop_exit_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = [
+        "inject",
+        "--root",
+        str(tmp_path),
+        "--url",
+        "https://gov.example.org/a.pdf",
+        "--title",
+        "T",
+        "--issuer",
+        "I",
+        "--language",
+        "en",
+    ]
+    assert main(argv) == 0
+    code = main(argv)
+    assert code == 0
+    assert "уже присутствует" in capsys.readouterr().out
+    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+
+
+def test_inject_subcommand_parses_optional_flags(tmp_path: Path) -> None:
+    code = main(
+        [
+            "inject",
+            "--root",
+            str(tmp_path),
+            "--url",
+            "https://gov.example.org/a.pdf",
+            "--title",
+            "T",
+            "--issuer",
+            "I",
+            "--language",
+            "en",
+            "--jurisdiction",
+            "me",
+            "--date",
+            "2026-03-01",
+            "--summary",
+            "short summary",
+            "--rights",
+            "cc-by",
+            "--sensitivity",
+            "confidential",
+        ]
+    )
+    assert code == 0
+    cand = store.load(tmp_path / "candidates.yaml")[0]
+    assert cand.jurisdiction == "me"
+    assert cand.doc_date is not None and cand.doc_date.isoformat() == "2026-03-01"
+    assert cand.native_summary == "short summary"
+    assert cand.rights == schema.Rights.cc_by
+    assert cand.sensitivity == schema.Sensitivity.confidential
