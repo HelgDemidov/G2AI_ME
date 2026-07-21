@@ -745,3 +745,74 @@ def test_incremental_rolls_back_on_failure(tmp_path: Path, monkeypatch: Any) -> 
     assert _chunk_rows(conn) == rows_before           # чанки не изменились
     assert read_meta(conn, "corpus_fingerprint") == fp_before  # отпечаток не обогнал
     conn.close()
+
+
+# --- chunks_from_corpus: пропуск записи без doc.md ---
+
+
+def test_chunks_from_corpus_skips_missing_md(tmp_path: Path, capsys: Any) -> None:
+    root = tmp_path / "src"
+    _write_corpus_doc(root, md=None)  # запись без doc.md
+    assert corpus_index.chunks_from_corpus(root, _fake_counter, _MAX) == []
+    assert "пропуск" in capsys.readouterr().err
+
+
+# --- _cmd_build / _cmd_search / main(): CLI-обвязка (коды возврата, вывод) ---
+
+
+def test_cmd_build_fts5_unavailable_returns_three(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    monkeypatch.setattr("index.corpus_index.fts5_available", lambda: False)
+    args = argparse.Namespace(
+        db=tmp_path / "c.db", sources=tmp_path / "src", max_tokens=_MAX, force=False
+    )
+    assert corpus_index._cmd_build(args) == 3
+    assert "FTS5" in capsys.readouterr().err
+
+
+def test_cmd_build_success_prints_status_and_creates_db(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    monkeypatch.setattr("index.corpus_index.token_counter", lambda: _fake_counter)
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    db = tmp_path / "c.db"
+
+    args = argparse.Namespace(db=db, sources=root, max_tokens=_MAX, force=False)
+    assert corpus_index._cmd_build(args) == 0
+    assert str(db) in capsys.readouterr().out
+    assert db.exists()
+
+
+def test_cmd_search_index_not_found_returns_two(tmp_path: Path, capsys: Any) -> None:
+    args = argparse.Namespace(db=tmp_path / "nope.db", query="x", limit=10, raw=False)
+    assert corpus_index._cmd_search(args) == 2
+    assert "индекс не найден" in capsys.readouterr().err
+
+
+def test_cmd_search_no_hits_prints_message(tmp_path: Path, capsys: Any) -> None:
+    db = tmp_path / "c.db"
+    create_db(db)
+    args = argparse.Namespace(db=db, query="nonexistentterm", limit=10, raw=False)
+    assert corpus_index._cmd_search(args) == 0
+    assert "ничего не найдено" in capsys.readouterr().out
+
+
+def test_main_build_subcommand_dispatches(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr("index.corpus_index.token_counter", lambda: _fake_counter)
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    db = tmp_path / "c.db"
+
+    assert corpus_index.main(["--db", str(db), "build", str(root)]) == 0
+    assert db.exists()
+
+
+def test_main_search_subcommand_dispatches(tmp_path: Path) -> None:
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, sample_chunks())
+    conn.close()
+
+    assert corpus_index.main(["--db", str(db), "search", "governance"]) == 0
