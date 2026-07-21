@@ -1005,7 +1005,9 @@ def test_main_no_cloud_flag_disables_cloud_path(tmp_path: Path) -> None:
     sources.mkdir()
     from run_pipeline import main
 
-    assert main([str(sources), "--no-cloud"]) == 0
+    # --db обязателен: без него argparse-дефолт указывает на РЕАЛЬНУЮ corpus.db,
+    # и пустой tmp-корпус вычищает боевой индекс (живой инцидент 2026-07-21, см. conftest)
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--no-cloud"]) == 0
     assert converters._CLOUD_DISABLED is True
 
 
@@ -1015,7 +1017,7 @@ def test_main_vlm_model_flag_overrides_active_model(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(cloud_ocr, "ACTIVE_MODEL", cloud_ocr.ACTIVE_MODEL)  # регистрируем авто-восстановление
     from run_pipeline import main
 
-    assert main([str(sources), "--vlm-model", "google/gemini-3-pro-preview"]) == 0
+    assert main([str(sources), "--db", str(tmp_path / "c.db"), "--vlm-model", "google/gemini-3-pro-preview"]) == 0
     assert cloud_ocr.ACTIVE_MODEL == "google/gemini-3-pro-preview"
 
 
@@ -1094,3 +1096,4 @@ def test_main_dry_run_logs_index_not_touched(tmp_path: Path, caplog: Any) -> Non
     with caplog.at_level("INFO", logger="run_pipeline"):
         assert main([str(sources), "--dry-run"]) == 0
     assert any("dry-run" in r.message for r in caplog.records)
+
