@@ -1,0 +1,154 @@
+# Allowlist мёртвых якорей memory_lint.py (spec docs/memory/memory-lint/spec.md).
+# Каждая запись — span, который линт помечает NOT FOUND, но куратор считает
+# ложным срабатыванием (классификатора или сверки). Правится ВРУЧНУЮ, каждая
+# запись — с причиной. Наполнен по живым ложнякам ПЕРВОГО прогона (2026-07-22,
+# смок против реального CLAUDE.md/memory/*) — не превентивно (спек §3).
+
+allow:
+  # --- Исторический контекст на СОСЕДНЕЙ, не текущей строке (эвристика §3 —
+  # line-scoped by design, не видит маркер "удалён"/"не существует" абзацем выше/ниже) ---
+  - span: ".claude/commands/directed-search.md"
+    reason: "историческая ссылка (project_discovery_manual.md) — маркер 'перенесён' на следующей строке того же абзаца, вне line-scoped эвристики"
+  - span: "agenda/"
+    reason: "историческая ссылка (project_docs_layout.md) — 'больше не существуют' на другой строке того же абзаца"
+  - span: "pipeline/setup/"
+    reason: "то же — историческая ссылка, маркер на другой строке"
+  - span: "pipeline/skills/"
+    reason: "упомянут как ОТВЕРГНУТАЯ альтернатива (project_agent_skills_packaging.md: 'не .agents/skills/ или pipeline/skills/'), негация не распознаётся эвристикой"
+  - span: ".agents/skills/"
+    reason: "то же — отвергнутая альтернатива в сравнении, не путь этого проекта"
+  - span: "VectorsStaleError"
+    reason: "класс упразднён PR #9 — в 3 из 4 упоминаний маркер рядом (INFO корректно), это упоминание в changelog-строке PR #7 без него"
+  - span: "sources.yaml"
+    reason: "плоский реестр, отвергнутый corpus-layout-v2 (project_corpus_layout.md, секция Why/How to apply) — контекст исторический без конкретного триггер-слова эвристики"
+
+  # --- Внешние идентификаторы: repo-слаги / модель-слаги / DOI-подобное без совпадения regex ---
+  - span: "HelgDemidov/G2AI_ME"
+    reason: "GitHub owner/repo слаг, не файловый путь"
+  - span: "google/gemini-3-flash-preview"
+    reason: "OpenRouter модель-слаг (provider/model), не файловый путь"
+  - span: "baidu/Unlimited-OCR"
+    reason: "GitHub repo слаг стороннего проекта (/landscape отчёт), не наш путь"
+
+  # --- ZIP-внутренние пути (DOCX/XLSX OOXML) — никогда не существуют на файловой системе ---
+  - span: "word/document.xml"
+    reason: "внутренний путь ZIP-архива .docx (OOXML), не путь на ФС"
+  - span: "word/media/*"
+    reason: "то же — внутренний путь .docx"
+  - span: "xl/charts/*"
+    reason: "внутренний путь ZIP-архива .xlsx (OOXML)"
+  - span: "xl/charts/*.xml"
+    reason: "то же — внутренний путь .xlsx"
+  - span: "embeddings/*.xlsx"
+    reason: "внутренний путь embedded-объекта в .docx zip, не путь на ФС"
+
+  # --- Многоуровневые glob-паттерны (* как СРЕДНИЙ сегмент, не только хвост — вне v1) ---
+  - span: "docs/pipeline/*/tech_specs/*/spec.md"
+    reason: "звёздочка в среднем сегменте — v1 глоб-поддержка только в хвостовом сегменте"
+  - span: "docs/pipeline/convert/tech_specs/convert-*/spec.md"
+    reason: "то же — многоуровневый глоб"
+  - span: "sources/**/meta.yaml"
+    reason: "рекурсивный ** как средний сегмент — не поддержан v1"
+  - span: "analyze-retrieval/spec.md"
+    reason: "сокращённая ссылка без полного префикса docs/pipeline/analyze/tech_specs/ (два уровня, не один)"
+
+  # --- Лениво создаваемые сайдкары — могут отсутствовать в текущем локальном корпусе ---
+  - span: ".discovery_cursors.yaml"
+    reason: "создаётся только после первого прогона discover.py discover (registry-коннекторы) — их ещё не было"
+  - span: ".cloudocr.parts.yaml"
+    reason: "кэш-сайдкар облачного OCR — создаётся только при реальном облачном прогоне конкретного документа"
+  - span: ".entities.yaml"
+    reason: "сайдкар L2 графа (graph-v2) — фича ещё не реализована, спек JIT"
+
+  # --- "/" как разделитель перечисления в прозе — не распознан текущими эвристиками ---
+  - span: "converter_name/version"
+    reason: "пара полей объекта через '/', не путь"
+  - span: "core/acquire/convert/index/graph"
+    reason: "перечисление слоёв кода через '/', не путь"
+  - span: "direct/live"
+    reason: "пара значений enum через '/', не путь"
+  - span: "cnr/sr→srp_latn"
+    reason: "маппинг языковых кодов через '/', не путь"
+  - span: "fitToWidth/fitToHeight=1"
+    reason: "пара XML-атрибутов через '/', не путь"
+  - span: "feature/**"
+    reason: "wildcard-паттерн git-веток в CI-триггере (push: branches), не файловый путь"
+  - span: "validate_sources/corpus_index/vector_store/ab_eval/build_graph/pdf_to_markdown.py"
+    reason: "перечисление CLI-шимов через '/', классификатор берёт последний сегмент как единственное имя файла"
+  - span: "charters/tech_specs"
+    reason: "перечисление двух поддиректорий через '/', не единый путь"
+  - span: "tech_specs/"
+    reason: "generic-упоминание паттерна подкаталога (есть под КАЖДЫМ блоком), не одна конкретная директория"
+  - span: "charters/"
+    reason: "то же — generic-упоминание, не конкретная директория"
+  - span: "commands/"
+    reason: "упоминание содержимого .claude/ одним словом ('commands/ шимы'), не отдельный путь для проверки"
+
+  # --- Внешние доменные/системные термины, не пойманные эвристикой домена ---
+  - span: "/proc"
+    reason: "реальный OS-путь (Linux procfs), не путь этого репозитория"
+  - span: "SID"
+    reason: "POSIX session ID (общий термин), не идентификатор кода проекта"
+  - span: "run_in_background"
+    reason: "параметр harness-инструмента (Claude Code Bash tool), не идентификатор в pipeline/scripts"
+  - span: "pd.read_excel"
+    reason: "описывает ВНУТРЕННЕЕ устройство стороннего инструмента (markitdown/pandas) для сравнения, не наш код"
+  - span: "OrganizationAdmin"
+    reason: "значение поля GitHub Rulesets API (описание почему НЕ используется), не идентификатор кода"
+  - span: "non_fast_forward"
+    reason: "имя правила GitHub Rulesets API (удалённая схема), не локальный идентификатор"
+  - span: "required_status_checks"
+    reason: "поле GitHub Rulesets API (удалённая схема), не локальный идентификатор"
+  - span: "files.readonlyInclude"
+    reason: "ключ .vscode/settings.json — вне корпуса сверки v1 (не .py/.yaml/.md/.toml)"
+  - span: "vectors_fingerprint"
+    reason: "упразднённый стоп-гэп PR #7 (заменён PR #9) — историческое упоминание вне line-scoped эвристики"
+
+  # --- Плейсхолдер-примеры секретов/ключей в прозе (не реальные значения) ---
+  - span: "KEY=your-key-here"
+    reason: "пример-плейсхолдер синтаксиса .env (feedback_secret_scanning_placeholders), не реальная константа"
+  - span: "OPENROUTER_API_KEY=sk-or-v1-xxxx…"
+    reason: "пример ЗАБЛОКИРОВАННОГО push-protection значения (историческая иллюстрация), не текущий плейсхолдер"
+
+  # --- Фикстуры/сторонние репо, упомянутые как источник заимствования/тестовый материал ---
+  - span: "scopus_search_code/.github/workflows/tests.yml"
+    reason: "путь в ДРУГОМ, соседнем локальном репозитории (источник адаптации ci.yml), не в этом"
+  - span: "scratchpad/ultimate_test/transplant.py"
+    reason: "одноразовый скретч-скрипт сессии (docx ultimate-тест), не персистентный файл репо"
+  - span: ".ru.md"
+    reason: "суффикс-паттерн имени файла (public_readme_draft.ru.md), не отдельный путь"
+
+  # --- Внешний каталог памяти Claude Code (~/.claude/projects/.../memory/) — вне репо,
+  # v1 проверяет только pipeline/sources/.claude/.github/docs внутри repo_root ---
+  - span: "MEMORY.md"
+    reason: "индекс памяти живёт во внешнем каталоге, не в дереве репозитория"
+  - span: "project_*.md"
+    reason: "glob-паттерн имён файлов внешнего каталога памяти"
+  - span: "feedback_*.md"
+    reason: "то же — внешний каталог памяти"
+  - span: "reference_*.md"
+    reason: "то же — внешний каталог памяти"
+  - span: "memory/*.md"
+    reason: "то же — путь до внешнего каталога памяти (relative-looking, но не в repo_root)"
+  - span: "project_spec_convention"
+    reason: "имя файла памяти без расширения, упомянуто в прозе (tech-spec.md)"
+  - span: "~/.claude/projects/-home-fastcentrifuge--------------Projects-Dev-G2AI-ME/memory/"
+    reason: "абсолютный машино-специфичный путь вне репозитория"
+
+  # --- Многоуровневые/множественные glob-паттерны (та же v1-граница, что раздел выше) ---
+  - span: "docs/pipeline/*/charters/*.md"
+    reason: "звёздочка в среднем сегменте — v1 глоб-поддержка только в хвостовом сегменте"
+  - span: "core/discovery/acquire/convert/knowledge/analyze"
+    reason: "перечисление функциональных блоков через '/', не путь"
+  - span: "feature/*"
+    reason: "wildcard-паттерн git-веток (CI-триггер), не файловый путь"
+
+  # --- YAML-ключи данных (не код) и ещё один model-слаг ---
+  - span: "main_commit"
+    reason: "ключ docs/memory/memory_sync/last_run.yaml — данные, не код (вне корпуса сверки)"
+  - span: "google/gemini-embedding-001"
+    reason: "OpenRouter модель-слаг, не файловый путь"
+  - span: ".venv/bin/..."
+    reason: "generic-пример 'любой бинарник в .venv/bin/', не конкретный файл"
+  - span: "frontend/"
+    reason: "пример-заглушка из шаблона post-merge-sync.md ('this repo has a single root CLAUDE.md, no frontend/'), не путь этого репо"
