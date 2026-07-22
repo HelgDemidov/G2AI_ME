@@ -125,6 +125,20 @@ def test_pie_type_gets_pie_mermaid() -> None:
     assert "```mermaid\npie" in out
 
 
+def test_pie_title_is_unquoted_plain_string() -> None:
+    """Живой дефект (найден на реальном визуальном рендере govtech-фикстуры,
+    2026-07-22): mermaid's ``pie title <text>`` — плоская строка БЕЗ кавычек
+    (в отличие от data-лейблов, которым кавычки обязательны); обёрнутый в
+    кавычки title mermaid не парсит как delimiter, а рендерит буквально —
+    хвостовая ``"`` была видна в SVG. Синтакс-валидация (mermaid-parser-bundle/
+    mermaid.parse()) эту форму пропускала как валидную (кавычки внутри плоской
+    строки не грамматическая ошибка) — поймал только визуальный рендер."""
+    out = render_chart(_pie_data())
+    assert out is not None
+    assert 'pie title "Pie"' not in out
+    assert "pie title Pie" in out
+
+
 def test_doughnut_type_maps_to_pie_mermaid() -> None:
     data = _data(
         chart_type="doughnut", categories=("A", "B"),

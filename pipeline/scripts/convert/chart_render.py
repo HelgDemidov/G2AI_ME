@@ -113,7 +113,15 @@ def _mermaid_pie(data: ChartData) -> str | None:
     values = _dense(data.series[0].values)
     if any(v < 0 for v in values):
         return None  # доля не может быть отрицательной — форма рискованна
-    lines = [f'pie title "{_sanitize_label(data.title)}"'] if data.title else ["pie"]
+    # "pie title <text>" — ПЛОСКАЯ строка, БЕЗ кавычек (в отличие от data-
+    # лейблов ниже, которые mermaid требует в кавычках): найдено на реальном
+    # рендере govtech-фикстуры (пользователь попросил визуально проверить
+    # результат) — кавычки, обёрнутые вокруг title, mermaid НЕ интерпретирует
+    # как delimiter, а рендерит буквально (хвостовая `"` была видна в SVG).
+    # mermaid-parser-bundle/mermaid.parse() эту форму пропускали как валидную
+    # (кавычки внутри плоской строки — не грамматическая ошибка), поэтому
+    # синтакс-валидация её не поймала — только визуальный рендер.
+    lines = [f"pie title {_sanitize_label(data.title)}"] if data.title else ["pie"]
     for cat, v in zip(data.categories, values, strict=True):
         lines.append(f'    "{_sanitize_label(cat)}" : {_fmt_num(v)}')
     return "```mermaid\n" + "\n".join(lines) + "\n```"
