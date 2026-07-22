@@ -94,6 +94,52 @@ def lint_conversion(md_text: str, *, raw_text_chars: int | None, fmt: str) -> li
     return defects
 
 
+def token_recall(reference: str, candidate: str) -> float:
+    """Доля УНИКАЛЬНЫХ буквенных токенов ``reference``, найденных где-либо в
+    ``candidate`` (регистронезависимо; юникодные буквы — диакритика — как
+    обычные буквы, см. ``_WORD_TOKEN_RE``). ``reference`` без единого буквенного
+    токена -> 1.0 (терять нечего, recall тривиально полный) — так свап
+    источника местами не меняет семантику: recall всегда «сколько из
+    reference нашлось в candidate»."""
+    reference_words = {w.lower() for w in _WORD_TOKEN_RE.findall(reference)}
+    if not reference_words:
+        return 1.0
+    candidate_words = {w.lower() for w in _WORD_TOKEN_RE.findall(candidate)}
+    return len(reference_words & candidate_words) / len(reference_words)
+
+
+def numeric_counter(text: str) -> Counter[str]:
+    """Мультимножество числовых токенов (``\\d+``) текста. Публичная — переиспользуется
+    ocr_eval.py::diverge (spec ocr-eval-harness §8.2/§4): тот же инвариант, что в
+    numeric_delta/witness_checks, не задваивается вторым regex-проходом."""
+    return Counter(_NUMBER_TOKEN_RE.findall(text))
+
+
+def numeric_delta(reference: str, candidate: str) -> tuple[int, int]:
+    """``(missing, added)`` — мультимножество числовых токенов (``\\d+``):
+    вхождения ``reference`` без пары в ``candidate``, и наоборот. Порядок/
+    позиция чисел в тексте не учитывается, только счёт по значению."""
+    reference_nums, candidate_nums = numeric_counter(reference), numeric_counter(candidate)
+    missing = sum((reference_nums - candidate_nums).values())
+    added = sum((candidate_nums - reference_nums).values())
+    return missing, added
+
+
+_NUMERIC_DIVERGENCE_TOKEN_CAP = 10  # токенов на сторону в строке дефекта — .state.yaml не резиновый
+
+
+def _format_missing_side(nums: Counter[str], other: Counter[str]) -> str:
+    """Сами числа стороны ``nums``, отсутствующие в ``other`` — множество (не
+    мультимножество: повтор значения неинформативен в списке «что разошлось»),
+    отсортировано численно для детерминизма отчёта, капается на ``_NUMERIC_DIVERGENCE_TOKEN_CAP``."""
+    missing = sorted((nums - other).keys(), key=int)
+    if not missing:
+        return "none"
+    shown = missing[:_NUMERIC_DIVERGENCE_TOKEN_CAP]
+    rest = len(missing) - len(shown)
+    return ",".join(shown) + (f"…+{rest}" if rest > 0 else "")
+
+
 def witness_checks(witness_text: str, cloud_text: str) -> list[str]:
     """Сверка облачного OCR-вывода с независимым свидетелем (tesseract-текст-слой
     нормализованного raw, spec convert-cloud-tier §3). **Сигнал, не отказ**: живая
@@ -101,30 +147,31 @@ def witness_checks(witness_text: str, cloud_text: str) -> list[str]:
     (свидетель сам шумит) — расхождение маркирует «посмотреть глазами» на Стадии 2,
     финальный арбитр — человек, не этот линт.
 
-    - Словарный token-recall (доля УНИКАЛЬНЫХ буквенных токенов свидетеля,
-      найденных где-либо в облачном тексте) ниже ``WITNESS_MIN_TOKEN_RECALL`` ->
-      ``"cloud-ocr-text-loss: <ratio>"`` — ловит выпавшие/пропущенные куски.
-    - Мультимножества числовых токенов (``\\d+``) расходятся -> ВСЕГДА (любая
-      ненулевая дельта) ``"cloud-ocr-numeric-divergence: -<n>/+<m>"`` (``n`` —
-      вхождения свидетеля без пары в облаке, ``m`` — наоборот) — самый опасный для
+    - Словарный token-recall (``token_recall``, доля УНИКАЛЬНЫХ буквенных токенов
+      свидетеля, найденных где-либо в облачном тексте) ниже ``WITNESS_MIN_TOKEN_RECALL``
+      -> ``"cloud-ocr-text-loss: <ratio>"`` — ловит выпавшие/пропущенные куски.
+    - Мультимножества числовых токенов расходятся -> ВСЕГДА (любая ненулевая
+      дельта) ``"cloud-ocr-numeric-divergence: witness_only=[...] cloud_only=[...]"``
+      — перечисляет САМИ расходящиеся числа (не только счётчик), капается на
+      ``_NUMERIC_DIVERGENCE_TOKEN_CAP`` на сторону (spec ocr-eval-harness §8.2:
+      живой разбор боевого флага без списка токенов занял ~20 мин на одном
+      документе — счётчик `-12/+18` не говорит, КТО прав). Самый опасный для
       юридического корпуса класс: тихая подмена цифры в номере статьи/дате/сумме.
     """
     if not witness_text.strip():
         return []  # свидетель пуст (сбой extract_text) — сигнал неинформативен, не 0.0-recall
 
     defects: list[str] = []
-    witness_words = {w.lower() for w in _WORD_TOKEN_RE.findall(witness_text)}
-    if witness_words:
-        cloud_words = {w.lower() for w in _WORD_TOKEN_RE.findall(cloud_text)}
-        recall = len(witness_words & cloud_words) / len(witness_words)
-        if recall < WITNESS_MIN_TOKEN_RECALL:
-            defects.append(f"cloud-ocr-text-loss: {recall:.2f}")
+    recall = token_recall(witness_text, cloud_text)
+    if recall < WITNESS_MIN_TOKEN_RECALL:
+        defects.append(f"cloud-ocr-text-loss: {recall:.2f}")
 
-    witness_nums = Counter(_NUMBER_TOKEN_RE.findall(witness_text))
-    cloud_nums = Counter(_NUMBER_TOKEN_RE.findall(cloud_text))
-    n_missing = sum((witness_nums - cloud_nums).values())
-    n_added = sum((cloud_nums - witness_nums).values())
-    if n_missing or n_added:
-        defects.append(f"cloud-ocr-numeric-divergence: -{n_missing}/+{n_added}")
+    witness_nums, cloud_nums = numeric_counter(witness_text), numeric_counter(cloud_text)
+    if witness_nums != cloud_nums:
+        defects.append(
+            "cloud-ocr-numeric-divergence: "
+            f"witness_only=[{_format_missing_side(witness_nums, cloud_nums)}] "
+            f"cloud_only=[{_format_missing_side(cloud_nums, witness_nums)}]"
+        )
 
     return defects

@@ -231,6 +231,16 @@ class OperationalState(BaseModel):
     # прогон бэкфиллит (см. run_pipeline._adopt_untracked_raw).
     raw_size: int | None = None
     raw_mtime_ns: int | None = None
+    # spec ocr-eval-harness §8.1 (S1): sha256 raw ДО OCR-мутации (ocrmypdf переписывает
+    # raw.pdf in-place, §2 convert-ocr — `sha256` выше отражает мутированный файл, не
+    # издательский оригинал). Проставляется ОДИН РАЗ, РОВНО когда нормализация реально
+    # происходит (converters._ocr_normalize, ветка NeedsOCR), НЕ ретроспективно по факту
+    # `_was_ocr_normalized` — иначе уже мутированные документы получили бы неверный хэш.
+    # ЖЁСТКИЙ КАВЕТАТ: для сканов, сконвертированных ДО появления этого поля (на момент
+    # написания — единственный, me-crps-registration-law-2025), оригинал уже утрачен —
+    # `original_sha256` останется None НАВСЕГДА; восстановление возможно только
+    # пере-добычей документа от издателя (вне скоупа), не задним числом в коде.
+    original_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     acquisition_method: AcquisitionMethod | None = None
     acquisition_checked: _dt.date | None = None
     fidelity: Fidelity | None = None
