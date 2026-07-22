@@ -793,41 +793,33 @@ def _docx_chart_md(chart_id: str, captions: str = "Chart title") -> str:
     )
 
 
-def test_docx_chart_marker_detected_by_has_bare_markers() -> None:
-    assert has_bare_markers(_docx_chart_md("b" * 12)) is True
+def test_docx_chart_marker_no_longer_detected_by_has_bare_markers() -> None:
+    """chart-data-extraction §4.3: kind="chart" резолвится data-driven
+    ДО этой стадии (docx_groups.inject_group_markers) — его caption-фолбэк
+    маркер (пустое извлечение, нет numCache) остаётся honest static text
+    навсегда, эта стадия его больше НЕ подхватывает (в отличие от group,
+    которая остаётся на VLM без изменений)."""
+    assert has_bare_markers(_docx_chart_md("b" * 12)) is False
 
 
-def test_apply_figures_pass_docx_chart_injects_chart_noun(tmp_path: Path, monkeypatch: Any) -> None:
-    """kind="chart" (§2-ter, нативный c:chart): единый цикл обработки с
-    группами, но существительное маркера сохраняется и в инъецированном виде."""
-    from convert import docx_groups
-    from tests.support import build_docx_with_inline_chart
-
+def test_apply_figures_pass_docx_chart_marker_left_untouched(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ноль сети/VLM-вызова на chart-kind маркер: `apply_figures_pass` видит
+    в тексте ТОЛЬКО chart-маркер (никаких group/figure/image рядом) -> честный
+    no-op (False), файл байт-в-байт нетронут — симметрично тому, как xlsx-
+    caption-фолбэк маркер никогда не эскалируется (см. коммит удаления
+    xlsx render+VLM пути)."""
     raw = tmp_path / "raw.docx"
-    raw.write_bytes(build_docx_with_inline_chart([], ["Chart title"], []))
-    _rewritten, groups = docx_groups.extract_and_strip_groups(raw)
-    cid = groups[0].id12
+    raw.write_bytes(b"docx bytes")
     md = tmp_path / "doc.md"
-    md.write_text(_docx_chart_md(cid), encoding="utf-8")
+    text = _docx_chart_md("b" * 12)
+    md.write_text(text, encoding="utf-8")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(
-        "convert.figures_vlm._render_docx_group", lambda raw_, id12: "data:image/jpeg;base64,AAA"
-    )
-    monkeypatch.setattr(
         "convert.figures_vlm.openrouter.chat_request",
-        lambda payload, *, api_key, timeout=1800.0: {
-            "choices": [{"message": {"content": "Chart description."}}]
-        },
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("chart-kind маркер не должен звать сеть")),
     )
-    changed = apply_figures_pass(md, raw, model="m")
-    assert changed is True
-    text = md.read_text(encoding="utf-8")
-    assert (
-        f"> [Figure, docx chart {cid} — VLM interpretation (m); "
-        "reconstruction, verify against original]" in text
-    )
-    assert "Chart description." in text
-    assert "chart content not analyzed" not in text
+    assert apply_figures_pass(md, raw, model="m") is False
+    assert md.read_text(encoding="utf-8") == text
 
 
 def test_apply_figures_pass_docx_group_cache_hit_skips_render(tmp_path: Path, monkeypatch: Any) -> None:

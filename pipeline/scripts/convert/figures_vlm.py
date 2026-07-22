@@ -56,12 +56,17 @@ _DOCX_IMAGE_MARKER_RE = re.compile(
     r"^> \[Image, docx media (?P<id>[0-9a-f]{12}) — raster content not analyzed\]$",
     re.MULTILINE,
 )
-# docx composite-группа ИЛИ нативный c:chart (spec convert-docx §2-ter): зеркало
+# docx composite-группа (spec convert-docx §2-ter): зеркало
 # docx_groups._render_group_marker — 2 строки (маркер + сохранённые captions,
-# zero-loss без VLM); kind различает существительное («composite»/«chart»),
-# обработка обоих идентична (рендер по id через extract_group_docx).
+# zero-loss без VLM). Сужено до group-only (spec chart-data-extraction §4.3):
+# нативные c:chart (kind="chart") резолвятся data-driven ДО этой стадии
+# (docx_groups.inject_group_markers), пустое извлечение даёт ТОТ ЖЕ маркер-
+# текст, что и раньше, но kind="chart" эта регулярка больше НЕ ловит — чарт
+# без numCache остаётся честным статичным маркером навсегда (симметрично
+# xlsx: нечитаемый нативный чарт caption-фолбэк честнее, чем VLM-эскалация,
+# см. Design rationale спека), а не эскалируется в soffice+VLM.
 _DOCX_GROUP_MARKER_RE = re.compile(
-    r"^> \[Figure, docx (?P<kind>group|chart) (?P<id>[0-9a-f]{12}) — (?:composite|chart) content not analyzed\]\n"
+    r"^> \[Figure, docx group (?P<id>[0-9a-f]{12}) — composite content not analyzed\]\n"
     r"> captions: .*$",
     re.MULTILINE,
 )
@@ -422,9 +427,9 @@ def _render_injected_docx_image(marker_id: str, model: str, markdown: str) -> st
     )
 
 
-def _render_injected_docx_group(id12: str, model: str, markdown: str, kind: str = "group") -> str:
+def _render_injected_docx_group(id12: str, model: str, markdown: str) -> str:
     return (
-        f"> [Figure, docx {kind} {id12} — VLM interpretation ({model}); "
+        f"> [Figure, docx group {id12} — VLM interpretation ({model}); "
         f"reconstruction, verify against original]\n\n{markdown}"
     )
 
@@ -544,7 +549,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 cache[gid] = entry
                 cache_dirty = True
             replacements.append(
-                (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"], m.group("kind")))
+                (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"]))
             )
     finally:
         if pdf_doc is not None:
