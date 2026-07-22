@@ -147,15 +147,18 @@ def _chart_title(chart_root: Any) -> tuple[str, ...]:
     return _filter_caption_texts(title.itertext())
 
 
-def extract_charts(raw: Path) -> list[XlsxChart]:
-    """Все встроенные чарты workbook, лист за листом. ``raw`` НЕ изменяется
-    (см. докстроку модуля). Малформед/недостижимая ссылка на любом шаге
-    цепочки (лист без drawing, drawing без rels, чарт-парт отсутствует) —
+def _iter_chart_entries(raw: Path) -> list[tuple[XlsxChart, Any]]:
+    """Общий обход workbook, лист за листом, для ``extract_charts`` (метаданные)
+    И ``extract_chart_roots`` (спек chart-data-extraction §4.1: data-driven
+    рендер нужен УЖЕ распарсенный ``chart_root``, а не только его id12/captions) —
+    один проход zip/XML на оба потребителя, а не два независимых. ``raw`` НЕ
+    изменяется (см. докстроку модуля). Малформед/недостижимая ссылка на любом
+    шаге цепочки (лист без drawing, drawing без rels, чарт-парт отсутствует) —
     честно пропускается (terminal safety net — конвертация не падает на
     повреждённом OOXML, симметрично ``_classify_docx``)."""
     with zipfile.ZipFile(raw) as z:
         names = set(z.namelist())
-        charts: list[XlsxChart] = []
+        entries: list[tuple[XlsxChart, Any]] = []
         for sheet_name, sheet_part in _sheet_parts(z).items():
             if sheet_part not in names:
                 continue
@@ -179,15 +182,33 @@ def extract_charts(raw: Path) -> list[XlsxChart]:
                 if chart_part not in names:
                     continue
                 chart_root = etree.fromstring(z.read(chart_part))
-                charts.append(
-                    XlsxChart(
-                        id12=hashlib.sha256(etree.tostring(chart_root)).hexdigest()[:12],
-                        sheet=sheet_name,
-                        anchor_cell=_anchor_cell(anchor),
-                        captions=_chart_title(chart_root),
+                entries.append(
+                    (
+                        XlsxChart(
+                            id12=hashlib.sha256(etree.tostring(chart_root)).hexdigest()[:12],
+                            sheet=sheet_name,
+                            anchor_cell=_anchor_cell(anchor),
+                            captions=_chart_title(chart_root),
+                        ),
+                        chart_root,
                     )
                 )
-        return charts
+        return entries
+
+
+def extract_charts(raw: Path) -> list[XlsxChart]:
+    """Все встроенные чарты workbook, лист за листом (метаданные — id12/sheet/
+    anchor/captions, БЕЗ распарсенного XML; для data-driven рендера см.
+    ``extract_chart_roots``)."""
+    return [entry for entry, _root in _iter_chart_entries(raw)]
+
+
+def extract_chart_roots(raw: Path) -> dict[str, Any]:
+    """id12 -> распарсенный ``chart_root`` (spec chart-data-extraction §4.1) —
+    вход для ``chart_data.parse_chart``. Разделено от ``extract_charts``
+    (которому распарсенный XML не нужен снаружи), но обход общий
+    (``_iter_chart_entries``) — воркбук не читается дважды."""
+    return {entry.id12: root for entry, root in _iter_chart_entries(raw)}
 
 
 def _parse_ref_range(ref_after_bang: str) -> tuple[int, int, int, int] | None:

@@ -500,24 +500,43 @@ def _sheet_table(ws: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_xlsx_chart_block(chart: Any, chart_root: Any) -> str:
+    """Data-driven рендер одного xlsx-чарта (spec chart-data-extraction §4.1/
+    §4.4): ``parse_chart``->``render_chart``; пустое извлечение (нет numCache) ->
+    caption-фолбэк (честный маркер, как раньше). Провенанс-строка (лист+якорь) —
+    добавляется ЗДЕСЬ (контейнером), не в ``render_chart`` (container-agnostic):
+    сохраняет позиционную привязку, которую нёс прежний VLM-маркер
+    (``on {sheet}!{anchor}``), критично для retrieval по листу/якорю."""
+    from convert import chart_data, chart_render, xlsx_charts
+
+    rendered = chart_render.render_chart(chart_data.parse_chart(chart_root))
+    if rendered is None:
+        return xlsx_charts.render_chart_marker(chart)
+    provenance = f"> лист {chart.sheet}, якорь {chart.anchor_cell}"
+    return f"{provenance}\n\n{rendered}"
+
+
 def _convert_xlsx(
     raw: Path, out: Path, language: str | None, *, record: schema.SourceRecord | None = None
 ) -> None:
-    """v1 (spec convert-xlsx §2/§3): один лист = одна GFM-таблица под
-    заголовком ``## {sheet}``, в порядке ``wb.sheetnames`` (workbook, не
-    алфавитный). Скрытые листы остаются частью документа с суффиксом
-    «(hidden)» — НЕ orphan-фильтр docx (лист — часть документа автора, просто
-    визуально свёрнута, см. Design rationale, честность vs privacy-фильтрация).
-    Пустой лист -> честный маркер, без пустой таблицы — КРОМЕ случая, когда на
-    нём всё же висит чарт без единой ячейки данных (chart-only лист): тогда
-    маркер листа не эмитится, а чарт-маркер(ы) не теряются молча. Маркеры
-    чартов данного листа — сразу после его таблицы, топ-лефт первым."""
+    """v2 (spec convert-xlsx §2/§3 + chart-data-extraction §4.1): один лист =
+    одна GFM-таблица под заголовком ``## {sheet}``, в порядке ``wb.sheetnames``
+    (workbook, не алфавитный). Скрытые листы остаются частью документа с
+    суффиксом «(hidden)» — НЕ orphan-фильтр docx (лист — часть документа
+    автора, просто визуально свёрнута, см. Design rationale, честность vs
+    privacy-фильтрация). Пустой лист -> честный маркер, без пустой таблицы —
+    КРОМЕ случая, когда на нём всё же висит чарт без единой ячейки данных
+    (chart-only лист): тогда маркер листа не эмитится, а чарт-блок(и) не
+    теряются молча. Чарты данного листа — сразу после его таблицы, в
+    детерминированном порядке по якорю (топ-лефт первым); каждый —
+    data-driven (таблица+mermaid) с caption-фолбэком на пустое извлечение."""
     import openpyxl
     from openpyxl.utils.cell import coordinate_to_tuple
 
     from convert import xlsx_charts
 
     wb = openpyxl.load_workbook(raw, data_only=True, read_only=False)
+    chart_roots = xlsx_charts.extract_chart_roots(raw)
     charts_by_sheet: dict[str, list[xlsx_charts.XlsxChart]] = {}
     for chart in xlsx_charts.extract_charts(raw):
         charts_by_sheet.setdefault(chart.sheet, []).append(chart)
@@ -538,7 +557,9 @@ def _convert_xlsx(
         if not _sheet_is_empty(ws):
             parts.append(_sheet_table(ws))
         if sheet_charts:
-            parts.append("\n\n".join(xlsx_charts.render_chart_marker(c) for c in sheet_charts))
+            parts.append(
+                "\n\n".join(_render_xlsx_chart_block(c, chart_roots[c.id12]) for c in sheet_charts)
+            )
         sections.append("\n\n".join(parts))
     if not any_content:
         raise ConversionError(f"{raw.name}: ни один лист workbook не содержит данных")
@@ -549,7 +570,7 @@ _CONVERTERS: dict[str, Converter] = {
     "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
     "html": Converter("html", "1", _convert_html),
     "docx": Converter("docx", "3", _convert_docx),  # v3: composite-группы (§2-ter)
-    "xlsx": Converter("xlsx", "1", _convert_xlsx),
+    "xlsx": Converter("xlsx", "2", _convert_xlsx),  # v2: data-driven чарты (chart-data-extraction §4.1)
 }
 
 
