@@ -249,6 +249,54 @@ def build_docx_with_group_and_standalone_image(
     return _docx_zip(body, images)
 
 
+def build_docx_with_shape_group_and_inline_chart(
+    group_captions: list[str], group_images: dict[str, bytes], chart_title_texts: list[str]
+) -> bytes:
+    """Композит: одна composite-группа (kind="group") + один нативный c:chart
+    (kind="chart") в ОДНОМ документе (spec chart-data-extraction §2) —
+    характеризационная фикстура: детект/вырезка/сентинел обоих kind делят
+    общий код (``docx_groups._iter_objects``), а РЕЗОЛЮЦИЯ chart-kind меняется
+    на data-driven — этот билдер даёт регресс-guard, что изменение резолюции
+    chart НЕ задевает group-путь (и наоборот)."""
+    group_ac = _docx_group_ac(group_captions, len(group_images))
+    body = f"<w:p><w:r>{group_ac}</w:r></w:p>"
+    body += f"<w:p><w:r>{_docx_chart_drawing('rId200')}</w:r></w:p>"
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_OOXML_W}"><w:body>{body}</w:body></w:document>'
+    )
+    image_rels = "".join(
+        f'<Relationship Id="rId{100 + i}" Type="{_OOXML_R}/image" Target="media/{name}"/>'
+        for i, name in enumerate(group_images)
+    )
+    doc_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'{image_rels}<Relationship Id="rId200" Type="{_OOXML_R}/chart" Target="charts/chart1.xml"/>'
+        "</Relationships>"
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
+        "</Types>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+        z.writestr("word/charts/chart1.xml", _docx_chart_part(chart_title_texts))
+        for name, data in group_images.items():
+            z.writestr(f"word/media/{name}", data)
+    return buf.getvalue()
+
+
 def build_pdf(
     *,
     lines: list[tuple[str, float, float, float]] | None = None,
