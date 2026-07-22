@@ -38,6 +38,7 @@ from tests.support import (
     build_docx_with_choice_only_images,
     build_docx_with_group_and_standalone_image,
     build_docx_with_inline_chart,
+    build_docx_with_inline_chart_data,
     build_docx_with_inline_image,
     build_docx_with_shape_group,
     build_minimal_docx,
@@ -308,9 +309,12 @@ def test_convert_docx_group_marker_positioned_with_captions(tmp_path: Path) -> N
 
 
 def test_convert_docx_chart_marker_positioned_with_title(tmp_path: Path) -> None:
-    """Нативный c:chart (kind="chart"): до расширения §2-ter mammoth терял его
-    МОЛЧА (ни маркера, ни текста) — теперь маркер с заголовком из chart-парта
-    стоит на месте чарта в потоке."""
+    """Нативный c:chart (kind="chart") БЕЗ numCache (``build_docx_with_inline_chart``
+    несёт только ``c:title`` — до расширения §2-ter mammoth терял чарт МОЛЧА,
+    ни маркера, ни текста): caption-фолбэк (chart-data-extraction §4.2) даёт
+    ТОТ ЖЕ маркер, что и до data-driven рефакторинга — на месте чарта в потоке.
+    Data-driven путь с реальным numCache — см.
+    ``test_convert_docx_chart_with_numcache_renders_data_driven_block``."""
     raw = tmp_path / "raw.docx"
     raw.write_bytes(build_docx_with_inline_chart(["Before."], ["Costs of LTE and 5G"], ["After."]))
     out = tmp_path / "out.md"
@@ -320,6 +324,30 @@ def test_convert_docx_chart_marker_positioned_with_title(tmp_path: Path) -> None
     assert "chart content not analyzed" in text
     assert "> captions: Costs of LTE and 5G" in text
     assert text.find("Before.") < text.find("[Figure, docx chart") < text.find("After.")
+    assert "DOCXGROUPSENTINEL" not in text
+
+
+def test_convert_docx_chart_with_numcache_renders_data_driven_block(tmp_path: Path) -> None:
+    """Живой факт (chart-data-extraction spec §4.2): нативный c:chart с
+    реальным numCache получает ПОЛНЫЙ data-driven рендер (mermaid+таблица,
+    отформатированная по value_format) IN-PLACE сентинела — позиция в потоке
+    (§4.4: докс-провенанс = сама позиция) сохранена точно, отдельной строки
+    провенанса, в отличие от xlsx, не требуется."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(
+        build_docx_with_inline_chart_data(
+            ["Before."], ["After."], title="Regional Scores",
+            categories=["Montenegro", "Estonia"], values=["0.42", "0.87"], value_format="0.0%",
+        )
+    )
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "[Figure, docx chart" not in text
+    assert "chart content not analyzed" not in text
+    assert "```mermaid\nxychart-beta" in text
+    assert "| Montenegro | 42.0% |" in text
+    assert text.find("Before.") < text.find("Regional Scores") < text.find("After.")
     assert "DOCXGROUPSENTINEL" not in text
 
 

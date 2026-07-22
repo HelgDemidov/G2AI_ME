@@ -79,10 +79,14 @@ def test_group_and_chart_coexist_chart_part_survives_in_rewritten_zip(tmp_path: 
 
 
 def test_group_and_chart_coexist_injection_gives_each_its_own_marker_kind(tmp_path: Path) -> None:
-    """ТЕКУЩЕЕ (до-рефакторинга) поведение ``inject_group_markers``: ОБА kind
-    сегодня дают одинаковую грамматику маркера (только noun различается) —
-    эта ассерция для kind="chart" ожидаемо изменится, когда резолюция
-    станет data-driven (см. докстроку модуля); group-часть — нет."""
+    """Post-рефакторинг (chart-data-extraction §4.2, ``inject_group_markers``
+    теперь резолвит kind="chart" data-driven): здесь ОБА kind всё ещё дают
+    маркер, а не data-driven вывод — не потому, что резолюция не изменилась
+    (изменилась), а потому, что ``_docx_chart_part`` (тестовый билдер) несёт
+    ТОЛЬКО ``c:title``, без единого ``c:ser``/numCache — извлечение честно
+    пустое, ``render_chart`` возвращает ``None``, caption-фолбэк совпадает с
+    до-рефакторинговым текстом дословно. Data-driven путь с реальным numCache
+    проверен отдельно (``test_docx_groups.py``/``test_converters.py``)."""
     raw = tmp_path / "raw.docx"
     raw.write_bytes(
         build_docx_with_shape_group_and_inline_chart(["Group cap"], {}, ["Chart cap"])

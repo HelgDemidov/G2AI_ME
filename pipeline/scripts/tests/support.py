@@ -198,11 +198,12 @@ def _docx_chart_part(title_texts: list[str]) -> str:
     )
 
 
-def build_docx_with_inline_chart(
-    before: list[str], title_texts: list[str], after: list[str]
-) -> bytes:
-    """docx с ОДНИМ нативным c:chart (spec convert-docx §2-ter, kind="chart"):
-    drawing-анкер в body + chart-парт с заголовком + rels/[Content_Types]."""
+def _docx_chart_zip(before: list[str], after: list[str], chart_part_xml: str) -> bytes:
+    """Общая сборка zip под ОДИН нативный ``c:chart`` (spec convert-docx
+    §2-ter, kind="chart"): drawing-анкер в body + произвольный chart-парт +
+    rels/[Content_Types] — используется и минимальным (``_docx_chart_part``,
+    только title) и data-driven (``_docx_chart_part_with_series``, numCache)
+    билдерами."""
     body = "".join(_docx_para(p) for p in before)
     body += f"<w:p><w:r>{_docx_chart_drawing('rId200')}</w:r></w:p>"
     body += "".join(_docx_para(p) for p in after)
@@ -231,8 +232,60 @@ def build_docx_with_inline_chart(
         z.writestr("_rels/.rels", _DOCX_RELS)
         z.writestr("word/document.xml", document)
         z.writestr("word/_rels/document.xml.rels", doc_rels)
-        z.writestr("word/charts/chart1.xml", _docx_chart_part(title_texts))
+        z.writestr("word/charts/chart1.xml", chart_part_xml)
     return buf.getvalue()
+
+
+def build_docx_with_inline_chart(
+    before: list[str], title_texts: list[str], after: list[str]
+) -> bytes:
+    """docx с ОДНИМ нативным c:chart (spec convert-docx §2-ter, kind="chart"):
+    drawing-анкер в body + chart-парт с заголовком (БЕЗ numCache — captions-only
+    фикстура; для data-driven резолюции см. ``build_docx_with_inline_chart_data``)
+    + rels/[Content_Types]."""
+    return _docx_chart_zip(before, after, _docx_chart_part(title_texts))
+
+
+def _docx_chart_part_with_series(
+    title: str, categories: list[str], values: list[str], value_format: str
+) -> str:
+    """chart-парт с РЕАЛЬНЫМ ``c:numCache``/``c:strCache`` (spec
+    chart-data-extraction §4.2) — та же DrawingML-схема ``c:chart``, что у
+    xlsx (``xl/charts/*.xml`` vs ``word/charts/*.xml``); один bar-серия чарт,
+    достаточный для сквозной сверки data-driven резолюции chart-kind."""
+    cat_pts = "".join(f'<c:pt idx="{i}"><c:v>{c}</c:v></c:pt>' for i, c in enumerate(categories))
+    val_pts = "".join(f'<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>' for i, v in enumerate(values))
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<c:chartSpace xmlns:c="{_OOXML_C}" xmlns:a="{_OOXML_A}"><c:chart>'
+        f'<c:title><c:tx><c:rich><a:p><a:r><a:t>{title}</a:t></a:r></a:p></c:rich></c:tx></c:title>'
+        '<c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>'
+        '<c:ser><c:idx val="0"/><c:order val="0"/>'
+        f'<c:cat><c:strRef><c:f>Sheet1!$A$2:$A${len(categories) + 1}</c:f>'
+        f'<c:strCache><c:ptCount val="{len(categories)}"/>{cat_pts}</c:strCache></c:strRef></c:cat>'
+        f'<c:val><c:numRef><c:f>Sheet1!$B$2:$B${len(values) + 1}</c:f>'
+        f'<c:numCache><c:formatCode>{value_format}</c:formatCode>'
+        f'<c:ptCount val="{len(values)}"/>{val_pts}</c:numCache></c:numRef></c:val>'
+        "</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"
+    )
+
+
+def build_docx_with_inline_chart_data(
+    before: list[str],
+    after: list[str],
+    *,
+    title: str = "My Chart",
+    categories: list[str] | None = None,
+    values: list[str] | None = None,
+    value_format: str = "0.0%",
+) -> bytes:
+    """Как ``build_docx_with_inline_chart``, но chart-парт несёт РЕАЛЬНЫЙ
+    numCache — под тесты data-driven резолюции (chart-data-extraction §4.2),
+    а не только caption-фолбэка."""
+    cats, vals = categories or ["A", "B"], values or ["1", "2"]
+    return _docx_chart_zip(
+        before, after, _docx_chart_part_with_series(title, cats, vals, value_format)
+    )
 
 
 def build_docx_with_group_and_standalone_image(

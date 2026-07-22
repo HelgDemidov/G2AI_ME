@@ -569,7 +569,7 @@ def _convert_xlsx(
 _CONVERTERS: dict[str, Converter] = {
     "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
     "html": Converter("html", "1", _convert_html),
-    "docx": Converter("docx", "3", _convert_docx),  # v3: composite-группы (§2-ter)
+    "docx": Converter("docx", "4", _convert_docx),  # v4: data-driven чарты (chart-data-extraction §4.2)
     "xlsx": Converter("xlsx", "2", _convert_xlsx),  # v2: data-driven чарты (chart-data-extraction §4.1)
 }
 

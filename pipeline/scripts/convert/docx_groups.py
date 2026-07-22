@@ -37,6 +37,9 @@ from typing import Any
 
 from lxml import etree
 
+from convert import chart_render
+from convert.chart_data import ChartData, parse_chart
+
 _NS = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
@@ -63,6 +66,10 @@ class DocxGroup:
     media_ids: frozenset[str]
     captions: tuple[str, ...]
     kind: str = "group"  # "group" (wpg-группа фигур) | "chart" (нативный c:chart)
+    # kind="chart" ТОЛЬКО (spec chart-data-extraction §4.2): распарсенные данные
+    # чарта для data-driven резолюции (inject_group_markers). kind="group" —
+    # всегда None, group-путь остаётся на VLM без изменений.
+    chart_data: ChartData | None = None
 
 
 def _rel_targets(z: zipfile.ZipFile, part: str) -> dict[str, str]:
@@ -112,21 +119,31 @@ def _group_captions(ac: Any) -> tuple[str, ...]:
     return _filter_caption_texts(ac.itertext())
 
 
-def _chart_captions(
+def _chart_root(
     drawing: Any, rel_targets: dict[str, str], z: zipfile.ZipFile, names: set[str]
-) -> tuple[str, ...]:
+) -> Any | None:
+    """Распарсенный chart-парт (``word/charts/chartN.xml``) референсированный
+    ``w:drawing``-анкером — общий резолв для captions (``_chart_captions``) И
+    данных (``chart_data.parse_chart``, spec chart-data-extraction §4.2). None —
+    анкер/rel/парт недостижимы (малформед OOXML, честно пропускается)."""
+    chart_ref = drawing.find(f".//{_q('c', 'chart')}")
+    rid = chart_ref.get(_q("r", "id")) if chart_ref is not None else None
+    if rid is None or rid not in rel_targets:
+        return None
+    part = posixpath.normpath(posixpath.join("word", rel_targets[rid]))
+    if part not in names:
+        return None
+    return etree.fromstring(z.read(part))
+
+
+def _chart_captions(chart_root: Any | None) -> tuple[str, ...]:
     """Заголовок чарта из его chart-парта (``c:title``): сам ``w:drawing``-анкер
     текста не несёт (данные и заголовок живут в ``word/charts/chartN.xml``).
     Берём ТОЛЬКО title, не весь парт — иначе captions затопило бы подписями
     осей/категорий/значений."""
-    chart_ref = drawing.find(f".//{_q('c', 'chart')}")
-    rid = chart_ref.get(_q("r", "id")) if chart_ref is not None else None
-    if rid is None or rid not in rel_targets:
+    if chart_root is None:
         return ()
-    part = posixpath.normpath(posixpath.join("word", rel_targets[rid]))
-    if part not in names:
-        return ()
-    title = etree.fromstring(z.read(part)).find(f".//{_q('c', 'title')}")
+    title = chart_root.find(f".//{_q('c', 'title')}")
     if title is None:
         return ()
     return _filter_caption_texts(title.itertext())
@@ -194,11 +211,21 @@ def extract_and_strip_groups(raw: Path) -> tuple[bytes, list[DocxGroup]]:
         groups: list[DocxGroup] = []
         for _block, el, kind in _iter_objects(body):
             media_ids = _group_media_ids(el, rel_targets, z, names)
-            captions = (
-                _group_captions(el) if kind == "group" else _chart_captions(el, rel_targets, z, names)
-            )
+            parsed_chart_data: ChartData | None = None
+            if kind == "group":
+                captions = _group_captions(el)
+            else:
+                chart_root = _chart_root(el, rel_targets, z, names)
+                captions = _chart_captions(chart_root)
+                if chart_root is not None:
+                    parsed_chart_data = parse_chart(chart_root)
             id12 = hashlib.sha256(etree.tostring(el)).hexdigest()[:12]
-            groups.append(DocxGroup(id12=id12, media_ids=media_ids, captions=captions, kind=kind))
+            groups.append(
+                DocxGroup(
+                    id12=id12, media_ids=media_ids, captions=captions, kind=kind,
+                    chart_data=parsed_chart_data,
+                )
+            )
 
             run = el.getparent()
             sentinel = etree.Element(_q("w", "t"))
@@ -257,8 +284,15 @@ def _render_group_marker(id12: str, captions: tuple[str, ...], kind: str = "grou
 
 def inject_group_markers(text: str, groups: list[DocxGroup]) -> str:
     """Заменить текстовые сентинелы (пережившие mammoth+markdownify на месте
-    вырезанной группы, см. ``extract_and_strip_groups``) на честный
-    маркер-блок с сохранёнными подписями."""
+    вырезанной группы, см. ``extract_and_strip_groups``) на итоговый блок.
+
+    kind="group" — БЕЗ ИЗМЕНЕНИЙ, честный VLM-маркер (spec chart-data-extraction
+    §4.2/§2: group-путь остаётся на VLM). kind="chart" — data-driven (spec §4.2):
+    ``chart_render.render_chart(group.chart_data)``, если извлечение непустое;
+    пустое извлечение (нет numCache и т.п.) -> ТОТ ЖЕ честный маркер, что и
+    раньше (caption-фолбэк, zero-loss без VLM). Позиция сохраняется точно —
+    сентинел заменяется IN-PLACE (spec §4.4: docx-провенанс = сама позиция в
+    потоке, отдельная строка не нужна, в отличие от xlsx)."""
     if not groups:
         return text
     by_id = {g.id12: g for g in groups}
@@ -267,6 +301,10 @@ def inject_group_markers(text: str, groups: list[DocxGroup]) -> str:
         group = by_id.get(m.group("id"))
         if group is None:  # практически невозможно (id12 — sha256), но не падаем
             return m.group(0)
+        if group.kind == "chart" and group.chart_data is not None:
+            rendered = chart_render.render_chart(group.chart_data)
+            if rendered is not None:
+                return f"\n\n{rendered}\n\n"
         return _render_group_marker(group.id12, group.captions, group.kind)
 
     return _SENTINEL_SCAN_RE.sub(_replace, text)
