@@ -401,6 +401,38 @@ def test_run_without_include_commands_skips_claude_commands(tmp_path: Path) -> N
     assert not any(f.span == "nonexistent_thing_xyz" for f in findings)
 
 
+# --- skip_stats() / --verbose ---
+
+def test_skip_stats_counts_classified_and_skipped(tmp_path: Path) -> None:
+    root = _make_repo(tmp_path)
+    src = root / "CLAUDE.md"
+    src.write_text("Путь `convert/converters.py` и мусор `build` и `--force`.\n", encoding="utf-8")
+    total, skipped = ml.skip_stats([src])
+    assert total == 3  # 3 бэктик-спана
+    assert skipped == 2  # "build" (односегментное слово) и "--force" (CLI-флаг) — класс 5
+
+
+def test_skip_stats_empty_sources() -> None:
+    assert ml.skip_stats([]) == (0, 0)
+
+
+def test_main_verbose_prints_skip_stats(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _make_repo(tmp_path)
+    mem = tmp_path / "empty_memory"
+    mem.mkdir()
+    code = ml.main(["--repo-root", str(root), "--memory-dir", str(mem), "--verbose"])
+    assert code == 0
+    assert "[verbose] спанов извлечено" in capsys.readouterr().out
+
+
+def test_main_without_verbose_omits_skip_stats(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _make_repo(tmp_path)
+    mem = tmp_path / "empty_memory"
+    mem.mkdir()
+    ml.main(["--repo-root", str(root), "--memory-dir", str(mem)])
+    assert "[verbose]" not in capsys.readouterr().out
+
+
 def test_main_exit_zero_by_default_even_with_dead_anchors(tmp_path: Path) -> None:
     root = _make_repo(tmp_path)
     mem = _make_memory_dir(tmp_path)

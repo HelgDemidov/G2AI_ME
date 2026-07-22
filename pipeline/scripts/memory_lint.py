@@ -391,6 +391,24 @@ def collect_sources(repo_root: Path, memory_dir: Path, include_commands: bool) -
     return [s for s in sources if s.exists()]
 
 
+def skip_stats(sources: list[Path]) -> tuple[int, int]:
+    """(всего извлечённых спанов, пропущено классом 5 — classify() вернул None).
+
+    Диагностика дрейфа самого классификатора (`--verbose`): резкий скачок доли
+    пропущенных спанов между прогонами — сигнал, что в CLAUDE.md/памяти появился
+    новый стиль записи, который классификатор ещё не умеет распознавать, ДО того
+    как это превратится в россыпь новых allowlist-записей по одной за раз."""
+    total = 0
+    skipped = 0
+    for src in sources:
+        text = src.read_text(encoding="utf-8")
+        for span, _line in extract_anchors(text):
+            total += 1
+            if classify(span) is None:
+                skipped += 1
+    return total, skipped
+
+
 def run(repo_root: Path, memory_dir: Path, include_commands: bool, allowlist_path: Path) -> list[Finding]:
     allowlist = load_allowlist(allowlist_path)
     corpus_text = build_corpus_text(repo_root)
@@ -426,11 +444,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allowlist", type=Path, default=None)
     parser.add_argument("--include-commands", action="store_true")
     parser.add_argument("--fail-on-dead", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="печатать статистику пропущенных спанов (класс 5)")
     args = parser.parse_args(argv)
 
     allowlist_path = args.allowlist or (args.repo_root / DEFAULT_ALLOWLIST_REL)
     findings = run(args.repo_root, args.memory_dir, args.include_commands, allowlist_path)
     print(format_report(findings))
+
+    if args.verbose:
+        sources = collect_sources(args.repo_root, args.memory_dir, args.include_commands)
+        total, skipped = skip_stats(sources)
+        pct = (skipped / total * 100) if total else 0.0
+        print(f"[verbose] спанов извлечено: {total}, пропущено классом 5: {skipped} ({pct:.0f}%)")
 
     if args.fail_on_dead and any(f.level == "WARNING" for f in findings):
         return 1
