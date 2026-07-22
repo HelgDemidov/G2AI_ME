@@ -63,7 +63,7 @@ The seed-list lesson (charter §8) is the reason this section exists: aggregator
 - Do NOT download or fetch document bodies (acquisition is `pipeline/scripts/run_pipeline.py`, post-triage).
 - Do NOT assign `target_fit`/axis verdicts or edit `relevance` — that is triage (`worksheet`/`apply`), a separate session.
 - Do NOT create candidates by editing `sources/candidates.yaml` directly or via ad-hoc scripts — `inject` is the only entry (provenance + dedup by construction).
-- Do NOT copy seed-list (`sources/temporary/small_states_v01.md`) titles into injects without the full verification above — its entries are leads of the lowest tier.
+- Do NOT copy seed-list titles into injects without the full verification above — such leads (the historical `small_states_v01.md`, removed by the curator 2026-07-22 after being fully mined) are the lowest tier.
 
 ## Session summary (end of every campaign session)
 
