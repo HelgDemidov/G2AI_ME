@@ -2,7 +2,7 @@
 # Установка: uv pip install -r requirements.txt
 pdfplumber==0.11.10   # PDF -> Markdown (pdf_to_markdown.py)
 trafilatura==2.1.0    # HTML -> Markdown (convert/converters.py: _convert_html)
-mammoth==1.11.0       # DOCX -> HTML (convert/converters.py: _convert_docx, custom image-handler)
+mammoth==1.12.0       # DOCX -> HTML (convert/converters.py: _convert_docx, custom image-handler)
 markdownify==1.2.3    # HTML -> Markdown (там же, сабкласс _DocxMarkdownify)
 lxml==6.1.1            # ELI-разметка -> <hN> до trafilatura (convert/eli.py); транзитивно у trafilatura, здесь — прямой импорт
 openpyxl==3.1.5        # XLSX -> Markdown (convert/converters.py: _convert_xlsx, convert/xlsx_charts.py)
