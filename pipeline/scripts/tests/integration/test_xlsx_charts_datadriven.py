@@ -1,21 +1,29 @@
 """Локальный детерминированный чек (spec chart-data-extraction §Тестовое
 покрытие + §Финальная приёмка): data-driven chart-путь на РЕАЛЬНОЙ, не
 синтетической книге стороннего автора (``tests/fixtures/local/
-govtech-2025-full.xlsx`` — ПОЛНЫЙ оригинал, не вырезка одного листа, World
-Bank GovTech Maturity Index Dataset, CC BY 4.0, gitignored -> skipif при
-свежем клоне). Заменил урезанную Stats-only фикстуру (24/55 чартов
-достижимы, остальные — осколки хирургической вырезки) 2026-07-22 по
-решению пользователя — финальная приёмка PR #30 прогонялась на полной
-книге (55/55 достижимых чартов, 9 листов), логично, чтобы регресс-тест
-покрывал то же самое, не подмножество. Цена — время: полная конвертация
-~22 с/прогон (было ~1.4 с на вырезке) — это цена только для локального
-``tests/integration/`` (CI не видит: фикстура вне git). В отличие от
-удалённого ``test_xlsx_charts_live.py`` (spec convert-xlsx §3, требовал
-системный soffice для рендера картинки) — этот чек НЕ имеет внешних
-системных зависимостей: parse_chart/render_chart чистые функции,
-``_convert_xlsx`` — openpyxl+lxml, никакого soffice/сети. Живёт в
-``tests/integration/`` (не ``unit/``) исключительно из-за зависимости на
-негерметичный внешний файл, не системный ресурс."""
+govtech-2025-charts.xlsx``, World Bank GovTech Maturity Index Dataset,
+CC BY 4.0, gitignored -> skipif при свежем клоне). ВСЕ 55 встроенных
+чартов сохранены byte-identical (``xl/charts/*``/``xl/drawings/*`` не
+тронуты) — обрезаны только избыточные строки/колонки листов и раздутые
+per-cell ``<hyperlinks>`` (см. ``make_govtech_charts_fixture.py`` рядом,
+регенерирует фикстуру из полной книги детерминированно). Заменила
+изначальный ПОЛНЫЙ оригинал (5.4 МБ, 2 листа с 700k+ живых ячеек) 2026-07-22
+по решению пользователя: полная книга оказалась слишком тяжёлой для
+локального full-gate (``openpyxl.load_workbook`` сам по себе — 16.5 с из-за
+объёма живых данных, никак не связанных с чартами — ``parse_chart`` читает
+ТОЛЬКО закэшированные ``<c:numCache>``/``<c:strCache>`` внутри chart-парта,
+не ячейки листа). После обрезки то же покрытие (55/55 чартов достижимы,
+0 крашей, 33/55 mermaid) при ``_convert_xlsx`` ~5 с/прогон (было ~22 с).
+Отличается от прежней урезанной Stats-only фикстуры (24/55 чартов
+достижимы, остальные — осколки хирургического удаления 8 ЛИСТОВ целиком)
+методом: здесь обрезаны только строки/колонки ВНУТРИ каждого из 9 листов,
+ни один лист/drawing/chart-парт не удалён — orphan-чартов в принципе не
+может возникнуть. В отличие от удалённого ``test_xlsx_charts_live.py``
+(spec convert-xlsx §3, требовал системный soffice для рендера картинки) —
+этот чек НЕ имеет внешних системных зависимостей: parse_chart/render_chart
+чистые функции, ``_convert_xlsx`` — openpyxl+lxml, никакого soffice/сети.
+Живёт в ``tests/integration/`` (не ``unit/``) исключительно из-за
+зависимости на негерметичный внешний файл, не системный ресурс."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -25,15 +33,15 @@ import pytest
 from convert import chart_data, chart_render, xlsx_charts
 from convert.converters import _convert_xlsx
 
-_FIXTURE = Path(__file__).parent.parent / "fixtures" / "local" / "govtech-2025-full.xlsx"
+_FIXTURE = Path(__file__).parent.parent / "fixtures" / "local" / "govtech-2025-charts.xlsx"
 
 pytestmark = pytest.mark.skipif(
     not _FIXTURE.exists(), reason="тестовая фикстура fixtures/local отсутствует (gitignored)"
 )
 
-# Полная книга: ВСЕ 55 физических xl/charts/*.xml части достижимы (3 листа —
-# Stats/Regions/Trends несут drawing-анкеры) — в отличие от урезанной Stats-only
-# вырезки, здесь нет осколков-сирот (extract_charts == голый zip-глоб по счёту,
+# Все 55 физических xl/charts/*.xml части достижимы (3 листа — Stats/Regions/
+# Trends несут drawing-анкеры) — обрезка листов не трогает ни один chart/drawing
+# парт, поэтому осколков-сирот нет (extract_charts == голый zip-глоб по счёту,
 # в кои-то веки совпадают, но код всё равно должен идти через первый — не глоб).
 _EXPECTED_REACHABLE_CHARTS = 55
 _KNOWN_DOUGHNUT_ID = "81e3f64eb12d"  # "Institutional Responsibility for GovTech" (Stats!BO37)
@@ -115,7 +123,9 @@ def test_all_mermaid_blocks_accepted_by_real_mermaid_js() -> None:
     приёмка): не только наши эвристики (``test_chart_render_visual.py``,
     синтетические ChartData), а ВСЕ реальные mermaid-блоки, которые
     ``render_chart`` производит из этой конкретной книги — через настоящий
-    mermaid.js (``mermaidx``, dev-зависимость). Живой замер: 33/55 чартов
+    mermaid.js (``mermaidx``, теперь runtime-зависимость, requirements.txt —
+    ``render_chart`` уже гейтит каждый блок через неё сам, этот тест дублирует
+    проверку явно, как постоянный регресс-чек). Живой замер: 33/55 чартов
     дают mermaid, ~116 мс/диаграмма на прогретом движке."""
     import mermaidx
 
