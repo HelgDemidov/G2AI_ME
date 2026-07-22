@@ -15,6 +15,4 @@ types-openpyxl==3.1.5.20260518
 reportlab==5.0.0       # синтетические PDF-фикстуры для тестов pdf_to_markdown (генерация на лету, ничего не коммитится)
 types-reportlab==4.5.1.20260712
 hypothesis==6.157.2    # property-based тестирование геометрии pdf_to_markdown (test-coverage-hardening); общепроектный стандарт
-mermaidx==0.9.3         # рендер mermaid-вывода chart_render.py настоящим mermaid.js (embedded QuickJS, без Node/браузера) —
-                        # ловит семантические/визуальные дефекты, которые синтакс-валидация (наши эвристики) пропускает
-                        # (живой пример: title в кавычках синтаксически валиден, но рендерится с буквальными кавычками)
+# mermaidx — теперь runtime-зависимость (requirements.txt), тянется сюда транзитивно через -r requirements.txt выше

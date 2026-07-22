@@ -7,7 +7,16 @@
 bubble/waterfall/treemap/sunburst/boxplot/3D/лог-шкалы) -> mermaid-конструкта
 НЕТ вовсе, только таблица. ``verify+fallback``: форма рискованна (несовпадение
 длин серии/категорий, пропуски, >1 серия у pie) -> mermaid снимается, таблица
-остаётся всегда (см. Design rationale спека)."""
+остаётся всегда (см. Design rationale спека).
+
+Двухуровневая верификация mermaid перед выдачей (решение пользователя
+2026-07-22, эволюция того же verify+fallback): структурные эвристики выше
+ловят рискованную ФОРМУ, но не гарантируют, что mermaid.js реально примет
+СИНТАКСИС/СЕМАНТИКУ результата — живой пример: кавычки в ``pie title``
+синтаксически валидны, но рендерятся буквально. Финальный гейт —
+``_mermaid_renders``: настоящий рендер через ``mermaidx`` (embedded QuickJS,
+runtime-зависимость с 2026-07-22), любой отказ -> откат к таблице-only, НЕ
+крах конвертации."""
 from __future__ import annotations
 
 import re
@@ -159,14 +168,41 @@ def _mermaid_radar(data: ChartData) -> str | None:
     return "```mermaid\nradar-beta\n" + "\n".join(lines) + "\n```"
 
 
+def _mermaid_renders(code: str) -> bool:
+    """Настоящая render-проверка через ``mermaidx`` (spec chart-data-extraction,
+    решение пользователя 2026-07-22 — сначала dev-тест, затем штатный
+    runtime-гейт): структурные эвристики выше (``_series_shape_ok`` и т.п.)
+    ловят РИСКОВАННУЮ форму, но не гарантируют, что mermaid.js реально
+    примет результат — живой пример (найден на визуальном рендере govtech,
+    коммит `509f6ff`): ``pie title "T"`` синтаксически валиден (кавычки
+    внутри плоской строки — не ошибка грамматики), но рендерится с
+    буквальными кавычками. Синтакс-валидаторы (``mermaid-parser-bundle``/
+    ``mermaid.parse()``) эту форму пропускали — только фактический рендер
+    различает «грамматически валидно» и «примет реальный рендерер». Любой
+    сбой (включая недоступность самой библиотеки) -> False, фейл-safe —
+    вызывающая сторона просто теряет mermaid-блок, НЕ конвертацию целиком."""
+    import mermaidx  # ленивый импорт: pdf/html-путь не платит за chart-специфичный вес
+
+    try:
+        mermaidx.render(code).svg()
+        return True
+    except Exception:  # noqa: BLE001 — любой отказ реального рендера -> честный откат к таблице
+        return False
+
+
 def _mermaid(data: ChartData) -> str | None:
     if data.chart_type in _PIE_LIKE:
-        return _mermaid_pie(data)
-    if data.chart_type in _XYCHART_LIKE:
-        return _mermaid_xychart(data)
-    if data.chart_type == "radar":
-        return _mermaid_radar(data)
-    return None  # scatter/stacked-bar/прочее — mermaid-конструкта нет вовсе
+        candidate = _mermaid_pie(data)
+    elif data.chart_type in _XYCHART_LIKE:
+        candidate = _mermaid_xychart(data)
+    elif data.chart_type == "radar":
+        candidate = _mermaid_radar(data)
+    else:
+        return None  # scatter/stacked-bar/прочее — mermaid-конструкта нет вовсе
+    if candidate is None:
+        return None
+    code = candidate.removeprefix("```mermaid\n").removesuffix("\n```")
+    return candidate if _mermaid_renders(code) else None
 
 
 def render_chart(data: ChartData) -> str | None:

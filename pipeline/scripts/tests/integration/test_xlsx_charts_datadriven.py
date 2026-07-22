@@ -1,13 +1,21 @@
 """Локальный детерминированный чек (spec chart-data-extraction §Тестовое
-покрытие): data-driven chart-путь на РЕАЛЬНОЙ, не синтетической книге
-стороннего автора (``tests/fixtures/local/govtech-2025-stats-excerpt.xlsx``,
-World Bank GovTech Maturity Index Dataset, CC BY 4.0, gitignored -> skipif
-при свежем клоне). В отличие от удалённого ``test_xlsx_charts_live.py``
-(spec convert-xlsx §3, требовал системный soffice для рендера картинки) —
-этот чек НЕ имеет внешних системных зависимостей: parse_chart/render_chart
-чистые функции, ``_convert_xlsx`` — openpyxl+lxml, никакого soffice/сети.
-Живёт в ``tests/integration/`` (не ``unit/``) исключительно из-за зависимости
-на негерметичный внешний файл, не системный ресурс."""
+покрытие + §Финальная приёмка): data-driven chart-путь на РЕАЛЬНОЙ, не
+синтетической книге стороннего автора (``tests/fixtures/local/
+govtech-2025-full.xlsx`` — ПОЛНЫЙ оригинал, не вырезка одного листа, World
+Bank GovTech Maturity Index Dataset, CC BY 4.0, gitignored -> skipif при
+свежем клоне). Заменил урезанную Stats-only фикстуру (24/55 чартов
+достижимы, остальные — осколки хирургической вырезки) 2026-07-22 по
+решению пользователя — финальная приёмка PR #30 прогонялась на полной
+книге (55/55 достижимых чартов, 9 листов), логично, чтобы регресс-тест
+покрывал то же самое, не подмножество. Цена — время: полная конвертация
+~22 с/прогон (было ~1.4 с на вырезке) — это цена только для локального
+``tests/integration/`` (CI не видит: фикстура вне git). В отличие от
+удалённого ``test_xlsx_charts_live.py`` (spec convert-xlsx §3, требовал
+системный soffice для рендера картинки) — этот чек НЕ имеет внешних
+системных зависимостей: parse_chart/render_chart чистые функции,
+``_convert_xlsx`` — openpyxl+lxml, никакого soffice/сети. Живёт в
+``tests/integration/`` (не ``unit/``) исключительно из-за зависимости на
+негерметичный внешний файл, не системный ресурс."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,21 +25,19 @@ import pytest
 from convert import chart_data, chart_render, xlsx_charts
 from convert.converters import _convert_xlsx
 
-_FIXTURE = Path(__file__).parent.parent / "fixtures" / "local" / "govtech-2025-stats-excerpt.xlsx"
+_FIXTURE = Path(__file__).parent.parent / "fixtures" / "local" / "govtech-2025-full.xlsx"
 
 pytestmark = pytest.mark.skipif(
     not _FIXTURE.exists(), reason="тестовая фикстура fixtures/local отсутствует (gitignored)"
 )
 
-# Живой факт (chart-data-extraction §1, эта сессия): вырезка несёт 55 ФИЗИЧЕСКИХ
-# xl/charts/*.xml частей (осколки хирургического удаления 8 из 9 листов
-# оригинала), но только 24 из них РЕАЛЬНО достижимы через drawing-цепочку
-# оставшегося листа Stats (extract_charts/extract_chart_roots — та же
-# OPC-навигация, что в проде, НЕ голый zip-глоб) — README.md фикстуры
-# подтверждает "24 чарта" как целевое число.
-_EXPECTED_REACHABLE_CHARTS = 24
-_KNOWN_DOUGHNUT_ID = "81e3f64eb12d"  # "Institutional Responsibility for GovTech"
-_KNOWN_RADAR_ID = "96a22b948568"  # "GovTech Maturity Index Components"
+# Полная книга: ВСЕ 55 физических xl/charts/*.xml части достижимы (3 листа —
+# Stats/Regions/Trends несут drawing-анкеры) — в отличие от урезанной Stats-only
+# вырезки, здесь нет осколков-сирот (extract_charts == голый zip-глоб по счёту,
+# в кои-то веки совпадают, но код всё равно должен идти через первый — не глоб).
+_EXPECTED_REACHABLE_CHARTS = 55
+_KNOWN_DOUGHNUT_ID = "81e3f64eb12d"  # "Institutional Responsibility for GovTech" (Stats!BO37)
+_KNOWN_RADAR_ID = "96a22b948568"  # "GovTech Maturity Index Components" (Stats!AP25)
 
 
 def test_all_reachable_charts_parse_and_render_without_crash() -> None:
@@ -53,8 +59,10 @@ def test_all_reachable_charts_parse_and_render_without_crash() -> None:
             mermaid_count += 1
     assert crashes == []
     # Нижний порог, не точное число — ловит грубую регрессию маппинга типов,
-    # не переобучен на текущий точный подсчёт (живой замер этой сессии: 20/24).
-    assert mermaid_count >= 15
+    # не переобучен на текущий точный подсчёт (живой замер финальной приёмки
+    # 2026-07-22: 33/55 — column/bar/combo/radar/doughnut получают mermaid,
+    # stacked-бары/scatter честно только таблица).
+    assert mermaid_count >= 25
 
 
 def test_known_doughnut_chart_type_and_categories() -> None:
@@ -85,7 +93,7 @@ def test_convert_xlsx_full_fixture_produces_stable_output_with_provenance(tmp_pa
     assert "Institutional Responsibility for GovTech" in text
     assert "GovTech Maturity Index Components" in text
     assert "```mermaid" in text
-    # Все 24 достижимых чарта извлекаются непусто (test_all_reachable_charts_
+    # Все 55 достижимых чартов извлекаются непусто (test_all_reachable_charts_
     # parse_and_render_without_crash) -> ни один не должен упасть на честный
     # caption-фолбэк маркер в полном прогоне конвертера.
     assert "chart content not analyzed" not in text
@@ -100,3 +108,31 @@ def test_convert_xlsx_full_fixture_deterministic_across_runs(tmp_path: Path) -> 
     _convert_xlsx(_FIXTURE, out1, "en")
     _convert_xlsx(_FIXTURE, out2, "en")
     assert out1.read_text(encoding="utf-8") == out2.read_text(encoding="utf-8")
+
+
+def test_all_mermaid_blocks_accepted_by_real_mermaid_js() -> None:
+    """Постоянный аналог финальной приёмки 2026-07-22 (спек §Финальная
+    приёмка): не только наши эвристики (``test_chart_render_visual.py``,
+    синтетические ChartData), а ВСЕ реальные mermaid-блоки, которые
+    ``render_chart`` производит из этой конкретной книги — через настоящий
+    mermaid.js (``mermaidx``, dev-зависимость). Живой замер: 33/55 чартов
+    дают mermaid, ~116 мс/диаграмма на прогретом движке."""
+    import mermaidx
+
+    charts = xlsx_charts.extract_charts(_FIXTURE)
+    roots = xlsx_charts.extract_chart_roots(_FIXTURE)
+    failures: list[tuple[str, str]] = []
+    mermaid_count = 0
+    for chart in charts:
+        data = chart_data.parse_chart(roots[chart.id12])
+        rendered = chart_render.render_chart(data)
+        if rendered is None or "```mermaid" not in rendered:
+            continue
+        mermaid_count += 1
+        fence = rendered.split("```mermaid\n", 1)[1].split("```", 1)[0]
+        try:
+            mermaidx.render(fence).svg()
+        except Exception as exc:  # noqa: BLE001 — любой отказ реального рендера — находка теста
+            failures.append((chart.id12, repr(exc)[:200]))
+    assert mermaid_count >= 25
+    assert failures == []
