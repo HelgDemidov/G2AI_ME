@@ -38,6 +38,7 @@ from tests.support import (
     build_docx_with_choice_only_images,
     build_docx_with_group_and_standalone_image,
     build_docx_with_inline_chart,
+    build_docx_with_inline_chart_data,
     build_docx_with_inline_image,
     build_docx_with_shape_group,
     build_minimal_docx,
@@ -308,9 +309,12 @@ def test_convert_docx_group_marker_positioned_with_captions(tmp_path: Path) -> N
 
 
 def test_convert_docx_chart_marker_positioned_with_title(tmp_path: Path) -> None:
-    """Нативный c:chart (kind="chart"): до расширения §2-ter mammoth терял его
-    МОЛЧА (ни маркера, ни текста) — теперь маркер с заголовком из chart-парта
-    стоит на месте чарта в потоке."""
+    """Нативный c:chart (kind="chart") БЕЗ numCache (``build_docx_with_inline_chart``
+    несёт только ``c:title`` — до расширения §2-ter mammoth терял чарт МОЛЧА,
+    ни маркера, ни текста): caption-фолбэк (chart-data-extraction §4.2) даёт
+    ТОТ ЖЕ маркер, что и до data-driven рефакторинга — на месте чарта в потоке.
+    Data-driven путь с реальным numCache — см.
+    ``test_convert_docx_chart_with_numcache_renders_data_driven_block``."""
     raw = tmp_path / "raw.docx"
     raw.write_bytes(build_docx_with_inline_chart(["Before."], ["Costs of LTE and 5G"], ["After."]))
     out = tmp_path / "out.md"
@@ -320,6 +324,30 @@ def test_convert_docx_chart_marker_positioned_with_title(tmp_path: Path) -> None
     assert "chart content not analyzed" in text
     assert "> captions: Costs of LTE and 5G" in text
     assert text.find("Before.") < text.find("[Figure, docx chart") < text.find("After.")
+    assert "DOCXGROUPSENTINEL" not in text
+
+
+def test_convert_docx_chart_with_numcache_renders_data_driven_block(tmp_path: Path) -> None:
+    """Живой факт (chart-data-extraction spec §4.2): нативный c:chart с
+    реальным numCache получает ПОЛНЫЙ data-driven рендер (mermaid+таблица,
+    отформатированная по value_format) IN-PLACE сентинела — позиция в потоке
+    (§4.4: докс-провенанс = сама позиция) сохранена точно, отдельной строки
+    провенанса, в отличие от xlsx, не требуется."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(
+        build_docx_with_inline_chart_data(
+            ["Before."], ["After."], title="Regional Scores",
+            categories=["Montenegro", "Estonia"], values=["0.42", "0.87"], value_format="0.0%",
+        )
+    )
+    out = tmp_path / "out.md"
+    _convert_docx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "[Figure, docx chart" not in text
+    assert "chart content not analyzed" not in text
+    assert "```mermaid\nxychart-beta" in text
+    assert "| Montenegro | 42.0% |" in text
+    assert text.find("Before.") < text.find("Regional Scores") < text.find("After.")
     assert "DOCXGROUPSENTINEL" not in text
 
 
@@ -527,6 +555,11 @@ def test_convert_xlsx_all_sheets_empty_raises(tmp_path: Path) -> None:
 
 
 def test_convert_xlsx_chart_marker_positioned_after_sheet_table(tmp_path: Path) -> None:
+    """``openpyxl.chart``'s writer (``add_data``) never populates ``c:numCache``
+    (empirically confirmed, chart-data-extraction spec) — this chart has no
+    cached data, so ``_render_xlsx_chart_block`` falls back to the honest
+    caption marker (data-driven table+mermaid path is covered separately, see
+    ``test_convert_xlsx_chart_with_numcache_renders_data_driven_block``)."""
     from openpyxl.chart import BarChart, Reference
 
     wb = openpyxl.Workbook()
@@ -551,8 +584,8 @@ def test_convert_xlsx_chart_marker_positioned_after_sheet_table(tmp_path: Path) 
 
 def test_convert_xlsx_chart_only_sheet_not_marked_empty(tmp_path: Path) -> None:
     """Лист без единой заполненной ячейки, но с висящим на нём чартом —
-    честный chart-маркер, НЕ «[Sheet ... — empty, skipped]» (иначе чарт
-    молча теряется)."""
+    честный chart-маркер (fallback — openpyxl не пишет numCache, см. тест
+    выше), НЕ «[Sheet ... — empty, skipped]» (иначе чарт молча теряется)."""
     from openpyxl.chart import BarChart, Reference
 
     wb = openpyxl.Workbook()
@@ -571,6 +604,92 @@ def test_convert_xlsx_chart_only_sheet_not_marked_empty(tmp_path: Path) -> None:
     text = out.read_text(encoding="utf-8")
     assert '> [Sheet "ChartOnly" — empty, skipped]' not in text
     assert "on ChartOnly!A1" in text
+
+
+def _xlsx_with_chart_numcache(
+    tmp_path: Path,
+    *,
+    sheet_name: str = "Data",
+    anchor: str = "D2",
+    title: str = "My Chart",
+    categories: list[str] | None = None,
+    values: list[str] | None = None,
+    value_format: str = "0.0%",
+) -> Path:
+    """openpyxl-сгенерированный workbook с чартом (корректная структура
+    worksheet/drawing/rels) -> ручной патч ``xl/charts/chart1.xml`` РЕАЛЬНЫМ
+    ``c:numCache``/``c:strCache`` (тот же приём, что ``_xlsx_with_cached_formula``
+    выше: openpyxl не пишет кэш, живой Excel/LibreOffice — пишет; см. spec
+    chart-data-extraction §1)."""
+    import io
+    import zipfile
+
+    from openpyxl.chart import BarChart, Reference
+
+    cats, vals = categories or ["A", "B"], values or ["1", "2"]
+    wb = openpyxl.Workbook()
+    ws = _active(wb)
+    ws.title = sheet_name
+    ws.append(["Cat", "Val"])
+    for c, v in zip(cats, vals, strict=True):
+        ws.append([c, v])
+    chart = BarChart()
+    chart.title = title
+    chart.add_data(Reference(ws, min_col=2, min_row=1, max_row=len(cats) + 1), titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=1, min_row=2, max_row=len(cats) + 1))
+    ws.add_chart(chart, anchor)
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    cat_pts = "".join(f'<c:pt idx="{i}"><c:v>{c}</c:v></c:pt>' for i, c in enumerate(cats))
+    val_pts = "".join(f'<c:pt idx="{i}"><c:v>{v}</c:v></c:pt>' for i, v in enumerate(vals))
+    chart_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        f'<c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{title}</a:t></a:r></a:p></c:rich></c:tx></c:title>'
+        '<c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>'
+        '<c:ser><c:idx val="0"/><c:order val="0"/>'
+        f'<c:tx><c:strRef><c:f>{sheet_name}!$B$1</c:f><c:strCache><c:ptCount val="1"/>'
+        '<c:pt idx="0"><c:v>Val</c:v></c:pt></c:strCache></c:strRef></c:tx>'
+        f'<c:cat><c:strRef><c:f>{sheet_name}!$A$2:$A${len(cats) + 1}</c:f>'
+        f'<c:strCache><c:ptCount val="{len(cats)}"/>{cat_pts}</c:strCache></c:strRef></c:cat>'
+        f'<c:val><c:numRef><c:f>{sheet_name}!$B$2:$B${len(vals) + 1}</c:f>'
+        f'<c:numCache><c:formatCode>{value_format}</c:formatCode>'
+        f'<c:ptCount val="{len(vals)}"/>{val_pts}</c:numCache></c:numRef></c:val>'
+        '</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>'
+    )
+
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as z:
+        names = z.namelist()
+        contents = {n: z.read(n) for n in names}
+    contents["xl/charts/chart1.xml"] = chart_xml.encode()
+    raw = tmp_path / "raw.xlsx"
+    with zipfile.ZipFile(raw, "w") as zo:
+        for n in names:
+            zo.writestr(n, contents[n])
+    return raw
+
+
+def test_convert_xlsx_chart_with_numcache_renders_data_driven_block(tmp_path: Path) -> None:
+    """Живой факт (chart-data-extraction spec §1): в отличие от openpyxl-
+    записанного чарта (fallback-тесты выше), чарт с реальным numCache
+    получает ПОЛНЫЙ data-driven рендер: провенанс-строка (§4.4) + mermaid +
+    отформатированная по value_format таблица, НЕ старый VLM-маркер."""
+    raw = _xlsx_with_chart_numcache(
+        tmp_path, sheet_name="Data", anchor="D2", title="My Chart",
+        categories=["A", "B"], values=["0.42", "0.87"], value_format="0.0%",
+    )
+    out = tmp_path / "out.md"
+    _convert_xlsx(raw, out, "en")
+    text = out.read_text(encoding="utf-8")
+    assert "> лист Data, якорь D2" in text
+    assert "```mermaid\nxychart-beta" in text
+    assert "| Category | Val |" in text
+    assert "| A | 42.0% |" in text
+    assert "| B | 87.0% |" in text
+    assert "[Figure, xlsx chart" not in text
+    assert text.index("| Cat | Val |") < text.index("> лист Data") < text.index("```mermaid")
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---

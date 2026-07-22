@@ -17,6 +17,7 @@ from convert.docx_groups import (
 )
 from tests.support import (
     build_docx_with_inline_chart,
+    build_docx_with_inline_chart_data,
     build_docx_with_shape_group,
     build_minimal_docx,
 )
@@ -160,6 +161,83 @@ def test_detects_native_chart_with_title_captions(tmp_path: Path) -> None:
         doc_xml = z.read("word/document.xml").decode("utf-8")
     assert "c:chart" not in doc_xml
     assert f"{SENTINEL_PREFIX}{chart.id12}" in doc_xml
+
+
+def test_native_chart_without_numcache_has_empty_chart_data(tmp_path: Path) -> None:
+    """``build_docx_with_inline_chart`` — captions-only фикстура (только
+    ``c:title``, никаких ``c:ser``): ``chart_data`` НЕ None (chart-парт
+    достижим), но извлечение честно пустое — ``chart_type="other"``, ноль
+    серий (см. ``chart_data.parse_chart``)."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(build_docx_with_inline_chart(["Before."], ["Title"], ["After."]))
+    _rewritten, groups = extract_and_strip_groups(raw)
+    chart = groups[0]
+    assert chart.chart_data is not None
+    assert chart.chart_data.series == ()
+
+
+def test_native_chart_with_numcache_gets_parsed_chart_data(tmp_path: Path) -> None:
+    """Живой факт (chart-data-extraction spec §4.2): chart-парт с реальным
+    numCache даёт непустой ``ChartData`` уже на этапе вырезки — резолюция
+    (``inject_group_markers``) больше не нужна, чтобы узнать, есть ли данные."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(
+        build_docx_with_inline_chart_data(
+            ["Before."], ["After."], title="Regional Scores",
+            categories=["A", "B"], values=["0.42", "0.87"], value_format="0.0%",
+        )
+    )
+    _rewritten, groups = extract_and_strip_groups(raw)
+    chart = groups[0]
+    assert chart.kind == "chart"
+    data = chart.chart_data
+    assert data is not None
+    assert data.chart_type == "column"
+    assert data.title == "Regional Scores"
+    assert data.categories == ("A", "B")
+    assert len(data.series) == 1
+    assert data.series[0].values == (0.42, 0.87)
+
+
+def test_inject_group_markers_chart_kind_renders_data_driven_table_and_mermaid(tmp_path: Path) -> None:
+    """``inject_group_markers`` (chart-data-extraction §4.2): chart-kind с
+    непустым извлечением -> ``render_chart`` вывод IN-PLACE сентинела, НЕ
+    честный маркер — позиция в потоке (Before./After.) сохраняется точно
+    (§4.4: docx-провенанс = сама позиция, отдельная строка не нужна)."""
+    raw = tmp_path / "raw.docx"
+    raw.write_bytes(
+        build_docx_with_inline_chart_data(
+            ["Before."], ["After."], title="Regional Scores",
+            categories=["A", "B"], values=["0.42", "0.87"], value_format="0.0%",
+        )
+    )
+    _rewritten, groups = extract_and_strip_groups(raw)
+    chart = groups[0]
+    text = f"Before.\n\n{SENTINEL_PREFIX}{chart.id12}\n\nAfter."
+    result = inject_group_markers(text, groups)
+    assert "chart content not analyzed" not in result
+    assert "```mermaid\nxychart-beta" in result
+    assert "| Category | Series 1 |" in result
+    assert "| A | 42.0% |" in result
+    assert result.index("Before.") < result.index("Regional Scores") < result.index("After.")
+
+
+def test_inject_group_markers_chart_kind_empty_extraction_falls_back_to_marker() -> None:
+    """chart-kind с пустым извлечением (нет numCache) -> ТОТ ЖЕ честный
+    маркер, что и до-рефакторинга (caption-фолбэк, не крах/пустой вывод)."""
+    from convert.docx_groups import DocxGroup
+    from convert.chart_data import ChartData
+
+    empty = ChartData(
+        chart_type="other", title=None, value_axis_title=None, value_format=None,
+        stacked=False, categories=(), series=(),
+    )
+    chart = DocxGroup(
+        id12="abc123def456", media_ids=frozenset(), captions=("Title",), kind="chart", chart_data=empty
+    )
+    result = inject_group_markers(f"{SENTINEL_PREFIX}abc123def456", [chart])
+    assert "> [Figure, docx chart abc123def456 — chart content not analyzed]" in result
+    assert "> captions: Title" in result
 
 
 def test_chart_inside_alternate_content_not_detected(tmp_path: Path) -> None:
