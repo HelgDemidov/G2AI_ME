@@ -7,7 +7,7 @@
 #   .venv/bin/python pipeline/scripts/validate_sources.py
 -r requirements.txt
 mypy==2.3.0
-ruff==0.15.21
+ruff==0.15.22
 pytest==9.1.1
 pytest-cov==7.1.0
 types-PyYAML==6.0.12.20260518
