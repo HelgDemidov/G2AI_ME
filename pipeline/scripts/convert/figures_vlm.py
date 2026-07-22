@@ -35,7 +35,7 @@ from typing import Any
 import pdfplumber
 import yaml
 
-from convert import docx_groups, pdf_graphics, pdf_to_markdown, xlsx_charts
+from convert import docx_groups, pdf_graphics, pdf_to_markdown
 from core import fsio, openrouter
 
 logger = logging.getLogger(__name__)
@@ -65,18 +65,9 @@ _DOCX_GROUP_MARKER_RE = re.compile(
     r"> captions: .*$",
     re.MULTILINE,
 )
-# xlsx-чарт (spec convert-xlsx §3, 5-я грамматика маркера): зеркало
-# xlsx_charts.render_chart_marker — 2 строки (маркер + сохранённые captions,
-# zero-loss без VLM), сентинела в потоке нет (у xlsx нет потока), маркер стоит
-# сразу после таблицы своего листа. Sheet — жадный ``.+``: сплит по ПОСЛЕДНЕМУ
-# ``!`` перед якорной ячейкой (лист с «!» в имени — теоретически валиден в
-# OOXML, хоть Excel UI это и блокирует).
-_XLSX_CHART_MARKER_RE = re.compile(
-    r"^> \[Figure, xlsx chart (?P<id>[0-9a-f]{12}) on (?P<sheet>.+)!(?P<anchor>[A-Z]+\d+) — "
-    r"chart content not analyzed\]\n"
-    r"> captions: .*$",
-    re.MULTILINE,
-)
+# xlsx-чарты БОЛЬШЕ НЕ идут через VLM (spec chart-data-extraction §4.3):
+# резолюция data-driven, происходит в момент конвертации (converters._convert_xlsx),
+# не в этой стадии — маркер-грамматика xlsx-чарта здесь больше не нужна.
 
 # Мимо-типы растровых форматов, которые word/media/* реально несёт (spec §2-bis:
 # "картинка уже отдельный файл" — рендер не нужен, только определить content-type
@@ -187,7 +178,6 @@ def has_bare_markers(text: str) -> bool:
         or _IMAGE_MARKER_RE.search(text)
         or _DOCX_IMAGE_MARKER_RE.search(text)
         or _DOCX_GROUP_MARKER_RE.search(text)
-        or _XLSX_CHART_MARKER_RE.search(text)
     )
 
 
@@ -332,9 +322,11 @@ def _content_bbox(page: Any) -> pdf_graphics.BBox | None:
 
 
 def _render_via_soffice(doc_bytes: bytes, *, suffix: str, raw_name: str, obj_id: str, obj_kind: str) -> str | None:
-    """Общий soffice-рендер изолированного мини-документа (docx-группа ИЛИ
-    xlsx-чарт — единственная разница между потребителями: расширение
-    временного файла и как получить ``doc_bytes``) -> PDF -> кроп по bbox
+    """soffice-рендер изолированного мини-документа (единственный оставшийся
+    потребитель — docx composite-группа, ``_render_docx_group``; xlsx-чарты
+    ушли на data-driven путь, spec chart-data-extraction §4.3 — функция
+    осталась параметризованной по расширению/kind, а не сужена под docx,
+    т.к. blast-radius сужения не даёт выигрыша) -> PDF -> кроп по bbox
     контента (``_content_bbox``, формат-агностичная pdfplumber-логика) ->
     data-URI JPEG. Требует системный LibreOffice — та же категория
     зависимости, что tesseract/ocrmypdf у OCR-пути (см.
@@ -394,30 +386,6 @@ def _render_docx_group(raw: Path, id12: str) -> str | None:
     return _render_via_soffice(mini_docx, suffix=".docx", raw_name=raw.name, obj_id=id12, obj_kind="группа")
 
 
-def _render_xlsx_chart(raw: Path, id12: str) -> str | None:
-    """Встроенный xlsx-чарт (spec convert-xlsx §3): изолированная мини-книга
-    (см. ``xlsx_charts.extract_chart_workbook`` — все листы, КРОМЕ
-    листа-хозяина, скрыты; drawing-парт листа-хозяина обрезан до ОДНОГО
-    целевого чарта) -> ``_render_via_soffice``. Известный неоткалиброванный
-    риск (spec §3): crop-геометрия и качество VLM-результата на xlsx НЕ
-    проверены живьём — первый реальный xlsx корпуса обязан пройти
-    adversarial-сверку (см. чек-лист спека, 🔶)."""
-    if not _soffice_available():
-        logger.warning(
-            "%s: soffice не установлен — чарт %s пропущен (sudo apt install libreoffice)",
-            raw.name, id12,
-        )
-        return None
-    mini_wb = xlsx_charts.extract_chart_workbook(raw, id12)
-    if mini_wb is None:
-        logger.warning(
-            "%s: чарт %s не найден при пере-детекции (raw изменился?) — маркер пропущен",
-            raw.name, id12,
-        )
-        return None
-    return _render_via_soffice(mini_wb, suffix=".xlsx", raw_name=raw.name, obj_id=id12, obj_kind="чарт")
-
-
 def _find_region(doc: pdf_to_markdown.DocGraphics, page_num: int, region_id: str) -> pdf_graphics.Region | None:
     if not 1 <= page_num <= len(doc.pages):
         return None
@@ -461,13 +429,6 @@ def _render_injected_docx_group(id12: str, model: str, markdown: str, kind: str 
     )
 
 
-def _render_injected_xlsx_chart(id12: str, sheet: str, anchor: str, model: str, markdown: str) -> str:
-    return (
-        f"> [Figure, xlsx chart {id12} on {sheet}!{anchor} — VLM interpretation ({model}); "
-        f"reconstruction, verify against original]\n\n{markdown}"
-    )
-
-
 def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     """Сканирует ``md_path`` на голые маркеры pdf_graphics, инъецирует VLM-
     интерпретацию (кэш-хит — офлайн; кэш-мисс — рендер+вызов+кэш). Возвращает
@@ -478,8 +439,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     image_matches = list(_IMAGE_MARKER_RE.finditer(text))
     docx_image_matches = list(_DOCX_IMAGE_MARKER_RE.finditer(text))
     docx_group_matches = list(_DOCX_GROUP_MARKER_RE.finditer(text))
-    xlsx_chart_matches = list(_XLSX_CHART_MARKER_RE.finditer(text))
-    if not any((figure_matches, image_matches, docx_image_matches, docx_group_matches, xlsx_chart_matches)):
+    if not any((figure_matches, image_matches, docx_image_matches, docx_group_matches)):
         return False
 
     # Ключ требуется ЛЕНИВО — только когда реально нужен облачный вызов (cache-miss,
@@ -585,24 +545,6 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 cache_dirty = True
             replacements.append(
                 (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"], m.group("kind")))
-            )
-
-        for m in xlsx_chart_matches:
-            cid, sheet, anchor = m.group("id"), m.group("sheet"), m.group("anchor")
-            entry = cache.get(cid)
-            if entry is None:
-                key = _require_key()
-                data_uri = _render_xlsx_chart(raw, cid)  # None -> уже залогировано (см. _render_xlsx_chart)
-                if data_uri is None:
-                    continue
-                markdown = _call_vlm_uri(data_uri, model=model, api_key=key, raw_name=raw.name)
-                if markdown is None:
-                    continue
-                entry = {"model": model, "markdown": markdown, "requested": _dt.date.today().isoformat()}
-                cache[cid] = entry
-                cache_dirty = True
-            replacements.append(
-                (m.start(), m.end(), _render_injected_xlsx_chart(cid, sheet, anchor, entry["model"], entry["markdown"]))
             )
     finally:
         if pdf_doc is not None:
