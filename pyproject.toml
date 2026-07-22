@@ -9,9 +9,9 @@ strict = true
 mypy_path = "pipeline/scripts"
 explicit_package_bases = true
 
-# networkx/tokenizers/onnxruntime/lxml/pypdfium2 не поставляют полноценные типы -> не флагать как «нет стабов».
+# networkx/tokenizers/onnxruntime/lxml/pypdfium2/mermaidx не поставляют полноценные типы -> не флагать как «нет стабов».
 [[tool.mypy.overrides]]
-module = ["networkx.*", "tokenizers.*", "onnxruntime.*", "lxml.*", "mammoth.*", "pypdfium2.*"]
+module = ["networkx.*", "tokenizers.*", "onnxruntime.*", "lxml.*", "mammoth.*", "pypdfium2.*", "mermaidx.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
