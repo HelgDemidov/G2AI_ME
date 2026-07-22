@@ -3,9 +3,10 @@ container-agnostic chart-XML (идентичная DrawingML-схема xlsx/doc
 XML in-memory, собранный ВРУЧНУЮ — ``openpyxl.chart`` для фикстур не годится:
 эмпирически подтверждено (2026-07-22), что ``chart.add_data()`` пишет чарт
 БЕЗ ``c:numCache``/``c:strCache`` вовсе (только ``<c:f>``-ссылку), а v1
-парсера читает ИСКЛЮЧИТЕЛЬНО кэш. Формы XML ниже сверены с реальными чартами
-``tests/fixtures/local/govtech-2025-stats-excerpt.xlsx`` (strLit/xVal-yVal/
-серия без собственного ``c:cat`` — все три живые находки этой сессии)."""
+парсера читает ИСКЛЮЧИТЕЛЬНО кэш. Формы XML ниже сверены с реальными чартами govtech-фикстуры
+(strLit/xVal-yVal/серия без собственного ``c:cat`` — все три живые находки
+этой сессии; фикстура сама с тех пор дважды переименована/пересобрана,
+см. ``tests/fixtures/local/README.md``)."""
 from __future__ import annotations
 
 from lxml import etree
