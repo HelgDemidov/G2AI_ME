@@ -26,6 +26,7 @@ pipeline/scripts/                   # код пайплайна СЛОЕВЫМИ
 #   ├─ run_pipeline.py — оркестратор (верхний уровень, сшивает слои)
 #   ├─ discover.py — CLI дискавери-слоя (`discover [--only id] [--dry-run]` PR #23; `inject`/`worksheet`/`apply [--dry-run]` PR #25) — тоже верхнеуровневый, НЕ шим (реальный код, как run_pipeline.py)
 #   ├─ docs_inventory.py — генератор AUTO-секций docs/pipeline/roadmap/ROADMAP.md (инвентарь блоков + сквозная очередь) из Статус-строк спеков/чартеров; верхнеуровневый, НЕ шим
+#   ├─ memory_lint.py — report-only линт мёртвых якорей в CLAUDE.md/памяти (спек docs/memory/memory-lint, PR #29) против живого репо; allowlist `pipeline/config/memory_lint_allow.yaml`; верхнеуровневый, НЕ шим
 #   ├─ validate_sources.py, corpus_index.py, vector_store.py, ab_eval.py, build_graph.py, pdf_to_markdown.py, hsearch.py
 #   │    — тонкие CLI-ШИМЫ для обратной совместимости команд (НЕ импортировать: библиотека — в пакетах)
 #   └─ tests/    — unit/<слой>/ (герметичные) + integration/ (@model/@corpus/@ocr — внешние ресурсы) + support.py (общие фабрики)
