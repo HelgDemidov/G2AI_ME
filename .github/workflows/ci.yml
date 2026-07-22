@@ -48,16 +48,6 @@ jobs:
           pip install pip-audit
           pip-audit -r requirements.txt -r requirements-dev.txt
 
-      - name: Memory-lint CLAUDE.md (report-only, non-blocking)
-        # Память ассистента вне git — CI её не видит (--memory-dir указывает на
-        # заведомо отсутствующий путь, тул деградирует до сканирования только
-        # трекаемого CLAUDE.md). --include-commands в CI-чекауте реально покрывает
-        # только .claude/skills/ (единственное трекаемое под .claude/ — PR #27,
-        # !/.claude/skills/ негейт) — .claude/commands/ гитигнорится и сюда просто
-        # не попадает, это не баг конфигурации. Никогда не гейт (|| true) —
-        # report-only философия инструмента: видимость дрейфа на PR, не блокировка.
-        run: python pipeline/scripts/memory_lint.py --memory-dir /nonexistent --include-commands || true
-
   # ---------------------------------------------------------------------------
   # Юнит-тесты (pipeline/scripts/tests/unit/) + coverage-гейт. Герметичны —
   # без сети/модели/локального корпуса, зеркалят слоевую структуру pipeline/scripts/.
