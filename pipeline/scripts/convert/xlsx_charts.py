@@ -144,15 +144,21 @@ def _chart_title(chart_root: Any) -> tuple[str, ...]:
     return _filter_caption_texts(title.itertext())
 
 
-def _iter_chart_entries(raw: Path) -> list[tuple[XlsxChart, Any]]:
-    """Общий обход workbook, лист за листом, для ``extract_charts`` (метаданные)
-    И ``extract_chart_roots`` (спек chart-data-extraction §4.1: data-driven
-    рендер нужен УЖЕ распарсенный ``chart_root``, а не только его id12/captions) —
-    один проход zip/XML на оба потребителя, а не два независимых. ``raw`` НЕ
-    изменяется (см. докстроку модуля). Малформед/недостижимая ссылка на любом
-    шаге цепочки (лист без drawing, drawing без rels, чарт-парт отсутствует) —
-    честно пропускается (terminal safety net — конвертация не падает на
-    повреждённом OOXML, симметрично ``_classify_docx``)."""
+def iter_chart_entries(raw: Path) -> list[tuple[XlsxChart, Any]]:
+    """Общий обход workbook, лист за листом: (метаданные, распарсенный
+    ``chart_root``) на каждый чарт — единственный проход по zip/XML.
+    Публичная (не ``_``-префикс), т.к. потребитель, которому нужны ОБА
+    среза сразу (``converters._convert_xlsx`` — метаданные для группировки
+    по листу/сортировки по якорю И roots для ``chart_data.parse_chart``),
+    обязан звать её напрямую ОДИН раз — иначе (живой дефект, найден на
+    ревью) ``extract_charts(raw)`` + ``extract_chart_roots(raw)`` в связке
+    читают и парсят книгу ДВАЖДЫ. ``extract_charts``/``extract_chart_roots``
+    ниже — тонкие обёртки для потребителей, которым нужен только один срез
+    (тесты, точечные проверки). ``raw`` НЕ изменяется (см. докстроку модуля).
+    Малформед/недостижимая ссылка на любом шаге цепочки (лист без drawing,
+    drawing без rels, чарт-парт отсутствует) — честно пропускается
+    (terminal safety net — конвертация не падает на повреждённом OOXML,
+    симметрично ``_classify_docx``)."""
     with zipfile.ZipFile(raw) as z:
         names = set(z.namelist())
         entries: list[tuple[XlsxChart, Any]] = []
@@ -195,17 +201,19 @@ def _iter_chart_entries(raw: Path) -> list[tuple[XlsxChart, Any]]:
 
 def extract_charts(raw: Path) -> list[XlsxChart]:
     """Все встроенные чарты workbook, лист за листом (метаданные — id12/sheet/
-    anchor/captions, БЕЗ распарсенного XML; для data-driven рендера см.
-    ``extract_chart_roots``)."""
-    return [entry for entry, _root in _iter_chart_entries(raw)]
+    anchor/captions, БЕЗ распарсенного XML). Удобная обёртка над
+    ``iter_chart_entries`` для потребителей, которым не нужны roots
+    (напр. точечная проверка в тесте) — для совместного использования
+    метаданных И roots см. докстроку ``iter_chart_entries``."""
+    return [entry for entry, _root in iter_chart_entries(raw)]
 
 
 def extract_chart_roots(raw: Path) -> dict[str, Any]:
     """id12 -> распарсенный ``chart_root`` (spec chart-data-extraction §4.1) —
-    вход для ``chart_data.parse_chart``. Разделено от ``extract_charts``
-    (которому распарсенный XML не нужен снаружи), но обход общий
-    (``_iter_chart_entries``) — воркбук не читается дважды."""
-    return {entry.id12: root for entry, root in _iter_chart_entries(raw)}
+    вход для ``chart_data.parse_chart``. Удобная обёртка над
+    ``iter_chart_entries`` для потребителей, которым не нужны метаданные
+    отдельно (напр. точечная проверка в тесте)."""
+    return {entry.id12: root for entry, root in iter_chart_entries(raw)}
 
 
 def _chart_refs(chart_root: Any) -> list[tuple[str, str]]:

@@ -536,9 +536,14 @@ def _convert_xlsx(
     from convert import xlsx_charts
 
     wb = openpyxl.load_workbook(raw, data_only=True, read_only=False)
-    chart_roots = xlsx_charts.extract_chart_roots(raw)
+    # Метаданные И roots нужны ОБА (группировка/сортировка по листу+якорю,
+    # затем parse_chart на каждый) — один проход книги через iter_chart_entries,
+    # не два независимых extract_charts()+extract_chart_roots() (живой
+    # дефект, найден на ревью: два вызова читали и парсили zip дважды).
+    chart_roots: dict[str, Any] = {}
     charts_by_sheet: dict[str, list[xlsx_charts.XlsxChart]] = {}
-    for chart in xlsx_charts.extract_charts(raw):
+    for chart, chart_root in xlsx_charts.iter_chart_entries(raw):
+        chart_roots[chart.id12] = chart_root
         charts_by_sheet.setdefault(chart.sheet, []).append(chart)
     for charts in charts_by_sheet.values():
         charts.sort(key=lambda c: coordinate_to_tuple(c.anchor_cell))
