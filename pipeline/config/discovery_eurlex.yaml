@@ -1,0 +1,22 @@
+# Тюнинг-параметры discovery-коннектора `eurlex` (EUR-Lex/CELLAR, живой SPARQL).
+# Правится ВРУЧНУЮ; трекается в git (как triage.yaml/discovery_agora.yaml). Спек:
+# docs/pipeline/discovery/tech_specs/discovery-eurlex/spec.md §7.
+
+enabled: true
+sparql_endpoint: "http://publications.europa.eu/webapi/rdf/sparql"
+
+eurovoc_concepts:                       # СПИСОК; VALUES-инъекция в SPARQL (§3). Дефолт v4:
+                                         # ИИ + наследники + smart-technology/cybernetics (OQ2)
+  - "http://eurovoc.europa.eu/3030"       # artificial intelligence
+  - "http://eurovoc.europa.eu/c_3dfe52ca" # machine learning
+  - "http://eurovoc.europa.eu/c_65b9cd79" # artificial neural network
+  - "http://eurovoc.europa.eu/c_67092197" # natural language processing
+  - "http://eurovoc.europa.eu/c_df93fd35" # text and data mining
+  - "http://eurovoc.europa.eu/c_5a195ffd" # smart technology (+67 работ вне 3030)
+  - "http://eurovoc.europa.eu/3293"       # cybernetics (+3)
+  # robotics (3740, +31) — ИСКЛЮЧЁН (v4): ось сильно мимо (механические/промроботы)
+  # ontology (c_782eaeb3) — ИСКЛЮЧЁН: 0 работ вне 3030, тема мимо оси
+
+expression_language: "ENG"              # каноническое выражение (EN); authority/language/<код>
+result_limit: 1000                      # safety-cap SPARQL; упор -> log() усечения
+timeout_seconds: 60
