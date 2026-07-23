@@ -35,9 +35,12 @@ from convert.converters import _convert_xlsx
 
 _FIXTURE = Path(__file__).parent.parent / "fixtures" / "local" / "govtech-2025-charts.xlsx"
 
-pytestmark = pytest.mark.skipif(
-    not _FIXTURE.exists(), reason="тестовая фикстура fixtures/local отсутствует (gitignored)"
-)
+pytestmark = [
+    pytest.mark.mermaid,
+    pytest.mark.skipif(
+        not _FIXTURE.exists(), reason="тестовая фикстура fixtures/local отсутствует (gitignored)"
+    ),
+]
 
 # Все 55 физических xl/charts/*.xml части достижимы (3 листа — Stats/Regions/
 # Trends несут drawing-анкеры) — обрезка листов не трогает ни один chart/drawing
