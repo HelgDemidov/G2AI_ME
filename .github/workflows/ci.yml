@@ -4,7 +4,11 @@ name: CI
 # 4 независимых параллельных джоба (single-responsibility, чёткая атрибуция отказа):
 # quality (ruff+mypy+pip-audit) / test-unit (+coverage) / test-integration / validate-corpus.
 # Модель- и корпус-зависимые тесты (@model — bge-m3 543 МБ; @corpus — локальный sources/,
-# raw.pdf/doc.md не в git) в CI недостижимы: -m "not model and not corpus" везде.
+# raw.pdf/doc.md не в git) в CI недостижимы, как и @ocr/@libreoffice/@mermaid (системные
+# ocrmypdf/soffice не установлены раннером, gitignored-фикстура для mermaid-рендера
+# отсутствует без явной генерации) — explicit-фильтр держит инвариант «эта строка == то,
+# что реально исполняется» явным, не полагаясь молча на совпадающий по эффекту skipif:
+# -m "not model and not corpus and not ocr and not libreoffice and not mermaid" везде.
 on:
   push:
     branches: [main, "feature/**"]
@@ -77,7 +81,8 @@ jobs:
         # здесь дублирует его для гарантии кода возврата (fail_under в конфиге сам по себе
         # не влияет на exit pytest без CLI-флага — проверено эмпирически 2026-07-16).
         run: >
-          python -m pytest pipeline/scripts/tests/unit -m "not model and not corpus"
+          python -m pytest pipeline/scripts/tests/unit
+          -m "not model and not corpus and not ocr and not libreoffice and not mermaid"
           --cov --cov-report=term-missing --cov-fail-under=95
 
   # ---------------------------------------------------------------------------
@@ -111,7 +116,7 @@ jobs:
       - name: Pytest integration (exit 5 = ничего CI-safe не собралось, это ок)
         run: |
           set +e
-          python -m pytest pipeline/scripts/tests/integration -m "not model and not corpus" -v
+          python -m pytest pipeline/scripts/tests/integration -m "not model and not corpus and not ocr and not libreoffice and not mermaid" -v
           code=$?
           if [ "$code" -eq 5 ]; then
             echo "0 CI-safe интеграционных тестов (всё требует model/corpus) — ожидаемо, не отказ."

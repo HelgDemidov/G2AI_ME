@@ -41,6 +41,9 @@ def _render_ok(code: str) -> str:
     return mermaidx.render(code).svg()  # type: ignore[no-any-return]
 
 
+pytestmark = pytest.mark.mermaid  # реальный рендер mermaidx на каждый тест — секунды, не мс
+
+
 def test_pie_with_title_renders_without_literal_quotes_in_title() -> None:
     """Регрессия (найдена на реальном рендере govtech-фикстуры, 2026-07-22):
     заголовок pie — плоская строка, не quote-delimited. Живой формат дефекта:
