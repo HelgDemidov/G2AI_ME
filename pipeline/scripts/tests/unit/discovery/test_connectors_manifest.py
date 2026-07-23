@@ -57,3 +57,49 @@ def test_agora_reachable_via_enabled_connectors_only_filter() -> None:
     )
     result = _run_check(code)
     assert result.returncode == 0, result.stderr
+
+
+def test_importing_discover_cli_registers_eurlex_via_manifest() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert 'eurlex' in registry.CONNECTORS, sorted(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_eurlex_registered_as_registry_kind_and_config_gated_enabled() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "from core import schema\n"
+        "conn = registry.CONNECTORS['eurlex']\n"
+        "assert conn.kind == schema.ConnectorKind.registry\n"
+        "assert conn.enabled is True\n"  # discovery_eurlex.yaml: enabled: true
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_eurlex_reachable_via_enabled_connectors_only_filter() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "found = registry.enabled_connectors(only=['eurlex'])\n"
+        "assert len(found) == 1 and found[0].id == 'eurlex'\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_both_agora_and_eurlex_coexist_in_registry() -> None:
+    """Второй registry-коннектор не вытесняет первый (register() отказал бы на дубль
+    id, но agora/eurlex — разные id) — оба доступны одновременно после импорта манифеста."""
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert {'agora', 'eurlex'} <= set(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr

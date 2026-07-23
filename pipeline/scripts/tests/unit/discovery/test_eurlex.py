@@ -589,3 +589,10 @@ def test_discover_eurlex_new_celex_appears_only_it_is_fresh() -> None:
     second = eurlex.discover_eurlex(first.cursor, config=_fake_config(), fetch=fake_fetch)
     assert [c.native_id for c in second.candidates] == ["32026R0150"]
     assert second.diagnostics["status"] == "fetched"
+
+
+def test_eurlex_connector_implements_protocol() -> None:
+    conn = eurlex.EurlexConnector(enabled=True)
+    assert conn.id == "eurlex"
+    assert conn.kind == schema.ConnectorKind.registry
+    assert conn.enabled is True

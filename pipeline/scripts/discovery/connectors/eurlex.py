@@ -26,7 +26,7 @@ import yaml
 
 from core import schema
 from core.env import REPO_ROOT
-from discovery import dedup
+from discovery import dedup, registry
 from discovery.base import ConnectorCursor, DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_eurlex.yaml"
@@ -356,3 +356,23 @@ def discover_eurlex(
         "skipped_no_title": skipped,
     }
     return DiscoverResult(candidates=fresh, cursor=new_cursor, diagnostics=diagnostics)
+
+
+@dataclass
+class EurlexConnector:
+    """Реализация протокола ``Connector`` (спек §0/§6) — второй экземпляр архетипа
+    `registry`. НЕ ``frozen`` — симметрично ``AgoraConnector`` (Protocol требует
+    settable-атрибуты, даже если ничего не переприсваивается)."""
+
+    id: str = CONNECTOR_ID
+    kind: schema.ConnectorKind = schema.ConnectorKind.registry
+    enabled: bool = True
+
+    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
+        return discover_eurlex(cursor)
+
+
+# Регистрация при импорте (чартер §4.3 «манифест», спек §6): `enabled` — из конфига,
+# не хардкод. Срабатывает один раз за интерпретатор — по факту импорта этого модуля
+# (см. `discovery/connectors/__init__.py` + `discover.py`).
+registry.register(EurlexConnector(enabled=load_config().enabled))
