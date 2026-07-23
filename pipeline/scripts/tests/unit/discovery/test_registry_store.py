@@ -35,9 +35,11 @@ def test_ingest_csv_stamps_provenance_columns(tmp_path: Path) -> None:
     registry_store.ingest_csv(
         conn, schema="agora", table="documents_raw", csv_path=csv_path, source_version="1.31.0"
     )
-    version, ingested_at = conn.execute(
+    row = conn.execute(
         "SELECT _source_version, _ingested_at FROM agora.documents_raw LIMIT 1"
     ).fetchone()
+    assert row is not None
+    version, ingested_at = row
     assert version == "1.31.0"
     assert ingested_at is not None
 
