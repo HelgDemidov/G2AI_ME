@@ -290,6 +290,30 @@ def test_apply_admit_v2_fields_reach_meta_yaml(tmp_path: Path) -> None:
     assert rec.relations[0].target == "eu-ai-act-2024"
 
 
+def test_apply_admit_language_override_reaches_meta_yaml(tmp_path: Path) -> None:
+    """spec discovery-agora §7: registry-кандидат без language (AGORA) промоутится, если
+    decisions.yaml несёт language — иначе promote_candidate отказал бы (тест ниже)."""
+    cand = _candidate(raw_hash="b" * 64, language=None)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    decision = _admit_decision("b" * 64, language="en")
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    rec = schema.load_records(tmp_path)[0]
+    assert rec.language == "en"
+
+
+def test_apply_admit_without_language_override_and_candidate_without_language_errors(
+    tmp_path: Path,
+) -> None:
+    cand = _candidate(raw_hash="b" * 64, language=None)
+    store.save([cand], tmp_path / "candidates.yaml")
+
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert len(summary.errors) == 1
+    assert "language" in summary.errors[0].detail
+
+
 def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Path) -> None:
     good = _candidate(raw_hash="b" * 64)
     bad = _candidate(raw_hash="c" * 64)
