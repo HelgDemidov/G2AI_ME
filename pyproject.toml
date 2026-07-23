@@ -25,6 +25,7 @@ markers = [
     "corpus: тест требует локальный корпус sources/ (в CI пропускается: -m 'not corpus')",
     "ocr: тест требует установленный ocrmypdf (в CI пропускается через skipif — бинарника нет)",
     "libreoffice: тест требует установленный soffice (в CI пропускается через skipif — бинарника нет)",
+    "mermaid: тест гоняет реальный рендер mermaidx (embedded QuickJS) — секунды на тест, не мс",
 ]
 
 [tool.coverage.run]
