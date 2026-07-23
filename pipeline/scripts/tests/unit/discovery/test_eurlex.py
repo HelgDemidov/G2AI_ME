@@ -272,6 +272,41 @@ def test_build_query_uses_expression_language_from_config() -> None:
     assert "authority/language/EST" in query
 
 
+def test_build_query_author_label_filter_follows_expression_language() -> None:
+    """Регресс-гвард на рассинхрон конфиг/код (найдено куратором): раньше
+    ``FILTER(LANG(?authorLabel) = "en")`` был захардкожен независимо от
+    ``expression_language`` — теперь единый источник (``resolve_iso_language``)."""
+    query = eurlex.build_query(_fake_config(expression_language="EST"))
+    assert 'FILTER(LANG(?authorLabel) = "et")' in query
+    assert 'FILTER(LANG(?authorLabel) = "en")' not in query
+
+
+def test_build_query_unknown_expression_language_raises() -> None:
+    with pytest.raises(ValueError, match="expression_language"):
+        eurlex.build_query(_fake_config(expression_language="XXX"))
+
+
+# --- resolve_iso_language ---
+
+
+def test_resolve_iso_language_known_codes() -> None:
+    assert eurlex.resolve_iso_language("ENG") == "en"
+    assert eurlex.resolve_iso_language("EST") == "et"  # НЕ "es" (первые-2-буквы труncation — Spanish)
+    assert eurlex.resolve_iso_language("HRV") == "hr"
+    assert eurlex.resolve_iso_language("FRA") == "fr"
+    assert eurlex.resolve_iso_language("CES") == "cs"  # НЕ "ce"/"cz"
+    assert eurlex.resolve_iso_language("GLE") == "ga"  # Irish — не первые 2 буквы GLE
+
+
+def test_resolve_iso_language_case_insensitive() -> None:
+    assert eurlex.resolve_iso_language("eng") == "en"
+
+
+def test_resolve_iso_language_unknown_code_raises_with_helpful_message() -> None:
+    with pytest.raises(ValueError, match="XXX"):
+        eurlex.resolve_iso_language("XXX")
+
+
 # --- parse_bindings ---
 
 
@@ -474,6 +509,22 @@ def test_map_group_missing_date_gives_none() -> None:
     assert candidates[0].doc_date is None
 
 
+def test_map_group_language_and_url_follow_iso_lang_param() -> None:
+    """Регресс-гвард на рассинхрон (найдено куратором): раньше ``language``/URL-сегмент
+    были захардкожены на ``"en"``/``"EN"`` независимо от того, что реально передано."""
+    rows = eurlex.parse_bindings(
+        _sparql_json(
+            [_row("32024R1689", date="2024-06-13", title="AI Akt", author="Euroopa Parlament")]
+        )
+    )
+    candidates, _ = eurlex.map_rows_to_candidates(rows, iso_lang="et")
+    cand = candidates[0]
+    assert cand.language == "et"
+    assert cand.source_url == (
+        "https://eur-lex.europa.eu/legal-content/ET/TXT/HTML/?uri=CELEX:32024R1689"
+    )
+
+
 def test_map_group_no_author_gives_none_issuer_not_fabricated() -> None:
     """EUR-Lex не даёт автора для этой (гипотетической) строки — issuer=None, не
     фабрикуем дефолт ('European Union' и т.п.); строгий промоушен упадёт явно (§6)."""
@@ -589,6 +640,41 @@ def test_discover_eurlex_new_celex_appears_only_it_is_fresh() -> None:
     second = eurlex.discover_eurlex(first.cursor, config=_fake_config(), fetch=fake_fetch)
     assert [c.native_id for c in second.candidates] == ["32026R0150"]
     assert second.diagnostics["status"] == "fetched"
+
+
+def test_discover_eurlex_non_default_expression_language_propagates_end_to_end() -> None:
+    """Полный регресс-гвард через реальную точку входа (не изолированные юниты):
+    смена ``expression_language`` в конфиге теперь согласованно доходит до
+    ``CandidateRecord.language`` И до URL, а не только до текста SPARQL-запроса."""
+    sparql_json = _sparql_json(
+        [_row("32024R1689", date="2024-06-13", title="AI Akt", author="Euroopa Parlament")]
+    )
+
+    def fake_fetch(query: str, *, endpoint: str, timeout: float) -> dict[str, Any]:
+        assert 'FILTER(LANG(?authorLabel) = "et")' in query  # запрос тоже согласован
+        return sparql_json
+
+    result = eurlex.discover_eurlex(
+        None, config=_fake_config(expression_language="EST"), fetch=fake_fetch
+    )
+    cand = result.candidates[0]
+    assert cand.language == "et"
+    assert cand.source_url == (
+        "https://eur-lex.europa.eu/legal-content/ET/TXT/HTML/?uri=CELEX:32024R1689"
+    )
+
+
+def test_discover_eurlex_unknown_expression_language_fails_before_network_call() -> None:
+    """Невалидный конфиг должен упасть ДО сетевого похода, не после (fail-fast)."""
+    calls: list[str] = []
+
+    def fake_fetch(query: str, *, endpoint: str, timeout: float) -> dict[str, Any]:
+        calls.append(query)
+        return _sparql_json([])
+
+    with pytest.raises(ValueError, match="expression_language"):
+        eurlex.discover_eurlex(None, config=_fake_config(expression_language="XXX"), fetch=fake_fetch)
+    assert calls == []  # сеть не тронута
 
 
 def test_eurlex_connector_implements_protocol() -> None:

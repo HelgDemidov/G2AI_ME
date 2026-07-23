@@ -109,10 +109,49 @@ def diff_cursor(
     return fresh_ids, {"seen_celex": new_seen}
 
 
-# --- §3: SPARQL-запрос (широкий тег-фильтр — тип решает триаж, не коннектор) ---
-
+# --- производный язык: единый источник — expression_language конфига ---
 
 _LANGUAGE_AUTHORITY = "http://publications.europa.eu/resource/authority/language"
+
+# EU authority alpha-3 (значения expression_language/cdm:expression_uses_language) ->
+# ISO 639-1 alpha-2 (CandidateRecord.language / URL-сегмент eur-lex.europa.eu /
+# LANG()-фильтр SPARQL). Живьём сверено с authority/language SPARQL-таблицей CELLAR
+# (2026-07-23, skos:exactMatch -> id.loc.gov/vocabulary/iso639-1/<код>) — НЕ по памяти:
+# первые-2-буквы труncation не работает (EST -> "et", не "ES" — это испанский код).
+# Скоуп — ровно 24 официальных языка ЕС: EUR-Lex физически не публикует ни на каких
+# других (см. чартер §2 "24 языка, вкл. et/hr" — это и есть исчерпывающий список).
+_EXPRESSION_LANGUAGE_TO_ISO = {
+    "BUL": "bg", "HRV": "hr", "CES": "cs", "DAN": "da", "NLD": "nl", "ENG": "en",
+    "EST": "et", "FIN": "fi", "FRA": "fr", "DEU": "de", "ELL": "el", "HUN": "hu",
+    "GLE": "ga", "ITA": "it", "LAV": "lv", "LIT": "lt", "MLT": "mt", "POL": "pl",
+    "POR": "pt", "RON": "ro", "SLK": "sk", "SLV": "sl", "SPA": "es", "SWE": "sv",
+}
+
+
+def resolve_iso_language(expression_language: str) -> str:
+    """``expression_language``-конфиг (EU authority alpha-3) -> ISO 639-1 alpha-2 —
+    ЕДИНЫЙ источник для трёх мест, которые раньше были захардкожены на ``"en"``
+    независимо друг от друга (URL-сегмент, ``CandidateRecord.language``, SPARQL
+    LANG()-фильтр издателя): смена ``expression_language`` в конфиге раньше молча НЕ
+    доходила ни до одного из них — рассинхрон конфиг/код, найденный куратором.
+
+    Неизвестный код -> ``ValueError`` (не молчаливая порча значения): в отличие от
+    ``decode_celex_type``/``concept_label`` (pre-signal триажу, безобидная ошибка),
+    ``language`` становится частью ``CandidateRecord.language`` -> ``SourceRecord.language``
+    -> реальные решения слоя знаний (фасеты/retrieval/OCR-языки) — неверный, но
+    похожий на правду код здесь опаснее явного отказа.
+    """
+    iso = _EXPRESSION_LANGUAGE_TO_ISO.get(expression_language.upper())
+    if iso is None:
+        known = ", ".join(sorted(_EXPRESSION_LANGUAGE_TO_ISO))
+        raise ValueError(
+            f"неизвестный expression_language {expression_language!r} — "
+            f"добавьте в _EXPRESSION_LANGUAGE_TO_ISO или используйте один из: {known}"
+        )
+    return iso
+
+
+# --- §3: SPARQL-запрос (широкий тег-фильтр — тип решает триаж, не коннектор) ---
 
 
 def build_query(config: EurlexConfig) -> str:
@@ -123,6 +162,7 @@ def build_query(config: EurlexConfig) -> str:
         raise ValueError("eurovoc_concepts пуст — нечего искать")
     values = "\n".join(f"    <{c}>" for c in config.eurovoc_concepts)
     language_uri = f"{_LANGUAGE_AUTHORITY}/{config.expression_language}"
+    iso_lang = resolve_iso_language(config.expression_language)
     return f"""
 PREFIX cdm:  <http://publications.europa.eu/ontology/cdm#>
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -140,7 +180,7 @@ SELECT ?celex ?date ?title ?authorLabel ?concept WHERE {{
   }}
   OPTIONAL {{
     ?work cdm:work_created_by_agent ?agent .
-    ?agent skos:prefLabel ?authorLabel . FILTER(LANG(?authorLabel) = "en")
+    ?agent skos:prefLabel ?authorLabel . FILTER(LANG(?authorLabel) = "{iso_lang}")
   }}
 }} ORDER BY DESC(?date) LIMIT {config.result_limit}
 """
@@ -252,8 +292,8 @@ def concept_label(uri: str) -> str:
 # --- §5: маппинг сгруппированного результата -> CandidateRecord ---
 
 
-def _build_source_url(celex: str) -> str:
-    return f"https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:{celex}"
+def _build_source_url(celex: str, iso_lang: str) -> str:
+    return f"https://eur-lex.europa.eu/legal-content/{iso_lang.upper()}/TXT/HTML/?uri=CELEX:{celex}"
 
 
 def _decode_date(raw: str | None) -> dt.date | None:
@@ -265,15 +305,21 @@ def _decode_date(raw: str | None) -> dt.date | None:
         return None
 
 
-def _map_group(celex: str, entry: dict[str, Any]) -> schema.CandidateRecord | None:
+def _map_group(
+    celex: str, entry: dict[str, Any], *, iso_lang: str
+) -> schema.CandidateRecord | None:
     """Одна сгруппированная запись -> ``CandidateRecord``. ``None`` — пропуск: без
-    непустого EN-заголовка кандидат непромоутим (``title`` обязателен) — data-quality
-    отсев (§0/§5), НЕ relevance-суждение о типе документа."""
+    непустого заголовка на ``iso_lang`` кандидат непромоутим (``title`` обязателен) —
+    data-quality отсев (§0/§5), НЕ relevance-суждение о типе документа.
+
+    ``iso_lang`` — РЕЗОЛЬВНУТЫЙ (``resolve_iso_language``) код, тот же, что ушёл в
+    SPARQL-запрос (§3) — источник ``language`` записи и URL-сегмента, ни то ни другое
+    больше не хардкожено на ``"en"`` независимо от конфига."""
     title = entry.get("title")
     if not title:
         return None
 
-    source_url = _build_source_url(celex)
+    source_url = _build_source_url(celex, iso_lang)
     authors: list[str] = entry.get("authors") or []
     issuer = " / ".join(authors) if authors else None
     doc_date = _decode_date(entry.get("date"))
@@ -292,7 +338,7 @@ def _map_group(celex: str, entry: dict[str, Any]) -> schema.CandidateRecord | No
         issuer=issuer,
         jurisdiction="European Union",
         doc_date=doc_date,
-        language="en",
+        language=iso_lang,
         source_url=source_url,
         native_summary=None,
         native_id=celex,
@@ -306,9 +352,14 @@ def _map_group(celex: str, entry: dict[str, Any]) -> schema.CandidateRecord | No
 
 
 def map_rows_to_candidates(
-    rows: list[dict[str, str | None]],
+    rows: list[dict[str, str | None]], *, iso_lang: str = "en",
 ) -> tuple[list[schema.CandidateRecord], int]:
     """Сгруппировать строки по CELEX (§3) и замаппить в ``CandidateRecord`` (§5).
+
+    ``iso_lang`` — РЕЗОЛЬВНУТЫЙ (``resolve_iso_language``) ISO 639-1 код; вызывающая
+    сторона (``discover_eurlex``) резолвит его из ``config.expression_language`` и
+    передаёт сюда. Дефолт ``"en"`` — для прямых вызовов этой функции с фикстурой без
+    полного конфига (обратная совместимость существующих тестов).
 
     Возвращает ``(кандидаты, пропущено_без_заголовка)`` — пропуск не роняет батч.
     Порядок кандидатов следует порядку первого появления CELEX во входных строках
@@ -318,7 +369,7 @@ def map_rows_to_candidates(
     candidates: list[schema.CandidateRecord] = []
     skipped = 0
     for celex, entry in grouped.items():
-        cand = _map_group(celex, entry)
+        cand = _map_group(celex, entry, iso_lang=iso_lang)
         if cand is None:
             skipped += 1
             continue
@@ -339,10 +390,11 @@ def discover_eurlex(
     -> распарсить -> сгруппировать+замаппить -> отфильтровать по seen-CELEX-курсору.
     ``fetch`` инжектируем — тесты подменяют фейком, сеть в CI не участвует."""
     cfg = config or load_config()
+    iso_lang = resolve_iso_language(cfg.expression_language)
     query = build_query(cfg)
     sparql_json = fetch(query, endpoint=cfg.sparql_endpoint, timeout=cfg.timeout_seconds)
     rows = parse_bindings(sparql_json)
-    candidates, skipped = map_rows_to_candidates(rows)
+    candidates, skipped = map_rows_to_candidates(rows, iso_lang=iso_lang)
 
     all_ids = [c.native_id for c in candidates if c.native_id]
     fresh_ids, new_cursor = diff_cursor(all_ids, cursor)
