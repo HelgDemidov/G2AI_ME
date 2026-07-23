@@ -144,6 +144,8 @@ def _build_fixture_zip(zip_path: Path) -> None:
         zf.writestr("agora/documents.csv", documents_csv)
         zf.writestr("agora/authorities.csv", authorities_csv)
         zf.writestr("agora/collections.csv", "Name,Description\n")
+        zf.writestr("agora/segments.csv", "decoy — discovery не использует\n")
+        zf.writestr("agora/fulltext/1.txt", "decoy per-document plaintext — discovery не использует\n")
 
 
 def test_ingest_dump_loads_documents_and_authorities(tmp_path: Path) -> None:
@@ -175,6 +177,21 @@ def test_ingest_dump_replaces_on_second_call_with_new_version(tmp_path: Path) ->
     version = conn.execute("SELECT DISTINCT _source_version FROM agora.documents_raw").fetchall()
     conn.close()
     assert version == [("1.1.0",)]  # старая версия не осталась (REPLACE, не UNION)
+
+
+def test_ingest_dump_never_persists_fulltext_or_extra_members(tmp_path: Path) -> None:
+    """Найдено куратором вживую (2026-07-23): extractall() распаковывал ВЕСЬ архив,
+    включая fulltext/ (1000+ файлов на реальном дампе) и segments.csv — discovery их
+    не использует (§Вне скоупа). Извлечение теперь избирательное + во временную папку —
+    после ingest_dump() рядом с zip не должно остаться НИЧЕГО, кроме самого zip."""
+    zip_path = tmp_path / "agora-1.0.0.zip"
+    _build_fixture_zip(zip_path)
+    db_path = tmp_path / "registry.duckdb"
+
+    agora.ingest_dump(zip_path, source_version="1.0.0", db_path=db_path)
+
+    leftovers = {p.name for p in tmp_path.iterdir()} - {zip_path.name, db_path.name}
+    assert leftovers == set(), f"остались лишние файлы/папки рядом с кэшем: {leftovers}"
 
 
 # --- гибрид-фильтр + маппинг (§4/§5) ---

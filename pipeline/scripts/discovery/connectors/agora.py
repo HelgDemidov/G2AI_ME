@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import tempfile
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -123,32 +124,41 @@ def download_zip(download_url: str, dest: Path, *, timeout: float = 300.0) -> No
 def ingest_dump(
     zip_path: Path, *, source_version: str, db_path: Path = registry_store.DEFAULT_DB_PATH
 ) -> None:
-    """Распаковать zip и загрузить ``documents.csv``+``authorities.csv`` в ``registry.duckdb``.
+    """Загрузить ``documents.csv``+``authorities.csv`` из zip в ``registry.duckdb``.
 
     CSV лежат в подпапке ``agora/`` ВНУТРИ архива (проверено живьём на реальном дампе,
-    не в корне zip) — распаковка идёт во временную папку рядом с zip-кэшем, не в его корень.
+    не в корне zip). Распаковываются ТОЛЬКО эти два члена архива, во временную папку,
+    которая удаляется по выходу из ``with`` — НЕ ``extractall`` (архив несёт также
+    ``segments.csv``/``fulltext/*``: посегментный AGORA-plaintext, 1000+ файлов на
+    реальном дампе, которые discovery не использует, §Вне скоупа — извлекать их на
+    диск, пусть даже временно, значило бы обрабатывать чужой текст документов сверх
+    заявленного скоупа коннектора и захламлять кэш).
     """
-    extract_dir = zip_path.parent / f"_extract-{source_version}"
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(extract_dir)
-    conn = registry_store.connect(db_path)
-    try:
-        registry_store.ingest_csv(
-            conn,
-            schema="agora",
-            table="documents_raw",
-            csv_path=extract_dir / "agora" / "documents.csv",
-            source_version=source_version,
-        )
-        registry_store.ingest_csv(
-            conn,
-            schema="agora",
-            table="authorities_raw",
-            csv_path=extract_dir / "agora" / "authorities.csv",
-            source_version=source_version,
-        )
-    finally:
-        conn.close()
+    members = ("agora/documents.csv", "agora/authorities.csv")
+    with tempfile.TemporaryDirectory(prefix="agora-extract-") as tmp_dir:
+        extract_dir = Path(tmp_dir)
+        with zipfile.ZipFile(zip_path) as zf:
+            for member in members:
+                zf.extract(member, extract_dir)
+
+        conn = registry_store.connect(db_path)
+        try:
+            registry_store.ingest_csv(
+                conn,
+                schema="agora",
+                table="documents_raw",
+                csv_path=extract_dir / "agora" / "documents.csv",
+                source_version=source_version,
+            )
+            registry_store.ingest_csv(
+                conn,
+                schema="agora",
+                table="authorities_raw",
+                csv_path=extract_dir / "agora" / "authorities.csv",
+                source_version=source_version,
+            )
+        finally:
+            conn.close()
 
 
 # --- §4: гибрид-фильтр (все не-US + US-проба по узкой оси agentic_g2ai) ---
