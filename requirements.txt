@@ -6,6 +6,7 @@ mammoth==1.12.0       # DOCX -> HTML (convert/converters.py: _convert_docx, cust
 markdownify==1.2.3    # HTML -> Markdown (там же, сабкласс _DocxMarkdownify)
 lxml==6.1.1           # ELI-разметка -> <hN> до trafilatura (convert/eli.py); транзитивно у trafilatura, здесь — прямой импорт
 openpyxl==3.1.5       # XLSX -> Markdown (convert/converters.py: _convert_xlsx, convert/xlsx_charts.py)
+duckdb==1.5.5         # bronze-слой сырья registry-коннекторов discovery (discovery/registry_store.py)
 mermaidx==0.9.3       # render-валидация mermaid-вывода настоящим mermaid.js (embedded QuickJS, без Node/браузера) —
                       # chart_render.py::_mermaid_renders, штатный gate перед выдачей mermaid-блока (не dev-only)
 pydantic==2.13.4      # схема метаданных sources.yaml (schema.py)

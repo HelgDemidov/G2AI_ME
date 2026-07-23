@@ -25,6 +25,7 @@ import pytest
 
 from convert import converters
 from core import schema
+from discovery import registry_store
 from index import corpus_index
 
 
@@ -45,6 +46,7 @@ _GUARDED_REAL_ARTIFACTS = (
     corpus_index.DEFAULT_DB,
     schema.DEFAULT_SOURCES / "candidates.yaml",
     schema.DEFAULT_SOURCES / ".discovery_cursors.yaml",
+    registry_store.DEFAULT_DB_PATH,
 )
 
 
