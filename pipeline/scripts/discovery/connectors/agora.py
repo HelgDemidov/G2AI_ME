@@ -23,7 +23,7 @@ import yaml
 
 from core import schema
 from core.env import REPO_ROOT
-from discovery import dedup, registry_store
+from discovery import dedup, registry, registry_store
 from discovery.base import ConnectorCursor, DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_agora.yaml"
@@ -349,9 +349,13 @@ def discover_agora(
     return DiscoverResult(candidates=candidates, cursor=new_cursor, diagnostics=diagnostics)
 
 
-@dataclass(frozen=True)
+@dataclass
 class AgoraConnector:
-    """Реализация протокола ``Connector`` (спек §0/§6) — первый экземпляр архетипа `registry`."""
+    """Реализация протокола ``Connector`` (спек §0/§6) — первый экземпляр архетипа `registry`.
+
+    НЕ ``frozen`` — ``Connector`` Protocol объявляет ``id``/``kind``/``enabled`` как
+    settable-атрибуты (mypy требует симметрии, не read-only) даже там, где реально
+    ничего не переприсваивается."""
 
     id: str = CONNECTOR_ID
     kind: schema.ConnectorKind = schema.ConnectorKind.registry
@@ -359,3 +363,9 @@ class AgoraConnector:
 
     def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
         return discover_agora(cursor)
+
+
+# Регистрация при импорте (чартер §4.3 «манифест», спек §6): `enabled` — из конфига,
+# не хардкод (коннектор конфиг-гейтед). Срабатывает один раз за интерпретатор — по
+# факту импорта этого модуля (см. `discovery/connectors/__init__.py` + `discover.py`).
+registry.register(AgoraConnector(enabled=load_config().enabled))

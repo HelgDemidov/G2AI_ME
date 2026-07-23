@@ -15,7 +15,7 @@ from typing import Any
 import yaml
 
 from core import schema, validate_sources
-from discovery import manual, store
+from discovery import connectors, manual, store  # noqa: F401 — connectors: манифест реальных коннекторов (§4.3)
 from discovery.orchestrate import DiscoverySummary, discover
 
 
