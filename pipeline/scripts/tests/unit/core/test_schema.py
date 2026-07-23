@@ -462,6 +462,66 @@ def test_promote_candidate_missing_source_url_raises() -> None:
         )
 
 
+def test_promote_candidate_language_override_success() -> None:
+    """spec discovery-agora §7: registry-каналы (AGORA) не дают язык — триаж подаёт
+    его через override при admit, симметрично doc_type/authority."""
+    data = valid_candidate()
+    data.update(title="Doc", issuer="Gov", source_url="https://ex.org/d.pdf")  # без language
+    cand = CandidateRecord.model_validate(data)
+    assert cand.language is None
+    rec = promote_candidate(
+        cand,
+        id="us-cabinet-agentic-2026",
+        entity_id="us",
+        track=Track.intl_xperience,
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="framework",
+        authority="soft_law",
+        relevance=_relevance(),
+        language="en",
+    )
+    assert rec.language == "en"
+
+
+def test_promote_candidate_language_override_none_and_candidate_none_raises() -> None:
+    """Без override И без языка у кандидата — прежнее поведение (ValueError), не тихий None."""
+    data = valid_candidate()
+    data.update(title="Doc", issuer="Gov", source_url="https://ex.org/d.pdf")  # без language
+    cand = CandidateRecord.model_validate(data)
+    with pytest.raises(ValueError, match="language"):
+        promote_candidate(
+            cand,
+            id="x-y-2026",
+            entity_id="xx",
+            track=Track.intl_xperience,
+            issuer_type=IssuerType.government,
+            geo_scope=GeoScope.national,
+            doc_type="framework",
+            authority="soft_law",
+            relevance=_relevance(),
+        )
+
+
+def test_promote_candidate_language_on_candidate_wins_without_override() -> None:
+    """manual-кандидат с языком (inject) продолжает работать без override — обратная совместимость."""
+    data = valid_candidate()
+    data.update(title="Doc", issuer="Gov", language="cnr", source_url="https://ex.org/d.pdf")
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="me-example-2026",
+        entity_id="me",
+        track=Track.montenegro,
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="framework",
+        authority="soft_law",
+        relevance=_relevance(),
+    )
+    assert rec.language == "cnr"
+
+
 def test_operational_state_default() -> None:
     st = OperationalState()
     assert st.sha256 is None

@@ -493,6 +493,7 @@ def promote_candidate(
     g2ai_pattern: list[str] | None = None,
     summary: str | None = None,
     relations: list[Relation] | None = None,
+    language: str | None = None,
 ) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
@@ -510,14 +511,21 @@ def promote_candidate(
     опустить эти аргументы по-прежнему штатно — ленивая Стадия 2 доберёт (triage-channel-policy §2).
     Словарную принадлежность ``topics``/``g2ai_pattern`` эта функция не проверяет — как и раньше,
     это ``validate_sources.py`` (schema словарей не грузит).
+
+    ``language`` (v3, spec discovery-agora §7) — опциональный override триажа: registry-каналы
+    (AGORA и т.п.) структурно не дают язык в метаданных реестра, а ``promote_candidate`` требует
+    его non-None — резолюция ``language if language is not None else cand.language`` (override
+    побеждает, ``None`` -> прежнее поведение). manual/directed_search-кандидаты с языком на
+    ``inject`` продолжают работать без override (обратная совместимость).
     """
-    title, issuer, language, source_url = cand.title, cand.issuer, cand.language, cand.source_url
+    title, issuer, source_url = cand.title, cand.issuer, cand.source_url
+    resolved_language = language if language is not None else cand.language
     missing = [
         name
         for name, val in (
             ("title", title),
             ("issuer", issuer),
-            ("language", language),
+            ("language", resolved_language),
             ("source_url", source_url),
         )
         if val is None
@@ -529,7 +537,7 @@ def promote_candidate(
             f"нельзя промоутить без полей: {', '.join(missing)}"
         )
     assert title is not None and issuer is not None
-    assert language is not None and source_url is not None
+    assert resolved_language is not None and source_url is not None
 
     return SourceRecord(
         id=id,
@@ -539,7 +547,7 @@ def promote_candidate(
         issuer=issuer,
         issuer_type=issuer_type,
         geo_scope=geo_scope,
-        language=language,
+        language=resolved_language,
         dates=Dates(published=cand.doc_date),
         doc_type=doc_type,
         authority=authority,

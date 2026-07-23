@@ -7,6 +7,11 @@
 ВНИМАНИЕ: на маленьком корпусе это смоук-сравнение плумбинга и первый сигнал, а не
 строгий бенчмарк — становится показательным по мере роста корпуса. Векторные режимы
 требуют .env с OPENROUTER_API_KEY (для эталона, опционально) и локально скачанный bge-m3.
+
+Помимо hit@1/hit@k считает MRR и precision@5 (бэклог §17, eval-precision-metrics,
+паспорт `/landscape` 2026-07-23): hit@k слеп к качеству ранжирования ВНУТРИ топа —
+выигрыш будущего реранкера (§17, rerank-layer-over-rrf) этим харнессом было бы
+нечем измерить.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ from core.env import REPO_ROOT, load_dotenv
 from index.vector_store import check_chunk_budget, chunk_hashes, embed_and_store, semantic_search
 
 DEFAULT_EVAL_QUERIES = REPO_ROOT / "pipeline" / "config" / "eval_queries.yaml"
+PRECISION_AT_K = 5  # глубина precision@5; поисковые вызовы ниже берут max(k, это)
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,8 @@ class QueryOutcome:
     query: str
     hit1: bool
     hitk: bool
+    reciprocal_rank: float  # 1/ранг первого чанка с ожидаемым термином; 0.0 — не найден
+    precision5: float  # доля чанков с ожидаемым термином в топ-PRECISION_AT_K
     top_score: float
     lang: str
 
@@ -74,6 +82,8 @@ class ModelResult:
     name: str  # напр. "fts" (модель-независим) или "bge-m3-onnx-int8 · hybrid"
     hit1_rate: float
     hitk_rate: float
+    mrr: float
+    precision5_rate: float
     outcomes: list[QueryOutcome]
 
 
@@ -86,12 +96,35 @@ def hit_at_k(ranked_texts: list[str], expect: tuple[str, ...], k: int) -> bool:
     return False
 
 
+def reciprocal_rank(ranked_texts: list[str], expect: tuple[str, ...]) -> float:
+    """1/ранг (1-based) первого чанка с ожидаемым термином среди ``ranked_texts``;
+    0.0, если термин не встретился ни в одном из них."""
+    for i, text in enumerate(ranked_texts, start=1):
+        low = text.lower()
+        if any(term in low for term in expect):
+            return 1.0 / i
+    return 0.0
+
+
+def precision_at_k(ranked_texts: list[str], expect: tuple[str, ...], k: int) -> float:
+    """Доля чанков с ожидаемым термином в топ-k. Делится на РЕАЛЬНОЕ число
+    полученных кандидатов (может быть < k на маленьком индексе), не на k формально
+    — иначе тонкий корпус штрафуется за нехватку кандидатов, а не за ранжирование."""
+    window = ranked_texts[:k]
+    if not window:
+        return 0.0
+    hits = sum(1 for text in window if any(term in text.lower() for term in expect))
+    return hits / len(window)
+
+
 def _summarize(name: str, outcomes: list[QueryOutcome], n_queries: int) -> ModelResult:
     n = n_queries or 1
     return ModelResult(
         name,
         sum(o.hit1 for o in outcomes) / n,
         sum(o.hitk for o in outcomes) / n,
+        sum(o.reciprocal_rank for o in outcomes) / n,
+        sum(o.precision5 for o in outcomes) / n,
         outcomes,
     )
 
@@ -100,8 +133,9 @@ def evaluate_fts(conn: sqlite3.Connection, queries: list[ControlQuery], k: int =
     """fts-режим: ранжированные ПОЛНЫЕ тексты (не snippet) из ``fts_search`` —
     модель-независим, вычисляется один раз вне зависимости от выбора эмбеддера."""
     outcomes: list[QueryOutcome] = []
+    search_depth = max(k, PRECISION_AT_K)
     for cq in queries:
-        hits = fts_search(conn, sanitize_fts_query(cq.query), k)
+        hits = fts_search(conn, sanitize_fts_query(cq.query), search_depth)
         ranked = []
         for h in hits:
             row = conn.execute(
@@ -114,6 +148,8 @@ def evaluate_fts(conn: sqlite3.Connection, queries: list[ControlQuery], k: int =
                 cq.query,
                 hit_at_k(ranked, cq.expect, 1),
                 hit_at_k(ranked, cq.expect, k),
+                reciprocal_rank(ranked, cq.expect),
+                precision_at_k(ranked, cq.expect, PRECISION_AT_K),
                 hits[0].rank if hits else 0.0,  # bm25: меньше = лучше (в отличие от cosine-строк ниже)
                 cq.lang,
             )
@@ -136,15 +172,18 @@ def evaluate_vector(
     только что добавленным) на запрос."""
     embed_and_store(conn, embedder, hashes, texts)
     outcomes: list[QueryOutcome] = []
+    search_depth = max(k, PRECISION_AT_K)
     for cq in queries:
         query_vec = embedder.embed([cq.query], kind="query")
-        hits = semantic_search(conn, query_vec[0], embedder.name, k)
+        hits = semantic_search(conn, query_vec[0], embedder.name, search_depth)
         ranked = [h.text for h in hits]
         outcomes.append(
             QueryOutcome(
                 cq.query,
                 hit_at_k(ranked, cq.expect, 1),
                 hit_at_k(ranked, cq.expect, k),
+                reciprocal_rank(ranked, cq.expect),
+                precision_at_k(ranked, cq.expect, PRECISION_AT_K),
                 hits[0].score if hits else 0.0,
                 cq.lang,
             )
@@ -158,14 +197,17 @@ def evaluate_hybrid(
     """hybrid-режим: ``retrieve()`` (RRF FTS+вектор). Предполагает, что векторы
     ``embedder`` УЖЕ сохранены (см. ``evaluate_vector`` — вызывается раньше в main)."""
     outcomes: list[QueryOutcome] = []
+    search_depth = max(k, PRECISION_AT_K)
     for cq in queries:
-        scored = retrieve(conn, cq.query, embedder, k)
+        scored = retrieve(conn, cq.query, embedder, search_depth)
         ranked = [c.text for c in scored]
         outcomes.append(
             QueryOutcome(
                 cq.query,
                 hit_at_k(ranked, cq.expect, 1),
                 hit_at_k(ranked, cq.expect, k),
+                reciprocal_rank(ranked, cq.expect),
+                precision_at_k(ranked, cq.expect, PRECISION_AT_K),
                 scored[0].rrf_score if scored else 0.0,
                 cq.lang,
             )
@@ -175,10 +217,16 @@ def evaluate_hybrid(
 
 def _report(results: list[ModelResult], k: int, n_queries: int) -> None:
     print("=" * 72)
-    print(f"A/B качества retrieval — hit@1 / hit@{k} на {n_queries} контрольных запросах")
+    print(
+        f"A/B качества retrieval — hit@1 / hit@{k} / MRR / precision@{PRECISION_AT_K} "
+        f"на {n_queries} контрольных запросах"
+    )
     print("=" * 72)
     for res in results:
-        print(f"\n### {res.name}   hit@1={res.hit1_rate:.0%}   hit@{k}={res.hitk_rate:.0%}")
+        print(
+            f"\n### {res.name}   hit@1={res.hit1_rate:.0%}   hit@{k}={res.hitk_rate:.0%}"
+            f"   MRR={res.mrr:.3f}   precision@{PRECISION_AT_K}={res.precision5_rate:.0%}"
+        )
         for out in res.outcomes:
             mark = "✓" if out.hit1 else ("~" if out.hitk else "✗")
             print(f"  {mark} [top={out.top_score:.3f}] {out.query}")
@@ -191,7 +239,12 @@ def _report(results: list[ModelResult], k: int, n_queries: int) -> None:
                 n = len(sub) or 1
                 h1 = sum(out.hit1 for out in sub) / n
                 hk = sum(out.hitk for out in sub) / n
-                print(f"    {lang}: hit@1={h1:.0%} hit@{k}={hk:.0%} (n={len(sub)})")
+                mrr = sum(out.reciprocal_rank for out in sub) / n
+                p5 = sum(out.precision5 for out in sub) / n
+                print(
+                    f"    {lang}: hit@1={h1:.0%} hit@{k}={hk:.0%} "
+                    f"MRR={mrr:.3f} precision@{PRECISION_AT_K}={p5:.0%} (n={len(sub)})"
+                )
     print("\nЛегенда: ✓ ожидаемый термин в топ-1, ~ в топ-k, ✗ не найден.")
 
 

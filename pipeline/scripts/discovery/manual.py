@@ -321,6 +321,7 @@ def _build_admit_record(
         g2ai_pattern=decision.get("g2ai_pattern"),
         summary=decision.get("summary"),
         relations=[schema.Relation.model_validate(r) for r in relations_raw] if relations_raw else None,
+        language=decision.get("language"),
     )
     return rec, defaulted
 

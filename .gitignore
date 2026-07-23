@@ -20,6 +20,10 @@ htmlcov/
 # Производные индексы (SQLite FTS5/векторы) — пересобираются из корпуса, не в git
 /pipeline/index/
 
+# Discovery bronze-кэш (registry-архетип: zip-архивы источников + registry.duckdb) —
+# пересобирается из upstream (Zenodo/…), не в git; спек discovery-agora §2
+/pipeline/discovery_cache/
+
 # OS / editor
 .DS_Store
 

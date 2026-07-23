@@ -1,0 +1,21 @@
+# Тюнинг-параметры discovery-коннектора `agora` (ETO AGORA, Zenodo bulk).
+# Правится ВРУЧНУЮ; трекается в git (как triage.yaml). Спек:
+# docs/pipeline/discovery/tech_specs/discovery-agora/spec.md §4.
+
+enabled: true
+zenodo_doi: "10.5281/zenodo.13883066"
+
+non_us:
+  include_all: true            # весь не-US хвост (China/Multinational/Other countries/пусто), без ранжирования
+
+us_axis_probe:                 # разведочный US-срез по узкой оси agentic_g2ai (pre-signal, не вердикт)
+  limit: 50
+  min_year: null               # null -> взять frontier_year из pipeline/config/triage.yaml; число -> override
+  match_terms:                 # дешёвый pre-signal, матч по ГРАНИЦЕ СЛОВА; тюнинг при живой сверке
+    - "agent"
+    - "autonomous"
+    - "agentic"
+    - "foundation model"
+    - "frontier model"
+    - "general-purpose"
+    - "planning ability"       # ловит таксон AGORA "Strategies: Tiering: Tiering based on planning ability"
