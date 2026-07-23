@@ -11,6 +11,7 @@ import yaml
 
 from index.ab_eval import (
     DEFAULT_EVAL_QUERIES,
+    PRECISION_AT_K,
     ModelResult,
     QueryOutcome,
     _report,
@@ -18,6 +19,8 @@ from index.ab_eval import (
     load_eval_queries,
     main,
     parse_backends,
+    precision_at_k,
+    reciprocal_rank,
 )
 from index.chunking import Chunk
 from index.corpus_index import create_db, fts5_available, index_chunks
@@ -42,6 +45,37 @@ def test_not_top1_but_topk() -> None:
 
 def test_miss() -> None:
     assert hit_at_k(["a", "b", "c"], ("zzz",), 3) is False
+
+
+# --- reciprocal_rank / precision_at_k (бэклог §17, eval-precision-metrics) ---
+
+
+def test_reciprocal_rank_top1() -> None:
+    assert reciprocal_rank(["about ACCOUNTABILITY here", "other"], ("account",)) == 1.0
+
+
+def test_reciprocal_rank_third_position() -> None:
+    ranked = ["irrelevant", "also irrelevant", "text about monitoring agents"]
+    assert reciprocal_rank(ranked, ("monitor",)) == pytest.approx(1 / 3)
+
+
+def test_reciprocal_rank_miss_is_zero() -> None:
+    assert reciprocal_rank(["a", "b"], ("zzz",)) == 0.0
+
+
+def test_precision_at_k_counts_matches_in_window() -> None:
+    ranked = ["monitor here", "irrelevant", "monitor there", "irrelevant", "irrelevant"]
+    assert precision_at_k(ranked, ("monitor",), 5) == pytest.approx(2 / 5)
+
+
+def test_precision_at_k_smaller_window_than_k_divides_by_actual_count() -> None:
+    """Индекс отдал меньше кандидатов, чем k — делим на реальное число, не на k
+    формально (иначе тонкий корпус штрафуется за нехватку кандидатов)."""
+    assert precision_at_k(["monitor here"], ("monitor",), 5) == 1.0
+
+
+def test_precision_at_k_empty_ranked_is_zero() -> None:
+    assert precision_at_k([], ("monitor",), 5) == 0.0
 
 
 # --- load_eval_queries: валидация YAML (spec analyze-retrieval §6) ---
@@ -331,20 +365,28 @@ def test_main_default_backends_matches_prior_single_bge_behavior(
 
 def test_report_prints_per_language_breakdown_when_multilingual(capsys: Any) -> None:
     outcomes = [
-        QueryOutcome("q1", True, True, 1.0, "en"),
-        QueryOutcome("q2", False, True, 0.5, "cnr"),
-        QueryOutcome("q3", False, False, 0.1, "cnr"),
+        QueryOutcome("q1", True, True, 1.0, 1.0, 1.0, "en"),
+        QueryOutcome("q2", False, True, 0.5, 0.4, 0.5, "cnr"),
+        QueryOutcome("q3", False, False, 0.0, 0.0, 0.1, "cnr"),
     ]
-    res = ModelResult("fake · vector", 1 / 3, 2 / 3, outcomes)
+    res = ModelResult("fake · vector", 1 / 3, 2 / 3, 0.5, 0.4, outcomes)
     _report([res], k=3, n_queries=3)
     out = capsys.readouterr().out
-    assert "cnr: hit@1=0% hit@3=50% (n=2)" in out
-    assert "en: hit@1=100% hit@3=100% (n=1)" in out
+    assert "cnr: hit@1=0% hit@3=50% MRR=0.250 precision@5=20%" in out
+    assert "en: hit@1=100% hit@3=100% MRR=1.000 precision@5=100%" in out
 
 
 def test_report_omits_per_language_breakdown_when_monolingual(capsys: Any) -> None:
-    outcomes = [QueryOutcome("q1", True, True, 1.0, "en")]
-    res = ModelResult("fake · vector", 1.0, 1.0, outcomes)
+    outcomes = [QueryOutcome("q1", True, True, 1.0, 1.0, 1.0, "en")]
+    res = ModelResult("fake · vector", 1.0, 1.0, 1.0, 1.0, outcomes)
     _report([res], k=1, n_queries=1)
     out = capsys.readouterr().out
     assert "en:" not in out
+
+
+def test_report_prints_mrr_and_precision5_in_header(capsys: Any) -> None:
+    outcomes = [QueryOutcome("q1", True, True, 1.0, 0.6, 1.0, "en")]
+    res = ModelResult("fake · vector", 1.0, 1.0, 1.0, 0.6, outcomes)
+    _report([res], k=3, n_queries=1)
+    out = capsys.readouterr().out
+    assert f"MRR=1.000   precision@{PRECISION_AT_K}=60%" in out
