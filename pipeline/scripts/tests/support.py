@@ -354,6 +354,7 @@ def build_pdf(
     *,
     lines: list[tuple[str, float, float, float]] | None = None,
     table: tuple[list[list[str]], float, float, float, float] | None = None,
+    links: list[tuple[str, float, float, float, float]] | None = None,
     page_size: tuple[float, float] = (612.0, 792.0),
 ) -> bytes:
     """Синтетический однострочичный PDF через reportlab (test-coverage-hardening) — реальный
@@ -364,7 +365,11 @@ def build_pdf(
     pdfplumber (0 у верхнего края страницы) — функция сама переводит в bottom-up систему
     reportlab. ``table`` — ``(data, x, y_from_top, col_width, row_height)`` — таблица с
     реальной сеткой линий (``GRID``), которую ``pdfplumber.find_tables()`` детектирует своей
-    штатной lines-стратегией (не наш код — сама библиотека)."""
+    штатной lines-стратегией (не наш код — сама библиотека). ``links`` — ``(uri, x0,
+    y_from_top_top, x1, y_from_top_bottom)`` — прямоугольная гиперлинк-аннотация (``Subtype
+    /Link``, простой ``Rect``, БЕЗ ``QuadPoints`` — reportlab их не выставляет; ровно то, что
+    несёт живой корпус, спек discovery-snowball §2.4), координаты тоже в top-down системе
+    pdfplumber — функция сама переводит в bottom-up reportlab."""
     from reportlab.lib import colors
     from reportlab.pdfgen import canvas
     from reportlab.platypus import Table, TableStyle
@@ -381,6 +386,9 @@ def build_pdf(
         t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.75, colors.black)]))
         _, th = t.wrap(0, 0)
         t.drawOn(c, tx, height - ty_from_top - th)
+    for uri, x0, y_from_top_top, x1, y_from_top_bottom in links or []:
+        rect = (x0, height - y_from_top_bottom, x1, height - y_from_top_top)
+        c.linkURL(uri, rect, relative=0)
     c.showPage()
     c.save()
     return buf.getvalue()
