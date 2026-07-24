@@ -16,6 +16,7 @@ from typing import Any
 import yaml
 
 from core import schema, validate_sources
+from core.env import load_dotenv
 from discovery import connectors, manual, store  # noqa: F401 — connectors: манифест реальных коннекторов (§4.3)
 from discovery.connectors import snowball
 from discovery.orchestrate import DiscoverySummary, discover
@@ -145,6 +146,8 @@ def _build_snowball_config_override(args: argparse.Namespace) -> snowball.Snowba
 
 def _cmd_snowball(args: argparse.Namespace) -> int:
     merged_config = _build_snowball_config_override(args)
+    if merged_config.emit.text_citations:
+        load_dotenv()  # §5 LLM-стадии нужен OPENROUTER_API_KEY из .env (зеркало run_pipeline)
     connector = snowball.SnowballConnector(config=merged_config, root=args.root)
     summary = discover(root=args.root, dry_run=args.dry_run, connectors_override=[connector])
     _print_summary(summary)
