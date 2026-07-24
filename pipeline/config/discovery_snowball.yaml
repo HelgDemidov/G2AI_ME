@@ -1,0 +1,33 @@
+# Тюнинг-параметры discovery-коннектора `snowball` (backward-snowballing по собственному
+# корпусу — извлечение ссылок из raw.*/doc.md уже принятых документов). Правится ВРУЧНУЮ;
+# трекается в git (как triage.yaml/discovery_agora.yaml/discovery_eurlex.yaml/
+# discovery_aiforgood.yaml). Спек: docs/pipeline/discovery/tech_specs/discovery-snowball/spec.md §3.
+#
+# Дефолты сознательно НЕ строгие (решение куратора 2026-07-24): все фильтры пустые/
+# разрешающие — коннектор майнит весь корпус без ограничений, пока фильтр не задан явно
+# (yaml-правкой или CLI-флагом `discover.py snowball` на один прогон).
+
+enabled: true
+
+source_filter:            # какие документы корпуса майнить; пусто = все
+  tracks: []               # intl-xperience | montenegro | research-papers | tech-standards
+  target_fit: []            # primary | context | background
+  include_doc_ids: []       # явный allowlist (если непуст — майнятся ТОЛЬКО эти doc_id)
+  exclude_doc_ids: []
+
+url_filter:
+  exclude_domains: []       # напр. vendor-блоги; пусто = ничего не режем
+  exclude_url_substrings: []
+
+emit:
+  pdf_annotations: true     # §2.1 гиперлинк-аннотации raw.pdf
+  html_hrefs: true          # §2.2 href raw.html
+  printed_urls: true        # §2.3 напечатанные URL в doc.md
+  text_citations: false     # §5 LLM-стадия текстовых цитат без URL — opt-in, требует сети
+
+max_candidates: null        # опциональный кап на прогон: null = без капа;
+                             # иначе целое >= 0 (произвольное число, без дискретных порогов)
+
+citations_model: "deepseek/deepseek-v4-flash"   # §5 модель LLM-стадии (полевая проверка
+                                                 # OpenRouter 2026-07-24); финал — мини-A/B
+                                                 # на реальной библиографии при реализации

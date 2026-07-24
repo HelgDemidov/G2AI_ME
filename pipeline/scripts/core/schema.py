@@ -178,6 +178,7 @@ class ConnectorKind(str, Enum):
     outlet_watcher = "outlet_watcher"
     directed_search = "directed_search"
     manual = "manual"
+    snowball = "snowball"
 
 
 class RelationType(str, Enum):
