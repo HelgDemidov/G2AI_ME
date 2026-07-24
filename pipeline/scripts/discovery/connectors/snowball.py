@@ -9,10 +9,14 @@ Spec `docs/pipeline/discovery/tech_specs/discovery-snowball/spec.md`. Пятый
 Коммит 1 — конфиг (§3 спека): типизированный ``SnowballConfig`` + ``load_config``.
 Коммит 2 — экстрактор PDF-аннотаций (§2.1/§2.4): группировка/склейка по ``uri``,
 crop anchor-текста, санитизация URL, отсев самоссылок/уже-в-корпусе.
-Маппинг/курсор/регистрация коннектора — последующие коммиты.
+Коммит 3 — экстракторы href raw.html и напечатанных URL doc.md (§2.2/§2.3).
+Коммит 4 — маппинг в CandidateRecord, pre-signal, курсор/fingerprint,
+регистрация коннектора в ядре (§3/§4).
 """
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import re
 import unicodedata
 from collections import defaultdict
@@ -25,8 +29,11 @@ import pdfplumber
 import yaml
 from lxml import html as lxml_html
 
+from convert.converters import was_ocr_normalized
 from core import schema
 from core.env import REPO_ROOT
+from discovery import registry
+from discovery.base import ConnectorCursor, DiscoverResult
 from discovery.dedup import normalize_url
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_snowball.yaml"
@@ -310,3 +317,266 @@ def extract_printed_urls(doc_md_path: Path, *, ocr_normalized: bool = False) -> 
             context = " ".join(line.split())
             links.append(RawLink(url=clean_url, anchor=context, ocr_text_url=ocr_normalized))
     return links
+
+
+# --- §3: source_filter/url_filter — применяются К СПИСКУ ДОКУМЕНТОВ / К ОДНОЙ находке ---
+
+
+def apply_source_filter(
+    records: list[schema.SourceRecord], source_filter: SourceFilter
+) -> list[schema.SourceRecord]:
+    """Отфильтровать документы корпуса, подлежащие майнингу (спек §3). Каждый непустой
+    компонент — независимое сужение (AND); пустой компонент — разрешает всё (§3: никаких
+    жёстких дефолтов). ``include_doc_ids`` — allowlist (если непуст, режет ДО остальных)."""
+    result = records
+    if source_filter.include_doc_ids:
+        result = [r for r in result if r.id in source_filter.include_doc_ids]
+    if source_filter.exclude_doc_ids:
+        result = [r for r in result if r.id not in source_filter.exclude_doc_ids]
+    if source_filter.tracks:
+        result = [r for r in result if r.track.value in source_filter.tracks]
+    if source_filter.target_fit:
+        result = [
+            r
+            for r in result
+            if r.relevance is not None and r.relevance.target_fit.value in source_filter.target_fit
+        ]
+    return result
+
+
+def is_url_filtered(url: str, url_filter: UrlFilter) -> bool:
+    """Находка отсеивается url_filter'ом (спек §3) — домен ИЛИ подстрока URL в чёрном
+    списке. Пустые списки — ничего не режем (§3: разрешающие дефолты)."""
+    host = urlsplit(url).netloc.lower()
+    if any(host == d.lower() or host.endswith("." + d.lower()) for d in url_filter.exclude_domains):
+        return True
+    return any(sub in url for sub in url_filter.exclude_url_substrings)
+
+
+# --- §4: pre-signal matched_vocab_tags — лексическое пересечение, НЕ вердикт ---
+
+_VOCAB_SOURCES = ("vocab_topics.yaml", "vocab_g2ai_patterns.yaml")
+
+
+def _load_vocab_terms() -> list[tuple[str, str]]:
+    """``(оригинальный-ключ, ключ-с-пробелами)`` из vocab_topics/vocab_g2ai_patterns —
+    источник истины для pre-сигнала (спек §3), не инлайновый список (skill-content-vs-
+    source-of-truth дисциплина)."""
+    terms: list[tuple[str, str]] = []
+    for name in _VOCAB_SOURCES:
+        raw: dict[str, Any] = yaml.safe_load((schema.VOCAB_DIR / name).read_text(encoding="utf-8"))
+        for key in (raw.get("terms") or {}):
+            terms.append((key, key.replace("-", " ")))
+    return terms
+
+
+def match_vocab_tags(text: str, vocab_terms: list[tuple[str, str]]) -> list[str]:
+    """Ключи словаря, чья space-форма встречается в ``text`` (регистронезависимо) —
+    дешёвый pre-сигнал (спек §4), НЕ триажный вердикт."""
+    lowered = text.lower()
+    return [key for key, spaced in vocab_terms if spaced and spaced in lowered]
+
+
+# --- §4: маппинг RawLink -> CandidateRecord ---
+
+
+def _fallback_title(url: str) -> str:
+    """Anchor пуст (напр. иконка-ссылка без текста, спек §2.1) -> последний осмысленный
+    сегмент пути URL, иначе домен."""
+    parts = urlsplit(url)
+    segment = parts.path.rstrip("/").rsplit("/", 1)[-1]
+    return segment or parts.netloc
+
+
+def map_link(
+    link: RawLink,
+    *,
+    source_record: schema.SourceRecord,
+    location_kind: str,
+    vocab_terms: list[tuple[str, str]],
+) -> schema.CandidateRecord:
+    """``RawLink`` -> ``CandidateRecord`` (спек §4). ``location_kind`` — какой экстрактор
+    породил находку (``"pdf"``/``"html"``/``"md"``) — определяет форму ``native_id``,
+    вызывающая сторона знает это по построению (какой экстрактор вызван), а не сама
+    находка (§2/§2.3: ``page_number`` есть только у pdf-находок)."""
+    normalized = normalize_url(link.url)
+    anchor = link.anchor.strip()
+    title = anchor or _fallback_title(link.url)
+    native_summary = anchor[: schema.CANDIDATE_SUMMARY_MAX] if anchor else None
+    host = urlsplit(link.url).netloc
+    native_tags = [f"domain: {host}", f"source: {source_record.id}"]
+    if link.ocr_text_url:
+        native_tags.append("ocr-text-url")
+    if location_kind == "pdf" and link.page_number is not None:
+        native_id = f"{source_record.id}#p{link.page_number}"
+    else:
+        native_id = f"{source_record.id}#{location_kind}"
+    raw_hash = hashlib.sha256(f"snowball|{normalized}".encode("utf-8")).hexdigest()
+    matched = match_vocab_tags(anchor, vocab_terms)
+
+    return schema.CandidateRecord(
+        title=title,
+        source_url=link.url,
+        native_summary=native_summary,
+        native_id=native_id,
+        native_tags=native_tags,
+        matched_vocab_tags=matched or None,
+        connector_id=CONNECTOR_ID,
+        retrieved_at=dt.date.today(),
+        raw_hash=raw_hash,
+        normalized_url=normalized,
+    )
+
+
+# --- §4: курсор — fingerprint по документу (sha256 raw + sha256 doc.md) ---
+
+
+def document_fingerprint(rec: schema.SourceRecord, root: Path) -> str:
+    """``sha256(sha256_raw | sha256_doc_md)`` (спек §4) — меняется, если поменялся ЛИБО
+    оригинал (``.state.yaml`` пересчитывает hash при передобыче), ЛИБО конвертация
+    (``doc.md``); отсутствующая часть — литерал ``"-"`` (нет ``.state.yaml``/`doc.md`
+    ещё не сгенерирован)."""
+    state_path = schema.state_file(rec, root)
+    raw_sha = "-"
+    if state_path.exists():
+        state = schema.load_state(state_path)
+        raw_sha = state.sha256 or "-"
+    md_path = schema.md_file(rec, root)
+    md_sha = "-"
+    if md_path.exists():
+        md_sha = hashlib.sha256(md_path.read_bytes()).hexdigest()
+    return hashlib.sha256(f"{raw_sha}|{md_sha}".encode("utf-8")).hexdigest()
+
+
+# --- §4: discover_snowball() top-level ---
+
+
+def discover_snowball(
+    cursor: ConnectorCursor | None,
+    *,
+    config: SnowballConfig | None = None,
+    root: Path = schema.DEFAULT_SOURCES,
+    records: list[schema.SourceRecord] | None = None,
+) -> DiscoverResult:
+    """``Connector.discover()`` для snowball (спек §4): отфильтровать документы (§3) ->
+    для каждого НЕизменившегося (по курсору) — скип; иначе прогнать включённые
+    экстракторы (§2) -> отсеять самоссылки/уже-в-корпусе/url_filter -> замаппить ->
+    применить ``max_candidates`` (если задан) -> обновить курсор ТОЛЬКО для документов,
+    чьи находки не были урезаны капом (спек §3: недомайненный хвост добирается
+    следующим прогоном).
+
+    ``records`` — инжектируемый список документов корпуса (тесты подставляют фикстуры;
+    по умолчанию читается с диска, как у остальных потребителей ``schema.load_records``).
+    """
+    cfg = config or load_config()
+    all_records = records if records is not None else schema.load_records(root)
+    filtered = apply_source_filter(all_records, cfg.source_filter)
+    vocab_terms = _load_vocab_terms()
+
+    mined_before = dict((cursor or {}).get("mined") or {})
+    mined_after = dict(mined_before)
+
+    candidates: list[schema.CandidateRecord] = []
+    docs_scanned = 0
+    docs_skipped_cursor = 0
+    truncated_docs = 0
+    truncated_candidates = 0
+    filtered_self_or_corpus = 0
+    filtered_by_url_filter = 0
+    per_extractor = {"pdf_annotations": 0, "html_hrefs": 0, "printed_urls": 0}
+    cap_remaining = cfg.max_candidates
+
+    for rec in filtered:
+        raw_path = schema.raw_file(rec, root)
+        md_path = schema.md_file(rec, root)
+        if raw_path is None or not md_path.exists():
+            continue  # документ ещё не добыт/не сконвертирован — просто нечего майнить
+
+        fingerprint = document_fingerprint(rec, root)
+        if mined_before.get(rec.id) == fingerprint:
+            docs_skipped_cursor += 1
+            continue
+        docs_scanned += 1
+
+        raw_links: list[tuple[RawLink, str]] = []
+        if cfg.emit.pdf_annotations and raw_path.suffix == ".pdf":
+            found = extract_pdf_annotation_links(raw_path)
+            per_extractor["pdf_annotations"] += len(found)
+            raw_links.extend((link, "pdf") for link in found)
+        if cfg.emit.html_hrefs and raw_path.suffix == ".html":
+            found = extract_html_href_links(raw_path, source_url=rec.source_url)
+            per_extractor["html_hrefs"] += len(found)
+            raw_links.extend((link, "html") for link in found)
+        if cfg.emit.printed_urls:
+            ocr_flag = raw_path.suffix == ".pdf" and was_ocr_normalized(raw_path)
+            found = extract_printed_urls(md_path, ocr_normalized=ocr_flag)
+            per_extractor["printed_urls"] += len(found)
+            raw_links.extend((link, "md") for link in found)
+
+        doc_candidates: list[schema.CandidateRecord] = []
+        for link, kind in raw_links:
+            normalized = normalize_url(link.url)
+            if is_self_or_corpus_link(normalized, source_url=rec.source_url, records=all_records):
+                filtered_self_or_corpus += 1
+                continue
+            if is_url_filtered(link.url, cfg.url_filter):
+                filtered_by_url_filter += 1
+                continue
+            doc_candidates.append(
+                map_link(link, source_record=rec, location_kind=kind, vocab_terms=vocab_terms)
+            )
+
+        doc_truncated = False
+        if cap_remaining is not None and len(doc_candidates) > cap_remaining:
+            truncated_candidates += len(doc_candidates) - cap_remaining
+            doc_candidates = doc_candidates[:cap_remaining]
+            doc_truncated = True
+            cap_remaining = 0
+        elif cap_remaining is not None:
+            cap_remaining -= len(doc_candidates)
+
+        candidates.extend(doc_candidates)
+
+        if doc_truncated:
+            truncated_docs += 1  # НЕ обновляем mined_after[rec.id] — хвост добирает следующий прогон
+        else:
+            mined_after[rec.id] = fingerprint
+
+        if cap_remaining is not None and cap_remaining <= 0:
+            break  # остальные документы этот прогон не трогает вовсе (курсор их не помнит)
+
+    status = "no_new" if cursor is not None and not candidates else "fetched"
+    diagnostics = {
+        "status": status,
+        "docs_scanned": docs_scanned,
+        "docs_skipped_cursor": docs_skipped_cursor,
+        "found": sum(per_extractor.values()),
+        "fresh": len(candidates),
+        "filtered_self_or_corpus": filtered_self_or_corpus,
+        "filtered_by_url_filter": filtered_by_url_filter,
+        "per_extractor": dict(per_extractor),
+        "truncated_docs": truncated_docs,
+        "truncated_candidates": truncated_candidates,
+    }
+    return DiscoverResult(candidates=candidates, cursor={"mined": mined_after}, diagnostics=diagnostics)
+
+
+@dataclass
+class SnowballConnector:
+    """Реализация протокола ``Connector`` (спек §1) — единственный архетип ``snowball``,
+    источник — не внешний сервис, а уже принятый корпус. НЕ ``frozen`` — симметрично
+    ``AgoraConnector``/``EurlexConnector``/``AiforgoodConnector`` (Protocol требует
+    settable-атрибуты, даже если ничего не переприсваивается)."""
+
+    id: str = CONNECTOR_ID
+    kind: schema.ConnectorKind = schema.ConnectorKind.snowball
+    enabled: bool = True
+
+    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
+        return discover_snowball(cursor)
+
+
+# Регистрация при импорте (чартер §4.3 «манифест», спек §1): `enabled` — из конфига,
+# не хардкод. Срабатывает один раз за интерпретатор — по факту импорта этого модуля
+# (см. `discovery/connectors/__init__.py` + `discover.py`).
+registry.register(SnowballConnector(enabled=load_config().enabled))

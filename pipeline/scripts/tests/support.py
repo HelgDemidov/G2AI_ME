@@ -426,15 +426,18 @@ def write_doc(
     rec: dict[str, Any],
     *,
     raw: bytes | None = None,
+    raw_ext: str = "pdf",
     md: str | None = None,
     state: dict[str, Any] | None = None,
 ) -> Path:
-    """Создать папку-документ sources/<track>/<entity>/<id>/ + meta.yaml (+ raw.pdf/doc.md/.state.yaml)."""
+    """Создать папку-документ sources/<track>/<entity>/<id>/ + meta.yaml (+ raw.<raw_ext>/
+    doc.md/.state.yaml). ``raw_ext`` — расширение оригинала (по умолчанию ``pdf``; ``html``
+    для тестов, которым нужен именно этот ``SourceFormat``, напр. discovery-snowball)."""
     d = root / str(rec["track"]) / str(rec["entity_id"]) / str(rec["id"])
     d.mkdir(parents=True, exist_ok=True)
     (d / "meta.yaml").write_text(yaml.safe_dump(rec, allow_unicode=True), encoding="utf-8")
     if raw is not None:
-        (d / "raw.pdf").write_bytes(raw)
+        (d / f"raw.{raw_ext}").write_bytes(raw)
     if md is not None:
         (d / "doc.md").write_text(md, encoding="utf-8")
     if state is not None:
