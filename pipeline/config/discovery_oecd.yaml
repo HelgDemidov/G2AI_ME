@@ -1,0 +1,22 @@
+# Тюнинг-параметры discovery-коннектора `oecd` (OECD.AI Policy Navigator, недокументированный
+# backend api.oecdai.org, живой paginated JSON). Правится ВРУЧНУЮ; трекается в git (как
+# triage.yaml/discovery_aiforgood.yaml/discovery_eurlex.yaml). Спек:
+# docs/pipeline/discovery/tech_specs/discovery-oecd/spec.md §4.
+
+enabled: true
+endpoint: "https://api.oecdai.org/policy-initiatives"
+user_agent: "G2AI-corpus-research/1.0 (+https://github.com/HelgDemidov/G2AI_ME)"  # нейтральный,
+                                         # не ИИ-брендированный (конвенция aiforgood)
+crawl_delay_seconds: 2.0                # robots.txt на api-хосте отсутствует (404) — вежливость наш выбор (§1)
+timeout_seconds: 30.0
+
+include_categories:                     # §2: полный охват (строки — verbatim из API)
+  - "National – Strategy"
+  - "National – AI governance bodies or mechanisms"
+  - "Regulations, guidelines and standards"
+  - "AI Policy Frameworks and Initiatives (intergovernmental or supranational)"
+  - "AI Governance Bodies and Mechanisms (intergovernmental or supranational)"
+
+probe_category: "AI policy initiatives, programmes and projects"  # §2: узкая проба, не всё целиком
+probe_initiative_types:                 # только эти типы внутри probe_category
+  - "AI use cases/projects in the public sector"
