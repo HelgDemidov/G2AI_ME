@@ -9,7 +9,13 @@ from pydantic import ValidationError
 
 from tests.support import valid_record, write_doc
 
+import re
+
+import yaml
+
 from core.schema import (
+    ENTITY_PATTERN,
+    VOCAB_DIR,
     AcquisitionMethod,
     AssessedStage,
     CandidateRecord,
@@ -729,3 +735,49 @@ def test_save_record_roundtrip_preserves_relations_and_analytics(tmp_path: Path)
     assert loaded.relations == [Relation(type=RelationType.implements, target="eu-ai-act-2024")]
     assert loaded.topics == rec.topics
     assert loaded.g2ai_pattern == rec.g2ai_pattern
+
+
+def test_track_tech_standards_accepted_with_international_geo_scope(tmp_path: Path) -> None:
+    """Спек aiforgood-standards §2: tech-standards требует geo_scope=international,
+    entity_id — слаг организации (не iso2) — не задевает entity_id==iso2-гейт."""
+    data = valid_record()
+    data["track"] = "tech-standards"
+    data["entity_id"] = "itu-t"
+    data["geo_scope"] = "international"
+    rec = SourceRecord.model_validate(data)
+    assert rec.track == Track.tech_standards
+    save_record(rec, tmp_path)
+    assert doc_dir(rec, tmp_path).is_dir()
+
+
+# --- vocab_standards_bodies.yaml (спек aiforgood-standards §3) ---
+
+STANDARDS_BODIES_PATH = VOCAB_DIR / "vocab_standards_bodies.yaml"
+_VALID_KINDS = {"international", "national", "sectoral"}
+
+
+def _load_standards_bodies() -> dict[str, Any]:
+    data: Any = yaml.safe_load(STANDARDS_BODIES_PATH.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+    return data
+
+
+def test_standards_bodies_entity_ids_match_entity_pattern() -> None:
+    bodies = _load_standards_bodies()
+    assert bodies, "справочник не должен быть пуст"
+    for entity_id in bodies:
+        assert re.fullmatch(ENTITY_PATTERN, entity_id), entity_id
+
+
+def test_standards_bodies_kind_and_full_name_present() -> None:
+    bodies = _load_standards_bodies()
+    for entity_id, entry in bodies.items():
+        assert entry["kind"] in _VALID_KINDS, f"{entity_id}: неизвестный kind {entry.get('kind')!r}"
+        assert entry["full_name"], f"{entity_id}: пустой full_name"
+
+
+def test_standards_bodies_covers_spec_organizations() -> None:
+    """Спек §3 перечисляет 6 организаций (itu-t/itu-r/ietf/u4ssc/etsi/tta) — регресс-гвард
+    против случайного удаления записи, которую коннектор (коммит 3) рассчитывает найти."""
+    bodies = _load_standards_bodies()
+    assert set(bodies) == {"itu-t", "itu-r", "ietf", "u4ssc", "etsi", "tta"}

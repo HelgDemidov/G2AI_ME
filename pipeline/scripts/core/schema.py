@@ -70,11 +70,21 @@ class Track(str, Enum):
     ничего не давая взамен (тот же вывод независимо подтверждён обзором практик
     коммерческих RAG-систем 2025-2026: иерархия retrieval живёт в метаданных документа/
     секции/чанка, а не в файловой системе — она там для провенанса и уникальности id).
+
+    ``tech_standards`` (2026-07-24, спек `aiforgood-standards`): четвёртая линия —
+    технические стандарты ИИ (ITU-T/ITU-R/U4SSC/IETF/ETSI/TTA), слой знания, на который
+    опираются регуляции/стратегии остальных треков. entity_id — слаг ИЗДАЮЩЕЙ ОРГАНИЗАЦИИ
+    (`itu-t`/`etsi`/`tta`/…), тот же паттерн, что `research_papers` — не страна, поэтому
+    `geo_scope=international` для ВСЕХ записей (иначе `entity_id="tta"` сломал бы гейт
+    `geo_scope=national ⇒ entity_id==iso2`). Классификация международный/национальный/
+    отраслевой — НЕ это поле, а отдельный справочник `vocab_standards_bodies.yaml`
+    (аналог `jurisdictions.yaml`), см. спек §3.
     """
 
     intl_xperience = "intl-xperience"
     montenegro = "montenegro"
     research_papers = "research-papers"
+    tech_standards = "tech-standards"
 
 
 class SourceFormat(str, Enum):
