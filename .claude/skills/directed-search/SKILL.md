@@ -42,6 +42,7 @@ The seed-list lesson (charter §8) is the reason this section exists: aggregator
 2. **Title** — as the publisher states it, not as a news article paraphrases it.
 3. **Date** — from the publisher's page or official announcement. If only secondary reporting dates the document, use the best-supported date and say so in `--summary`.
 4. Fetching METADATA pages (landing pages, press releases) is allowed. **Never fetch the document body**  — it passes through a small model and is not verbatim (CLAUDE.md rule); body acquisition belongs to `pipeline/scripts/run_pipeline.py`, after triage.
+   - WebFetch blocked (WAF) or the page renders empty (JS-built)? → try the local headless resolver: `node pipeline/browser/resolve.mjs "<url>"` (`core/browser_resolver.py`, PR #40; passes F5/Akamai, NOT Cloudflare; needs Node + `pipeline/browser/lightpanda`). It prints raw rendered HTML — save to a temp file and `rg` out only the fields you need (title/date/publisher), never read it wholesale; the body prohibition above applies unchanged.
 5. Capture `--rights`/`--sensitivity` best-effort if the page states them; otherwise omit (triage finalizes).
 
 ## Inject (one command per candidate)
