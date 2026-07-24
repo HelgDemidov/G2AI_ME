@@ -518,12 +518,23 @@ def _is_citation_heading(heading_text: str) -> bool:
 def _find_dense_year_blocks(text: str) -> list[str]:
     """Плотные блоки строк с годом-паттерном — фолбэк, когда в документе нет
     заголовка-кандидата (спек §5: «плотные блоки строк с годом ... и признаками
-    цитаты»). Порог длины строки отсеивает голые номера/даты в тексте документа."""
+    цитаты»). Порог длины строки отсеивает голые номера/даты в тексте документа.
+
+    Строки markdown-таблиц (``|``-префикс) исключены и РАЗРЫВАЮТ run (живой прецедент
+    первого боевого прогона, 2026-07-25: 39/39 строк всех ложных блоков на
+    ee-mkm-ai-data-action-plan-2024 — KPI-таблицы с годами, бэклог §20). Таблица —
+    по построению наших же конвертеров данные, не проза; библиография, свёрстанная
+    таблицей, пришла бы с заголовком секции/листа и ушла бы через heading-путь,
+    который этого фолбэка не касается вовсе."""
     blocks: list[str] = []
     run: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
-        if len(stripped) >= _DENSE_BLOCK_MIN_LINE_LEN and _YEAR_RE.search(stripped):
+        if (
+            len(stripped) >= _DENSE_BLOCK_MIN_LINE_LEN
+            and not stripped.startswith("|")
+            and _YEAR_RE.search(stripped)
+        ):
             run.append(stripped)
         else:
             if len(run) >= _DENSE_BLOCK_MIN_RUN:

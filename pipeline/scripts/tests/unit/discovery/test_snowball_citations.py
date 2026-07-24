@@ -129,6 +129,42 @@ def test_find_citation_sections_dense_block_below_min_run_is_ignored() -> None:
     assert find_citation_sections(text) == []
 
 
+def test_find_citation_sections_markdown_table_rows_not_caught_by_density_fallback() -> None:
+    """Регрессия на живой прецедент (ee-mkm-ai-data-action-plan-2024, бэклог §20):
+    KPI-таблица с годами в ячейках — табличные строки не считаются строками цитат."""
+    text = "\n".join(
+        [
+            "# Action plan",
+            "",
+            "| Measure one with sufficient length | 200 | AIRE | Q4 2026 |",
+            "| Measure two with sufficient length | 300 | Tehnopol | Q4 2025 |",
+            "| Measure three with sufficient length | 150 | MKM | Q1 2024 |",
+            "| Measure four with sufficient length | 500 | RIA | Q2 2026 |",
+        ]
+    )
+    assert find_citation_sections(text) == []
+
+
+def test_find_citation_sections_table_row_breaks_run_but_prose_after_it_evaluated_separately() -> None:
+    """Табличная строка именно РАЗРЫВАЕТ run (не выфильтровывается со склейкой прозы
+    через таблицу): 2 строки прозы до таблицы — ниже минимума, гасятся; 3 после — блок."""
+    text = "\n".join(
+        [
+            "Smith, J. (2024). A Long Enough Report Title Here.",
+            "Doe, A. (2023). Another Long Enough Citation Line.",
+            "| Table measure with a year inside 2025 | 100 | Q4 2026 |",
+            "Lee, K. (2022). Yet Another Sufficiently Long Citation.",
+            "Ray, M. (2021). One More Sufficiently Long Citation Line.",
+            "Kim, S. (2020). Final Sufficiently Long Citation Line Here.",
+        ]
+    )
+    sections = find_citation_sections(text)
+    assert len(sections) == 1
+    assert "Lee, K. (2022)" in sections[0]
+    assert "Smith, J. (2024)" not in sections[0]
+    assert "|" not in sections[0]
+
+
 # --- passes_verbatim_gate ---
 
 
