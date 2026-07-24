@@ -149,7 +149,7 @@ def load_vectors(conn: sqlite3.Connection, model: str) -> tuple[list[str], Float
     Потоковая форма даёт ~1x: курсор sqlite3 не материализует весь результат,
     живой BLOB в каждый момент один. На целевом масштабе корпуса (~163 тыс.
     чанков = ~640 МиБ матрицы) это разница между ~1.9 ГиБ и ~700 МиБ пика на
-    машине с 8 ГБ RAM — см. `docs/pipeline/general/pipeline_improvements.md` §16.
+    машине с 8 ГБ RAM — см. `docs/pipeline/core/charters/pipeline_improvements.md` §16.
 
     Размерность берётся из первой строки; строка с иной длиной BLOB'а уронит
     присваивание (broadcast) — это желаемое поведение: молча принять вектор
