@@ -148,6 +148,16 @@ def _cmd_snowball(args: argparse.Namespace) -> int:
     connector = snowball.SnowballConnector(config=merged_config, root=args.root)
     summary = discover(root=args.root, dry_run=args.dry_run, connectors_override=[connector])
     _print_summary(summary)
+
+    # §5: лиды (цитаты без URL) — перезаписываются целиком каждым прогоном с
+    # emit.text_citations включённым; --dry-run ничего не пишет на диск (симметрично
+    # candidates.yaml/cursors), отключённая стадия файл не трогает вовсе.
+    if not args.dry_run and merged_config.emit.text_citations and summary.connectors:
+        leads: list[dict[str, Any]] = summary.connectors[0].diagnostics.get("leads") or []  # type: ignore[assignment]
+        snowball.save_leads(leads, args.root)
+        if leads:
+            print(f"snowball: {len(leads)} лид(ов) без URL -> {args.root / snowball.LEADS_FILENAME}")
+
     return 1 if summary.failed else 0
 
 

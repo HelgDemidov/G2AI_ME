@@ -19,13 +19,19 @@ from discovery.dedup import dedup
 @dataclass
 class ConnectorRunSummary:
     """Итог прогона одного коннектора: сколько нашёл / сколько реально свежих / сколько
-    поглотил dedup / ошибка (если коннектор упал — прогон остальных не прерван)."""
+    поглотил dedup / ошибка (если коннектор упал — прогон остальных не прерван).
+
+    ``diagnostics`` — сырой ``DiscoverResult.diagnostics`` коннектора, прокинутый как
+    есть (спек discovery-snowball §5: `discover.py snowball` читает отсюда `leads` для
+    записи `.snowball_leads.yaml` — оркестратор его не интерпретирует, только переносит).
+    """
 
     connector_id: str
     found: int = 0
     fresh: int = 0
     merged: int = 0
     error: str | None = None
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -88,6 +94,7 @@ def discover(
                 found=len(result.candidates),
                 fresh=len(fresh),
                 merged=merged,
+                diagnostics=result.diagnostics,
             )
         )
 
