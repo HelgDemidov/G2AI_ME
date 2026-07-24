@@ -27,6 +27,7 @@ def _config(*, max_candidates: int | None = None) -> SnowballConfig:
         emit=EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=False),
         max_candidates=max_candidates,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
 
 
@@ -173,6 +174,7 @@ def test_url_filter_excludes_matching_domain_end_to_end(tmp_path: Path) -> None:
         emit=cfg.emit,
         max_candidates=cfg.max_candidates,
         citations_model=cfg.citations_model,
+        citations_model_fallback=cfg.citations_model_fallback,
     )
     result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec])
     urls = {c.source_url for c in result.candidates}
@@ -198,6 +200,7 @@ def test_emit_toggle_disables_printed_urls_extractor(tmp_path: Path) -> None:
         emit=EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=False, text_citations=False),
         max_candidates=None,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
     result_off = discover_snowball(None, config=cfg_off, root=tmp_path, records=[rec])
     assert result_off.candidates == []

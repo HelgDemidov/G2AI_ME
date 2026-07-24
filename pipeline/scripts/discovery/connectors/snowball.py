@@ -90,6 +90,7 @@ class SnowballConfig:
     emit: EmitConfig
     max_candidates: int | None
     citations_model: str
+    citations_model_fallback: str | None
 
 
 def _validate_max_candidates(value: Any) -> int | None:
@@ -140,6 +141,9 @@ def load_config(path: Path = CONFIG_PATH) -> SnowballConfig:
         ),
         max_candidates=_validate_max_candidates(raw.get("max_candidates")),
         citations_model=str(raw["citations_model"]),
+        citations_model_fallback=(
+            str(raw["citations_model_fallback"]) if raw.get("citations_model_fallback") else None
+        ),
     )
 
 
@@ -457,14 +461,19 @@ def document_fingerprint(rec: schema.SourceRecord, root: Path) -> str:
 
 # --- §5: LLM-стадия текстовых цитат без URL (opt-in `emit.text_citations`) ---
 
-_HEADING_RE = re.compile(r"^#{1,6}[ \t]+(.*)$", re.MULTILINE)
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*)$", re.MULTILINE)  # группа 1 = уровень, 2 = текст
 # Стоп-набор секций-кандидатов (спек §5) — EN + региональные (сербский/черногорский
-# латиница) варианты «Литература»/«Извори». Проверяется КАК ПОДСТРОКА заголовка
-# (регистронезависимо) — «References and further reading» тоже матчится.
+# латиница) варианты «Литература»/«Извори». «further resources»/«further reading»
+# добавлены по живой находке мини-A/B (2026-07-24): sg-imda-mgf-agentic-2026 несёт
+# единственный настоящий цитатный раздел корпуса именно под этим заголовком («Annex A:
+# Further resources») — без слов «references»/«bibliography» вовсе; без этой записи
+# детектор проходил бы мимо него целиком.
 _CITATION_HEADING_WORDS = (
     "references", "bibliography", "sources", "endnotes", "notes", "reference list",
+    "further resources", "further reading",
     "литература", "извори",
 )
+_HEADING_NUMBER_PREFIX_RE = re.compile(r"^[\d.]+\s*")
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 _DENSE_BLOCK_MIN_RUN = 3
 _DENSE_BLOCK_MIN_LINE_LEN = 20
@@ -489,8 +498,21 @@ CITATION_MAX_TOKENS = 4000
 
 
 def _is_citation_heading(heading_text: str) -> bool:
-    lowered = heading_text.strip().lower()
-    return any(word in lowered for word in _CITATION_HEADING_WORDS)
+    """Живая находка мини-A/B (2026-07-24, sg-imda-mgf-agentic-2026): чистый substring-
+    матч ложно ловил `#### 1.2.1 Sources of risk` (обычный содержательный заголовок,
+    НЕ библиография) по слову «sources» — «Sources» само по себе однозначно, «Sources
+    of X» уже нет. Разбор: ОДНОСЛОВНЫЕ кандидаты (sources/references/notes/…) требуют
+    ТОЧНОГО совпадения всего заголовка (после среза ведущей нумерации `1.2.1 `/`6. ` и
+    двоеточия) — многословные фразы (`further resources`/`reference list`/…)
+    самодостаточно специфичны и остаются подстрокой."""
+    stripped = _HEADING_NUMBER_PREFIX_RE.sub("", heading_text).strip().rstrip(":").lower()
+    for word in _CITATION_HEADING_WORDS:
+        if " " in word:
+            if word in stripped:
+                return True
+        elif stripped == word:
+            return True
+    return False
 
 
 def _find_dense_year_blocks(text: str) -> list[str]:
@@ -514,16 +536,26 @@ def _find_dense_year_blocks(text: str) -> list[str]:
 
 def find_citation_sections(text: str) -> list[str]:
     """Секции-кандидаты для LLM-экстракции (спек §5): текст между заголовком из
-    стоп-набора и следующим заголовком ЛЮБОГО уровня (не только следующим
-    citation-заголовком — иначе секция затекла бы в соседний нецитатный раздел).
-    Пусто -> LLM НЕ вызывается вовсе (дёшево до дорогого)."""
+    стоп-набора и следующим заголовком ТОГО ЖЕ ИЛИ БОЛЕЕ ВЫСОКОГО уровня (не любого
+    следующего — живая находка мини-A/B 2026-07-24: у sg-imda-mgf-agentic-2026
+    настоящий цитатный раздел («## Annex A: Further resources») организован
+    ВЛОЖЕННЫМИ подзаголовками («###### 1. Introduction to Agentic AI» и т.п.) —
+    граница «любой следующий заголовок» обрывала бы секцию на первой же строке,
+    теряя весь реальный контент; граница «того же/более высокого уровня» останавливается
+    только на настоящей соседней секции, напр. «## Annex B»). Пусто -> LLM НЕ
+    вызывается вовсе (дёшево до дорогого)."""
     headings = list(_HEADING_RE.finditer(text))
     sections: list[str] = []
     for i, h in enumerate(headings):
-        if not _is_citation_heading(h.group(1)):
+        level = len(h.group(1))
+        if not _is_citation_heading(h.group(2)):
             continue
         start = h.end()
-        end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+        end = len(text)
+        for later in headings[i + 1 :]:
+            if len(later.group(1)) <= level:
+                end = later.start()
+                break
         body = text[start:end].strip()
         if body:
             sections.append(body)
@@ -588,12 +620,34 @@ def _save_citations_cache(md_path: Path, cache: dict[str, Any]) -> None:
     )
 
 
+def _try_extract_raw_citations(
+    section: str, model: str, call_model: Callable[[dict[str, Any]], dict[str, Any]]
+) -> list[Any] | None:
+    """Один вызов модели -> сырой список ``citations``, либо ``None`` при ОТКАЗЕ (пустой
+    или синтаксически невалидный JSON-ответ). Живой класс дефекта (мини-A/B 2026-07-24,
+    `deepseek-v4-flash`): модель на дефолтном reasoning-effort может сжечь ВЕСЬ
+    `max_tokens` на скрытые reasoning-токены и вернуть пустой видимый контент —
+    воспроизведено дважды из трёх живых прогонов. Пустой СПИСОК (модель честно ответила
+    «цитат нет», валидный JSON) — НЕ отказ, fallback не запускает."""
+    response = call_model(_build_citation_payload(model, section))
+    raw_content = response["choices"][0]["message"].get("content") or ""
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    citations = parsed.get("citations")
+    return citations if isinstance(citations, list) else []
+
+
 def extract_text_citations(
     md_path: Path,
     *,
     doc_id: str,
     model: str,
     call_model: Callable[[dict[str, Any]], dict[str, Any]],
+    fallback_model: str | None = None,
 ) -> tuple[list[RawLink], list[CitationLead]]:
     """LLM-стадия текстовых цитат без URL (спек §5, opt-in). Возвращает
     ``(URL-несущие находки как RawLink, лиды без URL)`` — URL-находки идут ДАЛЬШЕ по
@@ -603,7 +657,11 @@ def extract_text_citations(
     partial вокруг ``core.openrouter.chat_request`` с живым ``OPENROUTER_API_KEY``,
     тот же паттерн, что ``fetch``/``get_standards_page`` у aiforgood/eurlex). Кэш
     ``.citations.yaml`` — ключ sha256(секции): повторный прогон по тем же секциям
-    НЕ зовёт ``call_model`` вовсе."""
+    НЕ зовёт ``call_model`` вовсе. ``fallback_model`` (решение куратора 2026-07-24,
+    по факту живого мини-A/B: minimax — основная, gemini — резерв) — если ``model``
+    отказал (см. ``_try_extract_raw_citations``), СРАЗУ повторный вызов на резервной
+    модели для ЭТОЙ секции, до финального пустого результата; какая модель реально
+    ответила — пишется в кэш (``entry["model"]``), не только номинальный конфиг."""
     text = md_path.read_text(encoding="utf-8")
     sections = find_citation_sections(text)
     if not sections:
@@ -618,13 +676,13 @@ def extract_text_citations(
         section_hash = hashlib.sha256(section.encode("utf-8")).hexdigest()
         entry = cache.get(section_hash)
         if entry is None:
-            response = call_model(_build_citation_payload(model, section))
-            raw_content = response["choices"][0]["message"]["content"]
-            try:
-                parsed = json.loads(raw_content)
-                raw_citations = parsed.get("citations") or [] if isinstance(parsed, dict) else []
-            except json.JSONDecodeError:
-                raw_citations = []
+            raw_citations = _try_extract_raw_citations(section, model, call_model)
+            used_model = model
+            if raw_citations is None and fallback_model is not None:
+                raw_citations = _try_extract_raw_citations(section, fallback_model, call_model)
+                used_model = fallback_model
+            if raw_citations is None:
+                raw_citations = []  # и основная, и резервная модель отказали — честный пустой результат
 
             verified: list[dict[str, Any]] = []
             for item in raw_citations:
@@ -636,7 +694,7 @@ def extract_text_citations(
                 verified.append(
                     {"title": title, "issuer": item.get("issuer"), "year": item.get("year"), "url": item.get("url")}
                 )
-            entry = {"model": model, "citations": verified}
+            entry = {"model": used_model, "citations": verified}
             cache[section_hash] = entry
             cache_dirty = True
 
@@ -752,7 +810,11 @@ def discover_snowball(
             raw_links.extend((link, "md") for link in found)
         if cfg.emit.text_citations and rec.sensitivity != schema.Sensitivity.confidential:
             cite_links, cite_leads = extract_text_citations(
-                md_path, doc_id=rec.id, model=cfg.citations_model, call_model=call_model
+                md_path,
+                doc_id=rec.id,
+                model=cfg.citations_model,
+                call_model=call_model,
+                fallback_model=cfg.citations_model_fallback,
             )
             per_extractor["text_citations"] += len(cite_links)
             raw_links.extend((link, "citation") for link in cite_links)

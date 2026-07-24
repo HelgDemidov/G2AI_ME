@@ -42,11 +42,61 @@ def test_find_citation_sections_recognizes_each_stopword(heading: str) -> None:
     assert "Smith, J. (2024)" in sections[0]
 
 
-def test_find_citation_sections_stops_at_next_heading_of_any_level() -> None:
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "1.2.1 Sources of risk",  # живая находка мини-A/B: sg-imda-mgf-agentic-2026, реальный заголовок
+        "Notes on methodology",
+        "6.2 Cross-References",
+        "Data sources and collection",
+    ],
+)
+def test_find_citation_sections_rejects_ambiguous_single_word_in_longer_heading(heading: str) -> None:
+    """Однословные кандидаты (sources/references/notes/…) НЕ матчатся как подстрока
+    более длинного содержательного заголовка — только точное совпадение всего
+    заголовка (после среза нумерации). Живой факт: без этого фикса «1.2.1 Sources of
+    risk» в sg-imda-mgf-agentic-2026 ложно всплывал как «цитатная секция»."""
+    text = f"# Intro\n\nprose\n\n# {heading}\n\nOrdinary content paragraph, not a citation list.\n"
+    assert find_citation_sections(text) == []
+
+
+def test_find_citation_sections_stops_at_next_heading_of_same_level() -> None:
     text = "# References\n\nSmith, J. (2024). A Report.\n\n# Appendix\n\nUnrelated appendix text.\n"
     sections = find_citation_sections(text)
     assert len(sections) == 1
     assert "Appendix" not in sections[0]
+    assert "Unrelated" not in sections[0]
+
+
+def test_find_citation_sections_does_not_stop_at_nested_sub_heading() -> None:
+    """Живая находка мини-A/B 2026-07-24 (sg-imda-mgf-agentic-2026, «## Annex A: Further
+    resources»): цитатный раздел организован ВЛОЖЕННЫМИ подзаголовками более глубокого
+    уровня — граница обязана пропустить их и остановиться только на следующем заголовке
+    ТОГО ЖЕ уровня, что и citation-заголовок (иначе секция обрывается на первой строке)."""
+    text = (
+        "## Further resources\n\n"
+        "###### Topic A\n\n"
+        "Smith, J. (2024). A Report.\n\n"
+        "###### Topic B\n\n"
+        "Doe, A. (2023). Another Report.\n\n"
+        "## Annex B\n\n"
+        "Unrelated appendix text.\n"
+    )
+    sections = find_citation_sections(text)
+    assert len(sections) == 1
+    assert "Topic A" in sections[0]
+    assert "Smith, J. (2024)" in sections[0]
+    assert "Topic B" in sections[0]
+    assert "Doe, A. (2023)" in sections[0]
+    assert "Unrelated" not in sections[0]
+
+
+def test_find_citation_sections_stops_at_sibling_heading_shallower_than_current() -> None:
+    """Заголовок БОЛЕЕ ВЫСОКОГО уровня (меньше #) тоже обязан остановить секцию — не
+    только тот же уровень."""
+    text = "## References\n\nSmith, J. (2024). A Report.\n\n# Top-level section\n\nUnrelated text.\n"
+    sections = find_citation_sections(text)
+    assert len(sections) == 1
     assert "Unrelated" not in sections[0]
 
 
@@ -119,6 +169,24 @@ class _FakeModel:
     def __call__(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.calls += 1
         content = json.dumps(self.response_json)
+        return {"choices": [{"message": {"content": content}}]}
+
+
+class _DispatchFakeModel:
+    """Разный ответ в зависимости от ``payload['model']`` — эмулирует основную vs
+    резервную модель (спек §5, решение куратора 2026-07-24: minimax основная, gemini
+    резерв). ``None`` в значении словаря -> пустой content (живой класс отказа —
+    модель сжигает весь max_tokens на reasoning-токены, см. discovery_snowball.yaml)."""
+
+    def __init__(self, responses: dict[str, dict[str, Any] | None]) -> None:
+        self.responses = responses
+        self.calls: list[str] = []
+
+    def __call__(self, payload: dict[str, Any]) -> dict[str, Any]:
+        model = payload["model"]
+        self.calls.append(model)
+        response_json = self.responses.get(model)
+        content = json.dumps(response_json) if response_json is not None else ""
         return {"choices": [{"message": {"content": content}}]}
 
 
@@ -216,6 +284,152 @@ def test_extract_text_citations_cache_hit_skips_model_call(tmp_path: Path) -> No
     assert second_links == first_links
 
 
+# --- fallback-модель (решение куратора 2026-07-24: minimax основная, gemini резерв) ---
+
+
+def test_extract_text_citations_falls_back_when_primary_returns_empty_content(tmp_path: Path) -> None:
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+    dispatcher = _DispatchFakeModel(
+        {
+            "primary/model": None,  # пустой content — живой класс отказа
+            "fallback/model": {
+                "citations": [{"title": "Cyber Security Strategy 2025", "url": "https://gov.example/strategy.pdf"}]
+            },
+        }
+    )
+
+    links, leads = extract_text_citations(
+        md_path, doc_id="doc-1", model="primary/model", call_model=dispatcher, fallback_model="fallback/model"
+    )
+
+    assert dispatcher.calls == ["primary/model", "fallback/model"]
+    assert links == [RawLink(url="https://gov.example/strategy.pdf", anchor="Cyber Security Strategy 2025")]
+
+
+def test_extract_text_citations_does_not_call_fallback_when_primary_succeeds(tmp_path: Path) -> None:
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+    dispatcher = _DispatchFakeModel(
+        {
+            "primary/model": {
+                "citations": [{"title": "Cyber Security Strategy 2025", "url": "https://gov.example/strategy.pdf"}]
+            },
+            "fallback/model": {"citations": []},
+        }
+    )
+
+    extract_text_citations(
+        md_path, doc_id="doc-1", model="primary/model", call_model=dispatcher, fallback_model="fallback/model"
+    )
+
+    assert dispatcher.calls == ["primary/model"]  # fallback НИКОГДА не вызывается, когда основная отвечает
+
+
+def test_extract_text_citations_both_primary_and_fallback_fail_yields_empty_not_crash(tmp_path: Path) -> None:
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+    dispatcher = _DispatchFakeModel({"primary/model": None, "fallback/model": None})
+
+    links, leads = extract_text_citations(
+        md_path, doc_id="doc-1", model="primary/model", call_model=dispatcher, fallback_model="fallback/model"
+    )
+
+    assert links == []
+    assert leads == []
+    assert dispatcher.calls == ["primary/model", "fallback/model"]
+
+
+def test_extract_text_citations_no_fallback_configured_keeps_old_behavior(tmp_path: Path) -> None:
+    """``fallback_model=None`` (не задан) -> отказ основной модели НЕ триггерит повторный
+    вызов — обратная совместимость с поведением до введения fallback."""
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+    dispatcher = _DispatchFakeModel({"primary/model": None})
+
+    links, leads = extract_text_citations(
+        md_path, doc_id="doc-1", model="primary/model", call_model=dispatcher, fallback_model=None
+    )
+
+    assert links == []
+    assert dispatcher.calls == ["primary/model"]
+
+
+def test_extract_text_citations_cache_records_model_that_actually_answered(tmp_path: Path) -> None:
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+    dispatcher = _DispatchFakeModel(
+        {
+            "primary/model": None,
+            "fallback/model": {
+                "citations": [{"title": "Cyber Security Strategy 2025", "url": "https://gov.example/strategy.pdf"}]
+            },
+        }
+    )
+
+    extract_text_citations(
+        md_path, doc_id="doc-1", model="primary/model", call_model=dispatcher, fallback_model="fallback/model"
+    )
+
+    import yaml
+
+    cache = yaml.safe_load((tmp_path / ".citations.yaml").read_text(encoding="utf-8"))
+    entry = next(iter(cache.values()))
+    assert entry["model"] == "fallback/model"  # не номинальный "primary/model" — тот, кто реально ответил
+
+
+def test_extract_text_citations_malformed_json_from_primary_also_triggers_fallback(tmp_path: Path) -> None:
+    """Не только пустой content (reasoning-token exhaustion), но и синтаксически битый
+    JSON тоже считается отказом основной модели и запускает fallback."""
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+
+    class _BrokenPrimaryThenGoodFallback:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __call__(self, payload: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(payload["model"])
+            if payload["model"] == "primary/model":
+                return {"choices": [{"message": {"content": "not valid json {{{"}}]}
+            good = {"citations": [{"title": "Cyber Security Strategy 2025", "url": None}]}
+            return {"choices": [{"message": {"content": json.dumps(good)}}]}
+
+    fake = _BrokenPrimaryThenGoodFallback()
+    links, leads = extract_text_citations(
+        md_path, doc_id="doc-1", model="primary/model", call_model=fake, fallback_model="fallback/model"
+    )
+
+    assert fake.calls == ["primary/model", "fallback/model"]
+    assert len(leads) == 1
+
+
+def test_extract_text_citations_valid_json_but_not_an_object_triggers_fallback(tmp_path: Path) -> None:
+    """Синтаксически валидный JSON, но верхний уровень НЕ объект (напр. голый массив) —
+    тоже отказ (``_try_extract_raw_citations`` ожидает ``{"citations": [...]}``, не
+    произвольный JSON), запускает fallback так же, как пустой content/битый синтаксис."""
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+
+    class _BareArrayPrimary:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __call__(self, payload: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(payload["model"])
+            if payload["model"] == "primary/model":
+                return {"choices": [{"message": {"content": "[1, 2, 3]"}}]}  # валидный JSON, не объект
+            return {"choices": [{"message": {"content": json.dumps({"citations": []})}}]}
+
+    fake = _BareArrayPrimary()
+    links, leads = extract_text_citations(
+        md_path, doc_id="doc-1", model="primary/model", call_model=fake, fallback_model="fallback/model"
+    )
+    assert fake.calls == ["primary/model", "fallback/model"]
+    assert links == []
+    assert leads == []
+
+
 # --- sensitivity gate: применяется на уровне discover_snowball (не extract_text_citations) ---
 
 
@@ -243,6 +457,7 @@ def test_confidential_document_skips_llm_stage_entirely(tmp_path: Path) -> None:
         emit=sb.EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=True),
         max_candidates=None,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
     result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec], call_model=boom)
     assert result.diagnostics["per_extractor"]["text_citations"] == 0
@@ -268,6 +483,7 @@ def test_normal_document_llm_stage_runs_when_emitted(tmp_path: Path) -> None:
         emit=sb.EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=True),
         max_candidates=None,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
     result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec], call_model=fake)
     urls = {c.source_url for c in result.candidates}
@@ -383,6 +599,7 @@ def test_discover_snowball_mines_html_document_end_to_end(tmp_path: Path) -> Non
         emit=sb.EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=False),
         max_candidates=None,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
     result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec])
     urls = {c.source_url for c in result.candidates}

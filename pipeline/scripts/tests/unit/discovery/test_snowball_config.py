@@ -39,7 +39,8 @@ def test_load_config_reads_real_tracked_config() -> None:
     assert config.emit.printed_urls is True
     assert config.emit.text_citations is False
     assert config.max_candidates is None
-    assert config.citations_model == "deepseek/deepseek-v4-flash"
+    assert config.citations_model == "minimax/minimax-m3"
+    assert config.citations_model_fallback == "google/gemini-3-flash-preview"
 
 
 # --- load_config: кастомный путь, дефолты вложенных секций ---
@@ -74,6 +75,7 @@ def test_load_config_custom_path_full(tmp_path: Path) -> None:
             },
             "max_candidates": 50,
             "citations_model": "test/model",
+            "citations_model_fallback": "test/fallback-model",
         },
     )
     config = snowball.load_config(path)
@@ -85,6 +87,7 @@ def test_load_config_custom_path_full(tmp_path: Path) -> None:
     assert config.emit.text_citations is True
     assert config.max_candidates == 50
     assert config.citations_model == "test/model"
+    assert config.citations_model_fallback == "test/fallback-model"
 
 
 def test_load_config_missing_nested_sections_default_to_permissive(tmp_path: Path) -> None:
@@ -98,6 +101,19 @@ def test_load_config_missing_nested_sections_default_to_permissive(tmp_path: Pat
     assert config.emit.pdf_annotations is True
     assert config.emit.text_citations is False
     assert config.max_candidates is None
+    assert config.citations_model_fallback is None
+
+
+@pytest.mark.parametrize("raw_value", [None, ""])
+def test_citations_model_fallback_falsy_yaml_value_is_none(tmp_path: Path, raw_value: str | None) -> None:
+    """``citations_model_fallback: null`` (или пустая строка) -> ``None`` (fallback
+    отключён) — не строка ``"None"``/пустая строка, которую попытались бы использовать
+    как реальный слаг модели."""
+    path = _write_config(
+        tmp_path, {"enabled": True, "citations_model": "x/y", "citations_model_fallback": raw_value}
+    )
+    config = snowball.load_config(path)
+    assert config.citations_model_fallback is None
 
 
 # --- max_candidates sanity-чек ---

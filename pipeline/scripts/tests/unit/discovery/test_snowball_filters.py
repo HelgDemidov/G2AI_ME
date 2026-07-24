@@ -25,6 +25,7 @@ def _base_config() -> snowball.SnowballConfig:
         ),
         max_candidates=None,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
 
 
@@ -132,6 +133,7 @@ def test_emit_toggle_disables_pdf_annotations_extractor(tmp_path: Path) -> None:
         ),
         max_candidates=None,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
     result = snowball.discover_snowball(None, config=cfg_off, root=tmp_path, records=[rec])
     assert result.candidates == []
@@ -164,6 +166,7 @@ def test_emit_toggle_disables_html_hrefs_extractor(tmp_path: Path) -> None:
         ),
         max_candidates=None,
         citations_model="test/model",
+        citations_model_fallback=None,
     )
     result = snowball.discover_snowball(None, config=cfg_off, root=tmp_path, records=[rec])
     assert result.candidates == []
