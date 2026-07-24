@@ -353,3 +353,199 @@ def test_diff_cursor_monotonic_never_shrinks_when_upstream_result_shrinks() -> N
     fresh, cursor = oecd.diff_cursor(["a"], {"seen_ids": ["a", "b"]})
     assert fresh == set()
     assert cursor == {"seen_ids": ["a", "b"]}
+
+
+# --- in_scope: гибридный фильтр §2 ---
+
+
+def test_in_scope_include_category_passes() -> None:
+    rec = {"category": "Cat A"}
+    assert oecd.in_scope(rec, _BASE_CONFIG) is True
+
+
+def test_in_scope_probe_category_with_target_type_passes() -> None:
+    rec = {"category": "Projects", "initiativeType": {"name": "Type A"}}
+    assert oecd.in_scope(rec, _BASE_CONFIG) is True
+
+
+def test_in_scope_probe_category_with_non_target_type_rejected() -> None:
+    rec = {"category": "Projects", "initiativeType": {"name": "Type B"}}
+    assert oecd.in_scope(rec, _BASE_CONFIG) is False
+
+
+def test_in_scope_probe_category_missing_initiative_type_rejected() -> None:
+    rec = {"category": "Projects", "initiativeType": None}
+    assert oecd.in_scope(rec, _BASE_CONFIG) is False
+
+
+def test_in_scope_unknown_category_rejected() -> None:
+    """Таксономия OECD может вырасти — новая категория проходит мимо честно, не молча
+    втягивается (rationale: include, не exclude)."""
+    rec = {"category": "Some New Category Nobody Configured Yet"}
+    assert oecd.in_scope(rec, _BASE_CONFIG) is False
+
+
+# --- _source_url ---
+
+
+def test_valid_url_accepts_http_and_https() -> None:
+    assert oecd._valid_url("http://example.org") is True
+    assert oecd._valid_url("https://example.org") is True
+
+
+@pytest.mark.parametrize("url", [None, "", "ftp://example.org", "example.org"])
+def test_valid_url_rejects_missing_or_non_http(url: str | None) -> None:
+    assert oecd._valid_url(url) is False
+
+
+def test_source_url_prefers_website() -> None:
+    rec = {"website": "https://gov.example.org", "relevantUrls": ["https://other.example.org"]}
+    assert oecd._source_url(rec) == "https://gov.example.org"
+
+
+def test_source_url_falls_back_to_relevant_urls() -> None:
+    rec = {"website": None, "relevantUrls": ["https://gov.example.org/doc"]}
+    assert oecd._source_url(rec) == "https://gov.example.org/doc"
+
+
+def test_source_url_none_when_neither_present() -> None:
+    rec: dict[str, Any] = {"website": None, "relevantUrls": []}
+    assert oecd._source_url(rec) is None
+
+
+def test_source_url_ignores_relevant_files_rehost() -> None:
+    """relevantFiles (OECD-hosted PDF) НЕ фолбэк для source_url (rationale §3)."""
+    rec = {
+        "website": None, "relevantUrls": [],
+        "relevantFiles": [{"path": "policy-initiatives/x.pdf"}],
+    }
+    assert oecd._source_url(rec) is None
+
+
+# --- _map_record: маппинг + Faker/PII-барьеры (спек §1/§3) ---
+
+
+_FAKER_POISONED_COUNTRY = {
+    "id": 141, "name": "Portugal", "slug": "portugal", "code": "PRT",
+    "language": "Myanmar", "populationIn2023": 344346626, "gdp": 248975843,
+    "incomeGroup": "Low income",
+}
+
+_FAKER_POISONED_IGO = {
+    "id": 8, "name": "European Union", "slug": "european-union",
+    "website": "http://demetrius.info", "description": "Temporibus rerum cupiditate.",
+    "yearFounded": 1993,
+}
+
+
+def _base_record(**overrides: Any) -> dict[str, Any]:
+    rec: dict[str, Any] = {
+        "id": 2526,
+        "englishName": "Justice Practical Guide",
+        "originalName": "Guia Prático da Justiça",
+        "description": "A digital tool that helps citizens find justice information.",
+        "website": "https://justica.gov.pt/Servicos/Guia-pratico-da-Justica",
+        "relevantUrls": [],
+        "gaiinCountry": _FAKER_POISONED_COUNTRY,
+        "intergovernmentalOrganisation": None,
+        "responsibleOrganisation": "Ministry of Justice",
+        "category": "AI policy initiatives, programmes and projects",
+        "initiativeType": {"name": "AI use cases/projects in the public sector"},
+        "extentBinding": None,
+        "startYear": 2023,
+        "updatedAt": "2026-07-21T00:00:00Z",
+        "createdByEmail": "tony.tripp@oecd.org",
+        "createdByName": "Tony Tripp",
+        "publishedByEmail": "tony.tripp@oecd.org",
+        "publishedByName": "Tony Tripp",
+        "updatedByEmail": "someone@oecd.org",
+    }
+    rec.update(overrides)
+    return rec
+
+
+def test_map_record_field_mapping() -> None:
+    cand = oecd._map_record(_base_record())
+    assert cand is not None
+    assert cand.title == "Justice Practical Guide"
+    assert cand.issuer == "Ministry of Justice"
+    assert cand.jurisdiction == "Portugal"
+    assert cand.doc_date is None
+    assert cand.language is None
+    assert cand.source_url == "https://justica.gov.pt/Servicos/Guia-pratico-da-Justica"
+    assert cand.native_id == "2526"
+    assert cand.connector_id == oecd.CONNECTOR_ID
+    assert "category: AI policy initiatives, programmes and projects" in (cand.native_tags or [])
+    assert "type: AI use cases/projects in the public sector" in (cand.native_tags or [])
+    assert "start_year: 2023" in (cand.native_tags or [])
+
+
+def test_map_record_faker_barrier_only_country_name_is_read() -> None:
+    """Барьер §1: демография gaiinCountry (язык/население/ВВП) НИКУДА не попадает —
+    ни в одно поле CandidateRecord, даже как побочный текст native_tags/summary."""
+    cand = oecd._map_record(_base_record())
+    assert cand is not None
+    dumped = cand.model_dump_json()
+    assert "Myanmar" not in dumped
+    assert "344346626" not in dumped
+    assert "Low income" not in dumped
+    assert cand.jurisdiction == "Portugal"
+
+
+def test_map_record_faker_barrier_igo_only_name_is_read() -> None:
+    """Тот же барьер для intergovernmentalOrganisation — живьём подтверждено, что и оно
+    несёт Faker-порченные website/description."""
+    rec = _base_record(gaiinCountry=None, intergovernmentalOrganisation=_FAKER_POISONED_IGO)
+    cand = oecd._map_record(rec)
+    assert cand is not None
+    assert cand.jurisdiction == "European Union"
+    dumped = cand.model_dump_json()
+    assert "demetrius" not in dumped
+    assert "Temporibus" not in dumped
+
+
+def test_map_record_pii_barrier_no_editor_fields_in_output() -> None:
+    """Барьер §1: PII редакторов OECD (email/имя) не должно быть нигде в дампе кандидата."""
+    cand = oecd._map_record(_base_record())
+    assert cand is not None
+    dumped = cand.model_dump_json()
+    assert "tony.tripp" not in dumped
+    assert "Tony Tripp" not in dumped
+
+
+def test_map_record_title_falls_back_to_original_name() -> None:
+    cand = oecd._map_record(_base_record(englishName=""))
+    assert cand is not None
+    assert cand.title == "Guia Prático da Justiça"
+
+
+def test_map_record_no_title_at_all_is_skipped() -> None:
+    assert oecd._map_record(_base_record(englishName="", originalName="")) is None
+
+
+def test_map_record_missing_url_is_skipped() -> None:
+    assert oecd._map_record(_base_record(website=None, relevantUrls=[])) is None
+
+
+def test_map_record_missing_id_is_skipped() -> None:
+    assert oecd._map_record(_base_record(id=None)) is None
+
+
+def test_map_record_igo_jurisdiction_when_no_country() -> None:
+    rec = _base_record(gaiinCountry=None, intergovernmentalOrganisation=_FAKER_POISONED_IGO)
+    cand = oecd._map_record(rec)
+    assert cand is not None
+    assert cand.jurisdiction == "European Union"
+
+
+def test_map_record_no_country_no_igo_jurisdiction_none() -> None:
+    rec = _base_record(gaiinCountry=None, intergovernmentalOrganisation=None)
+    cand = oecd._map_record(rec)
+    assert cand is not None
+    assert cand.jurisdiction is None
+
+
+def test_map_record_responsible_organisation_null_is_none_issuer() -> None:
+    cand = oecd._map_record(_base_record(responsibleOrganisation=None))
+    assert cand is not None
+    assert cand.issuer is None

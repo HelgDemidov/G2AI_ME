@@ -11,6 +11,8 @@ JSON, seen-id-курсор, без DuckDB) — плюс два свойства,
 """
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import json
 import sys
 import time
@@ -23,8 +25,9 @@ from typing import Any
 
 import yaml
 
-from core import fsio
+from core import fsio, schema
 from core.env import REPO_ROOT
+from discovery import dedup
 from discovery.base import ConnectorCursor
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_oecd.yaml"
@@ -178,3 +181,121 @@ def diff_cursor(
     fresh_ids = {i for i in all_ids if i not in seen}
     new_seen = sorted(seen | set(all_ids))
     return fresh_ids, {"seen_ids": new_seen}
+
+
+# --- §2/§3: фильтр объёма — гибрид (полные policy-категории + узкая проба из "projects") ---
+
+
+def in_scope(record: dict[str, Any], config: OecdConfig) -> bool:
+    """Гибридный фильтр §2 (решение куратора 2026-07-25): категория целиком в
+    ``include_categories``, ИЛИ категория — ``probe_category`` И ``initiativeType.name``
+    в ``probe_initiative_types``. Список include, не exclude (rationale): новая категория
+    в таксономии OECD пройдёт мимо честно (счётчик ``skipped_out_of_scope`` у вызывающей
+    стороны), не втянется молча."""
+    category = record.get("category")
+    if category in config.include_categories:
+        return True
+    if category != config.probe_category:
+        return False
+    itype = record.get("initiativeType")
+    itype_name = itype.get("name") if isinstance(itype, dict) else None
+    return itype_name in config.probe_initiative_types
+
+
+def _valid_url(url: str | None) -> bool:
+    if not url:
+        return False
+    return url.startswith("http://") or url.startswith("https://")
+
+
+def _source_url(record: dict[str, Any]) -> str | None:
+    """``website``, иначе первый валидный ``relevantUrls[0]`` (спек §3). ``relevantFiles``
+    (OECD-hosted PDF) сознательно НЕ фолбэк — rehost, не официальный первоисточник
+    (rationale)."""
+    website = record.get("website")
+    if _valid_url(website):
+        return website
+    urls = record.get("relevantUrls")
+    if isinstance(urls, list) and urls and _valid_url(urls[0]):
+        return str(urls[0])
+    return None
+
+
+# --- §3: маппинг записи -> CandidateRecord (Faker/PII-барьеры, §1) ---
+
+
+def _map_record(record: dict[str, Any]) -> schema.CandidateRecord | None:
+    """Одна запись ``data[]`` -> ``CandidateRecord`` (маппинг §3). ``None`` — пропуск
+    (диагностика у вызывающей стороны), не исключение — data-quality отсев, не relevance.
+
+    **Faker-барьер (§1):** из ``gaiinCountry``/``intergovernmentalOrganisation`` читается
+    ТОЛЬКО ``.name`` — оба объекта несут порченные Faker.js-поля (демография countries;
+    у intergovernmentalOrganisation живьём подтверждено то же самое — ``website``/
+    ``description`` вида ``"http://demetrius.info"``/``"Temporibus rerum cupiditate."``,
+    не настоящие данные организации). **PII-барьер (§1):** ``createdByEmail``/
+    ``publishedByEmail``/``*ByName`` и т.п. не читаются НИГДЕ в этой функции — живые
+    адреса @oecd.org не должны попасть в версионируемый ``candidates.yaml``.
+    """
+    native_id = record.get("id")
+    if native_id is None:
+        return None
+    native_id_str = str(native_id)
+
+    english_name = (record.get("englishName") or "").strip()
+    original_name = (record.get("originalName") or "").strip()
+    title = english_name or original_name or None
+    if not title:
+        return None
+
+    source_url = _source_url(record)
+    if source_url is None:
+        return None
+
+    country = record.get("gaiinCountry")
+    igo = record.get("intergovernmentalOrganisation")
+    jurisdiction: str | None = None
+    if isinstance(country, dict):
+        jurisdiction = country.get("name")
+    elif isinstance(igo, dict):
+        jurisdiction = igo.get("name")
+
+    issuer = record.get("responsibleOrganisation")
+    issuer = issuer if isinstance(issuer, str) and issuer.strip() else None
+
+    summary = (record.get("description") or "").strip()
+    native_summary = summary[: schema.CANDIDATE_SUMMARY_MAX] if summary else None
+
+    category = record.get("category")
+    itype = record.get("initiativeType")
+    itype_name = itype.get("name") if isinstance(itype, dict) else None
+    extent_binding = record.get("extentBinding")
+    start_year = record.get("startYear")
+
+    native_tags: list[str] = []
+    if category:
+        native_tags.append(f"category: {category}")
+    if itype_name:
+        native_tags.append(f"type: {itype_name}")
+    if extent_binding:
+        native_tags.append(f"binding: {extent_binding}")
+    if start_year:
+        native_tags.append(f"start_year: {start_year}")
+
+    canonical = "|".join([native_id_str, english_name, str(record.get("updatedAt"))])
+    raw_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    return schema.CandidateRecord(
+        title=title,
+        issuer=issuer,
+        jurisdiction=jurisdiction,
+        doc_date=None,
+        language=None,
+        source_url=source_url,
+        native_summary=native_summary,
+        native_id=native_id_str,
+        native_tags=native_tags or None,
+        connector_id=CONNECTOR_ID,
+        retrieved_at=dt.date.today(),
+        raw_hash=raw_hash,
+        normalized_url=dedup.normalize_url(source_url),
+    )
