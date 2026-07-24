@@ -103,6 +103,13 @@ def _was_ocr_normalized(raw: Path) -> bool:
     return "ocrmypdf" in creator
 
 
+def was_ocr_normalized(raw: Path) -> bool:
+    """Публичный алиас `_was_ocr_normalized` — потребители вне convert-слоя (напр.
+    discovery-snowball §2.3: пометка `ocr-text-url` для URL, извлечённых из OCR-текста,
+    подверженного искажению цифр/диакритики) читают этот факт, не дублируя логику."""
+    return _was_ocr_normalized(raw)
+
+
 # rec.language (schema.py: ISO 639-1, либо 639-3 где нет 639-1, напр. cnr) -> tesseract langcode.
 TESSERACT_LANGS = {
     "en": "eng", "et": "est", "sr": "srp_latn", "cnr": "srp_latn",

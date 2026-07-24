@@ -12,19 +12,26 @@ from pathlib import Path
 
 from core import schema
 from discovery import registry, store
+from discovery.base import Connector
 from discovery.dedup import dedup
 
 
 @dataclass
 class ConnectorRunSummary:
     """Итог прогона одного коннектора: сколько нашёл / сколько реально свежих / сколько
-    поглотил dedup / ошибка (если коннектор упал — прогон остальных не прерван)."""
+    поглотил dedup / ошибка (если коннектор упал — прогон остальных не прерван).
+
+    ``diagnostics`` — сырой ``DiscoverResult.diagnostics`` коннектора, прокинутый как
+    есть (спек discovery-snowball §5: `discover.py snowball` читает отсюда `leads` для
+    записи `.snowball_leads.yaml` — оркестратор его не интерпретирует, только переносит).
+    """
 
     connector_id: str
     found: int = 0
     fresh: int = 0
     merged: int = 0
     error: str | None = None
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -46,6 +53,7 @@ def discover(
     *,
     root: Path = schema.DEFAULT_SOURCES,
     dry_run: bool = False,
+    connectors_override: list[Connector] | None = None,
 ) -> DiscoverySummary:
     """Прогнать enabled-коннекторы (или подмножество ``only``), dedup'нуть и персистить.
 
@@ -53,6 +61,12 @@ def discover(
     уже собранных в ЭТОМ прогоне более ранними коннекторами) кандидатов — документ,
     найденный двумя коннекторами за один прогон, схлопывается так же, как если бы
     они запускались раздельно (чартер §4.4).
+
+    ``connectors_override`` — явный список коннекторов ВМЕСТО чтения реестра (спек
+    discovery-snowball §3): CLI-подкоманда `snowball` строит один переопределённый
+    экземпляр `SnowballConnector` из yaml+флагов на один прогон, не мутируя ни реестр,
+    ни файл конфига. ``only`` в этом режиме игнорируется — сам список уже финальный.
+    Без параметра (``None``, дефолт) поведение НЕ меняется — обычный путь через реестр.
     """
     candidates_path = root / "candidates.yaml"
     cursors_path = root / ".discovery_cursors.yaml"
@@ -63,7 +77,8 @@ def discover(
     summaries: list[ConnectorRunSummary] = []
     fresh_this_run: list[schema.CandidateRecord] = []
 
-    for connector in registry.enabled_connectors(only):
+    connectors = connectors_override if connectors_override is not None else registry.enabled_connectors(only)
+    for connector in connectors:
         try:
             result = connector.discover(cursors.get(connector.id))
         except Exception as exc:  # noqa: BLE001 — изоляция отказов, зеркало run_pipeline
@@ -79,6 +94,7 @@ def discover(
                 found=len(result.candidates),
                 fresh=len(fresh),
                 merged=merged,
+                diagnostics=result.diagnostics,
             )
         )
 

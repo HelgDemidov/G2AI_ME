@@ -354,6 +354,7 @@ def build_pdf(
     *,
     lines: list[tuple[str, float, float, float]] | None = None,
     table: tuple[list[list[str]], float, float, float, float] | None = None,
+    links: list[tuple[str, float, float, float, float]] | None = None,
     page_size: tuple[float, float] = (612.0, 792.0),
 ) -> bytes:
     """Синтетический однострочичный PDF через reportlab (test-coverage-hardening) — реальный
@@ -364,7 +365,11 @@ def build_pdf(
     pdfplumber (0 у верхнего края страницы) — функция сама переводит в bottom-up систему
     reportlab. ``table`` — ``(data, x, y_from_top, col_width, row_height)`` — таблица с
     реальной сеткой линий (``GRID``), которую ``pdfplumber.find_tables()`` детектирует своей
-    штатной lines-стратегией (не наш код — сама библиотека)."""
+    штатной lines-стратегией (не наш код — сама библиотека). ``links`` — ``(uri, x0,
+    y_from_top_top, x1, y_from_top_bottom)`` — прямоугольная гиперлинк-аннотация (``Subtype
+    /Link``, простой ``Rect``, БЕЗ ``QuadPoints`` — reportlab их не выставляет; ровно то, что
+    несёт живой корпус, спек discovery-snowball §2.4), координаты тоже в top-down системе
+    pdfplumber — функция сама переводит в bottom-up reportlab."""
     from reportlab.lib import colors
     from reportlab.pdfgen import canvas
     from reportlab.platypus import Table, TableStyle
@@ -381,6 +386,9 @@ def build_pdf(
         t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.75, colors.black)]))
         _, th = t.wrap(0, 0)
         t.drawOn(c, tx, height - ty_from_top - th)
+    for uri, x0, y_from_top_top, x1, y_from_top_bottom in links or []:
+        rect = (x0, height - y_from_top_bottom, x1, height - y_from_top_top)
+        c.linkURL(uri, rect, relative=0)
     c.showPage()
     c.save()
     return buf.getvalue()
@@ -418,15 +426,18 @@ def write_doc(
     rec: dict[str, Any],
     *,
     raw: bytes | None = None,
+    raw_ext: str = "pdf",
     md: str | None = None,
     state: dict[str, Any] | None = None,
 ) -> Path:
-    """Создать папку-документ sources/<track>/<entity>/<id>/ + meta.yaml (+ raw.pdf/doc.md/.state.yaml)."""
+    """Создать папку-документ sources/<track>/<entity>/<id>/ + meta.yaml (+ raw.<raw_ext>/
+    doc.md/.state.yaml). ``raw_ext`` — расширение оригинала (по умолчанию ``pdf``; ``html``
+    для тестов, которым нужен именно этот ``SourceFormat``, напр. discovery-snowball)."""
     d = root / str(rec["track"]) / str(rec["entity_id"]) / str(rec["id"])
     d.mkdir(parents=True, exist_ok=True)
     (d / "meta.yaml").write_text(yaml.safe_dump(rec, allow_unicode=True), encoding="utf-8")
     if raw is not None:
-        (d / "raw.pdf").write_bytes(raw)
+        (d / f"raw.{raw_ext}").write_bytes(raw)
     if md is not None:
         (d / "doc.md").write_text(md, encoding="utf-8")
     if state is not None:

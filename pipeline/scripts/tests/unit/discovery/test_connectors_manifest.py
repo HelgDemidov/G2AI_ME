@@ -148,3 +148,48 @@ def test_all_three_registry_connectors_coexist() -> None:
     )
     result = _run_check(code)
     assert result.returncode == 0, result.stderr
+
+
+def test_importing_discover_cli_registers_snowball_via_manifest() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert 'snowball' in registry.CONNECTORS, sorted(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_snowball_registered_as_snowball_kind_and_config_gated_enabled() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "from core import schema\n"
+        "conn = registry.CONNECTORS['snowball']\n"
+        "assert conn.kind == schema.ConnectorKind.snowball\n"
+        "assert conn.enabled is True\n"  # discovery_snowball.yaml: enabled: true
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_snowball_reachable_via_enabled_connectors_only_filter() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "found = registry.enabled_connectors(only=['snowball'])\n"
+        "assert len(found) == 1 and found[0].id == 'snowball'\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_snowball_coexists_with_three_registry_connectors() -> None:
+    """Пятый архетип (snowball) не вытесняет три registry-коннектора — все доступны разом."""
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert {'agora', 'eurlex', 'aiforgood', 'snowball'} <= set(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr

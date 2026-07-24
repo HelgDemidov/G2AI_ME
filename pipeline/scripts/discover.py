@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import logging
 from pathlib import Path
@@ -16,6 +17,7 @@ import yaml
 
 from core import schema, validate_sources
 from discovery import connectors, manual, store  # noqa: F401 — connectors: манифест реальных коннекторов (§4.3)
+from discovery.connectors import snowball
 from discovery.orchestrate import DiscoverySummary, discover
 
 
@@ -108,6 +110,57 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     return 1 if summary.errors else 0
 
 
+def _build_snowball_config_override(args: argparse.Namespace) -> snowball.SnowballConfig:
+    """yaml (``snowball.load_config()``) + CLI-флаги -> слитый конфиг НА ОДИН прогон
+    (спек discovery-snowball §3). Заданный флаг ЗАМЕЩАЕТ соответствующее поле yaml
+    целиком (не сливается поэлементно); незаданный (``None``/пустой список) — yaml как
+    есть. Файл на диске не трогается."""
+    base = snowball.load_config()
+    source_filter = base.source_filter
+    if args.doc:
+        source_filter = dataclasses.replace(source_filter, include_doc_ids=tuple(args.doc))
+    if args.track:
+        source_filter = dataclasses.replace(source_filter, tracks=tuple(args.track))
+    if args.tier:
+        source_filter = dataclasses.replace(source_filter, target_fit=tuple(args.tier))
+
+    url_filter = base.url_filter
+    if args.exclude_domain:
+        url_filter = dataclasses.replace(url_filter, exclude_domains=tuple(args.exclude_domain))
+
+    emit = base.emit
+    if args.with_citations:
+        emit = dataclasses.replace(emit, text_citations=True)
+
+    max_candidates = base.max_candidates if args.max_candidates is None else args.max_candidates
+
+    return dataclasses.replace(
+        base,
+        source_filter=source_filter,
+        url_filter=url_filter,
+        emit=emit,
+        max_candidates=max_candidates,
+    )
+
+
+def _cmd_snowball(args: argparse.Namespace) -> int:
+    merged_config = _build_snowball_config_override(args)
+    connector = snowball.SnowballConnector(config=merged_config, root=args.root)
+    summary = discover(root=args.root, dry_run=args.dry_run, connectors_override=[connector])
+    _print_summary(summary)
+
+    # §5: лиды (цитаты без URL) — перезаписываются целиком каждым прогоном с
+    # emit.text_citations включённым; --dry-run ничего не пишет на диск (симметрично
+    # candidates.yaml/cursors), отключённая стадия файл не трогает вовсе.
+    if not args.dry_run and merged_config.emit.text_citations and summary.connectors:
+        leads: list[dict[str, Any]] = summary.connectors[0].diagnostics.get("leads") or []  # type: ignore[assignment]
+        snowball.save_leads(leads, args.root)
+        if leads:
+            print(f"snowball: {len(leads)} лид(ов) без URL -> {args.root / snowball.LEADS_FILENAME}")
+
+    return 1 if summary.failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DISCOVERY: генератор кандидатов источников")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -152,6 +205,23 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
     p_apply.add_argument("--dry-run", action="store_true", help="план без записи store/meta.yaml")
     p_apply.set_defaults(func=_cmd_apply)
+
+    p_snowball = sub.add_parser(
+        "snowball", help="backward-snowballing по собственному корпусу (пятый архетип)"
+    )
+    p_snowball.add_argument("--doc", nargs="+", default=None, metavar="ID", help="сузить до этих doc_id")
+    p_snowball.add_argument("--track", nargs="+", default=None, metavar="TRACK")
+    p_snowball.add_argument(
+        "--tier", nargs="+", default=None, metavar="TIER", choices=[t.value for t in schema.TargetFit]
+    )
+    p_snowball.add_argument("--exclude-domain", nargs="+", default=None, metavar="DOMAIN")
+    p_snowball.add_argument(
+        "--with-citations", action="store_true", help="включить LLM-стадию текстовых цитат (§5)"
+    )
+    p_snowball.add_argument("--max-candidates", type=int, default=None, metavar="N")
+    p_snowball.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
+    p_snowball.add_argument("--dry-run", action="store_true", help="сводка без записи store/cursors")
+    p_snowball.set_defaults(func=_cmd_snowball)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")

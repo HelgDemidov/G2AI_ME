@@ -31,6 +31,7 @@ from convert.converters import (
     _tesseract_langs,
     _was_ocr_normalized,
     resolve_converter,
+    was_ocr_normalized,
 )
 from core import fsio, schema
 from core.schema import SourceRecord
@@ -796,6 +797,16 @@ def test_was_ocr_normalized_false_for_born_digital_pdf(monkeypatch: Any, tmp_pat
 def test_was_ocr_normalized_false_when_no_metadata_at_all(monkeypatch: Any, tmp_path: Path) -> None:
     _patch_open(monkeypatch, [])  # metadata=None -> {}
     assert _was_ocr_normalized(tmp_path / "raw.pdf") is False
+
+
+def test_public_was_ocr_normalized_alias_matches_private(monkeypatch: Any, tmp_path: Path) -> None:
+    """Публичный алиас (discovery-snowball §2.3: потребитель вне convert-слоя) должен
+    давать ИДЕНТИЧНЫЙ результат приватной реализации на одном и том же входе — иначе
+    рефактор одной из двух функций разошёлся бы незамеченным."""
+    _patch_open(monkeypatch, [], metadata={"Creator": "ocrmypdf 15.2.0"})
+    raw = tmp_path / "raw.pdf"
+    assert was_ocr_normalized(raw) is True
+    assert was_ocr_normalized(raw) == _was_ocr_normalized(raw)
 
 
 def test_convert_pdf_calls_pdf_convert_only_after_scan_check(monkeypatch: Any, tmp_path: Path) -> None:
