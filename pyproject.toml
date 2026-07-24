@@ -27,6 +27,7 @@ markers = [
     "libreoffice: тест требует установленный soffice (в CI пропускается через skipif — бинарника нет)",
     "mermaid: тест гоняет реальный рендер mermaidx (embedded QuickJS) — секунды на тест, не мс",
     "browser: тест требует Node в PATH и бинарь pipeline/browser/lightpanda (в CI пропускается через skipif — обоих нет)",
+    "heavy: умбрелла — автоматически проставляется (tests/conftest.py) любому тесту с model/corpus/ocr/libreoffice/mermaid/browser; полный гейт по умолчанию = '-m \"not heavy\"' (не растущий список имён)",
 ]
 
 [tool.coverage.run]
