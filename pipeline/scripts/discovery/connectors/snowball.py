@@ -571,9 +571,15 @@ class SnowballConnector:
     id: str = CONNECTOR_ID
     kind: schema.ConnectorKind = schema.ConnectorKind.snowball
     enabled: bool = True
+    config: SnowballConfig | None = None  # None -> discover_snowball грузит yaml сам;
+    # непустой — CLI-подкоманда `snowball` даёт слитый конфиг (yaml + CLI-флаги, спек §3),
+    # на один прогон, без мутации ни реестра, ни файла на диске (orchestrate.connectors_override).
+    root: Path = schema.DEFAULT_SOURCES  # ОБЯЗАН совпадать с --root оркестратора (discover.py
+    # передаёт его явно) — иначе коннектор молча сканирует боевой sources/ вместо тестового/
+    # переданного корня (живой дефект, пойманный test_discover_cli.py при написании коммита 5).
 
     def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return discover_snowball(cursor)
+        return discover_snowball(cursor, config=self.config, root=self.root)
 
 
 # Регистрация при импорте (чартер §4.3 «манифест», спек §1): `enabled` — из конфига,

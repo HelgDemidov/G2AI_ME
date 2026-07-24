@@ -429,3 +429,84 @@ def test_apply_subcommand_dry_run_skips_post_batch_validation(
     code = main(["apply", str(decisions_path), "--root", str(tmp_path), "--dry-run"])
     assert code == 0
     assert "невалиден" not in capsys.readouterr().out
+
+
+# --- `discover.py snowball` — полный проход через main(argv) (spec discovery-snowball §3,
+# коммит 5). Единственный внешний ресурс snowball — уже принятый корпус на диске; никакой
+# сети/модели — реальный CI-safe "интеграционный" тест этого слоя (см. spec §Тестовое
+# покрытие: конвенция проекта не заводит для этого отдельную integration/-папку). ---
+
+
+def test_snowball_subcommand_dry_run_finds_link_but_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tests.support import build_pdf, valid_record, write_doc
+
+    data = valid_record() | {"id": "snowball-cli-doc", "entity_id": "me", "track": "montenegro"}
+    raw_bytes = build_pdf(
+        lines=[("Egypt AI Strategy", 50.0, 60.0, 12.0)],
+        links=[("https://ai.gov.eg/strategy.pdf", 50.0, 55.0, 300.0, 80.0)],
+    )
+    write_doc(tmp_path, data, raw=raw_bytes, md="no printed urls", state={"sha256": "a" * 64})
+
+    code = main(
+        ["snowball", "--doc", "snowball-cli-doc", "--root", str(tmp_path), "--dry-run"]
+    )
+
+    assert code == 0
+    assert not (tmp_path / "candidates.yaml").exists()
+    out = capsys.readouterr().out
+    assert "snowball: найдено 1 | свежих 1 | слито 0" in out
+    assert "Итого: 1 новых кандидат" in out
+    assert "dry-run" in out
+
+
+def test_snowball_subcommand_persists_candidate(tmp_path: Path) -> None:
+    from tests.support import build_pdf, valid_record, write_doc
+
+    data = valid_record() | {"id": "snowball-cli-persist-doc", "entity_id": "me", "track": "montenegro"}
+    raw_bytes = build_pdf(
+        lines=[("Egypt AI Strategy", 50.0, 60.0, 12.0)],
+        links=[("https://ai.gov.eg/strategy.pdf", 50.0, 55.0, 300.0, 80.0)],
+    )
+    write_doc(tmp_path, data, raw=raw_bytes, md="no printed urls", state={"sha256": "a" * 64})
+
+    code = main(["snowball", "--doc", "snowball-cli-persist-doc", "--root", str(tmp_path)])
+
+    assert code == 0
+    loaded = store.load(tmp_path / "candidates.yaml")
+    assert len(loaded) == 1
+    assert loaded[0].source_url == "https://ai.gov.eg/strategy.pdf"
+    assert loaded[0].connector_id == "snowball"
+
+
+def test_snowball_subcommand_doc_filter_excludes_other_documents(tmp_path: Path) -> None:
+    from tests.support import build_pdf, valid_record, write_doc
+
+    data_a = valid_record() | {"id": "snowball-doc-a", "entity_id": "me", "track": "montenegro"}
+    data_b = valid_record() | {"id": "snowball-doc-b", "entity_id": "me", "track": "montenegro"}
+    write_doc(
+        tmp_path,
+        data_a,
+        raw=build_pdf(
+            lines=[("A link", 50.0, 60.0, 12.0)],
+            links=[("https://example.org/only-a", 50.0, 55.0, 300.0, 80.0)],
+        ),
+        md="x",
+        state={"sha256": "a" * 64},
+    )
+    write_doc(
+        tmp_path,
+        data_b,
+        raw=build_pdf(
+            lines=[("B link", 50.0, 60.0, 12.0)],
+            links=[("https://example.org/only-b", 50.0, 55.0, 300.0, 80.0)],
+        ),
+        md="x",
+        state={"sha256": "b" * 64},
+    )
+
+    main(["snowball", "--doc", "snowball-doc-a", "--root", str(tmp_path)])
+
+    loaded = store.load(tmp_path / "candidates.yaml")
+    assert [c.source_url for c in loaded] == ["https://example.org/only-a"]

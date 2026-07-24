@@ -135,3 +135,43 @@ def test_only_narrows_which_connectors_run(tmp_path: Path) -> None:
 
     assert conn_a.calls == [None]
     assert conn_b.calls == []
+
+
+# --- connectors_override (discovery-snowball §3): CLI-подкоманда `snowball` строит
+# коннектор с переопределённым конфигом на один прогон, минуя реестр целиком ---
+
+
+def test_connectors_override_used_when_registry_is_empty(tmp_path: Path) -> None:
+    """Реестр пуст (ничего не зарегистрировано) — override всё равно работает, dedup/
+    персист/cursor-запись идут тем же путём, что и для обычных registry-коннекторов."""
+    assert registry.CONNECTORS == {}
+    override_conn = _StaticConnector("snowball", [_candidate("snowball", "found1")])
+
+    summary = discover(root=tmp_path, connectors_override=[override_conn])
+
+    assert summary.total_fresh == 1
+    assert override_conn.calls == [None]
+    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    cursors = store.load_cursors(tmp_path / ".discovery_cursors.yaml")
+    assert cursors["snowball"] == {"n": 1}
+
+
+def test_connectors_override_ignores_only_param(tmp_path: Path) -> None:
+    """``only`` с неизвестным реестру id обычно кидает ValueError (registry.enabled_
+    connectors) — override обходит эту проверку целиком, реестр вообще не читается."""
+    override_conn = _StaticConnector("snowball", [])
+
+    summary = discover(root=tmp_path, only=["nonexistent-id"], connectors_override=[override_conn])
+
+    assert summary.connectors[0].connector_id == "snowball"
+
+
+def test_connectors_override_absent_falls_back_to_registry(tmp_path: Path) -> None:
+    """Регресс-тест: параметр отсутствует (``None``, дефолт) -> поведение НЕ меняется,
+    обычный путь через ``registry.enabled_connectors`` работает как раньше."""
+    registry.register(_StaticConnector("a", [_candidate("a", "doc1")]))
+
+    summary = discover(root=tmp_path)
+
+    assert summary.connectors[0].connector_id == "a"
+    assert summary.total_fresh == 1
