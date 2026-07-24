@@ -456,12 +456,98 @@ def test_run_ladder_html_blocked_no_alt_raises_manual_only_pdf_message(
 ) -> None:
     """Блок html-записи эскалирует в manual, но manual watch-folder — PDF-only в
     v1: сообщение должно явно называть это и путь усыновления, а не молча
-    отправлять html-документ на watch-folder, который его не примет."""
+    отправлять html-документ на watch-folder, который его не примет.
+
+    ``browser_resolver.is_available`` явно замокан в False — сценарий «резолвера
+    нет вообще» (сборка без Node/lightpanda). Сценарии «резолвер есть» —
+    отдельные тесты ниже (см. test_run_ladder_html_blocked_browser_resolver_*)."""
     blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
     monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.is_available", lambda: False)
     rec = _rec(source_format="html")
     with pytest.raises(AcquisitionBlocked, match="только PDF"):
         run_ladder(rec, tmp_path / "doc.html", user_agent="test-ua")
+
+
+def test_run_ladder_html_blocked_browser_resolver_succeeds_recovers(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Заблокированный html + доступный резолвер + резолвер реально отдал контент
+    -> лестница восстанавливается через browser rung, не падает в manual."""
+    blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.is_available", lambda: True)
+
+    class _Result:
+        ok = True
+        html = "<html><body>реальный контент длиной больше порога MIN_EXPECTED_HTML_SIZE " + "x" * 1024 + "</body></html>"
+        final_url = "https://example.org/doc.pdf"
+        error = ""
+
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.resolve", lambda url: _Result())
+    rec = _rec(source_format="html")
+    dest = tmp_path / "doc.html"
+    result = run_ladder(rec, dest, user_agent="test-ua")
+    assert result.method == schema.AcquisitionMethod.browser
+    assert result.fidelity == schema.Fidelity.rendered
+    assert "реальный контент" in dest.read_text(encoding="utf-8")
+
+
+def test_run_ladder_html_blocked_browser_resolver_fails_falls_through_with_reason(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Резолвер доступен, но не смог (страница всё равно блок) -> лестница падает
+    в manual КАК И РАНЬШЕ, но сообщение теперь несёт причину ПОСЛЕДНЕЙ (браузерной)
+    попытки, а не устаревшую curl-причину."""
+    blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.is_available", lambda: True)
+
+    class _Result:
+        ok = False
+        html = ""
+        final_url = "https://example.org/doc.pdf"
+        error = "Navigation timeout of 14000 ms exceeded"
+
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.resolve", lambda url: _Result())
+    rec = _rec(source_format="html")
+    with pytest.raises(AcquisitionBlocked, match="Navigation timeout"):
+        run_ladder(rec, tmp_path / "doc.html", user_agent="test-ua")
+
+
+def test_run_ladder_browser_resolver_not_attempted_for_dead_confidential(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """dead+confidential ведёт в manual тем же путём, что blocked, но это НЕ блок
+    (URL реально пропал) — резолвер рендерить 404 бессмысленно, вызываться НЕ должен."""
+    dead = ClassifiedResponse(AcquisitionOutcome.dead, 404, "HTTP 404")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([dead]))
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.is_available", lambda: True)
+
+    def _fail_if_called(url: str) -> Any:
+        raise AssertionError("browser_resolver.resolve не должен вызываться для dead-исхода")
+
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.resolve", _fail_if_called)
+    rec = _rec(source_format="html", sensitivity="confidential")
+    with pytest.raises(AcquisitionBlocked, match="только PDF"):
+        run_ladder(rec, tmp_path / "doc.html", user_agent="test-ua")
+
+
+def test_run_ladder_browser_resolver_not_attempted_for_pdf_format(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """PDF — вне скоупа резолвера (никогда не тестировался, спек §5): даже
+    заблокированный PDF не должен вызывать browser_resolver.resolve, только html."""
+    blocked = ClassifiedResponse(AcquisitionOutcome.blocked, 403, "WAF challenge signature detected")
+    monkeypatch.setattr("acquire.acquisition.fetch_and_classify", _scripted_fetch([blocked]))
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.is_available", lambda: True)
+
+    def _fail_if_called(url: str) -> Any:
+        raise AssertionError("browser_resolver.resolve не должен вызываться для source_format=pdf")
+
+    monkeypatch.setattr("acquire.acquisition.browser_resolver.resolve", _fail_if_called)
+    with pytest.raises(AcquisitionBlocked):
+        run_ladder(_rec(), tmp_path / "doc.pdf", user_agent="test-ua")  # дефолтный source_format=pdf
 
 
 def test_run_ladder_html_dead_confidential_also_raises_manual_only_pdf_message(

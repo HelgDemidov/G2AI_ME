@@ -17,6 +17,11 @@ htmlcov/
 # Локальные ML-модели (эмбеддинги и т.п.) — тяжёлые, качаются отдельно, не в git
 /pipeline/models/
 
+# Headless-browser resolver: бинарь Lightpanda (~146 МБ) и node_modules (puppeteer-core)
+# качаются отдельно; манифест package.json/-lock.json + README трекаются (pipeline/browser/README.md)
+/pipeline/browser/lightpanda
+/pipeline/browser/node_modules/
+
 # Производные индексы (SQLite FTS5/векторы) — пересобираются из корпуса, не в git
 /pipeline/index/
 

@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 import pdfplumber
 
-from core import schema
+from core import browser_resolver, schema
 
 
 class AcquisitionOutcome(str, Enum):
@@ -303,6 +303,34 @@ class LadderResult:
     retrieved_snapshot_date: _dt.date | None = None  # заполняется только archive-путём
 
 
+def _try_browser_rung(rec: schema.SourceRecord, dest: Path) -> ClassifiedResponse:
+    """Одна попытка резолва через headless-браузер (``core/browser_resolver``) —
+    ТОЛЬКО для ``expected=html`` (спек headless-browser-resolver: единственный
+    формат, для которого рендер-дамп — легитимный финальный артефакт; PDF/DOCX/XLSX
+    через браузер не тестировались, см. «Вне скоупа» спека). Инструментальный
+    отказ (Node/lightpanda недоступны или упали) трактуется как ``blocked``, не
+    пробрасывается исключением — следующая ступень (``manual``) должна сработать
+    как обычно, будто резолвера вовсе нет.
+
+    Синтезируем ``curl -D``-совместимый заголовочный блок и прогоняем контент
+    через уже существующий ``classify_response`` — переиспользуем WAF-маркеры и
+    размерный порог, а не дублируем их: движок-резолвер и без того не даёт
+    настоящих HTTP-заголовков (браузер их не эмитит наружу), контент —
+    единственный сигнал, который у нас есть.
+    """
+    try:
+        result = browser_resolver.resolve(rec.source_url)
+    except browser_resolver.BrowserResolverUnavailable as exc:
+        return ClassifiedResponse(AcquisitionOutcome.blocked, None, f"browser resolver unavailable: {exc}")
+    if not result.ok:
+        return ClassifiedResponse(AcquisitionOutcome.blocked, None, f"browser resolver: {result.error}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    body = result.html.encode("utf-8")
+    dest.write_bytes(body)
+    synthetic_headers = "HTTP/1.1 200\r\nContent-Type: text/html; charset=utf-8\r\n"
+    return classify_response(body, synthetic_headers, expected=schema.SourceFormat.html)
+
+
 def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> LadderResult:
     """Automatic portion of the ladder: try ``direct``, then ``official_alt`` once
     if blocked and available. Always starts fresh from ``direct`` — the ladder
@@ -332,6 +360,19 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
             )
             continue
         if nxt is schema.AcquisitionMethod.manual:
+            if (
+                classified.outcome is AcquisitionOutcome.blocked
+                and rec.source_format is schema.SourceFormat.html
+                and browser_resolver.is_available()
+            ):
+                # Заблокированный HTML — единственный формат/исход, где ступень
+                # manual (watch-folder) и без браузера уже была PDF-only тупиком
+                # (см. guard ниже) — резолвер даёт РЕАЛЬНОЕ автоматическое
+                # восстановление там, где раньше был безусловный терминальный отказ.
+                browser_classified = _try_browser_rung(rec, dest)
+                if browser_classified.outcome is AcquisitionOutcome.ok:
+                    return LadderResult(schema.AcquisitionMethod.browser, schema.Fidelity.rendered, browser_classified)
+                classified = browser_classified  # несём вперёд ПОСЛЕДНЮЮ причину (браузерную), не устаревшую curl-причину
             if rec.source_format is not schema.SourceFormat.pdf:
                 # manual watch-folder matching (title_matcher, PDF-magic sniff) is
                 # PDF-only in v1 — a non-PDF record can't ride that path (§3 of
@@ -339,7 +380,8 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
                 raise AcquisitionBlocked(
                     rec.source_url,
                     f"manual watch-folder поддерживает только PDF; сохраните страницу вручную в "
-                    f"<doc_dir>/raw.{rec.source_format.value} и перезапустите с --no-download",
+                    f"<doc_dir>/raw.{rec.source_format.value} и перезапустите с --no-download "
+                    f"(последняя причина: {classified.reason})",
                 )
             if classified.outcome is AcquisitionOutcome.dead:
                 raise AcquisitionBlocked(

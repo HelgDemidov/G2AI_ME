@@ -104,6 +104,7 @@ class AcquisitionMethod(str, Enum):
 
     direct = "direct"
     official_alt = "official_alt"
+    browser = "browser"  # headless-browser-resolver: Puppeteer-core+Lightpanda, только expected=html (spec §5)
     manual = "manual"
     archive = "archive"
 
@@ -113,6 +114,7 @@ class Fidelity(str, Enum):
 
     live = "live"
     rehost = "rehost"
+    rendered = "rendered"  # прошло через JS-рендер headless-браузера, не сырые байты сервера (browser rung)
     manual = "manual"
     archived_snapshot = "archived_snapshot"
 
