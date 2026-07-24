@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Генератор инвентаризационной секции ROADMAP.md (roadmap/ROADMAP.md).
 
-Сканирует docs/pipeline/**/{charters/*.md,tech_specs/*/spec.md}, извлекает первую
+Сканирует docs/pipeline/**/{charters/*.md,tech_specs/*/spec.md} (кроме `EXCLUDED_NAMES` —
+файлы бэклога, соседствующие с чартерами не как чартер), извлекает первую
 `Статус:`-строку каждого документа и перегенерирует ДВЕ секции целевого файла:
 таблицы по блокам (маркеры AUTO-INVENTORY) и сквозную нумерованную очередь
 (маркеры AUTO-QUEUE). Ручное (порядок блоков, колонка «Очередь», JIT-строки без
@@ -44,6 +45,10 @@ QUEUE_END_MARK = "<!-- AUTO-QUEUE:END -->"
 NO_STATUS = "(нет Статус-строки)"
 MAX_STATUS_LEN = 110  # длинные статусы (convert-ocr) усечь — таблица, не досье
 TERMINAL_STATUS_PREFIXES = ("реализовано", "❌")  # спек закрыт -> очередь ему не нужна
+# Бэклог, не чартер/спек — живёт в docs/pipeline/core/charters/ ради соседства с
+# реальными спеками (не "general/", где он был единственным обитателем), но у него
+# нет `Статус:`-строки и его не следует подхватывать как «Архитектура core».
+EXCLUDED_NAMES = frozenset({"pipeline_improvements.md"})
 
 _STATUS_RE = re.compile(r"^Статус:\s*(.+)$", re.MULTILINE)
 _QUEUE_NUM_RE = re.compile(r"^\*\*(\d+)\*\*\s*(?:·\s*(.*))?$")
@@ -78,6 +83,8 @@ def scan(docs_root: Path) -> list[DocRow]:
     """Чартеры + спеки по конвенции раскладки docs (сортировка глоба — детерминизм)."""
     rows: list[DocRow] = []
     for p in sorted(docs_root.glob("*/charters/*.md")):
+        if p.name in EXCLUDED_NAMES:
+            continue
         block = p.parent.parent.name
         rows.append(
             DocRow(block, f"Архитектура {block}", "чартер",

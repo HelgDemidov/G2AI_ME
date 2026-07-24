@@ -75,6 +75,17 @@ def test_scan_rows(tmp_path: Path) -> None:
     assert rows == di.scan(make_docs(tmp_path / "again"))  # детерминизм порядка
 
 
+def test_scan_excludes_pipeline_improvements_from_charters(tmp_path: Path) -> None:
+    """Бэклог живёт рядом с чартерами (docs/pipeline/core/charters/), но не Статус-документ
+    и не должен всплыть как «Архитектура <блок>» — EXCLUDED_NAMES исключает по имени файла."""
+    root = make_docs(tmp_path)
+    (root / "alpha" / "charters" / "pipeline_improvements.md").write_text(
+        "# Бэклог\n\nникакого Статус: тут нет\n", encoding="utf-8"
+    )
+    rows = di.scan(root)
+    assert {r.name for r in rows} == {"Архитектура alpha", "spec-a", "spec-b", "spec-pipe"}
+
+
 # --- render ---
 
 def test_render_order_queue_extra_and_escaping(tmp_path: Path) -> None:
