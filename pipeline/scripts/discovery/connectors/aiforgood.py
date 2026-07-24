@@ -26,7 +26,7 @@ import yaml
 
 from core import schema
 from core.env import REPO_ROOT
-from discovery import dedup
+from discovery import dedup, registry
 from discovery.base import ConnectorCursor, DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_aiforgood.yaml"
@@ -356,3 +356,23 @@ def discover_aiforgood(
         "skipped_no_title_or_url": skipped_no_title_or_url,
     }
     return DiscoverResult(candidates=fresh, cursor=new_cursor, diagnostics=diagnostics)
+
+
+@dataclass
+class AiforgoodConnector:
+    """Реализация протокола ``Connector`` (спек §0/§4) — третий экземпляр архетипа
+    `registry`. НЕ ``frozen`` — симметрично ``AgoraConnector``/``EurlexConnector``
+    (Protocol требует settable-атрибуты, даже если ничего не переприсваивается)."""
+
+    id: str = CONNECTOR_ID
+    kind: schema.ConnectorKind = schema.ConnectorKind.registry
+    enabled: bool = True
+
+    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
+        return discover_aiforgood(cursor)
+
+
+# Регистрация при импорте (чартер §4.3 «манифест», спек §4): `enabled` — из конфига,
+# не хардкод. Срабатывает один раз за интерпретатор — по факту импорта этого модуля
+# (см. `discovery/connectors/__init__.py` + `discover.py`).
+registry.register(AiforgoodConnector(enabled=load_config().enabled))
