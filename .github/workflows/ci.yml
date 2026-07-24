@@ -6,9 +6,9 @@ name: CI
 # Модель- и корпус-зависимые тесты (@model — bge-m3 543 МБ; @corpus — локальный sources/,
 # raw.pdf/doc.md не в git) в CI недостижимы, как и @ocr/@libreoffice/@mermaid/@browser (системные
 # ocrmypdf/soffice/Node+lightpanda не установлены раннером, gitignored-фикстура для mermaid-рендера
-# отсутствует без явной генерации) — explicit-фильтр держит инвариант «эта строка == то,
-# что реально исполняется» явным, не полагаясь молча на совпадающий по эффекту skipif:
-# -m "not model and not corpus and not ocr and not libreoffice and not mermaid and not browser" везде.
+# отсутствует без явной генерации). Все шесть — умбрелла-маркер @heavy (автопроставляется
+# pipeline/scripts/tests/conftest.py любому тесту с одним из них) — explicit-фильтр держит
+# инвариант «эта строка == то, что реально исполняется» явным: -m "not heavy" везде.
 on:
   push:
     branches: [main, "feature/**"]
@@ -82,7 +82,7 @@ jobs:
         # не влияет на exit pytest без CLI-флага — проверено эмпирически 2026-07-16).
         run: >
           python -m pytest pipeline/scripts/tests/unit
-          -m "not model and not corpus and not ocr and not libreoffice and not mermaid and not browser"
+          -m "not heavy"
           --cov --cov-report=term-missing --cov-fail-under=95
 
   # ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ jobs:
       - name: Pytest integration (exit 5 = ничего CI-safe не собралось, это ок)
         run: |
           set +e
-          python -m pytest pipeline/scripts/tests/integration -m "not model and not corpus and not ocr and not libreoffice and not mermaid and not browser" -v
+          python -m pytest pipeline/scripts/tests/integration -m "not heavy" -v
           code=$?
           if [ "$code" -eq 5 ]; then
             echo "0 CI-safe интеграционных тестов (всё требует model/corpus) — ожидаемо, не отказ."
