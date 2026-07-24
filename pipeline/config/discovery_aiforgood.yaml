@@ -1,0 +1,23 @@
+# Тюнинг-параметры discovery-коннектора `aiforgood` (ITU AI Standards Exchange,
+# aiforgood.itu.int, живой paginated JSON). Правится ВРУЧНУЮ; трекается в git
+# (как triage.yaml/discovery_agora.yaml/discovery_eurlex.yaml). Спек:
+# docs/pipeline/discovery/tech_specs/aiforgood-standards/spec.md §4.
+
+enabled: true
+ajax_endpoint: "https://aiforgood.itu.int/wp-admin/admin-ajax.php"
+topic: "tx518"                          # топик-фильтр сайта "AI" — единственный релевантный оси
+
+exclude_groups:                         # платные каталоги — коннектор их вовсе не эмитит (§1)
+  - "gx1401"                            # ISO/IEC -> iso.org/standard/*.html
+  - "gx1178"                            # IEEE -> ieeexplore.ieee.org (IEEE Xplore)
+
+exclude_status_substrings:              # регистронезависимая подстрока в standard_status —
+                                         # нет стабильного текста для акквизиции (§1)
+  - "draft"
+  - "under development"
+
+user_agent: "G2AI-corpus-research/1.0 (+https://github.com/HelgDemidov/G2AI_ME)"  # OQ1: нейтральный,
+                                         # не ИИ-брендированный (robots.txt Disallow: ClaudeBot)
+crawl_delay_seconds: 10.0               # robots.txt Crawl-delay — обязателен между запросами
+page_size: 10                           # сайт хардкодит 10 записей/страницу (не наш выбор)
+timeout_seconds: 30.0

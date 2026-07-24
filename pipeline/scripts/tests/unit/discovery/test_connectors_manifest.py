@@ -103,3 +103,48 @@ def test_both_agora_and_eurlex_coexist_in_registry() -> None:
     )
     result = _run_check(code)
     assert result.returncode == 0, result.stderr
+
+
+def test_importing_discover_cli_registers_aiforgood_via_manifest() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert 'aiforgood' in registry.CONNECTORS, sorted(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_aiforgood_registered_as_registry_kind_and_config_gated_enabled() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "from core import schema\n"
+        "conn = registry.CONNECTORS['aiforgood']\n"
+        "assert conn.kind == schema.ConnectorKind.registry\n"
+        "assert conn.enabled is True\n"  # discovery_aiforgood.yaml: enabled: true
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_aiforgood_reachable_via_enabled_connectors_only_filter() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "found = registry.enabled_connectors(only=['aiforgood'])\n"
+        "assert len(found) == 1 and found[0].id == 'aiforgood'\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_all_three_registry_connectors_coexist() -> None:
+    """Третий registry-коннектор не вытесняет первые два — все доступны одновременно."""
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert {'agora', 'eurlex', 'aiforgood'} <= set(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr

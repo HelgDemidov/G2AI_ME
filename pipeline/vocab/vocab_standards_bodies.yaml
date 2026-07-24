@@ -1,0 +1,24 @@
+# Справочник организаций-издателей трека tech-standards — entity_id -> классификация.
+# НЕ контролируемый словарь meta.yaml (не гейтится validate_sources.py), аналог
+# jurisdictions.yaml: даёт членство/классификацию по entity_id одним лукапом.
+# kind — классификация куратора (2026-07-24): международный/национальный/отраслевой.
+# Спек: docs/pipeline/discovery/tech_specs/aiforgood-standards/spec.md §3.
+
+itu-t:
+  kind: international
+  full_name: "ITU Telecommunication Standardization Sector (ITU-T)"
+itu-r:
+  kind: international
+  full_name: "ITU Radiocommunication Sector (ITU-R)"
+ietf:
+  kind: international
+  full_name: "Internet Engineering Task Force (IETF)"
+u4ssc:
+  kind: international
+  full_name: "United for Smart Sustainable Cities (U4SSC)"
+etsi:
+  kind: sectoral
+  full_name: "European Telecommunications Standards Institute (ETSI)"
+tta:
+  kind: national
+  full_name: "Telecommunications Technology Association (TTA, Republic of Korea)"
