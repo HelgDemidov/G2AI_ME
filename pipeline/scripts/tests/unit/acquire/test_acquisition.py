@@ -10,6 +10,8 @@ import pytest
 
 from core import schema
 from acquire.acquisition import (
+    CHALLENGE_BODY_MARKERS,
+    MIN_EXPECTED_HTML_SIZE,
     AcquisitionBlocked,
     AcquisitionDead,
     AcquisitionOutcome,
@@ -149,6 +151,69 @@ def test_classify_redirect_keeps_only_final_hop_status_and_headers() -> None:
     result = classify_response(CLOUDFLARE_BLOCK_BODY, REDIRECT_THEN_BLOCK_HEADERS)
     assert result.http_status == 403
     assert result.outcome == AcquisitionOutcome.blocked
+
+
+# --- F5/BigIP и Akamai-сигнатуры (спек aiforgood-standards §5, ОБЯЗАТЕЛЬНЫЙ фикс) ---
+# Размеры — живьём подтверждённые (2026-07-24): ITU F5-заглушка 245 Б, mcit.gov.sa
+# F5-заглушка 42 936 Б (обе HTTP 200 text/html — размерный порог их не ловит без
+# сигнатуры тела), Akamai errors.edgesuite.net 294 Б.
+
+BIGIP_HEADERS_200 = "HTTP/1.1 200 OK\ncontent-type: text/html\nserver: BigIP\n"
+
+_F5_REQUEST_REJECTED_CORE = (
+    b"<html><head><title>Request Rejected</title></head><body>"
+    b"The requested URL was rejected. Please consult with your "
+    b"administrator.<br>Your support ID is: 1234567890123456789"
+    b"</body></html>"
+)
+F5_REQUEST_REJECTED_BODY = _F5_REQUEST_REJECTED_CORE + b" " * (245 - len(_F5_REQUEST_REJECTED_CORE))
+
+F5_UNAUTHORIZED_ACCESS_BODY = (
+    b"<html><head><title>Unauthorized Access || \xd8\xaf\xd8\xae\xd9\x88\xd9\x84 "
+    b"\xd8\xba\xd9\x8a\xd8\xb1 \xd9\x85\xd8\xb5\xd8\xb1\xd8\xad</title></head><body>"
+    + b"x" * (42936 - 143) + b"</body></html>"
+)
+
+AKAMAI_HEADERS_200 = "HTTP/1.1 200 OK\ncontent-type: text/html\n"
+
+AKAMAI_ERROR_BODY = (
+    b"<HTML><HEAD>\n<TITLE>Invalid URL</TITLE>\n</HEAD><BODY>\n"
+    b"Invalid URL\nReference&#32;&#35;9&#46;a1b2c3d4&#46;1234567890&#46;12345678\n"
+    b"<a href=https://errors.edgesuite.net/9.html>https://errors.edgesuite.net/9.html</a>"
+    + b"x" * max(0, 294 - 220) + b"</BODY></HTML>"
+)
+
+
+def test_classify_f5_request_rejected_blocked_despite_200_text_html() -> None:
+    assert len(F5_REQUEST_REJECTED_BODY) == 245
+    result = classify_response(F5_REQUEST_REJECTED_BODY, BIGIP_HEADERS_200)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_f5_unauthorized_access_blocked_despite_large_body() -> None:
+    # 42 936 Б — на два порядка крупнее MIN_EXPECTED_PDF_SIZE/HTML_SIZE, размерный
+    # порог его НЕ ловит без сигнатуры тела (живой контрпример mcit.gov.sa).
+    assert len(F5_UNAUTHORIZED_ACCESS_BODY) > MIN_EXPECTED_HTML_SIZE * 10
+    result = classify_response(F5_UNAUTHORIZED_ACCESS_BODY, BIGIP_HEADERS_200)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_akamai_error_blocked() -> None:
+    result = classify_response(AKAMAI_ERROR_BODY, AKAMAI_HEADERS_200)
+    assert result.outcome == AcquisitionOutcome.blocked
+
+
+def test_classify_server_bigip_header_with_valid_html_is_ok_not_flagged() -> None:
+    # Контрольный кейс: Server: BigIP сам по себе — балансировщик перед сайтом, НЕ
+    # WAF-блок (mcit.gov.eg/tdra.gov.ae отдают тот же заголовок с реальным контентом).
+    # Классификация должна идти по ТЕЛУ, не по заголовку.
+    result = classify_response(REAL_HTML_BODY, BIGIP_HEADERS_200, schema.SourceFormat.html)
+    assert result.outcome == AcquisitionOutcome.ok
+
+
+def test_classify_f5_and_akamai_markers_present_in_registry() -> None:
+    for marker in (b"Request Rejected", b"Unauthorized Access", b"errors.edgesuite.net"):
+        assert marker in CHALLENGE_BODY_MARKERS
 
 
 # --- expected=html: мультиформатная классификация (convert-html spec §3) ---
