@@ -19,6 +19,7 @@ cloud_allowed`` (а через него — ``needed_stages``/маршрутиз
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -42,11 +43,14 @@ def _hermetic_cloud_env(monkeypatch: Any) -> None:
 # документов вычистил из боевого индекса chunks/doc_state. CI не ловил (без bge-токенизатора
 # стадия индекса «пропущена»), а самовосстановление пайплайна маскировало ущерб тихой полной
 # пере-чанковкой на следующем прогоне. Guard превращает тихую порчу в громкий красный тест.
-_GUARDED_REAL_ARTIFACTS = (
+_GUARDED_REAL_ARTIFACTS: tuple[Path, ...] = (
     corpus_index.DEFAULT_DB,
     schema.DEFAULT_SOURCES / "candidates.yaml",
     schema.DEFAULT_SOURCES / ".discovery_cursors.yaml",
     registry_store.DEFAULT_DB_PATH,
+    # discovery-snowball §5/§7: sources/.snowball_leads.yaml — та же ловушка (main()-путь
+    # без явного --root задел бы боевой файл лидов).
+    schema.DEFAULT_SOURCES / ".snowball_leads.yaml",
 )
 
 
@@ -62,12 +66,21 @@ def _artifact_snapshot() -> list[tuple[str, tuple[int, int] | None]]:
     return snapshot
 
 
+def _assert_artifacts_unchanged(
+    before: list[tuple[str, tuple[int, int] | None]], after: list[tuple[str, tuple[int, int] | None]]
+) -> None:
+    """Вынесено из фикстуры в отдельную функцию (spec discovery-snowball §7): тест на
+    сам guard-механизм зовёт ``_artifact_snapshot``/эту функцию напрямую, не полагаясь
+    на внутренности generator-фикстуры pytest."""
+    assert after == before, (
+        "unit-тест мутировал БОЕВОЙ артефакт — тесту не хватает явного tmp-пути "
+        f"(--db / --root / root=tmp_path):\n  до:    {before}\n  после: {after}"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _guard_real_artifacts() -> Iterator[None]:
     before = _artifact_snapshot()
     yield
     after = _artifact_snapshot()
-    assert after == before, (
-        "unit-тест мутировал БОЕВОЙ артефакт — тесту не хватает явного tmp-пути "
-        f"(--db / --root / root=tmp_path):\n  до:    {before}\n  после: {after}"
-    )
+    _assert_artifacts_unchanged(before, after)
