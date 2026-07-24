@@ -1,0 +1,13 @@
+{
+  "name": "g2ai-browser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless-browser resolver для G2AI-корпуса: Puppeteer-core драйвит движок Lightpanda через CDP (обход WAF F5/Akamai + лёгкость). См. docs/pipeline/core/tech_specs/headless-browser-resolver/spec.md",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "puppeteer-core": "25.3.0"
+  }
+}
