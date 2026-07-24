@@ -107,3 +107,12 @@ def test_multiple_urls_on_same_line_both_extracted(tmp_path: Path) -> None:
     doc_md.write_text("https://example.org/a and https://example.org/b\n", encoding="utf-8")
     links = extract_printed_urls(doc_md)
     assert {link.url for link in links} == {"https://example.org/a", "https://example.org/b"}
+
+
+def test_garbage_printed_url_matched_by_regex_but_rejected_by_sanitize(tmp_path: Path) -> None:
+    """Регекс матчит ``https://x`` (валидная http(s)-схема), но ``sanitize_url`` отсеивает
+    (нет точки в хосте) — находка не должна просочиться мимо санитизации."""
+    doc_md = tmp_path / "doc.md"
+    doc_md.write_text("See https://x for garbage and https://real.example.org/doc for real.\n", encoding="utf-8")
+    links = extract_printed_urls(doc_md)
+    assert [link.url for link in links] == ["https://real.example.org/doc"]

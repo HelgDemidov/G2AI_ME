@@ -15,6 +15,7 @@ from core import schema
 from discovery.connectors.snowball import (
     CitationLead,
     RawLink,
+    _default_call_model,
     discover_snowball,
     extract_text_citations,
     find_citation_sections,
@@ -300,3 +301,90 @@ def test_save_leads_overwrites_not_appends(tmp_path: Path) -> None:
 def test_save_leads_empty_list_still_writes_file(tmp_path: Path) -> None:
     save_leads([], tmp_path)
     assert (tmp_path / ".snowball_leads.yaml").exists()
+
+
+# --- дополнительное покрытие: дозаливка после первого замера --cov (coverage discipline,
+# /tech-spec §Тестовое покрытие) — плотность до этого места пропускала несколько реальных
+# веток, не только happy path. ---
+
+
+def test_find_citation_sections_dense_block_flushes_at_end_of_text_without_trailing_short_line() -> None:
+    """Плотный блок, доходящий до САМОГО КОНЦА текста (без завершающей короткой строки,
+    закрывающей run изнутри цикла) — блок должен зафиксироваться post-loop флашем, не
+    потеряться."""
+    text = "\n".join(
+        [
+            "Smith, J. (2024). A Long Enough Report Title Here.",
+            "Doe, A. (2023). Another Long Enough Citation Line.",
+            "Lee, K. (2022). Yet Another Sufficiently Long Citation.",
+        ]
+    )
+    sections = find_citation_sections(text)
+    assert len(sections) == 1
+    assert "Lee, K. (2022)" in sections[0]
+
+
+def test_extract_text_citations_corrupt_cache_yaml_treated_as_empty(tmp_path: Path) -> None:
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+    (tmp_path / ".citations.yaml").write_text("{{{not: valid: yaml", encoding="utf-8")
+
+    fake = _FakeModel({"citations": []})
+    links, leads = extract_text_citations(md_path, doc_id="doc-1", model="test/model", call_model=fake)
+
+    assert links == []
+    assert leads == []
+    assert fake.calls == 1  # повреждённый кэш == отсутствующий, модель ВСЁ РАВНО вызывается
+
+
+def test_extract_text_citations_non_dict_items_in_citations_array_are_skipped(tmp_path: Path) -> None:
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(_REFERENCES_MD, encoding="utf-8")
+    fake = _FakeModel({"citations": ["not a dict", 42, None, {"title": "Cyber Security Strategy 2025", "url": None}]})
+
+    links, leads = extract_text_citations(md_path, doc_id="doc-1", model="test/model", call_model=fake)
+
+    assert links == []
+    assert len(leads) == 1
+    assert leads[0].title == "Cyber Security Strategy 2025"
+
+
+def test_default_call_model_raises_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        _default_call_model({"model": "test/model", "messages": []})
+
+
+def test_discover_snowball_mines_html_document_end_to_end(tmp_path: Path) -> None:
+    """discover_snowball на HTML-документе (не только PDF, как остальные cursor-тесты) —
+    href-экстрактор реально подключается через основной оркестрационный путь, не только
+    напрямую через extract_html_href_links."""
+    data = valid_record() | {
+        "id": "html-e2e-doc",
+        "entity_id": "me",
+        "track": "montenegro",
+        "source_url": "https://gov.example/page",
+    }
+    rec = schema.SourceRecord.model_validate(data)
+    write_doc(
+        tmp_path,
+        data,
+        raw=b'<html><body><a href="https://example.org/found-via-html">a link</a></body></html>',
+        raw_ext="html",
+        md="no printed urls in md",
+        state={"sha256": "a" * 64},
+    )
+    from discovery.connectors import snowball as sb
+
+    cfg = sb.SnowballConfig(
+        enabled=True,
+        source_filter=sb.SourceFilter(tracks=(), target_fit=(), include_doc_ids=(), exclude_doc_ids=()),
+        url_filter=sb.UrlFilter(exclude_domains=(), exclude_url_substrings=()),
+        emit=sb.EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=False),
+        max_candidates=None,
+        citations_model="test/model",
+    )
+    result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec])
+    urls = {c.source_url for c in result.candidates}
+    assert "https://example.org/found-via-html" in urls
+    assert result.diagnostics["per_extractor"]["html_hrefs"] == 1
