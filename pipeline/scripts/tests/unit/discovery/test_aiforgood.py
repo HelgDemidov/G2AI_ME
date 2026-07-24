@@ -8,6 +8,7 @@ Fetch/parse РАЗДЕЛЕНЫ (принцип eurlex/agora): эти тесты 
 """
 from __future__ import annotations
 
+import datetime as dt
 import io
 import json
 import time
@@ -21,6 +22,7 @@ from typing import Any
 import pytest
 import yaml
 
+from core import schema
 from discovery.connectors import aiforgood
 
 # --- load_config ---
@@ -346,3 +348,289 @@ def test_diff_cursor_monotonic_never_shrinks_when_upstream_result_shrinks() -> N
     fresh, cursor = aiforgood.diff_cursor(["a"], {"seen_ids": ["a", "b"]})
     assert fresh == set()
     assert cursor == {"seen_ids": ["a", "b"]}
+
+
+# --- load_standards_bodies (справочник §3) — регресс-гвард против рассинхрона ---
+
+
+def test_load_standards_bodies_reads_real_tracked_vocab() -> None:
+    bodies = aiforgood.load_standards_bodies()
+    assert set(bodies) == {"itu-t", "itu-r", "ietf", "u4ssc", "etsi", "tta"}
+    assert bodies["itu-t"]["kind"] == "international"
+    assert "ITU Telecommunication" in bodies["itu-t"]["full_name"]
+    assert bodies["etsi"]["kind"] == "sectoral"
+    assert bodies["tta"]["kind"] == "national"
+
+
+def test_group_id_to_entity_all_targets_present_in_vocab() -> None:
+    """Регресс-гвард: каждый entity_id, который коннектор способен породить
+    (GROUP_ID_TO_ENTITY), обязан существовать в vocab_standards_bodies.yaml."""
+    bodies = aiforgood.load_standards_bodies()
+    for entity_id in aiforgood.GROUP_ID_TO_ENTITY.values():
+        assert entity_id in bodies, entity_id
+
+
+# --- is_excluded_status / _valid_url ---
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        ("In force", False),
+        ("Published", False),
+        ("Under development/Draft", True),
+        ("DRAFT", True),
+        ("under development", True),
+        (None, False),
+        ("", False),
+    ],
+)
+def test_is_excluded_status(status: str | None, expected: bool) -> None:
+    assert aiforgood.is_excluded_status(status, ("draft", "under development")) is expected
+
+
+def test_valid_url_accepts_http_and_https() -> None:
+    assert aiforgood._valid_url("https://www.itu.int/rec/T-REC-E.475") is True
+    assert aiforgood._valid_url("http://example.org") is True
+
+
+@pytest.mark.parametrize("url", [None, "", "ftp://example.org", "not-a-url"])
+def test_valid_url_rejects_missing_or_non_http(url: str | None) -> None:
+    assert aiforgood._valid_url(url) is False
+
+
+# --- _map_record (§4) ---
+
+
+def test_map_record_field_mapping() -> None:
+    record = _standard(
+        "14148",
+        standard_name="ITU-T E.475 (01/2020)",
+        standard_title="Interoperability testing",
+        standard_status="In force",
+        standard_type="Recommendation",
+        standard_summary="A summary of the standard.",
+        standard_url="https://www.itu.int/myworkspace/t-rec/item?id=14148",
+    )
+    cand = aiforgood._map_record(record, entity_id="itu-t", issuer_full_name="ITU Telecommunication Standardization Sector (ITU-T)")
+    assert cand is not None
+    assert cand.title == "ITU-T E.475 (01/2020): Interoperability testing"
+    assert cand.issuer == "ITU Telecommunication Standardization Sector (ITU-T)"
+    assert cand.source_url == "https://www.itu.int/myworkspace/t-rec/item?id=14148"
+    assert cand.native_id == "14148"
+    assert cand.native_summary == "A summary of the standard."
+    assert cand.native_tags == ["ITU AI Standards Exchange: In force", "type: Recommendation"]
+    assert cand.language is None
+    assert cand.doc_date is None
+    assert cand.jurisdiction is None
+    assert cand.connector_id == "aiforgood"
+
+
+def test_map_record_title_falls_back_to_single_part_when_other_empty() -> None:
+    record = _standard("1", standard_name="ITU-T E.475", standard_title="")
+    cand = aiforgood._map_record(record, entity_id="itu-t", issuer_full_name="ITU-T")
+    assert cand is not None
+    assert cand.title == "ITU-T E.475"
+
+
+def test_map_record_no_title_at_all_is_skipped() -> None:
+    record = _standard("1", standard_name="", standard_title="")
+    assert aiforgood._map_record(record, entity_id="itu-t", issuer_full_name="ITU-T") is None
+
+
+def test_map_record_missing_url_is_skipped() -> None:
+    record = _standard("1", standard_url="")
+    assert aiforgood._map_record(record, entity_id="itu-t", issuer_full_name="ITU-T") is None
+
+
+def test_map_record_dash_summary_becomes_none_not_fabricated() -> None:
+    record = _standard("1", standard_summary="-")
+    cand = aiforgood._map_record(record, entity_id="itu-t", issuer_full_name="ITU-T")
+    assert cand is not None
+    assert cand.native_summary is None
+
+
+def test_map_record_raw_hash_deterministic_and_changes_with_content() -> None:
+    a = aiforgood._map_record(_standard("1"), entity_id="itu-t", issuer_full_name="ITU-T")
+    b = aiforgood._map_record(_standard("1"), entity_id="itu-t", issuer_full_name="ITU-T")
+    c = aiforgood._map_record(_standard("1", standard_status="Withdrawn"), entity_id="itu-t", issuer_full_name="ITU-T")
+    assert a is not None and b is not None and c is not None
+    assert a.raw_hash == b.raw_hash
+    assert a.raw_hash != c.raw_hash
+
+
+def test_candidate_requires_language_override_like_agora() -> None:
+    """aiforgood-кандидат несёт language=None (организация — не страна) — промоушен
+    требует явный override триажа (тот же механизм, что AGORA, PR #36)."""
+    cand = aiforgood._map_record(_standard("1"), entity_id="itu-t", issuer_full_name="ITU-T")
+    assert cand is not None
+    record = schema.promote_candidate(
+        cand,
+        id="itu-t-e475-test",
+        entity_id="itu-t",
+        track=schema.Track.tech_standards,
+        issuer_type=schema.IssuerType.standards_body,
+        geo_scope=schema.GeoScope.international,
+        doc_type="technical_standard",
+        authority="voluntary_standard",
+        relevance=schema.Relevance(
+            target_fit=schema.TargetFit.primary,
+            axis="digital_sovereignty",
+            assessed_stage=schema.AssessedStage.triage,
+            rationale="test",
+            assessed_date=dt.date(2026, 7, 24),
+        ),
+        language="en",
+    )
+    assert record.language == "en"
+
+
+# --- discover_aiforgood (§4) ---
+
+
+def _bodies() -> dict[str, dict[str, str]]:
+    return {
+        entity_id: {"kind": "international", "full_name": entity_id.upper()}
+        for entity_id in aiforgood.GROUP_ID_TO_ENTITY.values()
+    }
+
+
+def _groups_payload(*groups: tuple[str, int]) -> dict[str, Any]:
+    return {
+        "success": True,
+        "data": [{"id": gid, "text": f"{gid} ({total})", "data": {"total": total}} for gid, total in groups],
+    }
+
+
+def test_discover_aiforgood_excludes_paid_catalog_groups_never_fetched() -> None:
+    """gx1401 (ISO/IEC) в exclude_groups — get_standards для неё не должен вызываться вовсе."""
+    fetch_calls: list[dict[str, str]] = []
+
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        fetch_calls.append(dict(params))
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 1), ("gx1401", 81))
+        assert params["group"] != "gx1401", "excluded group must not be paginated"
+        return {"standards": [_standard("1")], "totalCount": 1, "facets": []}
+
+    result = aiforgood.discover_aiforgood(
+        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+    )
+    assert result.diagnostics["excluded_groups"] == 1
+    assert all(c.native_tags for c in result.candidates)
+    group_params = [c["group"] for c in fetch_calls if c["action"] == "get_standards"]
+    assert "gx1401" not in group_params
+
+
+def test_discover_aiforgood_unknown_group_skipped_with_diagnostic() -> None:
+    """Группа не в exclude_groups и не в GROUP_ID_TO_ENTITY — новая организация,
+    пропускается с диагностикой, не угадывается."""
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx9999", 5))
+        raise AssertionError("unknown group must not be paginated")
+
+    result = aiforgood.discover_aiforgood(
+        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+    )
+    assert result.diagnostics["skipped_unknown_group"] == 1
+    assert result.candidates == []
+
+
+def test_discover_aiforgood_draft_status_skipped() -> None:
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 2))
+        return {
+            "standards": [
+                _standard("1", standard_status="Under development/Draft"),
+                _standard("2", standard_status="In force"),
+            ],
+            "totalCount": 2,
+            "facets": [],
+        }
+
+    result = aiforgood.discover_aiforgood(
+        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+    )
+    assert result.diagnostics["skipped_draft"] == 1
+    assert [c.native_id for c in result.candidates] == ["2"]
+
+
+def test_discover_aiforgood_first_run_all_fresh() -> None:
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 1))
+        return {"standards": [_standard("1")], "totalCount": 1, "facets": []}
+
+    result = aiforgood.discover_aiforgood(
+        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+    )
+    assert result.diagnostics["status"] == "fetched"
+    assert len(result.candidates) == 1
+    assert result.cursor == {"seen_ids": ["1"]}
+
+
+def test_discover_aiforgood_repeat_run_same_result_is_no_new() -> None:
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 1))
+        return {"standards": [_standard("1")], "totalCount": 1, "facets": []}
+
+    result = aiforgood.discover_aiforgood(
+        {"seen_ids": ["1"]}, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None,
+        bodies=_bodies(),
+    )
+    assert result.diagnostics["status"] == "no_new"
+    assert result.candidates == []
+
+
+def test_discover_aiforgood_new_id_appears_only_it_is_fresh() -> None:
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 2))
+        return {
+            "standards": [_standard("1"), _standard("2")],
+            "totalCount": 2,
+            "facets": [],
+        }
+
+    result = aiforgood.discover_aiforgood(
+        {"seen_ids": ["1"]}, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None,
+        bodies=_bodies(),
+    )
+    assert [c.native_id for c in result.candidates] == ["2"]
+    assert result.cursor == {"seen_ids": ["1", "2"]}
+
+
+def test_discover_aiforgood_invalid_url_skipped_not_crashing_batch() -> None:
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 2))
+        return {
+            "standards": [_standard("1", standard_url=""), _standard("2")],
+            "totalCount": 2,
+            "facets": [],
+        }
+
+    result = aiforgood.discover_aiforgood(
+        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+    )
+    assert result.diagnostics["skipped_no_title_or_url"] == 1
+    assert [c.native_id for c in result.candidates] == ["2"]
+
+
+def test_aiforgood_connector_uses_configured_topic_and_multiple_orgs() -> None:
+    """Смок нескольких организаций в одном прогоне — маппинг issuer идёт по entity_id, не
+    по сырому тексту группы."""
+    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 1), ("gx1043", 1))
+        group = params["group"]
+        return {"standards": [_standard(f"{group}-1")], "totalCount": 1, "facets": []}
+
+    result = aiforgood.discover_aiforgood(
+        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+    )
+    issuers = {c.native_id: c.issuer for c in result.candidates}
+    assert issuers == {"gx0-1": "ITU-T", "gx1043-1": "ETSI"}
