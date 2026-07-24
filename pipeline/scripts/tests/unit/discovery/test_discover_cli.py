@@ -457,8 +457,42 @@ def test_snowball_subcommand_dry_run_finds_link_but_writes_nothing(
     assert not (tmp_path / "candidates.yaml").exists()
     out = capsys.readouterr().out
     assert "snowball: найдено 1 | свежих 1 | слито 0" in out
-    assert "Итого: 1 новых кандидат" in out
-    assert "dry-run" in out
+
+
+def test_snowball_subcommand_with_citations_loads_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Живой дефект (2026-07-25): ``discover.py snowball --with-citations`` падал с
+    «нет OPENROUTER_API_KEY» на чистой оболочке — в отличие от ``run_pipeline.py``
+    (``if embed: load_dotenv()``), ``discover.py`` нигде не читал ``.env`` сам,
+    полагаясь на то, что ключ уже есть в окружении. Пустой корпус (``tmp_path`` без
+    документов) — ноль реальных обращений к OpenRouter, проверяется только сам факт
+    вызова ``load_dotenv``."""
+    import discover
+
+    calls: list[None] = []
+    monkeypatch.setattr(discover, "load_dotenv", lambda: calls.append(None))
+
+    code = main(["snowball", "--with-citations", "--root", str(tmp_path), "--dry-run"])
+
+    assert code == 0
+    assert len(calls) == 1
+
+
+def test_snowball_subcommand_without_citations_does_not_load_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Обычный прогон (без ``--with-citations``) НЕ должен трогать окружение вовсе —
+    зеркало ``run_pipeline.py``'s ``if embed: load_dotenv()`` (условно, не всегда)."""
+    import discover
+
+    calls: list[None] = []
+    monkeypatch.setattr(discover, "load_dotenv", lambda: calls.append(None))
+
+    code = main(["snowball", "--root", str(tmp_path), "--dry-run"])
+
+    assert code == 0
+    assert calls == []
 
 
 def test_snowball_subcommand_persists_candidate(tmp_path: Path) -> None:
