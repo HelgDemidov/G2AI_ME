@@ -16,15 +16,20 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from core import fsio
 from core.env import REPO_ROOT
+from discovery.base import ConnectorCursor
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_oecd.yaml"
+CACHE_DIR = REPO_ROOT / "pipeline" / "discovery_cache" / "oecd"
+SNAPSHOT_PATH = CACHE_DIR / "policy-initiatives-latest.json"
 CONNECTOR_ID = "oecd"
 
 RETRY_SCHEDULE = (1.0, 4.0, 15.0, 60.0)  # копия core/openrouter.py (принцип aiforgood/eurlex)
@@ -93,3 +98,83 @@ def fetch_json(
         print(f"попытка {attempt}/{total_attempts} через {delay:.0f}s: {reason}", file=sys.stderr)
         time.sleep(delay)
     raise RuntimeError(f"oecd: исчерпаны попытки ({total_attempts}) — {reason}")
+
+
+# --- §3: full-scan пагинация + shape-гейт честной деградации ---
+
+
+def _check_shape(page: dict[str, Any]) -> None:
+    """Backend недокументирован (найден в HTML фронтенда, нигде официально не объявлен,
+    §1) — может исчезнуть/сменить форму без предупреждения. Страница 1 обязана нести
+    непустой ``data`` И положительный ``total`` И ``lastPage`` >= 1; нарушение -> громкий
+    отказ (спек §3), не тихие «0 кандидатов» умершего backend'а."""
+    data = page.get("data")
+    total = page.get("total")
+    last_page = page.get("lastPage")
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"oecd: backend изменил форму/деградировал — пустой data: {page!r}")
+    if not isinstance(total, int) or total <= 0:
+        raise RuntimeError(f"oecd: backend изменил форму/деградировал — total={total!r}")
+    if not isinstance(last_page, int) or last_page < 1:
+        raise RuntimeError(f"oecd: backend изменил форму/деградировал — lastPage={last_page!r}")
+
+
+def fetch_all_pages(
+    config: OecdConfig,
+    *,
+    fetch: Callable[..., dict[str, Any]] = fetch_json,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[dict[str, Any]]:
+    """Полный обход ``page=1..lastPage`` (спек §3) — без early-stop по seen-id (rationale:
+    редакционная публикация со СТАРЫМ id может всплыть на любой глубине списка; полнота
+    важнее 5 минут вежливого обхода). ``sleep`` — между страницами, НЕ перед первой
+    (конвенция ``aiforgood.paginate_group``). Расхождение суммы полученного с заявленным
+    ``total`` — тоже отказ (backend соврал о своей форме на середине обхода)."""
+    first = fetch(1, endpoint=config.endpoint, user_agent=config.user_agent, timeout=config.timeout_seconds)
+    _check_shape(first)
+    records: list[dict[str, Any]] = list(first["data"])
+    last_page = int(first["lastPage"])
+    total = int(first["total"])
+
+    for page_num in range(2, last_page + 1):
+        sleep(config.crawl_delay_seconds)
+        page = fetch(
+            page_num, endpoint=config.endpoint, user_agent=config.user_agent,
+            timeout=config.timeout_seconds,
+        )
+        batch = page.get("data")
+        if not isinstance(batch, list):
+            raise RuntimeError(f"oecd: backend изменил форму на странице {page_num}: {page!r}")
+        records.extend(batch)
+
+    if len(records) != total:
+        raise RuntimeError(
+            f"oecd: заявлен total={total}, реально получено {len(records)} — "
+            "backend изменил форму/данные посреди обхода"
+        )
+    return records
+
+
+# --- §3: снапшот сырья — страховка от исчезновения недокументированного backend'а ---
+
+
+def save_snapshot(records: list[dict[str, Any]], *, path: Path = SNAPSHOT_PATH) -> None:
+    """Полный сырой массив записей плоским JSON (спек §3) — атомарная перезапись.
+    Пишется и при ``--dry-run`` (кэш-артефакт, не store — прецедент snowball
+    ``.citations.yaml``). НЕСЁТ PII редакторов OECD (§1) — gitignored, наружу не версионируется."""
+    fsio.atomic_write_text(path, json.dumps(records, ensure_ascii=False, indent=2))
+
+
+# --- §3: курсор — множество виденных native_id (как seen-CELEX у eurlex/aiforgood) ---
+
+
+def diff_cursor(
+    all_ids: list[str], cursor: ConnectorCursor | None
+) -> tuple[set[str], ConnectorCursor]:
+    """Новые (не виденные) ``id`` + новый курсор = объединение старых и текущих (спек §3).
+    Множество СТРОГО растёт — правка/удаление записи в живом индексе не выбрасывает её id
+    из seen (тот же принцип, что ``eurlex.diff_cursor``/``aiforgood.diff_cursor``)."""
+    seen = set((cursor or {}).get("seen_ids") or [])
+    fresh_ids = {i for i in all_ids if i not in seen}
+    new_seen = sorted(seen | set(all_ids))
+    return fresh_ids, {"seen_ids": new_seen}

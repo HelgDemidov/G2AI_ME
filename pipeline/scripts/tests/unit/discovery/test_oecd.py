@@ -21,6 +21,17 @@ import yaml
 
 from discovery.connectors import oecd
 
+_BASE_CONFIG = oecd.OecdConfig(
+    enabled=True,
+    endpoint="https://example.org/policy-initiatives",
+    user_agent="test-agent/1.0",
+    crawl_delay_seconds=0.0,
+    timeout_seconds=30.0,
+    include_categories=("Cat A",),
+    probe_category="Projects",
+    probe_initiative_types=("Type A",),
+)
+
 # --- load_config ---
 
 
@@ -201,3 +212,144 @@ def test_fetch_json_sends_configured_user_agent(monkeypatch: Any) -> None:
         timeout=30.0,
     )
     assert seen_headers.get("User-agent") == "G2AI-corpus-research/1.0"
+
+
+# --- fetch_all_pages: full-scan + shape-гейт (спек §3) ---
+
+
+def _page(records: list[dict[str, Any]], *, current: int, last: int, total: int) -> dict[str, Any]:
+    return {"data": records, "currentPage": current, "lastPage": last, "total": total}
+
+
+def test_fetch_all_pages_walks_until_last_page() -> None:
+    pages = {
+        1: _page([{"id": 1}, {"id": 2}], current=1, last=3, total=6),
+        2: _page([{"id": 3}, {"id": 4}], current=2, last=3, total=6),
+        3: _page([{"id": 5}, {"id": 6}], current=3, last=3, total=6),
+    }
+
+    def fake_fetch(page: int, **_: Any) -> dict[str, Any]:
+        return pages[page]
+
+    out = oecd.fetch_all_pages(_BASE_CONFIG, fetch=fake_fetch, sleep=lambda s: None)
+    assert [r["id"] for r in out] == [1, 2, 3, 4, 5, 6]
+
+
+def test_fetch_all_pages_sleeps_between_pages_not_before_first() -> None:
+    pages = {
+        1: _page([{"id": 1}], current=1, last=2, total=2),
+        2: _page([{"id": 2}], current=2, last=2, total=2),
+    }
+    sleeps: list[float] = []
+
+    def fake_fetch(page: int, **_: Any) -> dict[str, Any]:
+        return pages[page]
+
+    oecd.fetch_all_pages(_BASE_CONFIG, fetch=fake_fetch, sleep=lambda s: sleeps.append(s))
+    assert sleeps == [_BASE_CONFIG.crawl_delay_seconds]
+
+
+def test_fetch_all_pages_single_page_no_sleep() -> None:
+    page = _page([{"id": 1}], current=1, last=1, total=1)
+    sleeps: list[float] = []
+    out = oecd.fetch_all_pages(
+        _BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: sleeps.append(s)
+    )
+    assert [r["id"] for r in out] == [1]
+    assert sleeps == []
+
+
+def test_fetch_all_pages_empty_data_raises() -> None:
+    page = {"data": [], "currentPage": 1, "lastPage": 1, "total": 0}
+    with pytest.raises(RuntimeError, match="backend изменил форму"):
+        oecd.fetch_all_pages(_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None)
+
+
+def test_fetch_all_pages_missing_data_key_raises() -> None:
+    page = {"currentPage": 1, "lastPage": 1, "total": 5}
+    with pytest.raises(RuntimeError, match="backend изменил форму"):
+        oecd.fetch_all_pages(_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None)
+
+
+def test_fetch_all_pages_zero_total_raises() -> None:
+    page = _page([{"id": 1}], current=1, last=1, total=0)
+    with pytest.raises(RuntimeError, match="backend изменил форму"):
+        oecd.fetch_all_pages(_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None)
+
+
+def test_fetch_all_pages_missing_last_page_raises() -> None:
+    page = {"data": [{"id": 1}], "currentPage": 1, "total": 1}
+    with pytest.raises(RuntimeError, match="backend изменил форму"):
+        oecd.fetch_all_pages(_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None)
+
+
+def test_fetch_all_pages_later_page_non_list_data_raises() -> None:
+    pages = {
+        1: _page([{"id": 1}], current=1, last=2, total=2),
+        2: {"data": "not-a-list", "currentPage": 2, "lastPage": 2, "total": 2},
+    }
+    with pytest.raises(RuntimeError, match="изменил форму на странице 2"):
+        oecd.fetch_all_pages(
+            _BASE_CONFIG, fetch=lambda page_num, **_: pages[page_num], sleep=lambda s: None
+        )
+
+
+def test_fetch_all_pages_total_mismatch_after_full_scan_raises() -> None:
+    pages = {
+        1: _page([{"id": 1}], current=1, last=2, total=99),
+        2: _page([{"id": 2}], current=2, last=2, total=99),
+    }
+    with pytest.raises(RuntimeError, match="заявлен total=99, реально получено 2"):
+        oecd.fetch_all_pages(
+            _BASE_CONFIG, fetch=lambda page_num, **_: pages[page_num], sleep=lambda s: None
+        )
+
+
+# --- save_snapshot: атомарная страховочная запись сырья (спек §3) ---
+
+
+def test_save_snapshot_writes_raw_records_as_json(tmp_path: Path) -> None:
+    path = tmp_path / "oecd" / "policy-initiatives-latest.json"
+    records = [{"id": 1, "englishName": "X"}, {"id": 2, "englishName": "Y"}]
+    oecd.save_snapshot(records, path=path)
+    assert json.loads(path.read_text(encoding="utf-8")) == records
+
+
+def test_save_snapshot_overwrites_existing(tmp_path: Path) -> None:
+    path = tmp_path / "oecd" / "policy-initiatives-latest.json"
+    oecd.save_snapshot([{"id": 1}], path=path)
+    oecd.save_snapshot([{"id": 2}], path=path)
+    assert json.loads(path.read_text(encoding="utf-8")) == [{"id": 2}]
+
+
+def test_save_snapshot_no_staging_leftover(tmp_path: Path) -> None:
+    path = tmp_path / "oecd" / "policy-initiatives-latest.json"
+    oecd.save_snapshot([{"id": 1}], path=path)
+    assert list(path.parent.glob(".*.part")) == []
+
+
+# --- diff_cursor: seen-id, монотонный (зеркало test_aiforgood.py) ---
+
+
+def test_diff_cursor_first_run_all_fresh_all_seen() -> None:
+    fresh, cursor = oecd.diff_cursor(["a", "b"], None)
+    assert fresh == {"a", "b"}
+    assert cursor == {"seen_ids": ["a", "b"]}
+
+
+def test_diff_cursor_repeat_run_same_ids_no_new_fresh() -> None:
+    fresh, cursor = oecd.diff_cursor(["a", "b"], {"seen_ids": ["a", "b"]})
+    assert fresh == set()
+    assert cursor == {"seen_ids": ["a", "b"]}
+
+
+def test_diff_cursor_new_id_added_only_new_one_fresh() -> None:
+    fresh, cursor = oecd.diff_cursor(["a", "b", "c"], {"seen_ids": ["a", "b"]})
+    assert fresh == {"c"}
+    assert cursor == {"seen_ids": ["a", "b", "c"]}
+
+
+def test_diff_cursor_monotonic_never_shrinks_when_upstream_result_shrinks() -> None:
+    fresh, cursor = oecd.diff_cursor(["a"], {"seen_ids": ["a", "b"]})
+    assert fresh == set()
+    assert cursor == {"seen_ids": ["a", "b"]}
