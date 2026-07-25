@@ -480,6 +480,12 @@ def test_map_record_field_mapping() -> None:
     assert "start_year: 2023" in (cand.native_tags or [])
 
 
+def test_map_record_extent_binding_tag_when_present() -> None:
+    cand = oecd._map_record(_base_record(extentBinding="Binding"))
+    assert cand is not None
+    assert "binding: Binding" in (cand.native_tags or [])
+
+
 def test_map_record_faker_barrier_only_country_name_is_read() -> None:
     """Барьер §1: демография gaiinCountry (язык/население/ВВП) НИКУДА не попадает —
     ни в одно поле CandidateRecord, даже как побочный текст native_tags/summary."""
