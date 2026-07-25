@@ -336,7 +336,12 @@ def _do_download(
     удаляются перед публикацией нового, чтобы в папке не оказалось двух оригиналов.
 
     После успеха пишет операционное состояние (sha256/acquisition_method/fidelity/
-    checked) в ``.state.yaml`` (машиннописаный sidecar, corpus-layout-v2).
+    checked) в ``.state.yaml`` (машиннописаный sidecar, corpus-layout-v2) и закрывает
+    контур времени (spec post-acquisition-lifecycle): бутстрапит серверные валидаторы
+    под гейтом ступени (§2), просит проактивный снимок редакции (§4), снимает backoff
+    недобытых (§5) и гасит ``recheck_finding`` — передобыча и есть один из двух
+    человеческих путей разрешения дрейфа (§6). ЛЮБОЙ провал лестницы, наоборот,
+    фиксируется ``_record_acquisition_failure`` перед пробросом наверх.
     """
     if not rec.source_url:
         raise RuntimeError("нет source_url для скачивания")
