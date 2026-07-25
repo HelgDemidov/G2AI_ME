@@ -37,13 +37,15 @@ from lxml import html as lxml_html
 from convert.converters import was_ocr_normalized
 from core import fsio, openrouter, schema
 from core.env import REPO_ROOT
-from discovery import registry
+from discovery import registry, store
 from discovery.base import ConnectorCursor, DiscoverResult
 from discovery.dedup import normalize_url
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_snowball.yaml"
 CONNECTOR_ID = "snowball"
-LEADS_FILENAME = ".snowball_leads.yaml"
+LEADS_FILENAME = "snowball_leads.yaml"
+"""Имя файла лидов ВНУТРИ ``sources/.state/`` (каталог принадлежит ``discovery/store.py``:
+писатель владеет своим именем файла, раскладку знает store — см. ``store.state_dir``)."""
 _CITATIONS_CACHE_FILENAME = ".citations.yaml"
 
 # §2.4 шаг 4: срез хвостовой пунктуации ДО остальных проверок санитизации.
@@ -748,12 +750,18 @@ def extract_text_citations(
     return links, leads
 
 
+def leads_path(root: Path) -> Path:
+    """Файл лидов: ``<root>/.state/snowball_leads.yaml``."""
+    return store.state_dir(root) / LEADS_FILENAME
+
+
 def save_leads(leads: list[dict[str, Any]], root: Path) -> None:
     """Записать ``sources/.snowball_leads.yaml`` (спек §5) — ПЕРЕЗАПИСЫВАЕТСЯ целиком
     каждым прогоном с ``--with-citations`` (не аппендится): лиды — сырьё СЛЕДУЮЩЕЙ
     directed-search мини-кампании, не постоянное состояние; известное ограничение —
     лиды документа, не пере-майненного в этом прогоне (курсор его пропустил), в
     файл не попадают, пока документ не изменится или курсор не будет сброшен.
+    Путь — ``leads_path`` (каталог операционного состояния корпуса, ``store.state_dir``).
 
     Каждый лид дампится отдельно, записи разделяются пустой строкой — тот же приём
     человекочитаемости, что у ``store.save`` для кандидатов (YAML к пустой строке между
@@ -761,7 +769,7 @@ def save_leads(leads: list[dict[str, Any]], root: Path) -> None:
     вход РУЧНОЙ мини-кампании, слитное полотно записей в нём нечитаемо).
     """
     parts = [yaml.safe_dump([lead], allow_unicode=True, sort_keys=False) for lead in leads]
-    fsio.atomic_write_text(root / LEADS_FILENAME, "\n".join(parts))
+    fsio.atomic_write_text(leads_path(root), "\n".join(parts))
 
 
 # --- §4: discover_snowball() top-level ---

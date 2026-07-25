@@ -17,6 +17,15 @@
 Оба артефакта (кандидаты, курсоры) машиннописаные (комментарии не выживают перезапись) —
 тот же прецедент, что у ``.state.yaml`` (corpus-layout-v2): производные/операционные
 файлы, не курируемые человеком напрямую.
+
+**Операционное состояние уровня КОРПУСА живёт в ``sources/.state/``** (2026-07-25):
+курсоры коннекторов (``cursors.yaml``), лиды snowball (``snowball_leads.yaml``, пишет
+``connectors/snowball.py``), в будущем dangling-цитаты graph-v2. Каталог владеет ЭТОТ
+модуль (``state_dir``), имя файла — каждый писатель свой: store не должен знать о
+существовании snowball. Имя ``.state`` — то же слово, которым проект уже называет этот
+концепт на уровне ДОКУМЕНТА (``.state.yaml``/``OperationalState``): один концепт — одно
+слово на двух уровнях вложенности; точка-префикс сохраняет сигнал «операционное, не для
+просмотра человеком» и не мешается среди видимых треков корпуса.
 """
 from __future__ import annotations
 
@@ -30,11 +39,14 @@ from core import fsio, schema
 
 CANDIDATES_DIRNAME = "candidates"
 LEGACY_CANDIDATES_FILENAME = "candidates.yaml"
+STATE_DIRNAME = ".state"
+CURSORS_FILENAME = "cursors.yaml"
 
 CANDIDATES_DIR = schema.DEFAULT_SOURCES / CANDIDATES_DIRNAME
 LEGACY_CANDIDATES_PATH = schema.DEFAULT_SOURCES / LEGACY_CANDIDATES_FILENAME
-CURSORS_PATH = schema.DEFAULT_SOURCES / ".discovery_cursors.yaml"
-"""Dot-файл — операционное состояние (курсоры), не данные; вне git по deny-default `/sources/**`."""
+STATE_DIR = schema.DEFAULT_SOURCES / STATE_DIRNAME
+CURSORS_PATH = STATE_DIR / CURSORS_FILENAME
+"""Операционное состояние корпуса — вне git по deny-default `/sources/**` (см. docstring модуля)."""
 
 # Имя шарда: всё, что не буква/цифра/подчёркивание/дефис, схлопывается в "__".
 # Санитизация закрывает три ФС-риска разом (§1): ":" грамматики connector_id
@@ -57,6 +69,22 @@ def candidates_dir(root: Path = schema.DEFAULT_SOURCES) -> Path:
 def legacy_candidates_path(root: Path = schema.DEFAULT_SOURCES) -> Path:
     """Монолит ``sources/candidates.yaml`` — вход авто-миграции (§3), не цель записи."""
     return root / LEGACY_CANDIDATES_FILENAME
+
+
+def state_dir(root: Path = schema.DEFAULT_SOURCES) -> Path:
+    """Каталог операционного состояния корпуса: ``<root>/.state/`` (см. docstring модуля).
+
+    Владелец каталога — этот модуль; ИМЯ ФАЙЛА внутри принадлежит писателю
+    (``connectors/snowball.py`` — лиды, будущий cite-miner graph-v2 — dangling-цитаты):
+    store не знает о существовании конкретных коннекторов, а писатели не дублируют
+    знание о раскладке.
+    """
+    return root / STATE_DIRNAME
+
+
+def cursors_path(root: Path = schema.DEFAULT_SOURCES) -> Path:
+    """Курсоры коннекторов: ``<root>/.state/cursors.yaml``."""
+    return state_dir(root) / CURSORS_FILENAME
 
 
 def shard_name(connector_id: str) -> str:
@@ -156,14 +184,21 @@ def save(candidates: list[schema.CandidateRecord], root: Path = schema.DEFAULT_S
     legacy_candidates_path(root).unlink(missing_ok=True)  # авто-миграция завершена
 
 
-def load_cursors(path: Path = CURSORS_PATH) -> dict[str, dict[str, Any]]:
-    """``connector_id -> ConnectorCursor``; отсутствующий файл — пустой словарь (первый прогон)."""
+def load_cursors(root: Path = schema.DEFAULT_SOURCES) -> dict[str, dict[str, Any]]:
+    """``connector_id -> ConnectorCursor``; отсутствующий файл — пустой словарь (первый прогон).
+
+    Принимает КОРЕНЬ корпуса, а не путь файла — знание раскладки живёт только здесь
+    (тот же контракт, что у ``load``/``save`` кандидатов).
+    """
+    path = cursors_path(root)
     if not path.exists():
         return {}
     raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
     return raw if raw is not None else {}
 
 
-def save_cursors(cursors: dict[str, dict[str, Any]], path: Path = CURSORS_PATH) -> None:
+def save_cursors(
+    cursors: dict[str, dict[str, Any]], root: Path = schema.DEFAULT_SOURCES
+) -> None:
     text = yaml.safe_dump(cursors, allow_unicode=True, sort_keys=False)
-    fsio.atomic_write_text(path, text)
+    fsio.atomic_write_text(cursors_path(root), text)  # создаёт .state/ при необходимости

@@ -22,6 +22,7 @@ from discovery.connectors.snowball import (
     passes_verbatim_gate,
     save_leads,
 )
+from discovery.connectors.snowball import leads_path as snowball_leads_path
 from tests.support import build_pdf, valid_record, write_doc
 
 _EMPTY_PDF = build_pdf(lines=[])  # валидный PDF без аннотаций/текста — для документов,
@@ -533,7 +534,7 @@ def test_normal_document_llm_stage_runs_when_emitted(tmp_path: Path) -> None:
 def test_save_leads_writes_yaml_list(tmp_path: Path) -> None:
     leads = [{"title": "X", "issuer": None, "year": 2024, "source_doc_id": "doc-1", "context": "..."}]
     save_leads(leads, tmp_path)
-    path = tmp_path / ".snowball_leads.yaml"
+    path = snowball_leads_path(tmp_path)
     assert path.exists()
     import yaml
 
@@ -546,7 +547,7 @@ def test_save_leads_overwrites_not_appends(tmp_path: Path) -> None:
     save_leads([{"title": "Second run lead"}], tmp_path)
     import yaml
 
-    loaded = yaml.safe_load((tmp_path / ".snowball_leads.yaml").read_text(encoding="utf-8"))
+    loaded = yaml.safe_load(snowball_leads_path(tmp_path).read_text(encoding="utf-8"))
     assert loaded == [{"title": "Second run lead"}]
 
 
@@ -561,7 +562,7 @@ def test_save_leads_separates_records_with_blank_line(tmp_path: Path) -> None:
     ]
     save_leads(leads, tmp_path)
 
-    text = (tmp_path / ".snowball_leads.yaml").read_text(encoding="utf-8")
+    text = snowball_leads_path(tmp_path).read_text(encoding="utf-8")
     assert "\n\n- " in text
     assert yaml.safe_load(text) == leads  # round-trip не страдает
 
@@ -594,7 +595,7 @@ def test_lead_context_is_single_line_without_markdown_breaks(tmp_path: Path) -> 
 
 def test_save_leads_empty_list_still_writes_file(tmp_path: Path) -> None:
     save_leads([], tmp_path)
-    assert (tmp_path / ".snowball_leads.yaml").exists()
+    assert snowball_leads_path(tmp_path).exists()
 
 
 # --- дополнительное покрытие: дозаливка после первого замера --cov (coverage discipline,

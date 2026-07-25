@@ -68,10 +68,8 @@ def discover(
     ни файл конфига. ``only`` в этом режиме игнорируется — сам список уже финальный.
     Без параметра (``None``, дефолт) поведение НЕ меняется — обычный путь через реестр.
     """
-    cursors_path = root / ".discovery_cursors.yaml"
-
     existing = store.load(root)
-    cursors = store.load_cursors(cursors_path)
+    cursors = store.load_cursors(root)
 
     summaries: list[ConnectorRunSummary] = []
     fresh_this_run: list[schema.CandidateRecord] = []
@@ -99,6 +97,6 @@ def discover(
 
     if not dry_run:
         store.save(existing + fresh_this_run, root)
-        store.save_cursors(cursors, cursors_path)
+        store.save_cursors(cursors, root)
 
     return DiscoverySummary(connectors=summaries, dry_run=dry_run)

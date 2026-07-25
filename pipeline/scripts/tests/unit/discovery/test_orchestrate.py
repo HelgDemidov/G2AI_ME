@@ -72,7 +72,7 @@ def test_discover_persists_fresh_candidates(tmp_path: Path) -> None:
 def test_discover_persists_cursor_returned_by_connector(tmp_path: Path) -> None:
     registry.register(_StaticConnector("a", [_candidate("a", "doc1")]))
     discover(root=tmp_path)
-    assert store.load_cursors(tmp_path / ".discovery_cursors.yaml") == {"a": {"n": 1}}
+    assert store.load_cursors(tmp_path) == {"a": {"n": 1}}
 
 
 def test_failing_connector_does_not_abort_run(tmp_path: Path) -> None:
@@ -108,7 +108,7 @@ def test_dry_run_does_not_write_store_or_cursors(tmp_path: Path) -> None:
 
     assert summary.total_fresh == 1  # сводка честная...
     assert store.load(tmp_path) == []  # ...но store пуст (проверка через API — раскладка store её дело)
-    assert not (tmp_path / ".discovery_cursors.yaml").exists()
+    assert store.load_cursors(tmp_path) == {}  # через API — раскладку знает store
 
 
 def test_two_connectors_same_run_fold_into_one_candidate(tmp_path: Path) -> None:
@@ -152,7 +152,7 @@ def test_connectors_override_used_when_registry_is_empty(tmp_path: Path) -> None
     assert summary.total_fresh == 1
     assert override_conn.calls == [None]
     assert len(store.load(tmp_path)) == 1
-    cursors = store.load_cursors(tmp_path / ".discovery_cursors.yaml")
+    cursors = store.load_cursors(tmp_path)
     assert cursors["snowball"] == {"n": 1}
 
 

@@ -25,7 +25,6 @@ from typing import Any
 import pytest
 
 from convert import converters
-from core import schema
 from discovery import registry_store, store
 from index import corpus_index
 
@@ -50,17 +49,16 @@ _GUARDED_REAL_ARTIFACTS: tuple[Path, ...] = (
     # источник истины store (правило прецедентности `store.load`), и тихая мутация
     # именно его была бы порчей боевых данных.
     store.LEGACY_CANDIDATES_PATH,
-    schema.DEFAULT_SOURCES / ".discovery_cursors.yaml",
     registry_store.DEFAULT_DB_PATH,
-    # discovery-snowball §5/§7: sources/.snowball_leads.yaml — та же ловушка (main()-путь
-    # без явного --root задел бы боевой файл лидов).
-    schema.DEFAULT_SOURCES / ".snowball_leads.yaml",
 )
 
 # Боевые КАТАЛОГИ, чей состав тоже неприкосновенен (spec discovery-candidates-sharding §6):
 # для шардированного store недостаточно сторожить один файл — правку шарда на месте И
-# появление/исчезновение шарда ловит только снимок всего каталога.
-_GUARDED_REAL_DIRS: tuple[Path, ...] = (store.CANDIDATES_DIR,)
+# появление/исчезновение шарда ловит только снимок всего каталога. `.state/` (курсоры,
+# лиды snowball, в будущем dangling-цитаты graph-v2) сторожится тем же механизмом с
+# 2026-07-25: раньше это были два отдельных файла в списке выше, и КАЖДЫЙ новый
+# операционный артефакт требовал правки списка — каталог закрывает класс целиком.
+_GUARDED_REAL_DIRS: tuple[Path, ...] = (store.CANDIDATES_DIR, store.STATE_DIR)
 
 
 def _artifact_snapshot() -> list[tuple[str, tuple[int, int] | None]]:

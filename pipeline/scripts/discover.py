@@ -161,7 +161,7 @@ def _cmd_snowball(args: argparse.Namespace) -> int:
         leads: list[dict[str, Any]] = summary.connectors[0].diagnostics.get("leads") or []  # type: ignore[assignment]
         snowball.save_leads(leads, args.root)
         if leads:
-            print(f"snowball: {len(leads)} лид(ов) без URL -> {args.root / snowball.LEADS_FILENAME}")
+            print(f"snowball: {len(leads)} лид(ов) без URL -> {snowball.leads_path(args.root)}")
 
     return 1 if summary.failed else 0
 
