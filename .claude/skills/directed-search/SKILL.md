@@ -56,14 +56,15 @@ The seed-list lesson (charter §8) is the reason this section exists: aggregator
 
 - `--language`: ISO 639-1; 639-3 only where no 639-1 code exists (Montenegrin `cnr`).
 - `--summary`: 2-3 sentences EN, hard cap 600 characters (`schema.CANDIDATE_SUMMARY_MAX` — check if it changed; schema rejects longer — shorten, don't fight it).
-- Re-injecting a known URL is a safe no-op (dedup; rejected candidates do not resurrect) — do not pre-filter against `sources/candidates.yaml` manually, just inject.
+- Re-injecting a known URL is a safe no-op (dedup; rejected candidates do not resurrect) — do not pre-filter the candidate layer manually, just inject.
+- If the hit is a NEW EDITION of a document already in the corpus (same official URL, revised text — normal for laws), add `--supersedes <doc-id>`: candidate identity is the pair (URL, declared edition), so without the flag dedup absorbs the edition as a duplicate and it is lost. Without a known predecessor doc-id, treat it as an ordinary inject and flag it in the session summary.
 - A `кандидат уже присутствует (уже отклонён ранее: …)` response is a FINDING: record it in the summary, do not argue with it.
 
 ## Explicit prohibitions
 
 - Do NOT download or fetch document bodies (acquisition is `pipeline/scripts/run_pipeline.py`, post-triage).
 - Do NOT assign `target_fit`/axis verdicts or edit `relevance` — that is triage (`worksheet`/`apply`), a separate session.
-- Do NOT create candidates by editing `sources/candidates.yaml` directly or via ad-hoc scripts — `inject` is the only entry (provenance + dedup by construction).
+- Do NOT create candidates by editing the candidate layer (`sources/candidates/*.yaml` shards) directly or via ad-hoc scripts — `inject` is the only entry (provenance + dedup by construction).
 - Do NOT copy seed-list titles into injects without the full verification above — such leads (the historical `small_states_v01.md`, removed by the curator 2026-07-22 after being fully mined) are the lowest tier.
 
 ## Session summary (end of every campaign session)
