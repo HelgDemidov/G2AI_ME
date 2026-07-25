@@ -172,6 +172,91 @@ def test_graph_nodes_carry_validity_attributes() -> None:
     assert graph.nodes["doc:me-law-2025"]["valid_to"] == ""  # открытый интервал
 
 
+# --- CLI-режим среза ---
+
+
+def _write(root: Path, rec_data: dict[str, Any]) -> None:
+    from tests.support import write_doc
+
+    write_doc(root, rec_data, md="# doc\n")
+
+
+def _cli_records(root: Path) -> None:
+    from tests.support import valid_record
+
+    old = valid_record() | {"id": "me-law-2024", "dates": {"published": "2024-01-01"}}
+    new = valid_record() | {
+        "id": "me-law-2026",
+        "dates": {"published": "2026-01-01"},
+        "relations": [{"type": "supersedes", "target": "me-law-2024"}],
+    }
+    _write(root, old)
+    _write(root, new)
+
+
+def test_cli_as_of_prints_slice(tmp_path: Path, capsys: Any) -> None:
+    from graph.build_graph import main
+
+    _cli_records(tmp_path)
+    assert main([str(tmp_path), "--as-of", "2025-01-01"]) == 0
+    out = capsys.readouterr().out
+    assert "Действовали на 2025-01-01 (1 из 2)" in out
+    assert "me-law-2024" in out and "me-law-2026" not in out.split("Действовали")[1]
+
+
+def test_cli_as_of_marks_unknown_validity(tmp_path: Path, capsys: Any) -> None:
+    from tests.support import valid_record
+    from graph.build_graph import main
+
+    _write(tmp_path, valid_record() | {"id": "me-law-undated", "dates": {}})
+    assert main([str(tmp_path), "--as-of", "2025-01-01"]) == 0
+    assert "валидность неизвестна" in capsys.readouterr().out
+
+
+def test_cli_as_of_exports_slice_subgraph(tmp_path: Path) -> None:
+    """`--as-of` вместе с `--graphml` экспортирует СРЕЗ, а не полный граф — иначе флаг
+    молча давал бы файл, не соответствующий напечатанному списку."""
+    from graph.build_graph import main
+
+    _cli_records(tmp_path)
+    out = tmp_path / "slice.graphml"
+    assert main([str(tmp_path), "--as-of", "2025-01-01", "--graphml", str(out)]) == 0
+    exported = nx.read_graphml(out)
+    assert set(exported.nodes()) == {"doc:me-law-2024"}
+
+
+def test_cli_reports_dangling_identifier(tmp_path: Path, capsys: Any, monkeypatch: Any) -> None:
+    """Протухшая запись справочника видна куратору в выводе, а не только в логе."""
+    from graph import cite_mining
+    from graph.build_graph import main
+
+    _cli_records(tmp_path)
+    monkeypatch.setattr(cite_mining, "load_identifiers", lambda: {"CELEX:32024R1689": "no-such"})
+    assert main([str(tmp_path)]) == 0
+    assert "identifiers.yaml" in capsys.readouterr().out
+
+
+def test_cli_reports_leads_and_l1_edges(tmp_path: Path, capsys: Any, monkeypatch: Any) -> None:
+    from tests.support import valid_record, write_doc
+    from graph import cite_mining
+    from graph.build_graph import main
+
+    write_doc(tmp_path, valid_record() | {"id": "me-law-2025"},
+              md="ссылается на Regulation (EU) 2024/1689 и ISO/IEC 42001:2023\n")
+    monkeypatch.setattr(cite_mining, "load_identifiers", lambda: {"CELEX:32024R1689": "me-law-2025"})
+    assert main([str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Цитаты без записи в корпусе: 1" in out  # ISO — лид; CELEX — самоцитирование
+
+
+def test_cli_rejects_invalid_registry(tmp_path: Path, capsys: Any) -> None:
+    from graph.build_graph import main
+
+    (tmp_path / "intl-xperience" / "sg" / "broken").mkdir(parents=True)
+    (tmp_path / "intl-xperience" / "sg" / "broken" / "meta.yaml").write_text("id: broken\n", encoding="utf-8")
+    assert main([str(tmp_path)]) == 1
+
+
 def test_graphml_export_survives_unknown_dates(tmp_path: Path) -> None:
     """GraphML-writer падает на None — неизвестная дата обязана ехать пустой строкой,
     иначе экспорт корпуса ломается на первой же записи без дат."""
