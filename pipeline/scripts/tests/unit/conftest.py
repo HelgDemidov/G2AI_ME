@@ -26,7 +26,7 @@ import pytest
 
 from convert import converters
 from core import schema
-from discovery import registry_store
+from discovery import registry_store, store
 from index import corpus_index
 
 
@@ -45,7 +45,11 @@ def _hermetic_cloud_env(monkeypatch: Any) -> None:
 # пере-чанковкой на следующем прогоне. Guard превращает тихую порчу в громкий красный тест.
 _GUARDED_REAL_ARTIFACTS: tuple[Path, ...] = (
     corpus_index.DEFAULT_DB,
-    schema.DEFAULT_SOURCES / "candidates.yaml",
+    # Легаси-монолит слоя кандидатов: остаётся под guard'ом до конца миграционного
+    # периода (spec discovery-candidates-sharding §6) — пока он существует, именно он
+    # источник истины store (правило прецедентности `store.load`), и тихая мутация
+    # именно его была бы порчей боевых данных.
+    store.LEGACY_CANDIDATES_PATH,
     schema.DEFAULT_SOURCES / ".discovery_cursors.yaml",
     registry_store.DEFAULT_DB_PATH,
     # discovery-snowball §5/§7: sources/.snowball_leads.yaml — та же ловушка (main()-путь
@@ -53,11 +57,24 @@ _GUARDED_REAL_ARTIFACTS: tuple[Path, ...] = (
     schema.DEFAULT_SOURCES / ".snowball_leads.yaml",
 )
 
+# Боевые КАТАЛОГИ, чей состав тоже неприкосновенен (spec discovery-candidates-sharding §6):
+# для шардированного store недостаточно сторожить один файл — правку шарда на месте И
+# появление/исчезновение шарда ловит только снимок всего каталога.
+_GUARDED_REAL_DIRS: tuple[Path, ...] = (store.CANDIDATES_DIR,)
+
 
 def _artifact_snapshot() -> list[tuple[str, tuple[int, int] | None]]:
-    """(size, mtime_ns) каждого guarded-файла; None — файла нет (CI-сценарий)."""
+    """(size, mtime_ns) каждого guarded-файла; None — файла нет (CI-сценарий).
+
+    Для guarded-КАТАЛОГОВ снимок берётся по каждому их ``*.yaml`` (шарду) — состав
+    каталога входит в сравнение, поэтому появившийся или исчезнувший шард виден так же,
+    как правка существующего.
+    """
     snapshot: list[tuple[str, tuple[int, int] | None]] = []
-    for path in _GUARDED_REAL_ARTIFACTS:
+    paths = list(_GUARDED_REAL_ARTIFACTS)
+    for directory in _GUARDED_REAL_DIRS:
+        paths.extend(sorted(directory.glob("*.yaml")))
+    for path in paths:
         try:
             st = path.stat()
             snapshot.append((str(path), (st.st_size, st.st_mtime_ns)))
