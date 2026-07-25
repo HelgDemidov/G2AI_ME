@@ -3,6 +3,23 @@
 Ключи сравнения по убыванию надёжности (чартер §4.4): ``normalized_url`` -> ``(issuer,
 normalized_title, doc_date)`` -> ``content_hash``. Без fuzzy-библиотек — детерминизм важнее
 recall (остаточные дубли дочистит человек на worksheet, discovery-manual).
+
+**Один проход вместо трёх сканов (spec discovery-candidates-sharding §4).** Раньше на
+КАЖДОГО нового кандидата шли три последовательных линейных скана по всему пулу — при
+масштабе одного харвеста (1790 existing × сотни fresh) это сотни тысяч сравнений, и
+росло квадратично с корпусом кандидатов. Теперь пул индексируется ОДИН раз (три dict),
+поиск — три точных lookup: O(M+N) вместо O(M×N).
+
+**Каноническая семантика (решение куратора 2026-07-25): строгий приоритет СТРАТЕГИЙ
+над пулом.** Кандидат сверяется с ЕДИНЫМ пулом (existing + уже принятые в этом прогоне
+fresh) в порядке url -> key -> hash, остановка на первом попадании. Прежняя форма
+(``_find_match(cand, existing) or _find_match(cand, fresh)``) давала приоритет ПУЛУ над
+стратегией: в кросс-стратегийном углу (новый кандидат совпадает с existing-записью по
+ключу-2 И с fresh-записью по URL) она выбирала existing, единый пул выбирает fresh по URL.
+Отличие затрагивает ТОЛЬКО выбор цели merge-провенанса (кому дописать
+``merged_connector_ids``) — кандидаты не теряются и не дублируются ни в одной из форм;
+единый пул убирает двухуровневый порядок из инварианта и проще доказуем (property-тест
+сверяет прод-реализацию с независимым наивным оракулом этой же семантики).
 """
 from __future__ import annotations
 
@@ -35,27 +52,59 @@ def normalized_title(title: str) -> str:
     return _NON_WORD_RE.sub("", title.lower())
 
 
-def _match_key(cand: CandidateRecord) -> tuple[str, str, str] | None:
+def _match_key(cand: CandidateRecord) -> tuple[str, str, str, str | None] | None:
     if not (cand.title and cand.issuer):
         return None
-    return (cand.issuer, normalized_title(cand.title), str(cand.doc_date))
+    return (cand.issuer, normalized_title(cand.title), str(cand.doc_date), cand.supersedes)
 
 
-def _find_match(cand: CandidateRecord, pool: list[CandidateRecord]) -> CandidateRecord | None:
-    if cand.normalized_url:
-        for other in pool:
-            if other.normalized_url == cand.normalized_url:
-                return other
-    key = _match_key(cand)
-    if key is not None:
-        for other in pool:
-            if _match_key(other) == key:
-                return other
-    if cand.content_hash:
-        for other in pool:
-            if other.content_hash == cand.content_hash:
-                return other
-    return None
+class _PoolIndex:
+    """Три индекса над пулом кандидатов: ``normalized_url`` / ключ-2 / ``content_hash``.
+
+    **Дискриминатор редакций входит во ВСЕ ТРИ ключа единообразно** (spec
+    discovery-candidates-sharding §5): кандидат с ``supersedes=X`` сопоставляется только
+    с записями с тем же ``supersedes=X``. Это единое правило, а не три особых случая —
+    редакция есть другая identity по определению, какой бы стратегией её ни ловили.
+    Стратегия 2 обычно спасена новой ``doc_date``, но одинаковая дата переиздания —
+    реальный кейс; единообразие снимает его. ``supersedes=None`` (все существующие
+    кандидаты) даёт ключи, эквивалентные прежним.
+
+    **First-seen-wins:** если два кандидата пула дают один ключ (легаси-дубли внутри
+    ``existing``), индекс хранит ПЕРВОГО в порядке добавления — ровно то, что возвращал
+    линейный скан (``for other in pool: return first``). Пул наполняется
+    existing-до-fresh, поэтому ВНУТРИ одной стратегии existing по-прежнему выигрывает.
+    """
+
+    def __init__(self) -> None:
+        self.by_url: dict[tuple[str, str | None], CandidateRecord] = {}
+        self.by_key: dict[tuple[str, str, str, str | None], CandidateRecord] = {}
+        self.by_hash: dict[tuple[str, str | None], CandidateRecord] = {}
+
+    def add(self, cand: CandidateRecord) -> None:
+        if cand.normalized_url:
+            self.by_url.setdefault((cand.normalized_url, cand.supersedes), cand)
+        key = _match_key(cand)
+        if key is not None:
+            self.by_key.setdefault(key, cand)
+        if cand.content_hash:
+            self.by_hash.setdefault((cand.content_hash, cand.supersedes), cand)
+
+    def find(self, cand: CandidateRecord) -> CandidateRecord | None:
+        """Строгий порядок стратегий url -> key -> hash, остановка на первом попадании."""
+        if cand.normalized_url:
+            hit = self.by_url.get((cand.normalized_url, cand.supersedes))
+            if hit is not None:
+                return hit
+        key = _match_key(cand)
+        if key is not None:
+            hit = self.by_key.get(key)
+            if hit is not None:
+                return hit
+        if cand.content_hash:
+            hit = self.by_hash.get((cand.content_hash, cand.supersedes))
+            if hit is not None:
+                return hit
+        return None
 
 
 def _merge_provenance(existing: CandidateRecord, dup: CandidateRecord) -> None:
@@ -75,17 +124,23 @@ def dedup(
     ``existing`` (включая отклонённых триажем — они персистят с ``rejected_reason`` и
     не должны воскресать как "свежие") -> ``new``-кандидат НЕ добавляется, его
     ``connector_id`` дописывается в ``merged_connector_ids`` существующего (объект
-    ``existing`` мутируется на месте — вызывающая сторона персистит его вместе с ``fresh``).
+    ``existing`` мутируется на месте — вызывающая сторона персистит его вместе с ``fresh``;
+    шардированный ``store.save`` переписывает чужой шард автоматически, см. его §2).
     """
+    index = _PoolIndex()
+    for cand in existing:
+        index.add(cand)
+
     fresh: list[CandidateRecord] = []
     absorbed = 0
 
     for cand in new:
-        match = _find_match(cand, existing) or _find_match(cand, fresh)
+        match = index.find(cand)
         if match is not None:
             _merge_provenance(match, cand)
             absorbed += 1
             continue
         fresh.append(cand)
+        index.add(cand)  # принятый fresh участвует в сверке следующих (прежний _find_match(cand, fresh))
 
     return fresh, absorbed

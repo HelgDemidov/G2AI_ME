@@ -168,3 +168,24 @@ def test_dedup_content_hash_fallback_when_no_url_or_title() -> None:
     fresh, absorbed = dedup([dup], existing=[existing_cand])
     assert fresh == []
     assert absorbed == 1
+
+
+def test_dedup_candidate_without_any_key_is_never_absorbed() -> None:
+    """Кандидат без ВСЕХ трёх ключей (ни URL, ни пары issuer+title, ни content_hash) не
+    имеет идентичности для dedup — приходит «свежим» даже против побитово такого же.
+
+    Свойство ИСХОДНОГО дизайна трёх стратегий (прежний линейный ``_find_match`` возвращал
+    None на тех же входах), не следствие индексации — найдено property-тестом
+    (``test_dedup_properties``) и запинено здесь, чтобы поведение было видимым. Схема
+    такое допускает (всё, кроме connector_id/retrieved_at/raw_hash, опционально), но
+    реальные каналы его не порождают: ``inject`` требует url+title, registry-коннекторы
+    дают native-URL. ``raw_hash`` (идентичность для worksheet/apply) СТРАТЕГИЕЙ dedup
+    сознательно не является — набор ключей задан чартером §4.4.
+    """
+    keyless = _candidate(raw_hash="ha")
+    twin = _candidate(connector_id="agora", raw_hash="hb")
+
+    fresh, absorbed = dedup([twin], existing=[keyless])
+
+    assert fresh == [twin]
+    assert absorbed == 0

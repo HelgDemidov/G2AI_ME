@@ -64,7 +64,7 @@ def test_discover_persists_fresh_candidates(tmp_path: Path) -> None:
 
     assert summary.total_fresh == 1
     assert summary.failed == []
-    loaded = store.load(tmp_path / "candidates.yaml")
+    loaded = store.load(tmp_path)
     assert len(loaded) == 1
     assert loaded[0].raw_hash == "doc1"
 
@@ -86,7 +86,7 @@ def test_failing_connector_does_not_abort_run(tmp_path: Path) -> None:
     ok_summary = next(c for c in summary.connectors if c.connector_id == "ok")
     assert ok_summary.fresh == 1
     # отказавший коннектор не должен помешать персисту результата рабочего
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert len(store.load(tmp_path)) == 1
 
 
 def test_repeat_run_with_unchanged_upstream_is_idempotent(tmp_path: Path) -> None:
@@ -98,7 +98,7 @@ def test_repeat_run_with_unchanged_upstream_is_idempotent(tmp_path: Path) -> Non
 
     assert first.total_fresh == 1
     assert second.total_fresh == 0  # dedup против уже персистнутого — no-op
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1  # без дублей на диске
+    assert len(store.load(tmp_path)) == 1  # без дублей на диске
 
 
 def test_dry_run_does_not_write_store_or_cursors(tmp_path: Path) -> None:
@@ -107,7 +107,7 @@ def test_dry_run_does_not_write_store_or_cursors(tmp_path: Path) -> None:
     summary = discover(root=tmp_path, dry_run=True)
 
     assert summary.total_fresh == 1  # сводка честная...
-    assert not (tmp_path / "candidates.yaml").exists()  # ...но диск не тронут
+    assert store.load(tmp_path) == []  # ...но store пуст (проверка через API — раскладка store её дело)
     assert not (tmp_path / ".discovery_cursors.yaml").exists()
 
 
@@ -122,7 +122,7 @@ def test_two_connectors_same_run_fold_into_one_candidate(tmp_path: Path) -> None
     assert summary.total_fresh == 1
     b_summary = next(c for c in summary.connectors if c.connector_id == "b")
     assert b_summary.merged == 1
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert len(store.load(tmp_path)) == 1
 
 
 def test_only_narrows_which_connectors_run(tmp_path: Path) -> None:
@@ -151,7 +151,7 @@ def test_connectors_override_used_when_registry_is_empty(tmp_path: Path) -> None
 
     assert summary.total_fresh == 1
     assert override_conn.calls == [None]
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert len(store.load(tmp_path)) == 1
     cursors = store.load_cursors(tmp_path / ".discovery_cursors.yaml")
     assert cursors["snowball"] == {"n": 1}
 

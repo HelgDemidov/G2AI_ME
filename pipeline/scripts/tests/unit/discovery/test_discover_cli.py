@@ -57,7 +57,7 @@ def test_discover_subcommand_runs_and_persists(
     code = main(["discover", "--root", str(tmp_path)])
 
     assert code == 0
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert len(store.load(tmp_path)) == 1
     assert "1 новых кандидат" in capsys.readouterr().out
 
 
@@ -67,7 +67,7 @@ def test_discover_subcommand_dry_run_does_not_write(tmp_path: Path) -> None:
     code = main(["discover", "--root", str(tmp_path), "--dry-run"])
 
     assert code == 0
-    assert not (tmp_path / "candidates.yaml").exists()
+    assert store.load(tmp_path) == []
 
 
 def test_discover_subcommand_only_narrows_connectors(tmp_path: Path) -> None:
@@ -76,7 +76,7 @@ def test_discover_subcommand_only_narrows_connectors(tmp_path: Path) -> None:
 
     main(["discover", "--root", str(tmp_path), "--only", "a"])
 
-    loaded = store.load(tmp_path / "candidates.yaml")
+    loaded = store.load(tmp_path)
     assert [c.connector_id for c in loaded] == ["a"]
 
 
@@ -111,7 +111,7 @@ def test_inject_subcommand_adds_candidate(tmp_path: Path, capsys: pytest.Capture
         ]
     )
     assert code == 0
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert len(store.load(tmp_path)) == 1
     assert "добавлен кандидат" in capsys.readouterr().out
 
 
@@ -161,7 +161,7 @@ def test_inject_subcommand_duplicate_is_noop_exit_zero(
     code = main(argv)
     assert code == 0
     assert "уже присутствует" in capsys.readouterr().out
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert len(store.load(tmp_path)) == 1
 
 
 def test_inject_subcommand_parses_optional_flags(tmp_path: Path) -> None:
@@ -191,12 +191,54 @@ def test_inject_subcommand_parses_optional_flags(tmp_path: Path) -> None:
         ]
     )
     assert code == 0
-    cand = store.load(tmp_path / "candidates.yaml")[0]
+    cand = store.load(tmp_path)[0]
     assert cand.jurisdiction == "me"
     assert cand.doc_date is not None and cand.doc_date.isoformat() == "2026-03-01"
     assert cand.native_summary == "short summary"
     assert cand.rights == schema.Rights.cc_by
     assert cand.sensitivity == schema.Sensitivity.confidential
+
+
+def test_inject_subcommand_supersedes_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`--supersedes` заводит РЕДАКЦИЮ на том же URL (spec discovery-candidates-sharding §5):
+    dedup её не поглощает, сводка честно говорит, что это редакция."""
+    from tests.support import valid_record
+
+    rec = schema.SourceRecord.model_validate(
+        valid_record() | {"source_url": "https://gov.example.org/law.pdf"}
+    )
+    schema.save_record(rec, tmp_path)
+    common = [
+        "inject", "--root", str(tmp_path),
+        "--url", "https://gov.example.org/law.pdf",
+        "--title", "Registration Law", "--issuer", "Ministry", "--language", "en",
+    ]
+    assert main(common) == 0  # обычный кандидат на том же URL
+
+    code = main([*common, "--supersedes", rec.id])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"редакция, заменяет {rec.id}" in out
+    editions = [c for c in store.load(tmp_path) if c.supersedes == rec.id]
+    assert len(editions) == 1
+
+
+def test_inject_subcommand_supersedes_unknown_doc_id_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "inject", "--root", str(tmp_path),
+            "--url", "https://gov.example.org/law.pdf",
+            "--title", "T", "--issuer", "I", "--language", "en",
+            "--supersedes", "me-no-such-doc-2026",
+        ]
+    )
+
+    assert code == 1
+    assert "нет в реестре корпуса" in capsys.readouterr().out
+    assert store.load(tmp_path) == []
 
 
 # --- worksheet (spec discovery-manual §3) ---
@@ -294,7 +336,7 @@ def test_apply_subcommand_admits_and_exits_zero(
             "en",
         ]
     )
-    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    raw_hash = store.load(tmp_path)[0].raw_hash
     decisions_path = tmp_path / "decisions.yaml"
     decisions_path.write_text(_DECISIONS_YAML.format(raw_hash=raw_hash), encoding="utf-8")
 
@@ -332,7 +374,7 @@ def test_apply_subcommand_dry_run_flag(tmp_path: Path, capsys: pytest.CaptureFix
             "en",
         ]
     )
-    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    raw_hash = store.load(tmp_path)[0].raw_hash
     decisions_path = tmp_path / "decisions.yaml"
     decisions_path.write_text(_DECISIONS_YAML.format(raw_hash=raw_hash), encoding="utf-8")
 
@@ -386,7 +428,7 @@ def test_apply_subcommand_flags_invalid_axis_after_batch(
             "en",
         ]
     )
-    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    raw_hash = store.load(tmp_path)[0].raw_hash
     decisions_path = tmp_path / "decisions.yaml"
     decisions_path.write_text(
         _DECISIONS_YAML_BAD_AXIS.format(raw_hash=raw_hash), encoding="utf-8"
@@ -420,7 +462,7 @@ def test_apply_subcommand_dry_run_skips_post_batch_validation(
             "en",
         ]
     )
-    raw_hash = store.load(tmp_path / "candidates.yaml")[0].raw_hash
+    raw_hash = store.load(tmp_path)[0].raw_hash
     decisions_path = tmp_path / "decisions.yaml"
     decisions_path.write_text(
         _DECISIONS_YAML_BAD_AXIS.format(raw_hash=raw_hash), encoding="utf-8"
@@ -454,7 +496,7 @@ def test_snowball_subcommand_dry_run_finds_link_but_writes_nothing(
     )
 
     assert code == 0
-    assert not (tmp_path / "candidates.yaml").exists()
+    assert store.load(tmp_path) == []
     out = capsys.readouterr().out
     assert "snowball: найдено 1 | свежих 1 | слито 0" in out
 
@@ -508,7 +550,7 @@ def test_snowball_subcommand_persists_candidate(tmp_path: Path) -> None:
     code = main(["snowball", "--doc", "snowball-cli-persist-doc", "--root", str(tmp_path)])
 
     assert code == 0
-    loaded = store.load(tmp_path / "candidates.yaml")
+    loaded = store.load(tmp_path)
     assert len(loaded) == 1
     assert loaded[0].source_url == "https://ai.gov.eg/strategy.pdf"
     assert loaded[0].connector_id == "snowball"
@@ -542,5 +584,5 @@ def test_snowball_subcommand_doc_filter_excludes_other_documents(tmp_path: Path)
 
     main(["snowball", "--doc", "snowball-doc-a", "--root", str(tmp_path)])
 
-    loaded = store.load(tmp_path / "candidates.yaml")
+    loaded = store.load(tmp_path)
     assert [c.source_url for c in loaded] == ["https://example.org/only-a"]
