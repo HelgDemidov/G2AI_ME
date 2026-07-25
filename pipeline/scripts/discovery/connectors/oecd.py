@@ -27,8 +27,8 @@ import yaml
 
 from core import fsio, schema
 from core.env import REPO_ROOT
-from discovery import dedup
-from discovery.base import ConnectorCursor
+from discovery import dedup, registry
+from discovery.base import ConnectorCursor, DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_oecd.yaml"
 CACHE_DIR = REPO_ROOT / "pipeline" / "discovery_cache" / "oecd"
@@ -299,3 +299,78 @@ def _map_record(record: dict[str, Any]) -> schema.CandidateRecord | None:
         raw_hash=raw_hash,
         normalized_url=dedup.normalize_url(source_url),
     )
+
+
+# --- §3: discover_oecd() top-level ---
+
+
+def discover_oecd(
+    cursor: ConnectorCursor | None,
+    *,
+    config: OecdConfig | None = None,
+    fetch: Callable[..., dict[str, Any]] = fetch_json,
+    sleep: Callable[[float], None] = time.sleep,
+    snapshot_path: Path = SNAPSHOT_PATH,
+) -> DiscoverResult:
+    """``Connector.discover()`` для oecd (спек §3): полный обход -> снапшот сырья ->
+    фильтр §2 -> маппинг -> отсев по seen-id-курсору.
+
+    ``fetch``/``sleep`` инжектируем — тесты подменяют фейками, сеть/реальные паузы в CI
+    не участвуют. Снапшот пишется ВСЕГДА (даже при ``--dry-run`` у вызывающего CLI) —
+    кэш-артефакт-страховка, не store."""
+    cfg = config or load_config()
+    records = fetch_all_pages(cfg, fetch=fetch, sleep=sleep)
+    save_snapshot(records, path=snapshot_path)
+
+    candidates: list[schema.CandidateRecord] = []
+    skipped_out_of_scope = 0
+    # Комбинированный счётчик (принцип aiforgood.skipped_no_title_or_url): _map_record
+    # отдаёт None как единый data-quality сигнал (нет id/title/URL), не разложенный по
+    # причине — реконструировать причину постфактум у вызывающей стороны было бы
+    # дублированием той же логики, что уже внутри _map_record, и рисковало бы разойтись
+    # с ней при будущей правке.
+    skipped_unmappable = 0
+
+    for record in records:
+        if not in_scope(record, cfg):
+            skipped_out_of_scope += 1
+            continue
+        cand = _map_record(record)
+        if cand is None:
+            skipped_unmappable += 1
+            continue
+        candidates.append(cand)
+
+    all_ids = [c.native_id for c in candidates if c.native_id]
+    fresh_ids, new_cursor = diff_cursor(all_ids, cursor)
+    fresh = [c for c in candidates if c.native_id in fresh_ids]
+
+    status_label = "no_new" if cursor is not None and not fresh else "fetched"
+    diagnostics = {
+        "status": status_label,
+        "found": len(candidates),
+        "fresh": len(fresh),
+        "skipped_out_of_scope": skipped_out_of_scope,
+        "skipped_unmappable": skipped_unmappable,
+    }
+    return DiscoverResult(candidates=fresh, cursor=new_cursor, diagnostics=diagnostics)
+
+
+@dataclass
+class OecdConnector:
+    """Реализация протокола ``Connector`` (спек §0/§3) — четвёртый экземпляр архетипа
+    `registry`. НЕ ``frozen`` — симметрично ``AgoraConnector``/``EurlexConnector``/
+    ``AiforgoodConnector`` (Protocol требует settable-атрибуты)."""
+
+    id: str = CONNECTOR_ID
+    kind: schema.ConnectorKind = schema.ConnectorKind.registry
+    enabled: bool = True
+
+    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
+        return discover_oecd(cursor)
+
+
+# Регистрация при импорте (чартер §4.3 «манифест», спек §3): `enabled` — из конфига,
+# не хардкод. Срабатывает один раз за интерпретатор — по факту импорта этого модуля
+# (см. `discovery/connectors/__init__.py` + `discover.py`).
+registry.register(OecdConnector(enabled=load_config().enabled))

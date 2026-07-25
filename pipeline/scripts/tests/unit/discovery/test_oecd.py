@@ -549,3 +549,99 @@ def test_map_record_responsible_organisation_null_is_none_issuer() -> None:
     cand = oecd._map_record(_base_record(responsibleOrganisation=None))
     assert cand is not None
     assert cand.issuer is None
+
+
+# --- discover_oecd: end-to-end на фейк-fetch (спек §3) ---
+
+
+def test_discover_oecd_first_run_all_fresh(tmp_path: Path) -> None:
+    rec = _base_record(category="Cat A")
+    page = _page([rec], current=1, last=1, total=1)
+    result = oecd.discover_oecd(
+        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
+    )
+    assert result.diagnostics["status"] == "fetched"
+    assert len(result.candidates) == 1
+    assert result.cursor == {"seen_ids": ["2526"]}
+
+
+def test_discover_oecd_repeat_run_same_result_is_no_new(tmp_path: Path) -> None:
+    rec = _base_record(category="Cat A")
+    page = _page([rec], current=1, last=1, total=1)
+    result = oecd.discover_oecd(
+        {"seen_ids": ["2526"]}, config=_BASE_CONFIG, fetch=lambda page_num, **_: page,
+        sleep=lambda s: None, snapshot_path=tmp_path / "snap.json",
+    )
+    assert result.diagnostics["status"] == "no_new"
+    assert result.candidates == []
+    assert result.cursor == {"seen_ids": ["2526"]}
+
+
+def test_discover_oecd_new_id_appears_only_it_is_fresh(tmp_path: Path) -> None:
+    rec1 = _base_record(id=1, category="Cat A")
+    rec2 = _base_record(id=2, category="Cat A")
+    page = _page([rec1, rec2], current=1, last=1, total=2)
+    result = oecd.discover_oecd(
+        {"seen_ids": ["1"]}, config=_BASE_CONFIG, fetch=lambda page_num, **_: page,
+        sleep=lambda s: None, snapshot_path=tmp_path / "snap.json",
+    )
+    assert [c.native_id for c in result.candidates] == ["2"]
+    assert result.cursor == {"seen_ids": ["1", "2"]}
+
+
+def test_discover_oecd_out_of_scope_record_skipped_with_diagnostic(tmp_path: Path) -> None:
+    rec = _base_record(category="Some Unconfigured Category")
+    page = _page([rec], current=1, last=1, total=1)
+    result = oecd.discover_oecd(
+        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
+    )
+    assert result.diagnostics["skipped_out_of_scope"] == 1
+    assert result.candidates == []
+
+
+def test_discover_oecd_unmappable_record_skipped_with_diagnostic(tmp_path: Path) -> None:
+    rec = _base_record(category="Cat A", website=None, relevantUrls=[])
+    page = _page([rec], current=1, last=1, total=1)
+    result = oecd.discover_oecd(
+        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
+    )
+    assert result.diagnostics["skipped_unmappable"] == 1
+    assert result.candidates == []
+
+
+def test_discover_oecd_writes_snapshot_of_raw_records(tmp_path: Path) -> None:
+    rec = _base_record(category="Cat A")
+    page = _page([rec], current=1, last=1, total=1)
+    snapshot_path = tmp_path / "snap.json"
+    oecd.discover_oecd(
+        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=snapshot_path,
+    )
+    saved = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert saved == [rec]
+
+
+def test_discover_oecd_snapshot_written_even_when_nothing_in_scope(tmp_path: Path) -> None:
+    """Снапшот — страховка на ВСЁ сырьё, не только на прошедшее фильтр (спек §3)."""
+    rec = _base_record(category="Some Unconfigured Category")
+    page = _page([rec], current=1, last=1, total=1)
+    snapshot_path = tmp_path / "snap.json"
+    oecd.discover_oecd(
+        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=snapshot_path,
+    )
+    assert json.loads(snapshot_path.read_text(encoding="utf-8")) == [rec]
+
+
+def test_discover_oecd_shape_gate_failure_propagates(tmp_path: Path) -> None:
+    """Backend-деградация не глотается коннектором — падает громко (изоляция отказа
+    коннектора целиком — работа оркестратора, не этой функции)."""
+    bad_page = {"data": [], "currentPage": 1, "lastPage": 1, "total": 0}
+    with pytest.raises(RuntimeError, match="backend изменил форму"):
+        oecd.discover_oecd(
+            None, config=_BASE_CONFIG, fetch=lambda page_num, **_: bad_page, sleep=lambda s: None,
+            snapshot_path=tmp_path / "snap.json",
+        )
