@@ -71,7 +71,7 @@ def probe_url(
     url: str,
     *,
     user_agent: str,
-    expected: schema.SourceFormat,
+    expected: schema.SourceFormat | None,
     etag: str | None = None,
     http_last_modified: str | None = None,
     conditional: bool = True,
@@ -85,6 +85,9 @@ def probe_url(
     документа: все будущие проверки сравнивали бы мусор с мусором. Условный GET даёт
     нужное сам: ``304`` приходит без тела и безопасен (WAF не отвечает челленджем-304),
     а ``200`` приносит тело ровно тогда, когда его надо классифицировать.
+
+    ``expected=None`` — формат-агностичная классификация (``acquisition.classify_probe``)
+    для популяции (c): у кандидата слоя discovery ``source_format`` ещё не объявлен.
 
     Тело пишется во временный каталог ВНЕ папки документа — не в ``raw.*``: контур не
     мутирует оригинал ни при каком исходе.
@@ -109,11 +112,12 @@ def probe_url(
         if raw.status == 304:
             return ProbeOutcome(not_modified=True, classified=None)
         digest = hashlib.sha256(raw.body).hexdigest() if raw.body else None
-        return ProbeOutcome(
-            not_modified=False,
-            classified=acquisition.classify_response(raw.body, raw.headers_text, expected),
-            digest=digest,
+        classified = (
+            acquisition.classify_probe(raw.body, raw.headers_text)
+            if expected is None
+            else acquisition.classify_response(raw.body, raw.headers_text, expected)
         )
+        return ProbeOutcome(not_modified=False, classified=classified, digest=digest)
 
 
 def classify_recheck(
@@ -337,6 +341,25 @@ def due_records(
     return [r for _, r in with_raw[:limit]], [r for _, r in without_raw[:limit]]
 
 
+def due_candidates(
+    candidates: list[schema.CandidateRecord], *, limit: int
+) -> list[schema.CandidateRecord]:
+    """Популяция (c): кандидаты, отклонённые как ``unacquirable`` (§5).
+
+    «Не нужен» и «нужен, но недобываем» — разные состояния с разной судьбой: первое
+    терминально, второе живёт очередью ожидания обстоятельств (WAF снимут, появится
+    зеркало). Без этого различения второй закрывался бы навсегда по ошибке, потому что
+    заметить смену обстоятельств некому.
+    """
+    due = [
+        c
+        for c in candidates
+        if c.rejected_kind is schema.RejectionKind.unacquirable and c.source_url
+    ]
+    due.sort(key=lambda c: _checked_sort_key(c.probe_checked, c.raw_hash))
+    return due[:limit]
+
+
 # --- прогон ---
 
 
@@ -351,6 +374,7 @@ class RecheckItem:
 @dataclass
 class RecheckSummary:
     items: list[RecheckItem]
+    candidates_changed: bool = False
 
     @property
     def findings(self) -> list[RecheckItem]:
@@ -429,6 +453,34 @@ def _reprobe_unacquired(
     return RecheckItem(rec.id, note)
 
 
+def _probe_unacquirable(
+    cand: schema.CandidateRecord, *, user_agent: str, today: _dt.date
+) -> RecheckItem:
+    """Популяция (c): «а не открылось ли?» по URL недобываемого кандидата.
+
+    Мутирует переданную запись; персист — забота вызывающей стороны (оркестратор
+    сшивает слои: сам ACQUIRE в store слоя discovery не лезет).
+    """
+    assert cand.source_url is not None  # гарантирует отбор в due_candidates
+    probe = probe_url(cand.source_url, user_agent=user_agent, expected=None, conditional=False)
+    classified = probe.classified
+    assert classified is not None  # conditional=False => 304 невозможен
+    kind = {
+        acquisition.AcquisitionOutcome.ok: "acquirable",
+        acquisition.AcquisitionOutcome.dead: "dead",
+        acquisition.AcquisitionOutcome.blocked: "blocked",
+    }[classified.outcome]
+    cand.probe_checked = today
+    cand.probe_finding = f"{kind}: {classified.reason}"
+    label = f"{cand.raw_hash[:12]} {cand.title or cand.source_url}"
+    actionable = classified.outcome is acquisition.AcquisitionOutcome.ok
+    return RecheckItem(
+        label,
+        cand.probe_finding,
+        finding=f"acquirable: {classified.reason}" if actionable else None,
+    )
+
+
 def run_recheck(
     records: list[schema.SourceRecord],
     root: Path,
@@ -437,10 +489,16 @@ def run_recheck(
     limit: int = RECHECK_DEFAULT_LIMIT,
     deep: bool = False,
     today: _dt.date | None = None,
+    candidates: list[schema.CandidateRecord] | None = None,
 ) -> RecheckSummary:
-    """Прогон контура по популяциям (a) и (b). Отказ одного документа не рвёт прогон
+    """Прогон контура по трём популяциям. Отказ одного документа не рвёт прогон
     (изоляция как в ``process_docs``): упавший остаётся с прежним курсором и будет
-    взят следующим прогоном первым же."""
+    взят следующим прогоном первым же.
+
+    ``candidates`` (популяция (c)) мутируется НА МЕСТЕ; загрузку и сохранение store
+    делает вызывающая сторона — слой ACQUIRE не знает о раскладке слоя DISCOVERY.
+    ``RecheckSummary.candidates_changed`` говорит, есть ли что сохранять.
+    """
     today = today or _dt.date.today()
     with_raw, without_raw = due_records(records, root, limit=limit)
     items: list[RecheckItem] = []
@@ -459,7 +517,16 @@ def run_recheck(
             logger.error("  ✗ %s: %s", rec.id, exc)
             items.append(RecheckItem(rec.id, "", error=str(exc)))
 
-    return RecheckSummary(items)
+    changed = False
+    for cand in due_candidates(candidates or [], limit=limit):
+        try:
+            items.append(_probe_unacquirable(cand, user_agent=user_agent, today=today))
+            changed = True
+        except Exception as exc:  # noqa: BLE001 — изоляция отказа кандидата
+            logger.error("  ✗ %s: %s", cand.raw_hash[:12], exc)
+            items.append(RecheckItem(cand.raw_hash[:12], "", error=str(exc)))
+
+    return RecheckSummary(items, candidates_changed=changed)
 
 
 # Подсказки разрешения (§6): контур замыкается ДВУМЯ существующими дверями, выбор
@@ -472,6 +539,10 @@ _RESOLUTION_HINTS = {
     ),
     "link-rot": "URL умер -> run_pipeline.py --force --only <doc-id> (лестница уйдёт в archive)",
     "resurrected": "источник ожил -> run_pipeline.py --force --only <doc-id> (заберёт живую редакцию)",
+    "acquirable": (
+        "недобываемый кандидат открылся -> discover.py worksheet (секция недобываемых), "
+        "затем решение `action: revive` в decisions.yaml"
+    ),
 }
 
 

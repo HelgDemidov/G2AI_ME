@@ -230,6 +230,32 @@ def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> 
     )
 
 
+def classify_probe(body: bytes, headers_text: str) -> ClassifiedResponse:
+    """Формат-агностичная классификация probe (spec post-acquisition-lifecycle §2).
+
+    Отвечает на вопрос «не закрыт ли канал», а НЕ «тот ли это документ»: у кандидата
+    слоя discovery ``source_format`` вовсе нет — его объявляет куратор только при
+    триаже. С наивным дефолтом ``expected=pdf`` любой оживший HTML-источник навсегда
+    оставался бы «not a valid PDF» -> blocked, и «стало добываемо» было бы недостижимо
+    для половины кандидатов. Формат подтвердят триаж и добыча.
+
+    Порядок проверок повторяет форматные классификаторы: challenge ПЕРЕД статусом —
+    заглушка WAF сама приходит как ``200``.
+    """
+    status = _status_from_headers_text(headers_text)
+    headers = _headers_from_text(headers_text)
+
+    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+        return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
+    if status in DEAD_STATUS_CODES:
+        return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
+    if status == 200 and body:
+        return ClassifiedResponse(AcquisitionOutcome.ok, status, f"HTTP 200, тело {len(body)} Б")
+    return ClassifiedResponse(
+        AcquisitionOutcome.blocked, status, f"неожиданный ответ (HTTP {status}, тело {len(body)} Б)"
+    )
+
+
 # curl exit codes (stable across decades): 6 = couldn't resolve host, 7 = failed
 # to connect. Both mean "this URL is unreachable" — the same terminal signal as
 # a confirmed-dead HTTP status, so the ladder should treat them identically.

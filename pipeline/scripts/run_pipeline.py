@@ -51,6 +51,7 @@ from core import fsio
 from core import schema
 from core import validate_sources
 from core.env import load_dotenv
+from discovery import store
 from index import vector_store
 from index.chunking import strip_frontmatter
 from index.embed import (
@@ -869,10 +870,17 @@ def main(argv: list[str] | None = None) -> int:
     # скачивает, не конвертирует и не трогает индекс, а только спрашивает издателей
     # «изменилось ли». Возврат здесь и есть эта взаимоисключимость.
     if args.recheck:
+        # Слой кандидатов (популяция (c)) грузится/сохраняется ЗДЕСЬ: оркестратор
+        # сшивает слои по определению своей роли, а сам ACQUIRE о раскладке store
+        # слоя DISCOVERY не знает (и не должен).
+        candidates = store.load(args.sources)
         summary = recheck.run_recheck(
             records, args.sources,
             user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
+            candidates=candidates,
         )
+        if summary.candidates_changed:
+            store.save(candidates, args.sources)
         return recheck.report(summary)
 
     # Синхронный manual watch-folder путь — только осмыслен для одно-документного
