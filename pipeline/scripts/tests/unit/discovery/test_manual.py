@@ -527,6 +527,41 @@ def test_apply_admit_no_echo_when_all_explicit(tmp_path: Path) -> None:
     assert "по дефолту" not in summary.outcomes[0].detail
 
 
+def test_apply_rejects_decision_without_action_or_raw_hash(tmp_path: Path) -> None:
+    """Мусорное решение (нет raw_hash / неизвестный action) — ошибка ЭТОГО решения,
+    остальной батч применяется (изоляция отказов per-решение, spec §4)."""
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path)
+
+    summary = manual.apply_decisions(
+        [
+            {"action": "admit"},  # без raw_hash
+            {"raw_hash": "b" * 64, "action": "postpone"},  # неизвестный action
+            _admit_decision("b" * 64),
+        ],
+        root=tmp_path,
+    )
+
+    assert len(summary.errors) == 2
+    assert all("raw_hash обязателен" in e.detail for e in summary.errors)
+    assert len(schema.load_records(tmp_path)) == 1  # валидное решение отработало
+
+
+def test_apply_isolates_existing_meta_conflict(tmp_path: Path) -> None:
+    """Промоушен в уже занятый id (перезапись курируемого meta.yaml запрещена) — ошибка
+    решения, не краш батча. Живой путь для редакций: коллизия id при admit новой
+    редакции ловится здесь, а не порчей существующей записи."""
+    first, second = _candidate(raw_hash="b" * 64), _candidate(raw_hash="c" * 64)
+    store.save([first, second], tmp_path)
+    manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)  # id занят
+
+    summary = manual.apply_decisions([_admit_decision("c" * 64)], root=tmp_path)  # тот же id
+
+    assert len(summary.errors) == 1
+    assert "уже существует" in summary.errors[0].detail
+    assert len(schema.load_records(tmp_path)) == 1  # исходная запись не перезаписана
+
+
 def test_render_worksheet_header_documents_hidden_fields() -> None:
     text = manual.render_worksheet([])
     assert "hidden_fields" in text
