@@ -67,7 +67,7 @@ def _cmd_inject(args: argparse.Namespace) -> int:
 
 
 def _cmd_worksheet(args: argparse.Namespace) -> int:
-    candidates = store.load(args.root / "candidates.yaml")
+    candidates = store.load(args.root)
     records = schema.load_records(args.root)
     pending = manual.pending_candidates(candidates, records)
     text = manual.render_worksheet(pending)

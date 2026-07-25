@@ -89,10 +89,9 @@ def inject(
         normalized_url=normalized,
     )
 
-    candidates_path = root / "candidates.yaml"
-    existing = store.load(candidates_path)
+    existing = store.load(root)
     fresh, absorbed = dedup.dedup([cand], existing)
-    store.save(existing + fresh, candidates_path)
+    store.save(existing + fresh, root)
 
     if fresh:
         return cand, True
@@ -365,8 +364,7 @@ def apply_decisions(
     план (валидирует admit-решения через ``promote_candidate`` целиком, включая enum/pydantic
     ошибки) без записи store/meta.yaml.
     """
-    candidates_path = root / "candidates.yaml"
-    candidates = store.load(candidates_path)
+    candidates = store.load(root)
     outcomes: list[ApplyOutcome] = []
     store_changed = False
 
@@ -447,6 +445,6 @@ def apply_decisions(
         )
 
     if not dry_run and store_changed:
-        store.save(candidates, candidates_path)
+        store.save(candidates, root)
 
     return ApplySummary(outcomes=outcomes, dry_run=dry_run)

@@ -35,7 +35,7 @@ def test_inject_minimal_adds_candidate(tmp_path: Path) -> None:
     )
     assert is_new
     assert cand.connector_id == "manual"  # архетип канала — грамматика id, отдельного поля нет
-    loaded = store.load(tmp_path / "candidates.yaml")
+    loaded = store.load(tmp_path)
     assert len(loaded) == 1
     assert loaded[0].raw_hash == cand.raw_hash
 
@@ -87,16 +87,16 @@ def test_inject_duplicate_url_is_noop(tmp_path: Path) -> None:
         url="https://gov.example.org/a.pdf", title="T", issuer="I", language="en", root=tmp_path
     )
     assert is_new2 is False
-    assert len(store.load(tmp_path / "candidates.yaml")) == 1
+    assert len(store.load(tmp_path)) == 1
 
 
 def test_inject_duplicate_of_rejected_reports_reason(tmp_path: Path) -> None:
     cand, _ = manual.inject(
         url="https://gov.example.org/a.pdf", title="T", issuer="I", language="en", root=tmp_path
     )
-    all_cands = store.load(tmp_path / "candidates.yaml")
+    all_cands = store.load(tmp_path)
     all_cands[0].rejected_reason = "вне обеих осей"
-    store.save(all_cands, tmp_path / "candidates.yaml")
+    store.save(all_cands, tmp_path)
 
     cand2, is_new2 = manual.inject(
         url="https://gov.example.org/a.pdf", title="T", issuer="I", language="en", root=tmp_path
@@ -228,31 +228,31 @@ def _admit_decision(raw_hash: str, **overrides: object) -> dict[str, object]:
 
 def test_apply_reject_sets_rejected_reason(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="a" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     summary = manual.apply_decisions(
         [{"raw_hash": "a" * 64, "action": "reject", "reason": "вне обеих осей"}], root=tmp_path
     )
     assert summary.errors == []
-    reloaded = store.load(tmp_path / "candidates.yaml")
+    reloaded = store.load(tmp_path)
     assert reloaded[0].rejected_reason == "вне обеих осей"
 
 
 def test_apply_reject_does_not_overwrite_existing_reason(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="a" * 64, rejected_reason="первая причина")
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     summary = manual.apply_decisions(
         [{"raw_hash": "a" * 64, "action": "reject", "reason": "новая причина"}], root=tmp_path
     )
     assert summary.errors == []
-    reloaded = store.load(tmp_path / "candidates.yaml")
+    reloaded = store.load(tmp_path)
     assert reloaded[0].rejected_reason == "первая причина"
 
 
 def test_apply_admit_creates_meta_yaml_at_correct_path(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
     assert summary.errors == []
@@ -264,17 +264,17 @@ def test_apply_admit_creates_meta_yaml_at_correct_path(tmp_path: Path) -> None:
 
 def test_apply_admit_does_not_touch_candidate_in_store(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
-    reloaded = store.load(tmp_path / "candidates.yaml")
+    reloaded = store.load(tmp_path)
     assert len(reloaded) == 1
     assert reloaded[0].rejected_reason is None  # кандидат — аудит-след, apply его не трогает
 
 
 def test_apply_admit_v2_fields_reach_meta_yaml(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_decision(
         "b" * 64,
@@ -294,7 +294,7 @@ def test_apply_admit_language_override_reaches_meta_yaml(tmp_path: Path) -> None
     """spec discovery-agora §7: registry-кандидат без language (AGORA) промоутится, если
     decisions.yaml несёт language — иначе promote_candidate отказал бы (тест ниже)."""
     cand = _candidate(raw_hash="b" * 64, language=None)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_decision("b" * 64, language="en")
     summary = manual.apply_decisions([decision], root=tmp_path)
@@ -307,7 +307,7 @@ def test_apply_admit_without_language_override_and_candidate_without_language_er
     tmp_path: Path,
 ) -> None:
     cand = _candidate(raw_hash="b" * 64, language=None)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
     assert len(summary.errors) == 1
@@ -317,7 +317,7 @@ def test_apply_admit_without_language_override_and_candidate_without_language_er
 def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Path) -> None:
     good = _candidate(raw_hash="b" * 64)
     bad = _candidate(raw_hash="c" * 64)
-    store.save([good, bad], tmp_path / "candidates.yaml")
+    store.save([good, bad], tmp_path)
 
     incomplete = _admit_decision("c" * 64)
     del incomplete["relevance"]
@@ -331,7 +331,7 @@ def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Pa
 def test_apply_ambiguous_raw_hash_prefix_reports_error(tmp_path: Path) -> None:
     cand1 = _candidate(raw_hash="a" * 64)
     cand2 = _candidate(raw_hash="a" * 63 + "b")
-    store.save([cand1, cand2], tmp_path / "candidates.yaml")
+    store.save([cand1, cand2], tmp_path)
 
     summary = manual.apply_decisions(
         [{"raw_hash": "a" * 12, "action": "reject", "reason": "x"}], root=tmp_path
@@ -349,7 +349,7 @@ def test_apply_unknown_raw_hash_reports_error(tmp_path: Path) -> None:
 
 def test_apply_dry_run_does_not_write(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path, dry_run=True)
     assert summary.dry_run is True
@@ -361,12 +361,12 @@ def test_apply_dry_run_does_not_write(tmp_path: Path) -> None:
 
 def test_apply_dry_run_reject_does_not_write(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="a" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     manual.apply_decisions(
         [{"raw_hash": "a" * 64, "action": "reject", "reason": "x"}], root=tmp_path, dry_run=True
     )
-    assert store.load(tmp_path / "candidates.yaml")[0].rejected_reason is None
+    assert store.load(tmp_path)[0].rejected_reason is None
 
 
 def test_resolve_candidate_rejects_short_prefix() -> None:
@@ -402,7 +402,7 @@ def test_apply_admit_authority_defaults_from_doc_type(
     tmp_path: Path, doc_type: str, expected_authority: str
 ) -> None:
     cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_no_defaults("b" * 64)
     decision["doc_type"] = doc_type
@@ -414,7 +414,7 @@ def test_apply_admit_authority_defaults_from_doc_type(
 
 def test_apply_admit_track_defaults_me_jurisdiction_to_target_entity(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     manual.apply_decisions([_admit_no_defaults("b" * 64)], root=tmp_path)
     assert schema.load_records(tmp_path)[0].track == schema.Track.target_entity
@@ -453,7 +453,7 @@ def test_default_track_uses_injected_jurisdiction_list() -> None:
 
 def test_apply_admit_track_defaults_think_tank_to_research_papers(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64, jurisdiction=None)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_no_defaults("b" * 64)
     decision.update(id="oi-example-report-2026", entity_id="oi", issuer_type="think_tank",
@@ -464,7 +464,7 @@ def test_apply_admit_track_defaults_think_tank_to_research_papers(tmp_path: Path
 
 def test_apply_admit_track_defaults_otherwise_to_intl_xperience(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64, jurisdiction="sg")
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_no_defaults("b" * 64)
     decision.update(id="sg-example-framework-2026", entity_id="sg", doc_type="framework")
@@ -475,7 +475,7 @@ def test_apply_admit_track_defaults_otherwise_to_intl_xperience(tmp_path: Path) 
 def test_apply_admit_explicit_values_override_defaults(tmp_path: Path) -> None:
     """Явные authority/track всегда побеждают дефолт (кейс draft!)."""
     cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_no_defaults("b" * 64)
     decision["doc_type"] = "legislation"
@@ -487,7 +487,7 @@ def test_apply_admit_explicit_values_override_defaults(tmp_path: Path) -> None:
 
 def test_apply_admit_unknown_doc_type_without_authority_errors(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_no_defaults("b" * 64)
     decision["doc_type"] = "novel_genre"  # органически новый термин, карты дефолтов ещё нет
@@ -499,7 +499,7 @@ def test_apply_admit_unknown_doc_type_without_authority_errors(tmp_path: Path) -
 def test_apply_admit_hidden_fields_annotation_ignored(tmp_path: Path) -> None:
     """hidden_fields — аннотация для человека, apply её не читает и не падает."""
     cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     decision = _admit_no_defaults("b" * 64)
     decision["hidden_fields"] = ["authority", "track"]
@@ -510,7 +510,7 @@ def test_apply_admit_hidden_fields_annotation_ignored(tmp_path: Path) -> None:
 
 def test_apply_admit_outcome_echoes_defaults(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     summary = manual.apply_decisions([_admit_no_defaults("b" * 64)], root=tmp_path)
     detail = summary.outcomes[0].detail
@@ -521,7 +521,7 @@ def test_apply_admit_outcome_echoes_defaults(tmp_path: Path) -> None:
 
 def test_apply_admit_no_echo_when_all_explicit(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64)
-    store.save([cand], tmp_path / "candidates.yaml")
+    store.save([cand], tmp_path)
 
     summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
     assert "по дефолту" not in summary.outcomes[0].detail
