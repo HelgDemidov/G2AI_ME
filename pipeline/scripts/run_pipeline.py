@@ -78,6 +78,18 @@ class DocResult:
     done: list[Stage] = field(default_factory=list)
     up_to_date: bool = False
     error: str | None = None
+    # «Ждёт добычи» — третье состояние рядом с «актуально» и «ошибка» (spec
+    # post-acquisition-lifecycle §5): документ допущен триажем, добыть его пока не
+    # вышло, и в окне backoff мы сознательно не пробуем. Это НЕ ошибка прогона (exit-код
+    # не портится) и НЕ «актуально» — иначе недобытые молча растворились бы в сводке.
+    waiting_acquisition: str | None = None
+
+
+# Окно, в течение которого провалившаяся добыча не пере-пробуется штатным батчем
+# (§5). Константа, не конфиг — та же дисциплина, что у RRF_K/POOL: тюнить это
+# по одному документу незачем, а «упрямый» источник всё равно разбирает человек.
+RETRY_BACKOFF_DAYS = 7
+_FAILURE_REASON_MAX = 300  # причина живёт в .state.yaml ради читаемости, не ради полного трейса
 
 
 # --- пути и хеши (пути выводятся из папки-документа: schema.raw_file/md_file/state_file) ---
@@ -96,7 +108,29 @@ def _compose_md(rec: schema.SourceRecord, current_md: str) -> str:
     return schema.render_frontmatter(rec) + "\n" + body
 
 
-def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) -> list[Stage]:
+def download_deferred(
+    state: schema.OperationalState,
+    *,
+    force: bool = False,
+    ignore_backoff: bool = False,
+    today: _dt.date | None = None,
+) -> bool:
+    """Отложена ли добыча backoff'ом недобытых (spec post-acquisition-lifecycle §5).
+
+    Чистая функция от состояния: провал лестницы записал дату, и штатный батч не
+    долбит заведомо закрытый источник каждый прогон. Пробивают окно ровно два
+    сигнала явного намерения — ``--force`` и ``--only <id>`` (``ignore_backoff``):
+    куратор, назвавший конкретный документ, ждёт попытки сейчас (в т.ч. клика в
+    watch-folder), и молчаливый скип сбил бы его с толку.
+    """
+    if force or ignore_backoff or state.acquisition_failed is None:
+        return False
+    return ((today or _dt.date.today()) - state.acquisition_failed).days < RETRY_BACKOFF_DAYS
+
+
+def needed_stages(
+    rec: schema.SourceRecord, root: Path, *, force: bool = False, ignore_backoff: bool = False
+) -> list[Stage]:
     """Какие стадии нужны документу по фактическому состоянию ФС (пути выводятся из папки).
 
     Целостность raw — дешёвым stat-guard'ом: sha256 пересчитывается (полное чтение
@@ -111,13 +145,21 @@ def needed_stages(rec: schema.SourceRecord, root: Path, *, force: bool = False) 
     md = schema.md_file(rec, root)            # doc.md (путь; может не существовать)
     state = schema.load_state(schema.state_file(rec, root))
 
+    download_needed = False
     if force or raw is None:
-        stages.append(Stage.download)
+        download_needed = True
     elif state.sha256:
         st = raw.stat()
         stat_matches = st.st_size == state.raw_size and st.st_mtime_ns == state.raw_mtime_ns
         if not stat_matches and _sha256(raw) != state.sha256:
-            stages.append(Stage.download)     # файл повреждён/изменился vs записанный sha
+            download_needed = True            # файл повреждён/изменился vs записанный sha
+
+    if download_needed and download_deferred(state, force=force, ignore_backoff=ignore_backoff):
+        download_needed = False
+        if raw is None:
+            return []                         # ждёт смены обстоятельств — работать физически не с чем
+    if download_needed:
+        stages.append(Stage.download)
 
     stale = False
     if raw is not None and raw.exists() and md.exists():
@@ -204,6 +246,43 @@ def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
 _SNAPSHOT_FIDELITIES = frozenset({schema.Fidelity.live, schema.Fidelity.rendered})
 
 
+def _record_acquisition_failure(rec: schema.SourceRecord, root: Path, exc: BaseException) -> None:
+    """Зафиксировать провал добычи в ``.state.yaml`` (spec post-acquisition-lifecycle §5).
+
+    Отсюда растут обе половины контура «упрямых» источников: окно backoff
+    (``needed_stages`` не планирует download) и курсор популяции (b) recheck —
+    «а не открылось ли?». Причина обрезается: сайдкар читает человек, полный трейс
+    ему тут не нужен (он уже в логе прогона).
+
+    Отказ ЗАПИСИ состояния не должен подменять собой исходную ошибку добычи —
+    её вызывающая сторона и репортит, поэтому ``OSError`` тут глушится в debug.
+    """
+    try:
+        state_path = schema.state_file(rec, root)
+        state = schema.load_state(state_path)
+        state.acquisition_failed = _dt.date.today()
+        state.acquisition_failure_reason = str(exc)[:_FAILURE_REASON_MAX]
+        schema.save_state(state_path, state)
+    except OSError:
+        logger.debug("не удалось записать состояние отказа добычи для %s", rec.id, exc_info=True)
+
+
+def _acquisition_wait_note(rec: schema.SourceRecord, root: Path) -> str | None:
+    """Почему документу нечего делать: он ждёт добычи, а не «актуален» (§5).
+
+    Только для записей БЕЗ raw — документ с raw и непогашенным ``acquisition_failed``
+    (передобыча провалилась, старый оригинал на месте) штатно живёт дальше со своим
+    прежним текстом и в отдельный класс сводки не попадает.
+    """
+    if schema.raw_file(rec, root) is not None:
+        return None
+    state = schema.load_state(schema.state_file(rec, root))
+    if state.acquisition_failed is None:
+        return None
+    reason = state.acquisition_failure_reason or "добыча провалилась"
+    return f"с {state.acquisition_failed.isoformat()}: {reason}"
+
+
 def _maybe_request_snapshot(rec: schema.SourceRecord, state: schema.OperationalState) -> None:
     """Проактивный снимок редакции в Wayback (spec post-acquisition-lifecycle §4).
 
@@ -262,27 +341,36 @@ def _do_download(
     part = fsio.staging_path(raw)
     try:
         try:
-            result = acquisition.run_ladder(rec, part, user_agent=USER_AGENT)
-        except acquisition.AcquisitionBlocked as exc:
-            if not interactive:
-                raise
-            logger.info("  %s: %s", rec.id, exc)
-            logger.info(
-                "  открываю в браузере и жду файл (папка: %s)…",
-                watch_dir or acquisition.default_watch_dir(),
-            )
-            result = acquisition.acquire_manually(rec, part, watch_dir=watch_dir)
-        except acquisition.AcquisitionDead as exc:
-            logger.info("  %s: %s", rec.id, exc)
-            logger.info("  ищу снимок в Wayback…")
-            result = acquisition.fetch_from_archive(rec, part, user_agent=USER_AGENT)
-        for old in schema.doc_dir(rec, root).glob("raw.*"):
-            if old != raw:
-                old.unlink()  # смена канала/формата -> заменяем оригинал целиком
-        part.replace(raw)
-    finally:
-        part.unlink(missing_ok=True)  # после успешного replace part не существует — no-op;
-        # при любом исключении (в т.ч. пробрасываемом AcquisitionBlocked) убирает огрызок
+            try:
+                result = acquisition.run_ladder(rec, part, user_agent=USER_AGENT)
+            except acquisition.AcquisitionBlocked as exc:
+                if not interactive:
+                    raise
+                logger.info("  %s: %s", rec.id, exc)
+                logger.info(
+                    "  открываю в браузере и жду файл (папка: %s)…",
+                    watch_dir or acquisition.default_watch_dir(),
+                )
+                result = acquisition.acquire_manually(rec, part, watch_dir=watch_dir)
+            except acquisition.AcquisitionDead as exc:
+                logger.info("  %s: %s", rec.id, exc)
+                logger.info("  ищу снимок в Wayback…")
+                result = acquisition.fetch_from_archive(rec, part, user_agent=USER_AGENT)
+            for old in schema.doc_dir(rec, root).glob("raw.*"):
+                if old != raw:
+                    old.unlink()  # смена канала/формата -> заменяем оригинал целиком
+            part.replace(raw)
+        finally:
+            part.unlink(missing_ok=True)  # после успешного replace part не существует — no-op;
+            # при любом исключении (в т.ч. пробрасываемом AcquisitionBlocked) убирает огрызок
+    except Exception as exc:  # noqa: BLE001 — фиксируем ЛЮБОЙ провал добычи и пробрасываем дальше
+        # §5: покрываются все исходы лестницы разом (AcquisitionBlocked/AcquisitionDead
+        # батча, ArchiveUnavailable, ManualAcquisitionTimeout/Conflict интерактивного
+        # пути) — перечислять их поимённо значило бы забыть следующий: до этого спека
+        # таймаут watch-folder пролетал в generic-обработчик process_docs, не оставляя
+        # о себе ни следа в состоянии документа.
+        _record_acquisition_failure(rec, root, exc)
+        raise
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     st = raw.stat()
@@ -307,6 +395,8 @@ def _do_download(
     state.etag_confirms = 0
     if state.sha256 != previous_sha:
         state.snapshot_requested = None  # другие байты = другая редакция -> нужен новый снимок
+    state.acquisition_failed = None      # добыли — backoff снят (§5)
+    state.acquisition_failure_reason = None
     _maybe_request_snapshot(rec, state)
     schema.save_state(state_path, state)
     logger.info("  добыто %s: метод=%s fidelity=%s (.state.yaml обновлён)", rec.id, result.method.value, result.fidelity.value)
@@ -426,6 +516,7 @@ def process_docs(
     pause: float,
     interactive: bool = False,
     watch_dir: Path | None = None,
+    ignore_backoff: bool = False,
 ) -> list[DocResult]:
     """Прогнать документы по стадиям. Возвращает результаты по каждому документу.
 
@@ -454,15 +545,20 @@ def process_docs(
             fsio.cleanup_staging(schema.doc_dir(rec, root))  # останки упавшего прогона — самовосстановление
             if not dry_run:  # усыновление ПИШЕТ .state.yaml — dry-run обязан быть no-op
                 _adopt_untracked_raw(rec, root)  # ручной/старого формата raw — под контролем целостности
-            stages = needed_stages(rec, root, force=force)
+            stages = needed_stages(rec, root, force=force, ignore_backoff=ignore_backoff)
+            wait_note = _acquisition_wait_note(rec, root) if not stages else None
         except Exception as exc:  # noqa: BLE001 — изоляция отказа документа (планирование)
             res.error = f"planning: {exc}"
             logger.error("  ✗ %s: %s", rec.id, res.error)
             results.append(res)
             continue
         if not stages:
-            res.up_to_date = True
-            logger.info("• %s: актуально", rec.id)
+            if wait_note is not None:
+                res.waiting_acquisition = wait_note
+                logger.info("• %s: ждёт добычи — %s", rec.id, wait_note)
+            else:
+                res.up_to_date = True
+                logger.info("• %s: актуально", rec.id)
             results.append(res)
             continue
         logger.info("• %s: %s%s", rec.id, "→".join(s.value for s in stages), " [dry-run]" if dry_run else "")
@@ -677,13 +773,18 @@ def _report_scan_fallback(records: list[schema.SourceRecord], root: Path) -> Non
 def _report(results: list[DocResult]) -> int:
     up = sum(r.up_to_date for r in results)
     failed = [r for r in results if r.error]
+    waiting = [r for r in results if r.waiting_acquisition is not None]
     processed = [r for r in results if r.done and not r.error]
     logger.info(
-        "Итог: %d документ(ов) | актуально: %d | обработано: %d | ошибок: %d",
-        len(results), up, len(processed), len(failed),
+        "Итог: %d документ(ов) | актуально: %d | обработано: %d | ждут добычи: %d | ошибок: %d",
+        len(results), up, len(processed), len(waiting), len(failed),
     )
     for res in failed:
         logger.info("  ✗ %s — %s", res.doc_id, res.error)
+    # Отдельный класс, НЕ ошибка (§5): источник закрыт обстоятельствами, а не пайплайном.
+    # Пере-пробовать конкретный документ прямо сейчас — --only <id> (пробивает backoff).
+    for res in waiting:
+        logger.info("  ⏳ %s — %s", res.doc_id, res.waiting_acquisition)
     return 1 if failed else 0
 
 
@@ -746,6 +847,9 @@ def main(argv: list[str] | None = None) -> int:
         records, args.sources,
         force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
         interactive=bool(args.only), watch_dir=args.watch_dir,
+        # --only <id> — явное намерение куратора попробовать ИМЕННО этот документ
+        # сейчас; молчаливый скип по backoff сбил бы его (особенно на watch-folder пути)
+        ignore_backoff=bool(args.only),
     )
 
     # Сводка фолбэк-OCR-пути (S5, spec ocr-eval-harness §8.3) — читает ТОЛЬКО

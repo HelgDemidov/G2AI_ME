@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from core import schema
 from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
 from core import fsio
 from run_pipeline import (
+    RETRY_BACKOFF_DAYS,
     Stage,
     _adopt_untracked_raw,
     _compose_md,
@@ -27,6 +29,7 @@ from run_pipeline import (
     _do_frontmatter,
     _needs_index_rebuild,
     _read_index_fingerprint,
+    _report,
     _sha256,
     needed_stages,
     process_docs,
@@ -658,6 +661,119 @@ def test_do_download_replaces_prior_raw_of_different_ext(tmp_path: Path, monkeyp
 
     assert schema.raw_file(rec, tmp_path) == doc_dir / "raw.pdf"  # ровно один raw.* — новый
     assert not (doc_dir / "raw.html").exists()
+
+
+# --- backoff недобытых (spec post-acquisition-lifecycle §5) ---
+
+
+def _failed_state(days_ago: int, reason: str = "direct blocked (WAF challenge)") -> dict[str, Any]:
+    failed = dt.date.today() - dt.timedelta(days=days_ago)
+    return {"acquisition_failed": failed.isoformat(), "acquisition_failure_reason": reason}
+
+
+def test_do_download_records_failure_on_batch_block(tmp_path: Path, monkeypatch: Any) -> None:
+    """Провал лестницы перестаёт быть бесследным: дата+причина ложатся в .state.yaml,
+    откуда их читают и backoff, и популяция (b) recheck."""
+    rec = make()
+
+    def fake_run_ladder(rec_: SourceRecord, dest: Path, *, user_agent: str) -> Any:
+        raise acquisition.AcquisitionBlocked(rec_.source_url, "direct blocked (WAF challenge)")
+
+    monkeypatch.setattr("acquire.acquisition.run_ladder", fake_run_ladder)
+
+    with pytest.raises(acquisition.AcquisitionBlocked):
+        _do_download(rec, tmp_path, pause=0, interactive=False)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_failed == dt.date.today()
+    assert st.acquisition_failure_reason is not None and "WAF challenge" in st.acquisition_failure_reason
+
+
+def test_do_download_records_failure_on_manual_timeout(tmp_path: Path, monkeypatch: Any) -> None:
+    """До этого спека таймаут watch-folder пролетал в generic-обработчик process_docs,
+    не оставляя следа в состоянии документа — теперь покрыт тем же общим перехватом."""
+    rec = make()
+
+    def fake_run_ladder(rec_: SourceRecord, dest: Path, *, user_agent: str) -> Any:
+        raise acquisition.AcquisitionBlocked(rec_.source_url, "direct blocked")
+
+    def fake_manual(rec_: SourceRecord, dest: Path, **kw: Any) -> Any:
+        raise acquisition.ManualAcquisitionTimeout("не дождался файла")
+
+    monkeypatch.setattr("acquire.acquisition.run_ladder", fake_run_ladder)
+    monkeypatch.setattr("acquire.acquisition.acquire_manually", fake_manual)
+
+    with pytest.raises(acquisition.ManualAcquisitionTimeout):
+        _do_download(rec, tmp_path, pause=0, interactive=True)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_failed == dt.date.today()
+
+
+def test_successful_download_clears_backoff(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(3))
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_failed is None and st.acquisition_failure_reason is None
+
+
+def test_needed_stages_skips_download_inside_backoff_window(tmp_path: Path) -> None:
+    """Штатный батч не долбит заведомо закрытый источник каждый прогон. Стадий НОЛЬ,
+    а не «convert без raw»: конвертировать физически нечего, и фальшивая ошибка
+    стадии сделала бы весь батч красным на ровном месте."""
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(1))
+    assert needed_stages(rec, tmp_path) == []
+
+
+def test_needed_stages_retries_after_backoff_window(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(RETRY_BACKOFF_DAYS))
+    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
+
+
+@pytest.mark.parametrize("kwargs", [{"force": True}, {"ignore_backoff": True}])
+def test_backoff_is_pierced_by_explicit_intent(tmp_path: Path, kwargs: dict[str, bool]) -> None:
+    """--force и --only <id> — два сигнала «хочу попытку сейчас»; молчаливый скип
+    сбил бы куратора, который сидит и ждёт клика в watch-folder."""
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(1))
+    assert Stage.download in needed_stages(rec, tmp_path, **kwargs)
+
+
+def test_backoff_does_not_defer_document_that_already_has_raw(tmp_path: Path) -> None:
+    """Документ с raw и непогашенным провалом ПЕРЕдобычи живёт дальше со своим текстом:
+    окно закрывает только новую попытку скачивания, не остальные стадии."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 existing", state=_failed_state(1))
+    stages = needed_stages(rec, tmp_path)
+    assert Stage.download not in stages and Stage.convert in stages
+
+
+def test_process_docs_reports_waiting_class_not_error(tmp_path: Path, caplog: Any) -> None:
+    """«Ждут добычи» — третий класс сводки: не «актуально» (иначе недобытые растворились
+    бы) и не «ошибка» (exit-код прогона не портится — источник закрыт обстоятельствами)."""
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(1))
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        results = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+        rc = _report(results)
+
+    assert results[0].waiting_acquisition is not None
+    assert results[0].up_to_date is False and results[0].error is None
+    assert rc == 0
+    assert "ждут добычи: 1" in caplog.text
 
 
 def test_process_docs_cleans_stale_staging_before_planning(tmp_path: Path) -> None:
