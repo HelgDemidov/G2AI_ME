@@ -234,12 +234,99 @@ def test_deep_baseline_is_none_for_ocr_normalized_scan(tmp_path: Path, monkeypat
     assert recheck.deep_baseline(rec, tmp_path, _state()) is None
 
 
+def test_deep_baseline_skips_ocr_check_for_non_pdf(tmp_path: Path) -> None:
+    """OCR-путь существует только для PDF — открывать html/docx через pdfplumber
+    незачем (и падало бы: живой урок scan_fallback_counts на raw.html)."""
+    rec = schema.SourceRecord.model_validate({**valid_record(), "source_format": "html"})
+    assert recheck.deep_baseline(rec, tmp_path, _state()) == "a" * 64
+
+
+def test_deep_baseline_without_raw_falls_back_to_sha(tmp_path: Path) -> None:
+    rec = schema.SourceRecord.model_validate(valid_record())
+    assert recheck.deep_baseline(rec, tmp_path, _state()) == "a" * 64
+
+
 def test_deep_baseline_is_none_when_origin_undecidable(tmp_path: Path) -> None:
     """Не смогли определить происхождение raw (битый/нечитаемый PDF) — «непроверяемо»,
     а не тихое допущение «born-digital»: ложный drift хуже честного пробела."""
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"not a pdf at all")
     assert recheck.deep_baseline(rec, tmp_path, _state()) is None
+
+
+# --- probe_url: сборка условного запроса (сеть замокана на уровне fetch_raw) ---
+
+
+def _fake_fetch_raw(
+    monkeypatch: Any, response: acquisition.RawResponse
+) -> list[dict[str, str] | None]:
+    """Перехватить extra_headers, с которыми ушёл запрос."""
+    sent: list[dict[str, str] | None] = []
+
+    def fake(url: str, dest: Path, **kw: Any) -> acquisition.RawResponse:
+        sent.append(kw.get("extra_headers"))
+        return response
+
+    monkeypatch.setattr(acquisition, "fetch_raw", fake)
+    return sent
+
+
+def test_probe_url_sends_both_conditional_headers(monkeypatch: Any) -> None:
+    sent = _fake_fetch_raw(monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", b"%PDF body"))
+    recheck.probe_url(
+        "https://example.gov/d.pdf", user_agent="ua", expected=schema.SourceFormat.pdf,
+        etag='"v1"', http_last_modified="Wed, 21 Oct 2026 07:28:00 GMT",
+    )
+    assert sent[0] == {
+        "If-None-Match": '"v1"',
+        "If-Modified-Since": "Wed, 21 Oct 2026 07:28:00 GMT",
+    }
+
+
+def test_probe_url_unconditional_when_asked(monkeypatch: Any) -> None:
+    """Глубокая сверка и популяции (b)/(c) обязаны получить ТЕЛО, а не 304."""
+    sent = _fake_fetch_raw(monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", b"%PDF"))
+    recheck.probe_url(
+        "https://example.gov/d.pdf", user_agent="ua", expected=schema.SourceFormat.pdf,
+        etag='"v1"', conditional=False,
+    )
+    assert sent[0] == {}
+
+
+def test_probe_url_recognises_304(monkeypatch: Any) -> None:
+    _fake_fetch_raw(monkeypatch, acquisition.RawResponse(304, "HTTP/1.1 304 Not Modified\r\n", b""))
+    probe = recheck.probe_url("https://e.gov/d.pdf", user_agent="ua", expected=schema.SourceFormat.pdf)
+    assert probe.not_modified is True and probe.classified is None
+
+
+def test_probe_url_maps_unreachable_to_dead(monkeypatch: Any) -> None:
+    _fake_fetch_raw(
+        monkeypatch,
+        acquisition.RawResponse(None, "", b"", "curl exit 6: host unreachable (DNS/connect)"),
+    )
+    probe = recheck.probe_url("https://gone.gov/d.pdf", user_agent="ua", expected=schema.SourceFormat.pdf)
+    assert probe.classified is not None
+    assert probe.classified.outcome is acquisition.AcquisitionOutcome.dead
+
+
+def test_probe_url_computes_digest_for_deep_compare(monkeypatch: Any) -> None:
+    import hashlib
+
+    body = b"%PDF-1.4 content"
+    _fake_fetch_raw(monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", body))
+    probe = recheck.probe_url("https://e.gov/d.pdf", user_agent="ua", expected=schema.SourceFormat.pdf)
+    assert probe.digest == hashlib.sha256(body).hexdigest()
+
+
+def test_probe_url_uses_format_agnostic_classifier_when_expected_none(monkeypatch: Any) -> None:
+    """Популяция (c): у кандидата формата нет — вопрос «не закрыт ли канал», а не
+    «тот ли это документ»."""
+    _fake_fetch_raw(
+        monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", b"<html>real page</html>")
+    )
+    probe = recheck.probe_url("https://e.gov/page", user_agent="ua", expected=None)
+    assert probe.classified is not None
+    assert probe.classified.outcome is acquisition.AcquisitionOutcome.ok
 
 
 # --- §2: выбор URL проверки ---
@@ -385,6 +472,47 @@ def test_run_recheck_isolates_document_failure(tmp_path: Path, monkeypatch: Any)
     assert len(summary.errors) == 1 and len(summary.items) == 2
     boom = next(r for r in schema.load_records(tmp_path) if r.id == "aa-boom-2026")
     assert schema.load_state(schema.state_file(boom, tmp_path)).acquisition_checked == dt.date(2026, 7, 1)
+
+
+def test_due_records_skips_document_with_ambiguous_raw(tmp_path: Path, caplog: Any) -> None:
+    """Папка с двумя raw.* — проблема раскладки конкретного документа, не повод рвать
+    прогон контура: он громко пропускает её и идёт дальше."""
+    _doc(tmp_path, "aa-broken-2026")
+    (tmp_path / "intl-xperience" / "sg" / "aa-broken-2026" / "raw.html").write_bytes(b"<html/>")
+    _doc(tmp_path, "bb-fine-2026")
+
+    with caplog.at_level("WARNING", logger="recheck"):
+        with_raw, _ = recheck.due_records(schema.load_records(tmp_path), tmp_path, limit=10)
+
+    assert [r.id for r in with_raw] == ["bb-fine-2026"]
+    assert "aa-broken-2026" in caplog.text
+
+
+def test_run_recheck_isolates_unacquired_population_failure(tmp_path: Path, monkeypatch: Any) -> None:
+    _doc(tmp_path, "aa-blocked-2026", raw=None, state={"acquisition_failed": "2026-07-01"})
+
+    def boom(*a: Any, **kw: Any) -> recheck.ProbeOutcome:
+        raise RuntimeError("сеть отвалилась")
+
+    monkeypatch.setattr(recheck, "probe_url", boom)
+    summary = recheck.run_recheck(schema.load_records(tmp_path), tmp_path, user_agent="ua", today=TODAY)
+
+    assert len(summary.errors) == 1
+    rec = schema.load_records(tmp_path)[0]
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_failed == dt.date(2026, 7, 1)  # курсор не сдвинут
+
+
+def test_report_marks_failures_and_returns_nonzero(tmp_path: Path, caplog: Any) -> None:
+    """Ненулевой код — только при отказе САМОГО прогона (сеть/ФС), не при findings."""
+    summary = recheck.RecheckSummary(
+        [recheck.RecheckItem("aa-ok-2026", "304 — не изменялся"),
+         recheck.RecheckItem("bb-boom-2026", "", error="сеть отвалилась")]
+    )
+    with caplog.at_level("INFO", logger="recheck"):
+        rc = recheck.report(summary)
+    assert rc == 1
+    assert "aa-ok-2026" in caplog.text
 
 
 def test_report_returns_zero_when_only_findings(tmp_path: Path, monkeypatch: Any) -> None:
