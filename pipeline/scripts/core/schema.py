@@ -190,6 +190,20 @@ class ConnectorKind(str, Enum):
     snowball = "snowball"
 
 
+class RejectionKind(str, Enum):
+    """Природа отказа триажа (spec post-acquisition-lifecycle §5).
+
+    Enum, а не свободная строка, по правилу проекта: код ВЕТВИТСЯ по значению —
+    ``unacquirable`` открывает кандидату вторую жизнь (отдельная секция worksheet,
+    популяция (c) recheck-контура), ``irrelevant`` терминален. Отсутствие поля
+    (легаси-кандидаты, отклонённые до этого спека) читается как ``irrelevant``:
+    «не нужен» — исторический дефолт единственного существовавшего отказа.
+    """
+
+    irrelevant = "irrelevant"          # содержательно не подходит — решение окончательное
+    unacquirable = "unacquirable"      # нужен, но недобываем (WAF/мёртвая ссылка) — ждёт смены обстоятельств
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -222,7 +236,10 @@ class Dates(BaseModel):
     updated: _dt.date | None = None
     effective: _dt.date | None = None  # дата вступления в силу (для законов)
     retrieved: _dt.date | None = None  # дата скачивания
-    last_checked: _dt.date | None = None  # свежесть: когда последний раз перепроверяли источник
+    # Поля ``last_checked`` здесь БОЛЬШЕ НЕТ (spec post-acquisition-lifecycle §7):
+    # ручная бухгалтерия свежести протухает по построению (заполнялась вручную в
+    # 4 записях и не имела ни одного кодового читателя). Её работу выполняет
+    # ``OperationalState.acquisition_checked`` — машиннописаный курсор recheck-контура.
 
 
 class Relevance(BaseModel):
@@ -279,6 +296,31 @@ class OperationalState(BaseModel):
     # полям (модель + sha256 raw НА МОМЕНТ облачного вызова, т.е. ПОСЛЕ ocrmypdf).
     cloud_ocr_model: str | None = None
     cloud_ocr_raw_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # --- контур времени (spec post-acquisition-lifecycle §7); все Optional/с дефолтом,
+    # старые .state.yaml валидны без единой правки ---
+    # Серверные валидаторы ОТВЕТА, verbatim: единственный дешёвый способ спросить
+    # издателя «изменилось ли с прошлого раза» (условный GET). Захватываются ТОЛЬКО
+    # на ступенях direct/official_alt (§2): archive отдаёт заголовки Wayback, а не
+    # издателя, browser — синтетические, manual — вовсе без HTTP-ответа.
+    etag: str | None = None
+    http_last_modified: str | None = None
+    # Счётчик ПОДРЯД-совпадений валидатора (инкремент при 304 либо 200 с совпавшим
+    # ETag; сброс в 0 при смене/первичном бутстрапе). Без него правило «drift для
+    # html только при смене СТАБИЛЬНОГО валидатора» нереализуемо: по одним лишь
+    # etag/http_last_modified неотличимо «забутстрапили вчера» от «совпал пять раз».
+    etag_confirms: int = 0
+    # Findings recheck-контура — ОДНО поле-строка с префиксом (паттерн lint_defects,
+    # §2): `drift:`/`link-rot:`/`resurrected:` + евидентность. Машина флагует, человек
+    # читает и решает (§6); очищается успешной передобычей.
+    recheck_finding: str | None = None
+    # Дата ПОПЫТКИ проактивного снимка SavePageNow (§4) — best-effort страховка, не
+    # гарантия: нужна идемпотентности (повторный прогон не дёргает SPN за уже добытое).
+    snapshot_requested: _dt.date | None = None
+    # Backoff недобытых (§5): когда лестница провалилась и почему. Пока свежее
+    # RETRY_BACKOFF_DAYS — download не планируется (кроме --force/--only); успешная
+    # добыча очищает оба поля.
+    acquisition_failed: _dt.date | None = None
+    acquisition_failure_reason: str | None = None
 
 
 class SourceRecord(BaseModel):
@@ -318,7 +360,10 @@ class SourceRecord(BaseModel):
     summary: str | None = None                               # 2–3 предложения, EN
     relations: list[Relation] = Field(default_factory=list)
     relevance: Relevance | None = None       # вердикт триажа; обязателен — правило validate_sources
-    in_force: bool | None = None             # действует ли «живой» документ (взвешивание свежести)
+    # Поля ``in_force`` здесь БОЛЬШЕ НЕТ (spec post-acquisition-lifecycle §7): ручной
+    # bool «действует ли закон» на сотнях записей обречён протухнуть, и ни один
+    # потребитель его не читал. Валидность ВЫВОДИТСЯ из рёбер ``supersedes``
+    # (см. ``superseded_ids`` ниже и спек graph-v2), а не ведётся руками.
 
 
 # Жёсткий предел native_summary: ~2-3 предложения. Не «мягкая рекомендация» — pydantic
@@ -385,6 +430,16 @@ class CandidateRecord(BaseModel):
     supersedes: str | None = Field(default=None, pattern=ID_PATTERN)
     # причина отказа (если триаж отклонил — кандидат остаётся в слое кандидатов)
     rejected_reason: str | None = None
+    # Природа отказа (spec post-acquisition-lifecycle §5): None у легаси-записей ==
+    # ``irrelevant``-семантика. ``unacquirable`` — «нужен, но недобываем»: кандидат
+    # уходит не в терминальный отказ, а в очередь ожидания обстоятельств (WAF снимут,
+    # появится зеркало), которую периодически пробует recheck-контур.
+    rejected_kind: RejectionKind | None = None
+    # Probe-поля популяции (c) recheck: когда последний раз пробовали URL недобываемого
+    # кандидата и что увидели (``acquirable``/``blocked``/``dead`` + детали). Пишутся
+    # ТОЛЬКО машиной через store load-mutate-save; курируемого смысла не несут.
+    probe_checked: _dt.date | None = None
+    probe_finding: str | None = None
 
 
 def doc_dir(rec: SourceRecord, root: Path) -> Path:
@@ -437,6 +492,29 @@ def check_layout(meta_path: Path, rec: SourceRecord, seen_ids: set[str]) -> list
     if rec.id in seen_ids:
         errors.append(f"{meta_path}: дубль id '{rec.id}'")
     return errors
+
+
+def superseded_ids(records: list[SourceRecord]) -> set[str]:
+    """id записей, которые ЗАМЕНЕНЫ другой записью корпуса (выведенная валидность).
+
+    Нормализует ОБА направления ребра — ``supersedes`` (у преемника) и
+    ``superseded_by`` (у предшественника): оба легальны в ``RelationType``, и запись,
+    оформленная любым из них, обязана трактоваться одинаково. Единственное
+    определение на двух потребителей (spec post-acquisition-lifecycle §1 — исключение
+    из ротации recheck; spec graph-v2 §2 — фасет ``superseded``), поэтому расхождение
+    между ними исключено by construction, а не дисциплиной.
+
+    Дальний конец ребра не проверяется на существование — ссылочную целостность
+    ``relations`` держит ``validate_sources.py``, дублировать её здесь незачем.
+    """
+    superseded: set[str] = set()
+    for rec in records:
+        for rel in rec.relations:
+            if rel.type is RelationType.supersedes:
+                superseded.add(rel.target)      # rec заменяет target
+            elif rel.type is RelationType.superseded_by:
+                superseded.add(rec.id)          # rec заменён target'ом
+    return superseded
 
 
 def load_records(sources_root: Path) -> list[SourceRecord]:

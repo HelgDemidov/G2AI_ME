@@ -217,6 +217,11 @@ _WORKSHEET_HEADER = """\
 - raw_hash: "fed456abc789"
   reason: "outside both axes: marketing overview"
   action: reject
+
+- raw_hash: "0123456789ab"
+  reason: "wanted, but every ladder rung is WAF-blocked"
+  reject_kind: unacquirable   # см. ниже: НЕ терминальный отказ, а очередь ожидания
+  action: reject
 ```
 
 Заполняя `admit`:
@@ -236,11 +241,52 @@ _WORKSHEET_HEADER = """\
   URL — нормальное состояние для законов), а НЕ дубль: `reject` здесь потерял бы редакцию.
   Ребро `supersedes` в meta.yaml проставит `apply` сам — вписывать его в `relations` руками
   не нужно (дубля не будет, но и смысла нет).
+
+Заполняя `reject`:
+- `reject_kind` (опционально; значения — enum `schema.RejectionKind`) разводит два разных
+  отказа. Дефолт (ключ опущен) — «содержательно не подходит», решение окончательное.
+  Второе значение помечает «нужен, но недобываем» (WAF/мёртвая ссылка): такой кандидат
+  уходит НЕ в терминальный отказ, а в отдельную секцию этого worksheet, и `run_pipeline.py
+  --recheck` периодически пробует его URL — обстоятельства меняются, а заметить это иначе
+  некому.
+- `action: revive` возвращает недобываемого кандидата в ждущие (снимает отказ и probe-поля).
+  Только явное решение человека: dedup по-прежнему не воскрешает отклонённых сам.
+"""
+
+_UNACQUIRABLE_SECTION_HEADER = """\
+
+## Недобываемые — ждут смены обстоятельств
+
+Отклонены как «нужен, но недобываем», не как «не нужен». `probe_finding` — что увидел
+последний `run_pipeline.py --recheck`; `acquirable:` означает, что канал открылся —
+кандидата пора вернуть в ждущие решением `action: revive`.
 """
 
 
-def render_worksheet(pending: list[schema.CandidateRecord]) -> str:
-    """Markdown-таблица ждущих кандидатов + шапка-инструкция (spec §3)."""
+def unacquirable_candidates(
+    candidates: list[schema.CandidateRecord],
+) -> list[schema.CandidateRecord]:
+    """Кандидаты, отклонённые как «нужен, но недобываем» (spec post-acquisition-lifecycle §5).
+
+    Вычисляется реконсиляцией по ``rejected_kind``, как и всё остальное в этом модуле —
+    отдельного хранимого «статуса очереди» нет. Самые давно не пробованные первыми:
+    тот же порядок, в котором их берёт recheck, — куратор видит список в его логике.
+    """
+    due = [c for c in candidates if c.rejected_kind is schema.RejectionKind.unacquirable]
+    due.sort(key=lambda c: (c.probe_checked is not None, c.probe_checked or dt.date.min, c.raw_hash))
+    return due
+
+
+def render_worksheet(
+    pending: list[schema.CandidateRecord],
+    unacquirable: list[schema.CandidateRecord] | None = None,
+) -> str:
+    """Markdown-таблица ждущих кандидатов + шапка-инструкция (spec §3).
+
+    ``unacquirable`` — вторая секция (spec post-acquisition-lifecycle §5): очередь
+    ожидания обстоятельств. Пустая -> секция не печатается вовсе (шум в типовом
+    прогоне не нужен).
+    """
     lines = [_WORKSHEET_HEADER, ""]
     lines.append(
         "| raw_hash | title | issuer | jurisdiction | doc_date | supersedes | connector_id "
@@ -263,8 +309,27 @@ def render_worksheet(pending: list[schema.CandidateRecord]) -> str:
                 cand.source_url or "",
             )
         )
+    if unacquirable:
+        lines.append(_UNACQUIRABLE_SECTION_HEADER)
+        lines.append("| raw_hash | title | issuer | probe_checked | probe_finding | source_url |")
+        lines.append("|---|---|---|---|---|---|")
+        for cand in unacquirable:
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} |".format(
+                    cand.raw_hash[:12],
+                    cand.title or "",
+                    cand.issuer or "",
+                    cand.probe_checked.isoformat() if cand.probe_checked else "—",
+                    cand.probe_finding or "—",
+                    cand.source_url or "",
+                )
+            )
     return "\n".join(lines) + "\n"
 
+
+# Действия decisions.yaml. ``revive`` (spec post-acquisition-lifecycle §5) — обратный
+# ход для недобываемых: обстоятельства сменились, кандидат снова в игре.
+_ACTIONS = ("admit", "reject", "revive")
 
 _ADMIT_REQUIRED = (
     "id",
@@ -437,13 +502,13 @@ def apply_decisions(
         raw_hash_key = str(decision.get("raw_hash") or "")
         action = decision.get("action")
 
-        if not raw_hash_key or action not in ("admit", "reject"):
+        if not raw_hash_key or action not in _ACTIONS:
             outcomes.append(
                 ApplyOutcome(
                     raw_hash=raw_hash_key,
                     action=str(action),
                     ok=False,
-                    detail="raw_hash обязателен, action должен быть 'admit' или 'reject'",
+                    detail=f"raw_hash обязателен, action должен быть одним из: {', '.join(_ACTIONS)}",
                 )
             )
             continue
@@ -452,6 +517,36 @@ def apply_decisions(
             cand = _resolve_candidate(raw_hash_key, candidates)
         except ValueError as exc:
             outcomes.append(ApplyOutcome(raw_hash=raw_hash_key, action=action, ok=False, detail=str(exc)))
+            continue
+
+        if action == "revive":
+            # Реанимация недобываемого (spec post-acquisition-lifecycle §5): ЯВНОЕ
+            # решение человека, а не автоматика — невоскрешение отклонённых через
+            # dedup при этом не ослабляется ни на бит.
+            if cand.rejected_reason is None and cand.rejected_kind is None:
+                outcomes.append(
+                    ApplyOutcome(
+                        raw_hash=cand.raw_hash, action=action, ok=True,
+                        detail="не был отклонён — уже в ждущих (без изменений)",
+                    )
+                )
+                continue
+            if dry_run:
+                outcomes.append(
+                    ApplyOutcome(
+                        raw_hash=cand.raw_hash, action=action, ok=True,
+                        detail=f"план: вернуть в ждущие (был: {cand.rejected_reason})",
+                    )
+                )
+                continue
+            cand.rejected_reason = None
+            cand.rejected_kind = None
+            cand.probe_checked = None
+            cand.probe_finding = None
+            store_changed = True
+            outcomes.append(
+                ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=True, detail="возвращён в ждущие")
+            )
             continue
 
         if action == "reject":
@@ -466,16 +561,36 @@ def apply_decisions(
                 )
                 continue
             reason = decision.get("reason") or "отклонено триажем (без указанной причины)"
+            try:
+                # Ключ решения (`reject_kind`) и поле кандидата (`rejected_kind`) названы
+                # по-разному намеренно: язык ДЕЙСТВИЯ vs хранимое СОСТОЯНИЕ — та же пара,
+                # что `action: reject` -> `rejected_reason`. Опущенный ключ оставляет None
+                # (== легаси == «содержательно не подходит»), а не пишет дефолт в store.
+                kind = (
+                    schema.RejectionKind(decision["reject_kind"])
+                    if decision.get("reject_kind") is not None
+                    else None
+                )
+            except ValueError as exc:
+                outcomes.append(
+                    ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=False, detail=str(exc))
+                )
+                continue
+            suffix = f" [{kind.value}]" if kind is not None else ""
             if dry_run:
                 outcomes.append(
                     ApplyOutcome(
-                        raw_hash=cand.raw_hash, action=action, ok=True, detail=f"план: отклонить ({reason})"
+                        raw_hash=cand.raw_hash, action=action, ok=True,
+                        detail=f"план: отклонить{suffix} ({reason})",
                     )
                 )
                 continue
             cand.rejected_reason = reason
+            cand.rejected_kind = kind
             store_changed = True
-            outcomes.append(ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=True, detail="отклонён"))
+            outcomes.append(
+                ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=True, detail=f"отклонён{suffix}")
+            )
             continue
 
         # action == "admit"

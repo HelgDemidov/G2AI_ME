@@ -72,13 +72,16 @@ def _cmd_worksheet(args: argparse.Namespace) -> int:
     candidates = store.load(args.root)
     records = schema.load_records(args.root)
     pending = manual.pending_candidates(candidates, records)
-    text = manual.render_worksheet(pending)
+    unacquirable = manual.unacquirable_candidates(candidates)
+    text = manual.render_worksheet(pending, unacquirable)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text, encoding="utf-8")
         print(f"worksheet: {len(pending)} ждущих кандидат(ов) -> {args.out}")
     else:
         print(text)
+    if unacquirable:
+        print(f"(+ {len(unacquirable)} недобываемых в отдельной секции — ждут смены обстоятельств)")
     return 0
 
 

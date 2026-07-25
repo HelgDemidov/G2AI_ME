@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from core import schema
 from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
 from core import fsio
 from run_pipeline import (
+    RETRY_BACKOFF_DAYS,
     Stage,
     _adopt_untracked_raw,
     _compose_md,
@@ -27,6 +29,7 @@ from run_pipeline import (
     _do_frontmatter,
     _needs_index_rebuild,
     _read_index_fingerprint,
+    _report,
     _sha256,
     needed_stages,
     process_docs,
@@ -383,6 +386,222 @@ def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
     assert st.sha256 is not None
 
 
+def _fake_ladder(
+    method: schema.AcquisitionMethod,
+    fidelity: schema.Fidelity,
+    classified: ClassifiedResponse,
+    *,
+    body: bytes = b"%PDF-1.4 fake content",
+) -> Any:
+    """Подменить лестницу целиком: тест ступени/валидаторов не должен зависеть от
+    маршрутизации внутри run_ladder (она покрыта в test_acquisition.py)."""
+
+    def fake_run_ladder(rec_: SourceRecord, dest: Path, *, user_agent: str) -> Any:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(body)
+        return acquisition.LadderResult(method, fidelity, classified)
+
+    return fake_run_ladder
+
+
+def test_do_download_captures_validators_on_direct(tmp_path: Path, monkeypatch: Any) -> None:
+    """§2: успешная добыча с direct-ступени бутстрапит ETag/Last-Modified в .state.yaml —
+    без этого первый же recheck был бы безусловным полным GET."""
+    rec = make()
+    classified = ClassifiedResponse(
+        AcquisitionOutcome.ok, 200, "valid PDF", etag='"v1"', last_modified="Wed, 21 Oct 2026 07:28:00 GMT"
+    )
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(schema.AcquisitionMethod.direct, schema.Fidelity.live, classified),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.etag == '"v1"'
+    assert st.http_last_modified == "Wed, 21 Oct 2026 07:28:00 GMT"
+    assert st.etag_confirms == 0  # подтверждения считает только recheck, не добыча
+
+
+@pytest.mark.parametrize(
+    "method,fidelity",
+    [
+        (schema.AcquisitionMethod.archive, schema.Fidelity.archived_snapshot),
+        (schema.AcquisitionMethod.manual, schema.Fidelity.manual),
+        (schema.AcquisitionMethod.browser, schema.Fidelity.rendered),
+    ],
+)
+def test_do_download_does_not_capture_validators_off_publisher_rungs(
+    tmp_path: Path, monkeypatch: Any, method: schema.AcquisitionMethod, fidelity: schema.Fidelity
+) -> None:
+    """Гейт §2: заголовки Wayback/браузера/watch-folder издателю не принадлежат.
+    Записанные как валидаторы документа, они давали бы мусорный drift на КАЖДОЙ ротации
+    recheck — сравнение ETag архива с ответом официального сайта."""
+    rec = make()
+    classified = ClassifiedResponse(
+        AcquisitionOutcome.ok, 200, "ok", etag='"wayback-etag"', last_modified="Mon, 01 Jan 2024 00:00:00 GMT"
+    )
+    monkeypatch.setattr("acquire.acquisition.run_ladder", _fake_ladder(method, fidelity, classified))
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_method is method
+    assert st.etag is None and st.http_last_modified is None
+
+
+def test_do_download_resets_stale_validators_and_confirms(tmp_path: Path, monkeypatch: Any) -> None:
+    """Передобыча через непубликаторскую ступень СТИРАЕТ прежние валидаторы: state
+    описывает текущий raw, а он больше не те байты официального URL."""
+    rec = make()
+    _place(rec, tmp_path, state={"etag": '"old"', "http_last_modified": "old-date", "etag_confirms": 5})
+    classified = ClassifiedResponse(AcquisitionOutcome.ok, 200, "manual acquisition via watch-folder")
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(schema.AcquisitionMethod.manual, schema.Fidelity.manual, classified),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.etag is None and st.http_last_modified is None and st.etag_confirms == 0
+
+
+def _spy_snapshot(monkeypatch: Any, *, ok: bool = True) -> list[str]:
+    """Записывать URL, за которые дёрнули SavePageNow (сеть не трогается)."""
+    calls: list[str] = []
+
+    def fake(url: str, **kw: Any) -> bool:
+        calls.append(url)
+        return ok
+
+    monkeypatch.setattr("acquire.acquisition.request_snapshot", fake)
+    return calls
+
+
+def test_do_download_requests_snapshot_for_live_public_record(tmp_path: Path, monkeypatch: Any) -> None:
+    """§4: каждая НАША редакция публичного документа получает офсайт-копию — страховка
+    на случай будущей смерти URL (тогда archive-ступень найдёт нужную редакцию, а не
+    случайный старый снимок)."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url]
+    assert schema.load_state(schema.state_file(rec, tmp_path)).snapshot_requested is not None
+
+
+def test_do_download_skips_snapshot_for_confidential(tmp_path: Path, monkeypatch: Any) -> None:
+    """Обращение к Wayback публично — тот же гейт, что запрещает confidential-записям
+    archive-ступень лестницы."""
+    rec = make(sensitivity="confidential")
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == []
+    assert schema.load_state(schema.state_file(rec, tmp_path)).snapshot_requested is None
+
+
+@pytest.mark.parametrize(
+    "method,fidelity",
+    [
+        (schema.AcquisitionMethod.official_alt, schema.Fidelity.rehost),
+        (schema.AcquisitionMethod.manual, schema.Fidelity.manual),
+        (schema.AcquisitionMethod.archive, schema.Fidelity.archived_snapshot),
+    ],
+)
+def test_do_download_skips_snapshot_for_non_own_edition(
+    tmp_path: Path, monkeypatch: Any, method: schema.AcquisitionMethod, fidelity: schema.Fidelity
+) -> None:
+    """Снимать нечего: rehost — чужой хост, manual — файл из папки загрузок,
+    archived_snapshot — снимок уже существует (им мы и добыли документ)."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(method, fidelity, ClassifiedResponse(AcquisitionOutcome.ok, 200, "ok")),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == []
+
+
+def test_do_download_snapshot_is_idempotent_for_unchanged_bytes(tmp_path: Path, monkeypatch: Any) -> None:
+    """Повторная (напр. --force) добыча тех же байт не дёргает SPN снова: поле-дата
+    существует именно ради этого."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url]
+
+
+def test_do_download_snapshot_refires_when_bytes_changed(tmp_path: Path, monkeypatch: Any) -> None:
+    """Смена байт = новая редакция: она обязана получить СВОЙ снимок, иначе Wayback
+    навсегда останется с предыдущей версией документа."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    for body in (b"%PDF-1.4 v1", b"%PDF-1.4 v2 changed"):
+        monkeypatch.setattr(
+            "acquire.acquisition.run_ladder",
+            _fake_ladder(
+                schema.AcquisitionMethod.direct, schema.Fidelity.live,
+                ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=body,
+            ),
+        )
+        _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url, rec.source_url]
+
+
+def test_do_download_survives_snapshot_failure(tmp_path: Path, monkeypatch: Any) -> None:
+    """Отказ SPN — WARNING, не ошибка документа: страховка не может ронять добычу.
+    Дата всё равно пишется (по факту ПОПЫТКИ) — иначе отказавший сервис долбился бы
+    на каждом последующем прогоне."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch, ok=False)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url]
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.sha256 is not None and st.snapshot_requested is not None
+
+
 def test_do_download_html_record_targets_raw_html(tmp_path: Path, monkeypatch: Any) -> None:
     """source_format=html -> цель скачивания raw.html, не raw.pdf (ext-маршрутизация)."""
     rec = make(source_format="html")
@@ -442,6 +661,119 @@ def test_do_download_replaces_prior_raw_of_different_ext(tmp_path: Path, monkeyp
 
     assert schema.raw_file(rec, tmp_path) == doc_dir / "raw.pdf"  # ровно один raw.* — новый
     assert not (doc_dir / "raw.html").exists()
+
+
+# --- backoff недобытых (spec post-acquisition-lifecycle §5) ---
+
+
+def _failed_state(days_ago: int, reason: str = "direct blocked (WAF challenge)") -> dict[str, Any]:
+    failed = dt.date.today() - dt.timedelta(days=days_ago)
+    return {"acquisition_failed": failed.isoformat(), "acquisition_failure_reason": reason}
+
+
+def test_do_download_records_failure_on_batch_block(tmp_path: Path, monkeypatch: Any) -> None:
+    """Провал лестницы перестаёт быть бесследным: дата+причина ложатся в .state.yaml,
+    откуда их читают и backoff, и популяция (b) recheck."""
+    rec = make()
+
+    def fake_run_ladder(rec_: SourceRecord, dest: Path, *, user_agent: str) -> Any:
+        raise acquisition.AcquisitionBlocked(rec_.source_url, "direct blocked (WAF challenge)")
+
+    monkeypatch.setattr("acquire.acquisition.run_ladder", fake_run_ladder)
+
+    with pytest.raises(acquisition.AcquisitionBlocked):
+        _do_download(rec, tmp_path, pause=0, interactive=False)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_failed == dt.date.today()
+    assert st.acquisition_failure_reason is not None and "WAF challenge" in st.acquisition_failure_reason
+
+
+def test_do_download_records_failure_on_manual_timeout(tmp_path: Path, monkeypatch: Any) -> None:
+    """До этого спека таймаут watch-folder пролетал в generic-обработчик process_docs,
+    не оставляя следа в состоянии документа — теперь покрыт тем же общим перехватом."""
+    rec = make()
+
+    def fake_run_ladder(rec_: SourceRecord, dest: Path, *, user_agent: str) -> Any:
+        raise acquisition.AcquisitionBlocked(rec_.source_url, "direct blocked")
+
+    def fake_manual(rec_: SourceRecord, dest: Path, **kw: Any) -> Any:
+        raise acquisition.ManualAcquisitionTimeout("не дождался файла")
+
+    monkeypatch.setattr("acquire.acquisition.run_ladder", fake_run_ladder)
+    monkeypatch.setattr("acquire.acquisition.acquire_manually", fake_manual)
+
+    with pytest.raises(acquisition.ManualAcquisitionTimeout):
+        _do_download(rec, tmp_path, pause=0, interactive=True)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_failed == dt.date.today()
+
+
+def test_successful_download_clears_backoff(tmp_path: Path, monkeypatch: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(3))
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_failed is None and st.acquisition_failure_reason is None
+
+
+def test_needed_stages_skips_download_inside_backoff_window(tmp_path: Path) -> None:
+    """Штатный батч не долбит заведомо закрытый источник каждый прогон. Стадий НОЛЬ,
+    а не «convert без raw»: конвертировать физически нечего, и фальшивая ошибка
+    стадии сделала бы весь батч красным на ровном месте."""
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(1))
+    assert needed_stages(rec, tmp_path) == []
+
+
+def test_needed_stages_retries_after_backoff_window(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(RETRY_BACKOFF_DAYS))
+    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
+
+
+@pytest.mark.parametrize("kwargs", [{"force": True}, {"ignore_backoff": True}])
+def test_backoff_is_pierced_by_explicit_intent(tmp_path: Path, kwargs: dict[str, bool]) -> None:
+    """--force и --only <id> — два сигнала «хочу попытку сейчас»; молчаливый скип
+    сбил бы куратора, который сидит и ждёт клика в watch-folder."""
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(1))
+    assert Stage.download in needed_stages(rec, tmp_path, **kwargs)
+
+
+def test_backoff_does_not_defer_document_that_already_has_raw(tmp_path: Path) -> None:
+    """Документ с raw и непогашенным провалом ПЕРЕдобычи живёт дальше со своим текстом:
+    окно закрывает только новую попытку скачивания, не остальные стадии."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 existing", state=_failed_state(1))
+    stages = needed_stages(rec, tmp_path)
+    assert Stage.download not in stages and Stage.convert in stages
+
+
+def test_process_docs_reports_waiting_class_not_error(tmp_path: Path, caplog: Any) -> None:
+    """«Ждут добычи» — третий класс сводки: не «актуально» (иначе недобытые растворились
+    бы) и не «ошибка» (exit-код прогона не портится — источник закрыт обстоятельствами)."""
+    rec = make()
+    _place(rec, tmp_path, state=_failed_state(1))
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        results = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+        rc = _report(results)
+
+    assert results[0].waiting_acquisition is not None
+    assert results[0].up_to_date is False and results[0].error is None
+    assert rc == 0
+    assert "ждут добычи: 1" in caplog.text
 
 
 def test_process_docs_cleans_stale_staging_before_planning(tmp_path: Path) -> None:

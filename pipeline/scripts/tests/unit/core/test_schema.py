@@ -184,7 +184,6 @@ def test_relevance_default_none() -> None:
     del data["relevance"]
     rec = SourceRecord.model_validate(data)
     assert rec.relevance is None
-    assert rec.in_force is None
 
 
 @pytest.mark.parametrize("drop", ["rationale", "assessed_date"])
@@ -219,12 +218,20 @@ def test_relevance_axis_accepts_any_nonempty_string() -> None:
         SourceRecord.model_validate(data)
 
 
-@pytest.mark.parametrize("value", [True, False, None])
-def test_in_force_parse(value: bool | None) -> None:
+@pytest.mark.parametrize("field,value", [("in_force", True), ("dates", {"last_checked": "2026-07-15"})])
+def test_slimmed_freshness_fields_rejected(field: str, value: object) -> None:
+    """Слим §7 post-acquisition-lifecycle: ручная бухгалтерия свежести удалена ИЗ СХЕМЫ,
+    а не просто перестала читаться — ``extra="forbid"`` обязан отвергнуть оба поля.
+
+    Тест сторожит и обратное: возврат поля «на всякий случай» немедленно красный.
+    Данные мигрированы в том же коммите (4 meta.yaml корпуса, 6 строк)."""
     data = valid_record()
-    data["in_force"] = value
-    rec = SourceRecord.model_validate(data)
-    assert rec.in_force is value
+    if field == "dates":
+        data["dates"] = value
+    else:
+        data[field] = value
+    with pytest.raises(ValidationError):
+        SourceRecord.model_validate(data)
 
 
 def test_triage_config_wellformed() -> None:

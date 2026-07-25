@@ -8,6 +8,8 @@ that calls into it, same separation as ``build_graph.py``/``corpus_index.py``.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -21,6 +23,8 @@ from urllib.parse import quote
 import pdfplumber
 
 from core import browser_resolver, schema
+
+logger = logging.getLogger("acquisition")
 
 
 class AcquisitionOutcome(str, Enum):
@@ -36,6 +40,13 @@ class ClassifiedResponse:
     outcome: AcquisitionOutcome
     http_status: int | None
     reason: str
+    # Серверные валидаторы ответа verbatim (spec post-acquisition-lifecycle §2).
+    # Заполняет ``classify_response`` из уже разобранных заголовков — ноль новых
+    # запросов: добыча и без того парсит ``curl -D``-дамп. Пути, не имеющие
+    # настоящего HTTP-ответа (watch-folder, синтетические заголовки браузерной
+    # ступени), оставляют None по построению.
+    etag: str | None = None
+    last_modified: str | None = None
 
 
 class AcquisitionBlocked(RuntimeError):
@@ -112,10 +123,21 @@ def _headers_from_text(headers_text: str) -> dict[str, str]:
     return headers
 
 
-def _has_cloudflare_fingerprint(headers: dict[str, str]) -> bool:
+# AWS WAF (CloudFront) объявляет своё действие ОТДЕЛЬНЫМ заголовком и отдаёт челлендж
+# ПУСТЫМ телом с кодом 202 — маркеры тела при таком ответе не могут сработать в
+# принципе. Найдено живьём 2026-07-25 на eur-lex.europa.eu: `HTTP/1.1 202 Accepted`,
+# `Content-Length: 0`, `x-amzn-waf-action: challenge`. Значение проверяется, а не сам
+# факт наличия заголовка — тот же урок, что с `Server: BigIP` (ложноположителен на
+# реальном контенте).
+_AWS_WAF_ACTIONS = frozenset({"challenge", "captcha"})
+
+
+def _has_waf_header_fingerprint(headers: dict[str, str]) -> bool:
     if "cf-ray" in headers:
         return True
-    return "__cf_bm" in headers.get("set-cookie", "")
+    if "__cf_bm" in headers.get("set-cookie", ""):
+        return True
+    return headers.get("x-amzn-waf-action", "").strip().lower() in _AWS_WAF_ACTIONS
 
 
 def classify_response(
@@ -134,22 +156,29 @@ def classify_response(
     headers = _headers_from_text(headers_text)
 
     if status in DEAD_STATUS_CODES:
-        return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
+        result = ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
+    elif expected is schema.SourceFormat.html:
+        result = _classify_html(body, headers, status)
+    elif expected is schema.SourceFormat.docx:
+        result = _classify_docx(body, headers, status)
+    elif expected is schema.SourceFormat.xlsx:
+        result = _classify_xlsx(body, headers, status)
+    else:
+        result = _classify_pdf(body, headers, status)
 
-    if expected is schema.SourceFormat.html:
-        return _classify_html(body, headers, status)
-    if expected is schema.SourceFormat.docx:
-        return _classify_docx(body, headers, status)
-    if expected is schema.SourceFormat.xlsx:
-        return _classify_xlsx(body, headers, status)
-    return _classify_pdf(body, headers, status)
+    # Валидаторы навешиваются ЗДЕСЬ, а не в каждой формат-ветке: они не зависят от
+    # формата и не участвуют в самой классификации (спорный ответ остаётся спорным
+    # независимо от того, прислал ли сервер ETag).
+    result.etag = headers.get("etag")
+    result.last_modified = headers.get("last-modified")
+    return result
 
 
 def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
     if body.startswith(b"%PDF"):
         return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid PDF")
 
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if len(body) < MIN_EXPECTED_PDF_SIZE:
@@ -163,7 +192,7 @@ def _classify_docx(body: bytes, headers: dict[str, str], status: int | None) -> 
     условие (любой zip пройдёт эту проверку) — терминальная страховка на
     неразличимость от честного docx здесь: mammoth/markdownify поднимут
     ``ConversionError`` при конвертации не-docx zip'а (см. ``convert/converters._convert_docx``)."""
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if status == 200 and body.startswith(DOCX_MAGIC) and len(body) >= MIN_EXPECTED_DOCX_SIZE:
@@ -179,7 +208,7 @@ def _classify_xlsx(body: bytes, headers: dict[str, str], status: int | None) -> 
     контейнер OOXML/zip, та же терминальная страховка (zip-магия — необходимое,
     НЕ достаточное условие; ``openpyxl`` поднимет ``ConversionError`` при
     конвертации не-xlsx zip'а, см. ``convert/converters._convert_xlsx``)."""
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if status == 200 and body.startswith(XLSX_MAGIC) and len(body) >= MIN_EXPECTED_XLSX_SIZE:
@@ -194,7 +223,7 @@ def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> 
     # WAF-challenge check comes BEFORE the content-type check: a challenge page
     # is itself served as "200 text/html" — a content-type-only check would wave
     # it straight through as "ok".
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if body.startswith(b"%PDF"):
@@ -212,10 +241,104 @@ def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> 
     )
 
 
+def classify_probe(body: bytes, headers_text: str) -> ClassifiedResponse:
+    """Формат-агностичная классификация probe (spec post-acquisition-lifecycle §2).
+
+    Отвечает на вопрос «не закрыт ли канал», а НЕ «тот ли это документ»: у кандидата
+    слоя discovery ``source_format`` вовсе нет — его объявляет куратор только при
+    триаже. С наивным дефолтом ``expected=pdf`` любой оживший HTML-источник навсегда
+    оставался бы «not a valid PDF» -> blocked, и «стало добываемо» было бы недостижимо
+    для половины кандидатов. Формат подтвердят триаж и добыча.
+
+    Порядок проверок повторяет форматные классификаторы: challenge ПЕРЕД статусом —
+    заглушка WAF сама приходит как ``200``.
+    """
+    status = _status_from_headers_text(headers_text)
+    headers = _headers_from_text(headers_text)
+
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+        return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
+    if status in DEAD_STATUS_CODES:
+        return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
+    if status == 200 and body:
+        return ClassifiedResponse(AcquisitionOutcome.ok, status, f"HTTP 200, тело {len(body)} Б")
+    return ClassifiedResponse(
+        AcquisitionOutcome.blocked, status, f"неожиданный ответ (HTTP {status}, тело {len(body)} Б)"
+    )
+
+
 # curl exit codes (stable across decades): 6 = couldn't resolve host, 7 = failed
 # to connect. Both mean "this URL is unreachable" — the same terminal signal as
 # a confirmed-dead HTTP status, so the ladder should treat them identically.
 _CURL_UNREACHABLE_CODES = (6, 7)
+
+
+@dataclass
+class RawResponse:
+    """Ответ ДО интерпретации: тело + заголовочный дамп, без классификации.
+
+    Существует ради второго потребителя curl-обвязки — условного запроса
+    recheck-контура (spec post-acquisition-lifecycle §2), которому нужно выбрать
+    классификатор самому (форматный для записей корпуса, формат-агностичный для
+    кандидатов) и увидеть ``304``, у которого тела нет вовсе.
+    """
+
+    status: int | None
+    headers_text: str
+    body: bytes
+    unreachable_reason: str | None = None  # curl exit 6/7 — DNS/connect
+
+
+def fetch_raw(
+    url: str,
+    dest: Path,
+    *,
+    user_agent: str,
+    extra_headers: dict[str, str] | None = None,
+    timeout: int = 30,
+    total_timeout: int = 300,
+) -> RawResponse:
+    """Одна попытка скачивания без интерпретации результата.
+
+    Deliberately omits ``-f``: a hard HTTP error (403/404) must still land its
+    status/body so the caller's classifier can tell a block apart from a dead URL —
+    with ``-f`` curl discards the response before we ever see it.
+
+    A network-level curl failure (exit 6/7 — DNS/connect unreachable) surfaces as
+    ``unreachable_reason`` rather than an exception: this is the single most common
+    shape of "the URL is gone" (a decommissioned government domain), and the ladder
+    must route it to the archive rung instead of crashing. Offline-vs-dead-domain is
+    not disambiguated here — see design rationale in the spec: the archive rung's own
+    curl call fails the same way, so the worst case is one wasted archive attempt, not
+    silent corruption. ``--max-time`` bounds the whole transfer (``--connect-timeout``
+    alone doesn't cap a stalled transfer on a slow LTE link).
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="acq-headers-", suffix=".txt", delete=False) as tmp:
+        headers_path = Path(tmp.name)
+    try:
+        cmd = [
+            "curl", "-sSL", "--retry", "3", "--retry-delay", "2",
+            "--connect-timeout", str(timeout), "--max-time", str(total_timeout),
+            "-A", user_agent,
+        ]
+        for name, value in (extra_headers or {}).items():
+            cmd += ["-H", f"{name}: {value}"]
+        cmd += ["-D", str(headers_path), "-o", str(dest), url]
+        proc = subprocess.run(cmd, check=False)
+        if proc.returncode in _CURL_UNREACHABLE_CODES:
+            return RawResponse(
+                None, "", b"", f"curl exit {proc.returncode}: host unreachable (DNS/connect)"
+            )
+        if proc.returncode != 0:
+            # 28 = timeout after --retry already exhausted transients; anything
+            # else is an unexpected curl failure — not a classification, a bug/env issue.
+            raise RuntimeError(f"curl failed (exit {proc.returncode}) for {url}")
+        headers_text = headers_path.read_text(encoding="utf-8", errors="replace")
+        body = dest.read_bytes() if dest.exists() else b""
+        return RawResponse(_status_from_headers_text(headers_text), headers_text, body)
+    finally:
+        headers_path.unlink(missing_ok=True)
 
 
 def fetch_and_classify(
@@ -227,48 +350,22 @@ def fetch_and_classify(
     total_timeout: int = 300,
     expected: schema.SourceFormat = schema.SourceFormat.pdf,
 ) -> ClassifiedResponse:
-    """Single download attempt (no ladder stepping — that's the caller's job).
+    """Single download attempt (no ladder stepping — that's the caller's job):
+    ``fetch_raw`` + форматная классификация."""
+    raw = fetch_raw(url, dest, user_agent=user_agent, timeout=timeout, total_timeout=total_timeout)
+    if raw.unreachable_reason is not None:
+        return ClassifiedResponse(AcquisitionOutcome.dead, None, raw.unreachable_reason)
+    return classify_response(raw.body, raw.headers_text, expected)
 
-    Deliberately omits ``-f``: a hard HTTP error (403/404) must still land its
-    status/body so ``classify_response`` can tell a block apart from a dead URL —
-    with ``-f`` curl discards the response before we ever see it.
 
-    A network-level curl failure (exit 6/7 — DNS/connect unreachable) is
-    classified as ``dead`` directly: this is the single most common shape of
-    "the URL is gone" (a decommissioned government domain), and without this
-    check it would raise instead of routing to the archive rung. Offline-vs-
-    dead-domain is not disambiguated here — see design rationale in the spec:
-    the archive rung's own curl call fails the same way, so the worst case is
-    one wasted archive attempt, not silent corruption. ``--max-time`` bounds
-    the whole transfer (``--connect-timeout`` alone doesn't cap a stalled
-    transfer on a slow LTE link).
-    """
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(prefix="acq-headers-", suffix=".txt", delete=False) as tmp:
-        headers_path = Path(tmp.name)
-    try:
-        cmd = [
-            "curl", "-sSL", "--retry", "3", "--retry-delay", "2",
-            "--connect-timeout", str(timeout), "--max-time", str(total_timeout),
-            "-A", user_agent,
-            "-D", str(headers_path), "-o", str(dest), url,
-        ]
-        proc = subprocess.run(cmd, check=False)
-        if proc.returncode in _CURL_UNREACHABLE_CODES:
-            return ClassifiedResponse(
-                AcquisitionOutcome.dead, None,
-                f"curl exit {proc.returncode}: host unreachable (DNS/connect)",
-            )
-        if proc.returncode != 0:
-            # 28 = timeout after --retry already exhausted transients; anything
-            # else is an unexpected curl failure — not a classification, a bug/env issue.
-            raise RuntimeError(f"curl failed (exit {proc.returncode}) for {url}")
-        headers_text = headers_path.read_text(encoding="utf-8", errors="replace")
-        body = dest.read_bytes() if dest.exists() else b""
-        return classify_response(body, headers_text, expected)
-    finally:
-        headers_path.unlink(missing_ok=True)
-
+# Ступени, чьи валидаторы принадлежат ИЗДАТЕЛЮ и потому годятся для будущего
+# условного запроса (spec post-acquisition-lifecycle §2). Гейт обязателен: archive
+# отдаёт заголовки Wayback (recheck сравнивал бы ETag архива с ответом официального
+# сайта -> мусорный drift на каждой ротации), browser синтезирует заголовки сам,
+# manual вовсе не имеет HTTP-ответа.
+VALIDATOR_CAPTURE_RUNGS = frozenset(
+    {schema.AcquisitionMethod.direct, schema.AcquisitionMethod.official_alt}
+)
 
 # --- ladder routing (§2/§4/§9 of the spec) ---
 _FIDELITY_BY_AUTOMATIC_RUNG = {
@@ -623,6 +720,42 @@ def find_wayback_snapshot(
         return None  # неразбираемая строка — трактуем как «снимка нет», не IndexError
     timestamp = fields[1]
     return ArchiveSnapshot(timestamp, f"https://web.archive.org/web/{timestamp}id_/{original_url}")
+
+
+# --- проактивный снимок: SavePageNow при добыче (§4 spec post-acquisition-lifecycle) ---
+WAYBACK_SAVE_URL = "https://web.archive.org/save/"
+SPN_TIMEOUT_SECONDS = 20  # жёсткий потолок: снимок — страховка, а не часть критического пути
+
+
+def request_snapshot(url: str, *, timeout: int = SPN_TIMEOUT_SECONDS) -> bool:
+    """Попросить Wayback сохранить ТЕКУЩУЮ редакцию ``url`` (SPN2, анонимно).
+
+    Fire-and-forget: тело ответа не читается, ретраев нет, ЛЮБОЙ отказ — WARNING в
+    лог и ``False``, никогда не исключение. Долговечность обеспечивает локальный raw
+    (и будущий R2-бэкап), а это — страховка на случай смерти официального URL: когда
+    archive-ступень лестницы понадобится, снимок нужной редакции уже будет существовать.
+    Ровно практика, которой Wikipedia автоархивирует каждую внешнюю ссылку.
+
+    Анонимного доступа достаточно на нашем темпе (единицы запросов за прогон);
+    аутентифицированный SPN с более высокими лимитами — эскалация на случай, если
+    анонимный начнёт отказывать.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-sS", "-o", os.devnull,
+                "--connect-timeout", str(timeout), "--max-time", str(timeout),
+                f"{WAYBACK_SAVE_URL}{url}",
+            ],
+            check=False,
+        )
+    except OSError as exc:  # curl отсутствует/не запускается — не повод ронять добычу
+        logger.warning("SavePageNow недоступен для %s: %s", url, exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning("SavePageNow не ответил для %s (curl exit %d)", url, proc.returncode)
+        return False
+    return True
 
 
 _CDX_MIMETYPE_BY_FORMAT = {

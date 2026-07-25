@@ -11,7 +11,6 @@ language: cnr
 dates:
   published: '2025-08-01'
   retrieved: '2026-07-17'
-  last_checked: '2026-07-17'
 doc_type: legislation
 authority: binding_law
 source_url: https://natlex.ilo.org/dyn/natlex2/natlex2/files/download/118479/MNE-118479.pdf
@@ -50,4 +49,3 @@ relevance:
     number rejoin + CAPS-length recalibration, unifying heading levels that used
     to disagree between pdf_to_markdown's own size clustering and ocr_headings.
   assessed_date: '2026-07-17'
-in_force: true
