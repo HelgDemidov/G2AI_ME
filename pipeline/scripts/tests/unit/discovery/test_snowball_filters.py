@@ -61,8 +61,8 @@ def test_doc_flag_overrides_include_doc_ids(_patched_load_config: snowball.Snowb
 
 
 def test_track_flag_overrides_tracks(_patched_load_config: snowball.SnowballConfig) -> None:
-    merged = discover._build_snowball_config_override(_args(track=["montenegro", "research-papers"]))
-    assert merged.source_filter.tracks == ("montenegro", "research-papers")
+    merged = discover._build_snowball_config_override(_args(track=["target-entity", "research-papers"]))
+    assert merged.source_filter.tracks == ("target-entity", "research-papers")
 
 
 def test_tier_flag_overrides_target_fit(_patched_load_config: snowball.SnowballConfig) -> None:
@@ -116,7 +116,7 @@ def test_cli_override_does_not_mutate_yaml_on_disk(tmp_path: Path) -> None:
 
 
 def test_emit_toggle_disables_pdf_annotations_extractor(tmp_path: Path) -> None:
-    data = valid_record() | {"id": "emit-pdf-off-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "emit-pdf-off-doc", "entity_id": "me", "track": "target-entity"}
     rec = schema.SourceRecord.model_validate(data)
     raw_bytes = build_pdf(
         lines=[("A link", 50.0, 60.0, 12.0)],
@@ -144,7 +144,7 @@ def test_emit_toggle_disables_html_hrefs_extractor(tmp_path: Path) -> None:
     data = valid_record() | {
         "id": "emit-html-off-doc",
         "entity_id": "me",
-        "track": "montenegro",
+        "track": "target-entity",
         "source_url": "https://gov.example/page",
     }
     rec = schema.SourceRecord.model_validate(data)

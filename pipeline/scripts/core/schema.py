@@ -56,9 +56,18 @@ class GeoScope(str, Enum):
 class Track(str, Enum):
     """Верхний аналитический раскол корпуса (== верхняя папка под ``sources/``; corpus-layout-v2).
 
+    ``target_entity`` (переименован из ``montenegro`` 2026-07-25): ПЕРВИЧНЫЙ объект анализа
+    проекта — государство(-а), для которого(-ых) пишется итоговый пакет предложений (сегодня
+    единственно Черногория; список — `pipeline/config/target_entities.yaml`, НЕ хардкод в коде
+    — `discovery/manual.py::_default_track` читает его, не сравнивает jurisdiction с "me"
+    напрямую). Переименован из странового имени в ролевое: расширение фокуса на новую
+    юрисдикцию — правка конфига, не схемы; `entity_id` (== iso2 юрисдикции) внутри трека
+    остаётся содержательным разграничителем МЕЖДУ несколькими target-сущностями, когда/если
+    их станет больше одной.
+
     ``research_papers`` (2026-07-19): третья, ГЕОГРАФИЧЕСКИ-НЕЙТРАЛЬНАЯ линия — вторичная
     аналитическая литература (think tank/university research hub отчёты: WEF, CNAS, UNIDIR
-    и т.п.), а не практика конкретного государства. Отличие от intl_xperience/montenegro:
+    и т.п.), а не практика конкретного государства. Отличие от intl_xperience/target_entity:
     те — ПЕРВОИСТОЧНИКИ (что государство реально сделало/приняло), это — АНАЛИЗ О практиках
     (что исследователи ДУМАЮТ о них); классическое разделение primary/secondary sources.
     entity_id для этого трека — слаг ИЗДАТЕЛЯ (`wef`/`unidir`/`cnas`, не iso2 — geo_scope
@@ -82,7 +91,7 @@ class Track(str, Enum):
     """
 
     intl_xperience = "intl-xperience"
-    montenegro = "montenegro"
+    target_entity = "target-entity"
     research_papers = "research-papers"
     tech_standards = "tech-standards"
 

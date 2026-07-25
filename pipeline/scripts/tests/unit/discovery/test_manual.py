@@ -209,7 +209,7 @@ def _admit_decision(raw_hash: str, **overrides: object) -> dict[str, object]:
         "action": "admit",
         "id": "me-example-strategy-2026",
         "entity_id": "me",
-        "track": "montenegro",
+        "track": "target-entity",
         "issuer_type": "government",
         "geo_scope": "national",
         "doc_type": "national_strategy",
@@ -256,7 +256,7 @@ def test_apply_admit_creates_meta_yaml_at_correct_path(tmp_path: Path) -> None:
 
     summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
     assert summary.errors == []
-    meta_path = tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml"
+    meta_path = tmp_path / "target-entity" / "me" / "me-example-strategy-2026" / "meta.yaml"
     assert meta_path.exists()
     records = schema.load_records(tmp_path)
     assert len(records) == 1 and records[0].id == "me-example-strategy-2026"
@@ -355,7 +355,7 @@ def test_apply_dry_run_does_not_write(tmp_path: Path) -> None:
     assert summary.dry_run is True
     assert summary.errors == []
     assert schema.load_records(tmp_path) == []
-    meta_path = tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml"
+    meta_path = tmp_path / "target-entity" / "me" / "me-example-strategy-2026" / "meta.yaml"
     assert not meta_path.exists()
 
 
@@ -412,12 +412,43 @@ def test_apply_admit_authority_defaults_from_doc_type(
     assert rec.authority == expected_authority
 
 
-def test_apply_admit_track_defaults_me_jurisdiction_to_montenegro(tmp_path: Path) -> None:
+def test_apply_admit_track_defaults_me_jurisdiction_to_target_entity(tmp_path: Path) -> None:
     cand = _candidate(raw_hash="b" * 64, jurisdiction="me")
     store.save([cand], tmp_path / "candidates.yaml")
 
     manual.apply_decisions([_admit_no_defaults("b" * 64)], root=tmp_path)
-    assert schema.load_records(tmp_path)[0].track == schema.Track.montenegro
+    assert schema.load_records(tmp_path)[0].track == schema.Track.target_entity
+
+
+def test_load_target_entity_jurisdictions_reads_real_tracked_config() -> None:
+    """pipeline/config/target_entities.yaml — настоящий трекаемый файл, не фикстура."""
+    assert manual.load_target_entity_jurisdictions() == ("me",)
+
+
+def test_load_target_entity_jurisdictions_custom_path(tmp_path: Path) -> None:
+    path = tmp_path / "target_entities.yaml"
+    path.write_text("jurisdictions: [xx, yy]\n", encoding="utf-8")
+    assert manual.load_target_entity_jurisdictions(path) == ("xx", "yy")
+
+
+def test_default_track_not_hardcoded_me_falls_through_when_absent_from_config() -> None:
+    """Решение куратора 2026-07-25: список конфигурируем, jurisdiction=='me' САМ ПО СЕБЕ
+    в коде больше ничего не значит — только присутствие в конфиге. Инъекция другого
+    списка (без 'me') доказывает отсутствие хардкода: 'me' без совпадения в списке
+    падает в intl-xperience, как любая другая юрисдикция."""
+    track = manual._default_track(
+        "me", schema.IssuerType.government, target_entity_jurisdictions=("xx",)
+    )
+    assert track == schema.Track.intl_xperience
+
+
+def test_default_track_uses_injected_jurisdiction_list() -> None:
+    """Симметрично: юрисдикция из ИНЪЕЦИРОВАННОГО (не реального) списка триггерит
+    target_entity — подтверждает, что список читается конфигурируемо, не завязан на 'me'."""
+    track = manual._default_track(
+        "xx", schema.IssuerType.government, target_entity_jurisdictions=("xx",)
+    )
+    assert track == schema.Track.target_entity
 
 
 def test_apply_admit_track_defaults_think_tank_to_research_papers(tmp_path: Path) -> None:
@@ -485,7 +516,7 @@ def test_apply_admit_outcome_echoes_defaults(tmp_path: Path) -> None:
     detail = summary.outcomes[0].detail
     assert "по дефолту" in detail
     assert "authority=soft_law" in detail
-    assert "track=montenegro" in detail
+    assert "track=target-entity" in detail
 
 
 def test_apply_admit_no_echo_when_all_explicit(tmp_path: Path) -> None:

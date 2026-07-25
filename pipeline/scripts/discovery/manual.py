@@ -13,8 +13,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from core import schema
+from core.env import REPO_ROOT
 from discovery import dedup, store
+
+TARGET_ENTITIES_CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "target_entities.yaml"
 
 
 def raw_hash_for_manual(normalized_url: str, title: str, doc_date: dt.date | None) -> str:
@@ -163,7 +168,8 @@ _WORKSHEET_HEADER = """\
   `authority` — из doc_type: legislation→binding_law, regulation→regulation,
   report/academic_paper→report, guidance/framework/national_strategy→soft_law,
   technical_standard/technical_spec→voluntary_standard. Исключения (draft!) — задавать явно.
-  `track` — jurisdiction=me→montenegro, think_tank/academia→research-papers, иначе intl-xperience.
+  `track` — jurisdiction в pipeline/config/target_entities.yaml (сегодня только me)→target-entity,
+  think_tank/academia→research-papers, иначе intl-xperience.
 - `relations` — если связь с другим документом реестра видна уже сейчас (`implements`/`cites`/…),
   указать сразу: второго прохода по документу не будет (pre-wave требование graph-v2).
 - `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf` (дефолт); сверить с квотой
@@ -228,13 +234,32 @@ _AUTHORITY_BY_DOC_TYPE = {
 }
 
 
-def _default_track(jurisdiction: str | None, issuer_type: schema.IssuerType) -> schema.Track:
-    """track — из jurisdiction/issuer_type. Приоритет: jurisdiction=me -> montenegro
-    (прецедент me-undp-aila-2025: igo-доклад О Черногории живёт в треке montenegro),
-    затем think_tank/academia -> research-papers (вторичная аналитика), иначе
-    intl-xperience. На всех 6 документах текущего корпуса дефолт угадывает точно."""
-    if jurisdiction == "me":
-        return schema.Track.montenegro
+def load_target_entity_jurisdictions(path: Path = TARGET_ENTITIES_CONFIG_PATH) -> tuple[str, ...]:
+    """Юрисдикции трека ``target_entity`` — из ``pipeline/config/target_entities.yaml``,
+    НЕ хардкод в коде (решение куратора 2026-07-25: список конфигурируем, но лениво —
+    сегодня в нём только Черногория; уход от хардкода важнее самого списка переключателей)."""
+    raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return tuple(raw["jurisdictions"])
+
+
+def _default_track(
+    jurisdiction: str | None,
+    issuer_type: schema.IssuerType,
+    *,
+    target_entity_jurisdictions: tuple[str, ...] | None = None,
+) -> schema.Track:
+    """track — из jurisdiction/issuer_type. Приоритет: jurisdiction в списке target-юрисдикций
+    (прецедент me-undp-aila-2025: igo-доклад о target-юрисдикции живёт в треке target_entity)
+    -> target_entity, затем think_tank/academia -> research-papers (вторичная аналитика),
+    иначе intl-xperience. ``target_entity_jurisdictions=None`` -> читается реальный
+    трекаемый конфиг (инъекция — только для тестов, не продакшн-путь)."""
+    jurisdictions = (
+        target_entity_jurisdictions
+        if target_entity_jurisdictions is not None
+        else load_target_entity_jurisdictions()
+    )
+    if jurisdiction is not None and jurisdiction in jurisdictions:
+        return schema.Track.target_entity
     if issuer_type in (schema.IssuerType.think_tank, schema.IssuerType.academia):
         return schema.Track.research_papers
     return schema.Track.intl_xperience
@@ -280,7 +305,7 @@ def _build_admit_record(
     """Построить ``SourceRecord`` из ``admit``-решения (промоушен, ничего не пишет на диск).
 
     Возвращает ``(запись, применённые_дефолты)`` — второй элемент вида
-    ``["authority=soft_law", "track=montenegro"]`` для эха в сводке apply (куратор
+    ``["authority=soft_law", "track=target-entity"]`` для эха в сводке apply (куратор
     видит, во что развернулись опущенные поля)."""
     missing = [k for k in _ADMIT_REQUIRED if k not in decision]
     if missing:

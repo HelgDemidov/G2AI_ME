@@ -266,7 +266,7 @@ _DECISIONS_YAML = """\
   action: admit
   id: me-example-strategy-2026
   entity_id: me
-  track: montenegro
+  track: target-entity
   issuer_type: government
   geo_scope: national
   doc_type: national_strategy
@@ -302,7 +302,7 @@ def test_apply_subcommand_admits_and_exits_zero(
     assert code == 0
     out = capsys.readouterr().out
     assert "Следующий шаг" in out
-    assert (tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
+    assert (tmp_path / "target-entity" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
 
 
 def test_apply_subcommand_error_exits_nonzero(
@@ -339,7 +339,7 @@ def test_apply_subcommand_dry_run_flag(tmp_path: Path, capsys: pytest.CaptureFix
     code = main(["apply", str(decisions_path), "--root", str(tmp_path), "--dry-run"])
     assert code == 0
     assert "dry-run" in capsys.readouterr().out
-    assert not (tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
+    assert not (tmp_path / "target-entity" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
 
 
 def test_apply_subcommand_rejects_non_list_decisions_file(tmp_path: Path) -> None:
@@ -355,7 +355,7 @@ _DECISIONS_YAML_BAD_AXIS = """\
   action: admit
   id: me-example-strategy-2026
   entity_id: me
-  track: montenegro
+  track: target-entity
   issuer_type: government
   geo_scope: national
   doc_type: national_strategy
@@ -398,7 +398,7 @@ def test_apply_subcommand_flags_invalid_axis_after_batch(
     assert "невалиден" in out
     assert "relevance.axis" in out and "вне словаря" in out
     # meta.yaml уже записан — гейт здесь постфактум, не блокирует запись (см. rationale)
-    assert (tmp_path / "montenegro" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
+    assert (tmp_path / "target-entity" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
 
 
 def test_apply_subcommand_dry_run_skips_post_batch_validation(
@@ -442,7 +442,7 @@ def test_snowball_subcommand_dry_run_finds_link_but_writes_nothing(
 ) -> None:
     from tests.support import build_pdf, valid_record, write_doc
 
-    data = valid_record() | {"id": "snowball-cli-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "snowball-cli-doc", "entity_id": "me", "track": "target-entity"}
     raw_bytes = build_pdf(
         lines=[("Egypt AI Strategy", 50.0, 60.0, 12.0)],
         links=[("https://ai.gov.eg/strategy.pdf", 50.0, 55.0, 300.0, 80.0)],
@@ -498,7 +498,7 @@ def test_snowball_subcommand_without_citations_does_not_load_dotenv(
 def test_snowball_subcommand_persists_candidate(tmp_path: Path) -> None:
     from tests.support import build_pdf, valid_record, write_doc
 
-    data = valid_record() | {"id": "snowball-cli-persist-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "snowball-cli-persist-doc", "entity_id": "me", "track": "target-entity"}
     raw_bytes = build_pdf(
         lines=[("Egypt AI Strategy", 50.0, 60.0, 12.0)],
         links=[("https://ai.gov.eg/strategy.pdf", 50.0, 55.0, 300.0, 80.0)],
@@ -517,8 +517,8 @@ def test_snowball_subcommand_persists_candidate(tmp_path: Path) -> None:
 def test_snowball_subcommand_doc_filter_excludes_other_documents(tmp_path: Path) -> None:
     from tests.support import build_pdf, valid_record, write_doc
 
-    data_a = valid_record() | {"id": "snowball-doc-a", "entity_id": "me", "track": "montenegro"}
-    data_b = valid_record() | {"id": "snowball-doc-b", "entity_id": "me", "track": "montenegro"}
+    data_a = valid_record() | {"id": "snowball-doc-a", "entity_id": "me", "track": "target-entity"}
+    data_b = valid_record() | {"id": "snowball-doc-b", "entity_id": "me", "track": "target-entity"}
     write_doc(
         tmp_path,
         data_a,
