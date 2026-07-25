@@ -17,16 +17,21 @@ CLI печатает статистику и примеры запросов.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import logging
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import networkx as nx
 import yaml
 
-from core.schema import VOCAB_DIR, DEFAULT_SOURCES, GeoScope, SourceRecord
+from core.schema import VOCAB_DIR, DEFAULT_SOURCES, GeoScope, RelationType, SourceRecord
 from core.validate_sources import validate_sources
+
+logger = logging.getLogger("build_graph")
 
 JURISDICTIONS_PATH = VOCAB_DIR / "jurisdictions.yaml"
 
@@ -70,6 +75,100 @@ def load_jurisdictions(path: Path = JURISDICTIONS_PATH) -> dict[str, dict[str, A
     return result
 
 
+@dataclass(frozen=True)
+class Validity:
+    """Временнóй интервал действия документа — ВЫВЕДЕННЫЙ, не хранимый (spec graph-v2 §1).
+
+    ``valid_to is None`` — открытый интервал (преемника нет). ``known=False`` — честная
+    неопределённость: либо у документа нет ни одной даты начала, либо преемник есть, но
+    сам без даты. Такой документ НИКОГДА не выпадает из среза молча — ``as_of`` включает
+    его с пометкой (принцип «сомнение ⇒ проза» этого же проекта).
+    """
+
+    valid_from: _dt.date | None
+    valid_to: _dt.date | None
+    known: bool
+
+
+def _valid_from(rec: SourceRecord) -> _dt.date | None:
+    """Начало действия: ``dates.effective`` (для законов точнее) иначе ``dates.published``."""
+    return rec.dates.effective or rec.dates.published
+
+
+def validity_intervals(records: list[SourceRecord]) -> dict[str, Validity]:
+    """Интервалы действия всех записей — чистая функция от реестра (spec graph-v2 §1).
+
+    Правило: ребро ``supersedes``/``superseded_by`` (нормализуются к одному направлению
+    «преемник →supersedes→ предшественник») закрывает интервал предшественника датой
+    начала преемника. ``amends`` НЕ закрывает — поправка меняет документ, а не заменяет
+    его. Несколько преемников → закрывает САМЫЙ РАННИЙ (+ warning: топология
+    подозрительная, обычно это ошибка курирования, а не реальная развилка).
+
+    Почему выводится, а не ведётся полями: ручная бухгалтерия действия закона на сотнях
+    записей протухает по построению — тот же аргумент, что похоронил ``in_force``
+    (spec post-acquisition-lifecycle §7). Пересборка графа бесплатна, поля — нет.
+    """
+    starts = {rec.id: _valid_from(rec) for rec in records}
+    successors: dict[str, list[str]] = {rec.id: [] for rec in records}
+    for rec in records:
+        for rel in rec.relations:
+            if rel.type is RelationType.supersedes:
+                successors.setdefault(rel.target, []).append(rec.id)   # rec заменяет target
+            elif rel.type is RelationType.superseded_by:
+                successors.setdefault(rec.id, []).append(rel.target)   # rec заменён target'ом
+
+    intervals: dict[str, Validity] = {}
+    for rec in records:
+        heirs = successors.get(rec.id, [])
+        heir_dates = sorted(d for d in (starts.get(h) for h in heirs) if d is not None)
+        if len(heir_dates) > 1:
+            logger.warning(
+                "  ⚠ %s: несколько преемников с датами (%s) — интервал закрывает самый ранний",
+                rec.id, ", ".join(d.isoformat() for d in heir_dates),
+            )
+        valid_to = heir_dates[0] if heir_dates else None
+        start = starts[rec.id]
+        # Преемник есть, но датировать закрытие нечем -> честное «не знаем», а не
+        # молчаливый вывод «действует до сих пор».
+        known = start is not None and (not heirs or valid_to is not None)
+        intervals[rec.id] = Validity(start, valid_to, known)
+    return intervals
+
+
+def _as_graphml_date(value: _dt.date | None) -> str:
+    """GraphML не умеет ``None`` — неизвестная дата едет пустой строкой (writer падает
+    на None, проверено; тот же приём, что у остальных скалярных атрибутов экспорта)."""
+    return value.isoformat() if value is not None else ""
+
+
+def as_of(graph: nx.MultiDiGraph, date: _dt.date) -> list[str]:
+    """doc-узлы, действовавшие на ``date`` (spec graph-v2 §1).
+
+    Границы: ``valid_from`` ВКЛЮЧИТЕЛЬНО (документ действует со дня вступления в силу),
+    ``valid_to`` ИСКЛЮЧИТЕЛЬНО (в день начала преемника действует уже преемник) — иначе
+    на стыке редакций обе версии оказались бы действующими одновременно.
+
+    Документы с ``validity_known=False`` включаются ВСЕГДА: неизвестность — не повод
+    молча удалить документ из среза, за который потом пишутся нормативные предложения.
+    """
+    selected: list[str] = []
+    for node, data in graph.nodes(data=True):
+        if data.get("ntype") != "document":
+            continue
+        if not data.get("validity_known", False):
+            selected.append(str(node))
+            continue
+        start = data.get("valid_from") or ""
+        end = data.get("valid_to") or ""
+        iso = date.isoformat()
+        if start and iso < start:
+            continue
+        if end and iso >= end:
+            continue
+        selected.append(str(node))
+    return sorted(selected)
+
+
 def build_graph(
     records: list[SourceRecord],
     jurisdictions: dict[str, dict[str, Any]] | None = None,
@@ -83,10 +182,12 @@ def build_graph(
             graph.add_node(node_id, ntype=ntype, label=label, **attrs)
 
     countries_seen: set[str] = set()
+    intervals = validity_intervals(records)  # выведенная валидность (spec graph-v2 §1)
 
     # первый проход: документы и концепты
     for rec in records:
         doc = _doc_node(rec.id)
+        validity = intervals[rec.id]
         ensure(
             doc,
             "document",
@@ -97,6 +198,9 @@ def build_graph(
             entity=rec.entity_id,
             issuer=rec.issuer,
         )
+        graph.nodes[doc]["valid_from"] = _as_graphml_date(validity.valid_from)
+        graph.nodes[doc]["valid_to"] = _as_graphml_date(validity.valid_to)
+        graph.nodes[doc]["validity_known"] = validity.known
         issuer = _issuer_node(rec.issuer)
         ensure(issuer, "issuer", rec.issuer, issuer_type=rec.issuer_type.value)
         graph.add_edge(doc, issuer, etype="published_by")
@@ -188,6 +292,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Построитель графа знаний G2AI-корпуса")
     parser.add_argument("sources", nargs="?", type=Path, default=DEFAULT_SOURCES)
     parser.add_argument("--graphml", type=Path, default=None, help="экспортировать граф в GraphML")
+    parser.add_argument(
+        "--as-of", dest="as_of", type=_dt.date.fromisoformat, default=None, metavar="YYYY-MM-DD",
+        help="временнóй срез: какие документы действовали на эту дату (валидность выводится "
+             "из рёбер supersedes, не хранится полем)",
+    )
     args = parser.parse_args(argv)
 
     sources_path: Path = args.sources
@@ -201,6 +310,21 @@ def main(argv: list[str] | None = None) -> int:
 
     graph = build_graph(records, load_jurisdictions())
     print(summary(graph))
+
+    if args.as_of is not None:
+        # Срез — самостоятельный режим вывода: печатаем ЕГО и выходим, чтобы примеры
+        # запросов ниже (полный граф) не смешивались со срезом в одном выводе.
+        docs = as_of(graph, args.as_of)
+        print(f"\nДействовали на {args.as_of.isoformat()} ({len(docs)} из {len(records)}):")
+        for node in docs:
+            data = graph.nodes[node]
+            mark = "" if data.get("validity_known") else "  ⚠ валидность неизвестна"
+            span = f"{data.get('valid_from') or '?'} → {data.get('valid_to') or '…'}"
+            print(f"  {node[len('doc:'):]}  [{span}]{mark}")
+        if args.graphml is not None:
+            export_graphml(graph.subgraph(docs).copy(), args.graphml)
+            print(f"\nGraphML среза записан: {args.graphml}")
+        return 0
 
     # примеры запросов
     patterns = sorted(n[len("pattern:"):] for n, d in graph.nodes(data=True) if d.get("ntype") == "pattern")
