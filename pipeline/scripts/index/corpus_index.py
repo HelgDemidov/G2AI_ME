@@ -29,6 +29,7 @@ from index.bge_tokenizer import EMBED_MAX_TOKENS, token_counter
 from index.chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
 from core.env import REPO_ROOT
 from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, md_file
+from core.schema import superseded_ids as schema_superseded_ids
 
 DEFAULT_DB = REPO_ROOT / "pipeline" / "index" / "corpus.db"
 
@@ -80,7 +81,8 @@ CREATE TABLE IF NOT EXISTS doc_facets (
     axis           TEXT,
     target_fit     TEXT,
     assessed_stage TEXT,
-    sensitivity    TEXT NOT NULL DEFAULT 'public'
+    sensitivity    TEXT NOT NULL DEFAULT 'public',
+    superseded     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS topics_map (
     doc_id TEXT NOT NULL,
@@ -204,15 +206,26 @@ def _reset_derived_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_facets_sensitivity(conn: sqlite3.Connection) -> None:
-    """Аддитивная миграция ``doc_facets.sensitivity`` (spec embed-api-first §3.1) —
-    БЕЗ бампа ``SCHEMA_VERSION`` (тот дропнул бы ``vectors``, запрещено). Свежие/
-    мигрированные БД получают колонку прямо из ``_SCHEMA``; эта функция бэкфиллит
-    её на уже существующей v3 ``doc_facets``, где колонки ещё нет. Идемпотентна;
-    отсутствие таблицы (легаси до v3, ещё будет создана ниже) — no-op."""
+def _ensure_facet_column(conn: sqlite3.Connection, column: str, ddl: str) -> None:
+    """Аддитивная миграция колонки ``doc_facets`` БЕЗ бампа ``SCHEMA_VERSION`` (тот
+    дропнул бы ``vectors``, запрещено). Свежие/мигрированные БД получают колонку прямо
+    из ``_SCHEMA``; эта функция бэкфиллит её на уже существующей v3 ``doc_facets``, где
+    колонки ещё нет. Идемпотентна; отсутствие таблицы (легаси до v3, ещё будет создана
+    ниже) — no-op.
+
+    Обобщена на втором применении (``sensitivity`` — spec embed-api-first §3.1,
+    ``superseded`` — spec graph-v2 §2): третья аддитивная колонка добавляется строкой
+    в ``_ensure_facet_columns``, а не копией функции.
+    """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
-    if cols and "sensitivity" not in cols:
-        conn.execute("ALTER TABLE doc_facets ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'public'")
+    if cols and column not in cols:
+        conn.execute(f"ALTER TABLE doc_facets ADD COLUMN {column} {ddl}")
+
+
+def _ensure_facet_columns(conn: sqlite3.Connection) -> None:
+    """Все аддитивные колонки ``doc_facets``, добавленные после введения схемы v3."""
+    _ensure_facet_column(conn, "sensitivity", "TEXT NOT NULL DEFAULT 'public'")
+    _ensure_facet_column(conn, "superseded", "INTEGER NOT NULL DEFAULT 0")
 
 
 def create_db(db_path: Path) -> sqlite3.Connection:
@@ -223,7 +236,7 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     if _is_legacy_schema(conn):
         _reset_derived_tables(conn)
     conn.executescript(_SCHEMA)
-    _ensure_facets_sensitivity(conn)
+    _ensure_facet_columns(conn)
     write_meta(conn, "schema_version", SCHEMA_VERSION)
     conn.commit()
     return conn
@@ -233,14 +246,20 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
     """Перезаписать ``doc_facets``/``topics_map`` из курируемых записей (полная
     перезапись — O(сотен строк), дешевле любой инкрементальности diff'а). ``axis``/
     ``target_fit``/``assessed_stage`` — ``None``, если у записи ещё нет ``relevance``
-    (spec analyze-retrieval §2.3)."""
+    (spec analyze-retrieval §2.3).
+
+    ``superseded`` (spec graph-v2 §2) — кросс-документный фасет: считается общим
+    ``schema.superseded_ids`` (тем же, которым recheck-контур исключает записи из
+    ротации — одно определение на двух потребителей) на УЖЕ загруженном списке записей,
+    ноль новых чтений с диска."""
+    superseded = schema_superseded_ids(records)
     conn.execute("DELETE FROM doc_facets")
     conn.execute("DELETE FROM topics_map")
     conn.executemany(
         "INSERT INTO doc_facets "
         "(doc_id, entity_id, track, doc_type, authority, language, axis, target_fit, "
-        "assessed_stage, sensitivity) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assessed_stage, sensitivity, superseded) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 rec.id,
@@ -253,6 +272,7 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
                 rec.relevance.target_fit.value if rec.relevance else None,
                 rec.relevance.assessed_stage.value if rec.relevance else None,
                 rec.sensitivity.value,
+                int(rec.id in superseded),
             )
             for rec in records
         ],
