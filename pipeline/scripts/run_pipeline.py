@@ -933,9 +933,12 @@ def main(argv: list[str] | None = None) -> int:
         _report_unembedded(args.db, args.embed_backend)
 
     if args.graphml is not None and not args.dry_run:
-        graph = build_graph.build_graph(records, build_graph.load_jurisdictions())
+        # build_corpus_graph, а не голый build_graph: экспорт из оркестратора обязан
+        # нести тот же L1-слой цитат, что и CLI графа — иначе два «одинаковых» графа
+        # расходились бы содержанием.
+        graph, mining = build_graph.build_corpus_graph(records, args.sources)
         build_graph.export_graphml(graph, args.graphml)
-        logger.info("GraphML: %s", args.graphml)
+        logger.info("GraphML: %s (L1-цитат: %d)", args.graphml, len(mining.edges))
 
     rc = _report(results)
     return 1 if index_error else rc

@@ -29,6 +29,7 @@ import networkx as nx
 import yaml
 
 from core.schema import VOCAB_DIR, DEFAULT_SOURCES, GeoScope, RelationType, SourceRecord
+from graph import cite_mining
 from core.validate_sources import validate_sources
 
 logger = logging.getLogger("build_graph")
@@ -172,8 +173,16 @@ def as_of(graph: nx.MultiDiGraph, date: _dt.date) -> list[str]:
 def build_graph(
     records: list[SourceRecord],
     jurisdictions: dict[str, dict[str, Any]] | None = None,
+    cites: list[cite_mining.CiteEdge] | None = None,
 ) -> nx.MultiDiGraph:
-    """Собрать гетерогенный ориентированный мультиграф из записей реестра."""
+    """Собрать гетерогенный ориентированный мультиграф из записей реестра.
+
+    Чистая функция от ДАННЫХ: чтение ``doc.md`` ради L1-цитат живёт в
+    ``cite_mining.mine_corpus`` — сюда его результат приходит готовым списком
+    (``cites``). Каждое ребро несёт ``layer``: ``L0`` — курируемое (meta.yaml/vocab),
+    ``L1`` — детерминированный автослой. Значение вводится сразу трёхзначным (L2 —
+    будущая LLM-экстракция), чтобы она не потребовала миграции атрибутов.
+    """
     jurisdictions = jurisdictions or {}
     graph: nx.MultiDiGraph = nx.MultiDiGraph()
 
@@ -203,24 +212,24 @@ def build_graph(
         graph.nodes[doc]["validity_known"] = validity.known
         issuer = _issuer_node(rec.issuer)
         ensure(issuer, "issuer", rec.issuer, issuer_type=rec.issuer_type.value)
-        graph.add_edge(doc, issuer, etype="published_by")
+        graph.add_edge(doc, issuer, etype="published_by", layer="L0")
 
         for pattern in rec.g2ai_pattern:
             node = _pattern_node(pattern)
             ensure(node, "pattern", pattern)
-            graph.add_edge(doc, node, etype="exemplifies")
+            graph.add_edge(doc, node, etype="exemplifies", layer="L0")
 
         for topic in rec.topics:
             node = _topic_node(topic)
             ensure(node, "topic", topic)
-            graph.add_edge(doc, node, etype="about")
+            graph.add_edge(doc, node, etype="about", layer="L0")
 
         if rec.geo_scope is GeoScope.national:
             iso2 = rec.entity_id.lower()  # для наций entity_id == iso2 (даёт членство в блоках)
             countries_seen.add(iso2)
             node = _country_node(iso2)
             ensure(node, "jurisdiction", iso2.upper(), jlevel="country")
-            graph.add_edge(doc, node, etype="applies_to")
+            graph.add_edge(doc, node, etype="applies_to", layer="L0")
 
     # member_of: страна -> блок (только для стран, встретившихся в корпусе)
     for key, info in jurisdictions.items():
@@ -230,15 +239,42 @@ def build_graph(
         bloc = _bloc_node(key)
         ensure(bloc, "jurisdiction", info["label"], jlevel="bloc")
         for iso2 in sorted(present):
-            graph.add_edge(_country_node(iso2), bloc, etype="member_of")
+            graph.add_edge(_country_node(iso2), bloc, etype="member_of", layer="L0")
 
     # второй проход: документ -> документ (relations; все doc-узлы уже созданы)
     for rec in records:
         doc = _doc_node(rec.id)
         for rel in rec.relations:
-            graph.add_edge(doc, _doc_node(rel.target), etype=rel.type.value)
+            graph.add_edge(doc, _doc_node(rel.target), etype=rel.type.value, layer="L0")
+
+    # третий проход: L1 — детерминированные цитаты (spec graph-v2 §3). Отличимы от
+    # курируемых по построению (layer/rule), а не по договорённости.
+    for edge in cites or []:
+        graph.add_edge(
+            _doc_node(edge.source_id), _doc_node(edge.target_id),
+            etype="cites", layer="L1", rule=edge.rule, identifier=edge.identifier,
+        )
 
     return graph
+
+
+def build_corpus_graph(
+    records: list[SourceRecord], root: Path, *, write_leads: bool = True
+) -> tuple[nx.MultiDiGraph, cite_mining.MiningResult]:
+    """Граф корпуса «под ключ»: L0 из реестра + L1 из майнинга ``doc.md``.
+
+    Единственная точка сшивания для ОБОИХ потребителей (CLI этого модуля и
+    ``run_pipeline --graphml``) — иначе экспорт из оркестратора молча остался бы без
+    L1-слоя, и два «одинаковых» графа расходились бы содержанием.
+
+    ``write_leads=False`` — для вызывающих сторон, которым нельзя писать на диск
+    (dry-run/тесты): майнинг чистый, побочный эффект ровно один и он отключаем.
+    """
+    mining = cite_mining.mine_corpus(records, root)
+    graph = build_graph(records, load_jurisdictions(), cites=mining.edges)
+    if write_leads:
+        cite_mining.save_leads(mining.leads, root)
+    return graph, mining
 
 
 def docs_by_pattern(graph: nx.MultiDiGraph, pattern: str) -> list[str]:
@@ -308,8 +344,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {err}", file=sys.stderr)
         return 1
 
-    graph = build_graph(records, load_jurisdictions())
+    graph, mining = build_corpus_graph(records, sources_path)
     print(summary(graph))
+    if mining.edges:
+        print(f"L1-цитат: {len(mining.edges)} (детерминированный автослой, ноль LLM)")
+    if mining.leads:
+        print(
+            f"Цитаты без записи в корпусе: {len(mining.leads)} -> "
+            f"{cite_mining.leads_path(sources_path)} (сырьё для discovery, НЕ кандидаты)"
+        )
+    for entry in mining.dangling:
+        print(f"  ⚠ identifiers.yaml: {entry}")
 
     if args.as_of is not None:
         # Срез — самостоятельный режим вывода: печатаем ЕГО и выходим, чтобы примеры
