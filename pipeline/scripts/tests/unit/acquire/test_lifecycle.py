@@ -6,8 +6,16 @@
 """
 from __future__ import annotations
 
+import subprocess
+from typing import Any
+
 from acquire import acquisition
 from core import schema
+
+# Снято ДО autouse-заглушки герметичности (tests/unit/conftest.py подменяет
+# ``acquisition.request_snapshot``, чтобы ни один тест добычи не ходил в сеть) —
+# тестам САМОЙ функции нужна настоящая реализация, а не заглушка.
+_REAL_REQUEST_SNAPSHOT = acquisition.request_snapshot
 
 
 def _headers(*extra: str, status: int = 200) -> str:
@@ -65,6 +73,42 @@ def test_validator_capture_rungs_are_publisher_owned_only() -> None:
         schema.AcquisitionMethod.direct,
         schema.AcquisitionMethod.official_alt,
     }
+
+
+# --- §4: SavePageNow — fire-and-forget, никогда не исключение ---
+
+
+def _capture_curl(monkeypatch: Any, *, returncode: int = 0) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+def test_request_snapshot_hits_savepagenow_endpoint(monkeypatch: Any) -> None:
+    calls = _capture_curl(monkeypatch)
+    assert _REAL_REQUEST_SNAPSHOT("https://example.gov/strategy.pdf") is True
+    assert calls[0][-1] == "https://web.archive.org/save/https://example.gov/strategy.pdf"
+    assert "--max-time" in calls[0]  # снимок — страховка, а не часть критического пути
+
+
+def test_request_snapshot_returns_false_on_curl_error(monkeypatch: Any) -> None:
+    """Отказ Wayback не обязан ничего ронять: ретраев нет, гарантии нет — долговечность
+    держит локальный raw, а не этот вызов."""
+    _capture_curl(monkeypatch, returncode=28)
+    assert _REAL_REQUEST_SNAPSHOT("https://example.gov/doc.pdf") is False
+
+
+def test_request_snapshot_survives_missing_curl(monkeypatch: Any) -> None:
+    def boom(cmd: list[str], **kw: Any) -> None:
+        raise OSError("curl не найден")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert _REAL_REQUEST_SNAPSHOT("https://example.gov/doc.pdf") is False
 
 
 def test_browser_rung_synthetic_headers_carry_no_validators() -> None:

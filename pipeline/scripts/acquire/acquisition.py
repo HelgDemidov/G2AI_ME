@@ -8,6 +8,8 @@ that calls into it, same separation as ``build_graph.py``/``corpus_index.py``.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -21,6 +23,8 @@ from urllib.parse import quote
 import pdfplumber
 
 from core import browser_resolver, schema
+
+logger = logging.getLogger("acquisition")
 
 
 class AcquisitionOutcome(str, Enum):
@@ -646,6 +650,42 @@ def find_wayback_snapshot(
         return None  # неразбираемая строка — трактуем как «снимка нет», не IndexError
     timestamp = fields[1]
     return ArchiveSnapshot(timestamp, f"https://web.archive.org/web/{timestamp}id_/{original_url}")
+
+
+# --- проактивный снимок: SavePageNow при добыче (§4 spec post-acquisition-lifecycle) ---
+WAYBACK_SAVE_URL = "https://web.archive.org/save/"
+SPN_TIMEOUT_SECONDS = 20  # жёсткий потолок: снимок — страховка, а не часть критического пути
+
+
+def request_snapshot(url: str, *, timeout: int = SPN_TIMEOUT_SECONDS) -> bool:
+    """Попросить Wayback сохранить ТЕКУЩУЮ редакцию ``url`` (SPN2, анонимно).
+
+    Fire-and-forget: тело ответа не читается, ретраев нет, ЛЮБОЙ отказ — WARNING в
+    лог и ``False``, никогда не исключение. Долговечность обеспечивает локальный raw
+    (и будущий R2-бэкап), а это — страховка на случай смерти официального URL: когда
+    archive-ступень лестницы понадобится, снимок нужной редакции уже будет существовать.
+    Ровно практика, которой Wikipedia автоархивирует каждую внешнюю ссылку.
+
+    Анонимного доступа достаточно на нашем темпе (единицы запросов за прогон);
+    аутентифицированный SPN с более высокими лимитами — эскалация на случай, если
+    анонимный начнёт отказывать.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-sS", "-o", os.devnull,
+                "--connect-timeout", str(timeout), "--max-time", str(timeout),
+                f"{WAYBACK_SAVE_URL}{url}",
+            ],
+            check=False,
+        )
+    except OSError as exc:  # curl отсутствует/не запускается — не повод ронять добычу
+        logger.warning("SavePageNow недоступен для %s: %s", url, exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning("SavePageNow не ответил для %s (curl exit %d)", url, proc.returncode)
+        return False
+    return True
 
 
 _CDX_MIMETYPE_BY_FORMAT = {

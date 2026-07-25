@@ -465,6 +465,140 @@ def test_do_download_resets_stale_validators_and_confirms(tmp_path: Path, monkey
     assert st.etag is None and st.http_last_modified is None and st.etag_confirms == 0
 
 
+def _spy_snapshot(monkeypatch: Any, *, ok: bool = True) -> list[str]:
+    """Записывать URL, за которые дёрнули SavePageNow (сеть не трогается)."""
+    calls: list[str] = []
+
+    def fake(url: str, **kw: Any) -> bool:
+        calls.append(url)
+        return ok
+
+    monkeypatch.setattr("acquire.acquisition.request_snapshot", fake)
+    return calls
+
+
+def test_do_download_requests_snapshot_for_live_public_record(tmp_path: Path, monkeypatch: Any) -> None:
+    """§4: каждая НАША редакция публичного документа получает офсайт-копию — страховка
+    на случай будущей смерти URL (тогда archive-ступень найдёт нужную редакцию, а не
+    случайный старый снимок)."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url]
+    assert schema.load_state(schema.state_file(rec, tmp_path)).snapshot_requested is not None
+
+
+def test_do_download_skips_snapshot_for_confidential(tmp_path: Path, monkeypatch: Any) -> None:
+    """Обращение к Wayback публично — тот же гейт, что запрещает confidential-записям
+    archive-ступень лестницы."""
+    rec = make(sensitivity="confidential")
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == []
+    assert schema.load_state(schema.state_file(rec, tmp_path)).snapshot_requested is None
+
+
+@pytest.mark.parametrize(
+    "method,fidelity",
+    [
+        (schema.AcquisitionMethod.official_alt, schema.Fidelity.rehost),
+        (schema.AcquisitionMethod.manual, schema.Fidelity.manual),
+        (schema.AcquisitionMethod.archive, schema.Fidelity.archived_snapshot),
+    ],
+)
+def test_do_download_skips_snapshot_for_non_own_edition(
+    tmp_path: Path, monkeypatch: Any, method: schema.AcquisitionMethod, fidelity: schema.Fidelity
+) -> None:
+    """Снимать нечего: rehost — чужой хост, manual — файл из папки загрузок,
+    archived_snapshot — снимок уже существует (им мы и добыли документ)."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(method, fidelity, ClassifiedResponse(AcquisitionOutcome.ok, 200, "ok")),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == []
+
+
+def test_do_download_snapshot_is_idempotent_for_unchanged_bytes(tmp_path: Path, monkeypatch: Any) -> None:
+    """Повторная (напр. --force) добыча тех же байт не дёргает SPN снова: поле-дата
+    существует именно ради этого."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url]
+
+
+def test_do_download_snapshot_refires_when_bytes_changed(tmp_path: Path, monkeypatch: Any) -> None:
+    """Смена байт = новая редакция: она обязана получить СВОЙ снимок, иначе Wayback
+    навсегда останется с предыдущей версией документа."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch)
+    for body in (b"%PDF-1.4 v1", b"%PDF-1.4 v2 changed"):
+        monkeypatch.setattr(
+            "acquire.acquisition.run_ladder",
+            _fake_ladder(
+                schema.AcquisitionMethod.direct, schema.Fidelity.live,
+                ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=body,
+            ),
+        )
+        _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url, rec.source_url]
+
+
+def test_do_download_survives_snapshot_failure(tmp_path: Path, monkeypatch: Any) -> None:
+    """Отказ SPN — WARNING, не ошибка документа: страховка не может ронять добычу.
+    Дата всё равно пишется (по факту ПОПЫТКИ) — иначе отказавший сервис долбился бы
+    на каждом последующем прогоне."""
+    rec = make()
+    calls = _spy_snapshot(monkeypatch, ok=False)
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"),
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert calls == [rec.source_url]
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.sha256 is not None and st.snapshot_requested is not None
+
+
 def test_do_download_html_record_targets_raw_html(tmp_path: Path, monkeypatch: Any) -> None:
     """source_format=html -> цель скачивания raw.html, не raw.pdf (ext-маршрутизация)."""
     rec = make(source_format="html")

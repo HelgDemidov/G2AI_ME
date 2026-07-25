@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 
+from acquire import acquisition
 from convert import converters
 from discovery import registry_store, store
 from index import corpus_index
@@ -34,6 +35,18 @@ def _hermetic_cloud_env(monkeypatch: Any) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "")
     monkeypatch.setattr(converters, "_CLOUD_DISABLED", False)
     monkeypatch.setattr(converters, "_CLOUD_KEY_WARNED", False)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_savepagenow(monkeypatch: Any) -> None:
+    """Проактивный снимок (spec post-acquisition-lifecycle §4) — единственный сетевой
+    вызов, который ``_do_download`` делает САМ, вне замоканной лестницы: любой уже
+    существующий тест успешной добычи иначе начал бы молча дёргать web.archive.org.
+
+    Заглушка возвращает True (успех), поэтому наблюдаемое поведение — как у рабочего
+    SPN; тесты, проверяющие сам вызов/отказ, ставят свой спай поверх (monkeypatch
+    внутри теста применяется ПОСЛЕ фикстуры)."""
+    monkeypatch.setattr(acquisition, "request_snapshot", lambda url, **kw: True)
 
 
 # Боевые машиннописаные артефакты, которые ни один unit-тест не имеет права трогать.

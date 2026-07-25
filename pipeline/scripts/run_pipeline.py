@@ -198,6 +198,32 @@ def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
             schema.save_state(state_path, state)
 
 
+# Ступени добычи, чей результат — НАША редакция официального URL. Только их и есть
+# смысл просить заархивировать: rehost — чужой хост, manual — файл из папки загрузок
+# (URL издателя мог и не отдать его), archived_snapshot — снимок уже существует.
+_SNAPSHOT_FIDELITIES = frozenset({schema.Fidelity.live, schema.Fidelity.rendered})
+
+
+def _maybe_request_snapshot(rec: schema.SourceRecord, state: schema.OperationalState) -> None:
+    """Проактивный снимок редакции в Wayback (spec post-acquisition-lifecycle §4).
+
+    Три гейта: ``sensitivity != confidential`` (обращение к Wayback публично — тот же
+    принцип, что запрещает confidential-записям archive-ступень), fidelity нашей
+    редакции (см. ``_SNAPSHOT_FIDELITIES``) и идемпотентность по
+    ``snapshot_requested``. Дата пишется по ФАКТУ ПОПЫТКИ, а не успеха: SPN
+    best-effort, и вечно долбить отказавший сервис на каждом прогоне — худший из
+    исходов. Смена байт raw сбрасывает поле у вызывающей стороны — новая редакция
+    получает собственный снимок.
+    """
+    if rec.sensitivity is schema.Sensitivity.confidential:
+        return
+    if state.fidelity not in _SNAPSHOT_FIDELITIES or state.snapshot_requested is not None:
+        return
+    if acquisition.request_snapshot(rec.source_url):
+        logger.info("  %s: запрошен снимок Wayback (SavePageNow)", rec.id)
+    state.snapshot_requested = _dt.date.today()
+
+
 # --- исполнители стадий (side-effect, атомарная запись) ---
 def _do_download(
     rec: schema.SourceRecord,
@@ -260,6 +286,7 @@ def _do_download(
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     st = raw.stat()
+    previous_sha = state.sha256
     state.sha256 = _sha256(raw)
     state.raw_size = st.st_size
     state.raw_mtime_ns = st.st_mtime_ns
@@ -278,6 +305,9 @@ def _do_download(
     else:
         state.etag = state.http_last_modified = None
     state.etag_confirms = 0
+    if state.sha256 != previous_sha:
+        state.snapshot_requested = None  # другие байты = другая редакция -> нужен новый снимок
+    _maybe_request_snapshot(rec, state)
     schema.save_state(state_path, state)
     logger.info("  добыто %s: метод=%s fidelity=%s (.state.yaml обновлён)", rec.id, result.method.value, result.fidelity.value)
     if pause > 0:
