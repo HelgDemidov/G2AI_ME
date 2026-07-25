@@ -193,3 +193,49 @@ def test_snowball_coexists_with_three_registry_connectors() -> None:
     )
     result = _run_check(code)
     assert result.returncode == 0, result.stderr
+
+
+def test_importing_discover_cli_registers_oecd_via_manifest() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert 'oecd' in registry.CONNECTORS, sorted(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_oecd_registered_as_registry_kind_and_config_gated_enabled() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "from core import schema\n"
+        "conn = registry.CONNECTORS['oecd']\n"
+        "assert conn.kind == schema.ConnectorKind.registry\n"
+        "assert conn.enabled is True\n"  # discovery_oecd.yaml: enabled: true
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_oecd_reachable_via_enabled_connectors_only_filter() -> None:
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "found = registry.enabled_connectors(only=['oecd'])\n"
+        "assert len(found) == 1 and found[0].id == 'oecd'\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
+
+
+def test_all_four_registry_connectors_and_snowball_coexist() -> None:
+    """Четвёртый registry-коннектор (oecd) не вытесняет никого из предыдущих четырёх —
+    все пять доступны одновременно после импорта манифеста."""
+    code = (
+        "from discover import main\n"
+        "from discovery import registry\n"
+        "assert {'agora', 'eurlex', 'aiforgood', 'snowball', 'oecd'} <= set(registry.CONNECTORS)\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr

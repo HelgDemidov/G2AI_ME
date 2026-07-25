@@ -7,4 +7,5 @@ dedup/store/orchestrate) о конкретных коннекторах не з�
 from discovery.connectors import agora  # noqa: F401 — регистрирует "agora" при импорте пакета
 from discovery.connectors import aiforgood  # noqa: F401 — регистрирует "aiforgood" при импорте пакета
 from discovery.connectors import eurlex  # noqa: F401 — регистрирует "eurlex" при импорте пакета
+from discovery.connectors import oecd  # noqa: F401 — регистрирует "oecd" при импорте пакета
 from discovery.connectors import snowball  # noqa: F401 — регистрирует "snowball" при импорте пакета
