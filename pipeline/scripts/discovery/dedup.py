@@ -52,14 +52,22 @@ def normalized_title(title: str) -> str:
     return _NON_WORD_RE.sub("", title.lower())
 
 
-def _match_key(cand: CandidateRecord) -> tuple[str, str, str] | None:
+def _match_key(cand: CandidateRecord) -> tuple[str, str, str, str | None] | None:
     if not (cand.title and cand.issuer):
         return None
-    return (cand.issuer, normalized_title(cand.title), str(cand.doc_date))
+    return (cand.issuer, normalized_title(cand.title), str(cand.doc_date), cand.supersedes)
 
 
 class _PoolIndex:
     """Три индекса над пулом кандидатов: ``normalized_url`` / ключ-2 / ``content_hash``.
+
+    **Дискриминатор редакций входит во ВСЕ ТРИ ключа единообразно** (spec
+    discovery-candidates-sharding §5): кандидат с ``supersedes=X`` сопоставляется только
+    с записями с тем же ``supersedes=X``. Это единое правило, а не три особых случая —
+    редакция есть другая identity по определению, какой бы стратегией её ни ловили.
+    Стратегия 2 обычно спасена новой ``doc_date``, но одинаковая дата переиздания —
+    реальный кейс; единообразие снимает его. ``supersedes=None`` (все существующие
+    кандидаты) даёт ключи, эквивалентные прежним.
 
     **First-seen-wins:** если два кандидата пула дают один ключ (легаси-дубли внутри
     ``existing``), индекс хранит ПЕРВОГО в порядке добавления — ровно то, что возвращал
@@ -68,23 +76,23 @@ class _PoolIndex:
     """
 
     def __init__(self) -> None:
-        self.by_url: dict[str, CandidateRecord] = {}
-        self.by_key: dict[tuple[str, str, str], CandidateRecord] = {}
-        self.by_hash: dict[str, CandidateRecord] = {}
+        self.by_url: dict[tuple[str, str | None], CandidateRecord] = {}
+        self.by_key: dict[tuple[str, str, str, str | None], CandidateRecord] = {}
+        self.by_hash: dict[tuple[str, str | None], CandidateRecord] = {}
 
     def add(self, cand: CandidateRecord) -> None:
         if cand.normalized_url:
-            self.by_url.setdefault(cand.normalized_url, cand)
+            self.by_url.setdefault((cand.normalized_url, cand.supersedes), cand)
         key = _match_key(cand)
         if key is not None:
             self.by_key.setdefault(key, cand)
         if cand.content_hash:
-            self.by_hash.setdefault(cand.content_hash, cand)
+            self.by_hash.setdefault((cand.content_hash, cand.supersedes), cand)
 
     def find(self, cand: CandidateRecord) -> CandidateRecord | None:
         """Строгий порядок стратегий url -> key -> hash, остановка на первом попадании."""
         if cand.normalized_url:
-            hit = self.by_url.get(cand.normalized_url)
+            hit = self.by_url.get((cand.normalized_url, cand.supersedes))
             if hit is not None:
                 return hit
         key = _match_key(cand)
@@ -93,7 +101,7 @@ class _PoolIndex:
             if hit is not None:
                 return hit
         if cand.content_hash:
-            hit = self.by_hash.get(cand.content_hash)
+            hit = self.by_hash.get((cand.content_hash, cand.supersedes))
             if hit is not None:
                 return hit
         return None

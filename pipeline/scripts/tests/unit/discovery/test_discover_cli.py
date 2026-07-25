@@ -199,6 +199,48 @@ def test_inject_subcommand_parses_optional_flags(tmp_path: Path) -> None:
     assert cand.sensitivity == schema.Sensitivity.confidential
 
 
+def test_inject_subcommand_supersedes_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`--supersedes` заводит РЕДАКЦИЮ на том же URL (spec discovery-candidates-sharding §5):
+    dedup её не поглощает, сводка честно говорит, что это редакция."""
+    from tests.support import valid_record
+
+    rec = schema.SourceRecord.model_validate(
+        valid_record() | {"source_url": "https://gov.example.org/law.pdf"}
+    )
+    schema.save_record(rec, tmp_path)
+    common = [
+        "inject", "--root", str(tmp_path),
+        "--url", "https://gov.example.org/law.pdf",
+        "--title", "Registration Law", "--issuer", "Ministry", "--language", "en",
+    ]
+    assert main(common) == 0  # обычный кандидат на том же URL
+
+    code = main([*common, "--supersedes", rec.id])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"редакция, заменяет {rec.id}" in out
+    editions = [c for c in store.load(tmp_path) if c.supersedes == rec.id]
+    assert len(editions) == 1
+
+
+def test_inject_subcommand_supersedes_unknown_doc_id_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            "inject", "--root", str(tmp_path),
+            "--url", "https://gov.example.org/law.pdf",
+            "--title", "T", "--issuer", "I", "--language", "en",
+            "--supersedes", "me-no-such-doc-2026",
+        ]
+    )
+
+    assert code == 1
+    assert "нет в реестре корпуса" in capsys.readouterr().out
+    assert store.load(tmp_path) == []
+
+
 # --- worksheet (spec discovery-manual §3) ---
 
 

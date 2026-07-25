@@ -53,13 +53,15 @@ def _cmd_inject(args: argparse.Namespace) -> int:
             query=args.query,
             rights=schema.Rights(args.rights) if args.rights else None,
             sensitivity=schema.Sensitivity(args.sensitivity) if args.sensitivity else None,
+            supersedes=args.supersedes,
             root=args.root,
         )
     except ValueError as exc:
         print(f"✗ {exc}")
         return 1
     if is_new:
-        print(f"добавлен кандидат: raw_hash={cand.raw_hash[:12]} title={cand.title!r}")
+        edition = f" (редакция, заменяет {cand.supersedes})" if cand.supersedes else ""
+        print(f"добавлен кандидат: raw_hash={cand.raw_hash[:12]} title={cand.title!r}{edition}")
         return 0
     status = f"уже отклонён ранее: {cand.rejected_reason}" if cand.rejected_reason else "уже есть"
     print(f"кандидат уже присутствует ({status}): raw_hash={cand.raw_hash[:12]}")
@@ -194,6 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     p_inject.add_argument("--rights", default=None, choices=[r.value for r in schema.Rights])
     p_inject.add_argument(
         "--sensitivity", default=None, choices=[s.value for s in schema.Sensitivity]
+    )
+    p_inject.add_argument(
+        "--supersedes", default=None, metavar="DOC_ID",
+        help="doc-id записи корпуса, которую этот кандидат ЗАМЕНЯЕТ (новая редакция на том же "
+             "URL); предшественник обязан существовать в реестре",
     )
     p_inject.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
     p_inject.set_defaults(func=_cmd_inject)

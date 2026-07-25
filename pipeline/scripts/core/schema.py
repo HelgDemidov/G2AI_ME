@@ -372,7 +372,18 @@ class CandidateRecord(BaseModel):
     # dedup-ключи (заполняет discovery)
     normalized_url: str | None = None
     content_hash: str | None = None
-    # причина отказа (если триаж отклонил — кандидат остаётся в candidates.yaml)
+    # Заявленная РЕДАКЦИЯ: doc-id записи корпуса, которую этот кандидат сознательно
+    # заменяет (spec discovery-candidates-sharding §5). Идентичность кандидата — не URL,
+    # а пара (URL-идентичность, редакция): новая редакция закона живёт на ТОМ ЖЕ URL
+    # (задокументированный факт «движущейся цели»), и без дискриминатора dedup поглощал
+    # бы её как дубль предшественника — цикл редакций был бы физически невозможен через
+    # единственную дверь `inject`. Концептуально — различение work/expression из ELI:
+    # URL адресует work, корпусу нужны expressions. Дефолт None => поведение всех
+    # существующих путей не меняется ни на бит (ключи с None-компонентой эквивалентны
+    # прежним). Заполняется ТОЛЬКО явным `inject --supersedes` (решение человека, не
+    # автоматика); `promote_candidate` материализует его в ребро графа.
+    supersedes: str | None = Field(default=None, pattern=ID_PATTERN)
+    # причина отказа (если триаж отклонил — кандидат остаётся в слое кандидатов)
     rejected_reason: str | None = None
 
 
@@ -539,6 +550,13 @@ def promote_candidate(
     его non-None — резолюция ``language if language is not None else cand.language`` (override
     побеждает, ``None`` -> прежнее поведение). manual/directed_search-кандидаты с языком на
     ``inject`` продолжают работать без override (обратная совместимость).
+
+    ``cand.supersedes`` (v4, spec discovery-candidates-sharding §5) — ЕДИНСТВЕННАЯ точка, где
+    временнáя цепочка редакций материализуется в курируемое ядро: непустое значение
+    добавляет ребро ``Relation(supersedes, target=cand.supersedes)``. Слияние с переданными
+    ``relations`` — без дублей по ключу ``(type, target)``: куратор, вписавший то же ребро
+    руками в decisions.yaml, не получает двойного. Потребитель ребра — вывод валидности
+    (спек graph-v2): именно из него следует, что предшественник больше не действует.
     """
     title, issuer, source_url = cand.title, cand.issuer, cand.source_url
     resolved_language = language if language is not None else cand.language
@@ -561,6 +579,12 @@ def promote_candidate(
     assert title is not None and issuer is not None
     assert resolved_language is not None and source_url is not None
 
+    resolved_relations = list(relations or [])
+    if cand.supersedes is not None:
+        auto_edge = Relation(type=RelationType.supersedes, target=cand.supersedes)
+        if not any((r.type, r.target) == (auto_edge.type, auto_edge.target) for r in resolved_relations):
+            resolved_relations.append(auto_edge)
+
     return SourceRecord(
         id=id,
         entity_id=entity_id,
@@ -581,7 +605,7 @@ def promote_candidate(
         topics=topics or [],
         g2ai_pattern=g2ai_pattern or [],
         summary=summary,
-        relations=relations or [],
+        relations=resolved_relations,
     )
 
 

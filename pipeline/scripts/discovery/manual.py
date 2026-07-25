@@ -22,14 +22,25 @@ from discovery import dedup, store
 TARGET_ENTITIES_CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "target_entities.yaml"
 
 
-def raw_hash_for_manual(normalized_url: str, title: str, doc_date: dt.date | None) -> str:
+def raw_hash_for_manual(
+    normalized_url: str, title: str, doc_date: dt.date | None, supersedes: str | None = None
+) -> str:
     """sha256 канонической строки идентичности ручного/directed-кандидата.
 
     В отличие от коннекторных кандидатов, у ручного нет нативной записи-источника, откуда
     обычно берётся ``raw_hash`` — идентичность конструируется из уже нормализованного URL,
     заголовка и (опциональной) даты документа. Детерминирован: те же входы -> тот же хэш.
+
+    ``supersedes`` (spec discovery-candidates-sharding §5) входит в строку ТОЛЬКО когда
+    задан — хэши всех существующих кандидатов не меняются ни на бит. Без этого редакция с
+    совпадающими (url, title, doc_date) — а одинаковая дата переиздания реальна — дала бы
+    ``raw_hash``, БАЙТ-В-БАЙТ равный хэшу кандидата-предшественника (тот персистит в store
+    навсегда), и ``_resolve_candidate`` падал бы «raw_hash неоднозначен» для ОБОИХ: ключ
+    worksheet/apply сломан у обеих записей разом.
     """
     canonical = f"{normalized_url}|{title}|{doc_date.isoformat() if doc_date else ''}"
+    if supersedes is not None:
+        canonical = f"{canonical}|{supersedes}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -47,6 +58,7 @@ def inject(
     query: str | None = None,
     rights: schema.Rights | None = None,
     sensitivity: schema.Sensitivity | None = None,
+    supersedes: str | None = None,
     root: Path = schema.DEFAULT_SOURCES,
 ) -> tuple[schema.CandidateRecord, bool]:
     """Завести ручного/directed-search кандидата (spec discovery-manual §2).
@@ -56,9 +68,16 @@ def inject(
     Повторный inject той же ссылки — no-op (dedup ловит совпадение, включая уже отклонённые
     триажем — они не должны воскресать как "свежие").
 
+    ``supersedes`` (spec discovery-candidates-sharding §5) — doc-id записи корпуса, которую
+    кандидат сознательно ЗАМЕНЯЕТ (новая редакция на том же URL). Единственная дверь
+    остаётся единственной: редакция входит через тот же inject, но с ЯВНЫМ намерением
+    куратора. Валидация — предшественник обязан существовать в реестре: опечатка падает
+    здесь, а не при промоушене (реестр читается только когда флаг задан).
+
     Возвращает ``(candidate, is_new)``: при ``is_new=False`` — по возможности возвращается
-    СУЩЕСТВУЮЩАЯ запись (по совпадению ``normalized_url``), чтобы вызывающая сторона могла
-    сообщить куратору причину (уже есть / уже отклонён и почему), не только сам факт дубля.
+    СУЩЕСТВУЮЩАЯ запись (по совпадению пары ``(normalized_url, supersedes)``), чтобы
+    вызывающая сторона могла сообщить куратору причину (уже есть / уже отклонён и почему),
+    не только сам факт дубля.
     """
     if kind == schema.ConnectorKind.directed_search:
         if not campaign:
@@ -69,13 +88,21 @@ def inject(
     else:
         connector_id = "manual"
 
+    if supersedes is not None:
+        known_ids = {rec.id for rec in schema.load_records(root)}
+        if supersedes not in known_ids:
+            raise ValueError(
+                f"--supersedes {supersedes!r}: такого документа нет в реестре корпуса "
+                "(редакция обязана ссылаться на существующего предшественника)"
+            )
+
     normalized = dedup.normalize_url(url)
     # архетип канала отдельным полем не хранится — он выводится из грамматики
     # connector_id ("manual" | "search:<кампания>"), см. docstring CandidateRecord
     cand = schema.CandidateRecord(
         connector_id=connector_id,
         retrieved_at=dt.date.today(),
-        raw_hash=raw_hash_for_manual(normalized, title, date),
+        raw_hash=raw_hash_for_manual(normalized, title, date, supersedes),
         title=title,
         issuer=issuer,
         jurisdiction=jurisdiction,
@@ -87,6 +114,7 @@ def inject(
         native_summary=summary,
         matched_query=query,
         normalized_url=normalized,
+        supersedes=supersedes,
     )
 
     existing = store.load(root)
@@ -95,9 +123,31 @@ def inject(
 
     if fresh:
         return cand, True
-    matched = next((c for c in existing if c.normalized_url == normalized), None)
+    matched = next(
+        (c for c in existing if (c.normalized_url, c.supersedes) == (normalized, supersedes)), None
+    )
     assert absorbed  # dedup гарантирует: не fresh -> поглощён кем-то из existing
     return matched or cand, False
+
+
+def _registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
+    """Пары ``(нормализованный source_url, заменяемый doc-id | None)``, уже представленные
+    в реестре — правая часть реконсиляции ``pending_candidates``.
+
+    Каждая запись регистрирует ``(url, None)`` — URL как таковой корпусом покрыт — И
+    ``(url, target)`` для каждого своего ребра ``supersedes``: последнее означает «редакция,
+    заменяющая target, УЖЕ промоутнута». Разделение нужно, чтобы обычное пере-обнаружение
+    того же URL не всплывало ждущим, а конкретная редакция гасилась только собственным
+    промоушеном.
+    """
+    pairs: set[tuple[str, str | None]] = set()
+    for rec in records:
+        url = dedup.normalize_url(rec.source_url)
+        pairs.add((url, None))
+        for rel in rec.relations:
+            if rel.type is schema.RelationType.supersedes:
+                pairs.add((url, rel.target))
+    return pairs
 
 
 def pending_candidates(
@@ -105,19 +155,28 @@ def pending_candidates(
 ) -> list[schema.CandidateRecord]:
     """«Ждущие» кандидаты — вычисляется реконсиляцией, не хранимым статусом (spec §3).
 
-    Кандидат «ждущий», если у него нет ``rejected_reason`` И его URL (``normalized_url``,
-    либо ``source_url`` нормализованный на лету) не совпадает ни с одним ``source_url``
-    записи реестра. Кандидат без URL вовсе (совпадение только по ``content_hash``/тайтлу)
-    реконсиляцией по URL отфильтровать нельзя — остаётся ждущим (безопасный дефолт: не
-    прячем от куратора то, чего не можем уверенно сопоставить).
+    Кандидат «ждущий», если у него нет ``rejected_reason`` И его пара
+    ``(URL, supersedes)`` не представлена в реестре (см. ``_registered_pairs``). Кандидат
+    без URL вовсе (совпадение только по ``content_hash``/тайтлу) реконсиляцией по URL
+    отфильтровать нельзя — остаётся ждущим (безопасный дефолт: не прячем от куратора то,
+    чего не можем уверенно сопоставить).
+
+    **Почему пара, а не голый URL** (spec discovery-candidates-sharding §5): новая редакция
+    живёт на ТОМ ЖЕ URL, что предшественник. При сверке по одному URL кандидат-редакция
+    гасился бы НЕМЕДЛЕННО — совпадением с предшественником — и никогда не попадал бы в
+    worksheet; штатный батч-триаж редакций был бы физически невозможен, а цикл разрешения
+    дрейфа (спек post-acquisition-lifecycle §6) обрывался бы на первом же шаге. Редакция
+    перестаёт быть ждущей, когда промоутнута ОНА САМА (её ребро ``supersedes`` в реестре).
+    Куратор, переписавший авто-ребро при триаже, вернёт кандидата в worksheet — видимый
+    сбой, не тихий.
     """
-    registered_urls = {dedup.normalize_url(r.source_url) for r in records}
+    registered = _registered_pairs(records)
     pending: list[schema.CandidateRecord] = []
     for cand in candidates:
         if cand.rejected_reason is not None:
             continue
         url = cand.normalized_url or (dedup.normalize_url(cand.source_url) if cand.source_url else None)
-        if url is not None and url in registered_urls:
+        if url is not None and (url, cand.supersedes) in registered:
             continue
         pending.append(cand)
     return pending
@@ -173,6 +232,10 @@ _WORKSHEET_HEADER = """\
   указать сразу: второго прохода по документу не будет (pre-wave требование graph-v2).
 - `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf` (дефолт); сверить с квотой
   форматов волны.
+- Непустой `supersedes` в строке = НОВАЯ РЕДАКЦИЯ документа, уже лежащего в корпусе (тот же
+  URL — нормальное состояние для законов), а НЕ дубль: `reject` здесь потерял бы редакцию.
+  Ребро `supersedes` в meta.yaml проставит `apply` сам — вписывать его в `relations` руками
+  не нужно (дубля не будет, но и смысла нет).
 """
 
 
@@ -180,19 +243,21 @@ def render_worksheet(pending: list[schema.CandidateRecord]) -> str:
     """Markdown-таблица ждущих кандидатов + шапка-инструкция (spec §3)."""
     lines = [_WORKSHEET_HEADER, ""]
     lines.append(
-        "| raw_hash | title | issuer | jurisdiction | doc_date | connector_id "
+        "| raw_hash | title | issuer | jurisdiction | doc_date | supersedes | connector_id "
         "| native_tags/matched_query | source_url |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for cand in pending:
         tags = ", ".join(cand.native_tags) if cand.native_tags else (cand.matched_query or "")
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 cand.raw_hash[:12],
                 cand.title or "",
                 cand.issuer or "",
                 cand.jurisdiction or "",
                 cand.doc_date.isoformat() if cand.doc_date else "",
+                # непустое значение = редакция существующей записи корпуса, не дубль
+                cand.supersedes or "",
                 cand.connector_id,
                 tags,
                 cand.source_url or "",
