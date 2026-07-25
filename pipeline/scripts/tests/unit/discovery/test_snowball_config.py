@@ -58,7 +58,7 @@ def test_load_config_custom_path_full(tmp_path: Path) -> None:
         {
             "enabled": False,
             "source_filter": {
-                "tracks": ["montenegro"],
+                "tracks": ["target-entity"],
                 "target_fit": ["primary"],
                 "include_doc_ids": ["me-crps-registration-law-2025"],
                 "exclude_doc_ids": ["eu-ai-act-2024"],
@@ -80,7 +80,7 @@ def test_load_config_custom_path_full(tmp_path: Path) -> None:
     )
     config = snowball.load_config(path)
     assert config.enabled is False
-    assert config.source_filter.tracks == ("montenegro",)
+    assert config.source_filter.tracks == ("target-entity",)
     assert config.source_filter.include_doc_ids == ("me-crps-registration-law-2025",)
     assert config.url_filter.exclude_domains == ("example.com",)
     assert config.emit.pdf_annotations is False

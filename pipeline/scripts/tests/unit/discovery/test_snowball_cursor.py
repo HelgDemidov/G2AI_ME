@@ -39,7 +39,7 @@ def _pdf_with_link(url: str, anchor: str) -> bytes:
 
 
 def _seed_doc(root: Path, *, doc_id: str, raw_sha: str, links: list[tuple[str, str]]) -> schema.SourceRecord:
-    data = valid_record() | {"id": doc_id, "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": doc_id, "entity_id": "me", "track": "target-entity"}
     rec = schema.SourceRecord.model_validate(data)
     raw_bytes = build_pdf(
         lines=[(anchor, 50.0 + i * 0, 60.0 + i * 60.0, 12.0) for i, (_, anchor) in enumerate(links)],
@@ -50,7 +50,7 @@ def _seed_doc(root: Path, *, doc_id: str, raw_sha: str, links: list[tuple[str, s
 
 
 def test_document_without_raw_or_doc_md_is_skipped_not_errored(tmp_path: Path) -> None:
-    data = valid_record() | {"id": "no-raw-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "no-raw-doc", "entity_id": "me", "track": "target-entity"}
     write_doc(tmp_path, data)  # только meta.yaml — ни raw, ни doc.md
     rec = schema.SourceRecord.model_validate(data)
     result = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
@@ -79,7 +79,7 @@ def test_second_run_unchanged_corpus_is_noop(tmp_path: Path) -> None:
 
 
 def test_changed_doc_md_triggers_remine(tmp_path: Path) -> None:
-    data = valid_record() | {"id": "remine-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "remine-doc", "entity_id": "me", "track": "target-entity"}
     rec = schema.SourceRecord.model_validate(data)
     raw_bytes = _pdf_with_link("https://example.org/c", "Doc C")
     write_doc(tmp_path, data, raw=raw_bytes, md="version one", state={"sha256": "a" * 64})
@@ -120,7 +120,7 @@ def test_max_candidates_not_exceeded_document_marked_mined_normally(tmp_path: Pa
 def test_max_candidates_zero_emits_nothing_but_untouched_doc_not_truncated(tmp_path: Path) -> None:
     """Документ БЕЗ находок при max_candidates=0 — не «урезан» (нечего урезать), fingerprint
     фиксируется нормально; урезание — только когда реально что-то отброшено."""
-    data = valid_record() | {"id": "zero-cap-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "zero-cap-doc", "entity_id": "me", "track": "target-entity"}
     rec = schema.SourceRecord.model_validate(data)
     raw_bytes = build_pdf(lines=[("no links on this page", 50.0, 60.0, 12.0)])
     write_doc(tmp_path, data, raw=raw_bytes, md="no urls here either", state={"sha256": "a" * 64})
@@ -134,12 +134,12 @@ def test_self_link_and_corpus_link_are_excluded_end_to_end(tmp_path: Path) -> No
     other_data = valid_record() | {
         "id": "other-existing-doc",
         "entity_id": "me",
-        "track": "montenegro",
+        "track": "target-entity",
         "source_url": "https://example.org/other-doc",
     }
     other_rec = schema.SourceRecord.model_validate(other_data)
 
-    self_data = valid_record() | {"id": "self-link-doc", "entity_id": "me", "track": "montenegro"}
+    self_data = valid_record() | {"id": "self-link-doc", "entity_id": "me", "track": "target-entity"}
     self_rec = schema.SourceRecord.model_validate(self_data)
     raw_bytes = build_pdf(
         lines=[("self", 50.0, 60.0, 12.0), ("corpus", 50.0, 120.0, 12.0), ("fresh", 50.0, 180.0, 12.0)],
@@ -183,7 +183,7 @@ def test_url_filter_excludes_matching_domain_end_to_end(tmp_path: Path) -> None:
 
 
 def test_emit_toggle_disables_printed_urls_extractor(tmp_path: Path) -> None:
-    data = valid_record() | {"id": "emit-toggle-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "emit-toggle-doc", "entity_id": "me", "track": "target-entity"}
     rec = schema.SourceRecord.model_validate(data)
     raw_bytes = build_pdf(lines=[("no annotation links", 50.0, 60.0, 12.0)])
     write_doc(

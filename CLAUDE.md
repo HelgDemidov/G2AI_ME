@@ -20,7 +20,7 @@
 
 ## Структура репозитория
 ```
-sources/{track}/{entity}/{doc-id}/      # ПАПКА-НА-ДОКУМЕНТ (corpus-layout-v2): track=intl-xperience|montenegro|research-papers|tech-standards; entity=слаг (sg/ee/oecd…; для research-papers/tech-standards — издатель: wef/unidir/cnas…/itu-t/etsi…, НЕ iso2; geo_scope=international для tech-standards)
+sources/{track}/{entity}/{doc-id}/      # ПАПКА-НА-ДОКУМЕНТ (corpus-layout-v2): track=intl-xperience|target-entity|research-papers|tech-standards (target-entity — переименован из montenegro 2026-07-25, юрисдикции конфигурируемы через pipeline/config/target_entities.yaml, сегодня только me); entity=слаг (sg/ee/oecd…; для research-papers/tech-standards — издатель: wef/unidir/cnas…/itu-t/etsi…, НЕ iso2; geo_scope=international для tech-standards)
 #   ├─ meta.yaml    — курируемая запись (Dublin Core + topics/g2ai_pattern/summary/relevance); ТРЕКАЕТСЯ в git
 #   └─ raw.* (pdf|html|docx|xlsx — SourceFormat) / doc.md / .state.yaml — оригинал / конвертация / операц.состояние (sha256/acquisition); НЕ в git
 sources/candidates.yaml             # слой кандидатов (CandidateRecord) ДО допуска триажем (НЕ в git)

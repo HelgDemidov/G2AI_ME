@@ -473,7 +473,7 @@ def test_confidential_document_skips_llm_stage_entirely(tmp_path: Path) -> None:
     data = valid_record() | {
         "id": "confidential-doc",
         "entity_id": "me",
-        "track": "montenegro",
+        "track": "target-entity",
         "sensitivity": "confidential",
     }
     rec = schema.SourceRecord.model_validate(data)
@@ -501,7 +501,7 @@ def test_confidential_document_skips_llm_stage_entirely(tmp_path: Path) -> None:
 
 
 def test_normal_document_llm_stage_runs_when_emitted(tmp_path: Path) -> None:
-    data = valid_record() | {"id": "normal-doc", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "normal-doc", "entity_id": "me", "track": "target-entity"}
     rec = schema.SourceRecord.model_validate(data)
     # raw.* обязателен — discover_snowball скипает документ БЕЗ него ещё до LLM-гейта
     # (тот же ранний "нечего майнить" скип, что у pdf/html/md-экстракторов).
@@ -614,7 +614,7 @@ def test_discover_snowball_mines_html_document_end_to_end(tmp_path: Path) -> Non
     data = valid_record() | {
         "id": "html-e2e-doc",
         "entity_id": "me",
-        "track": "montenegro",
+        "track": "target-entity",
         "source_url": "https://gov.example/page",
     }
     rec = schema.SourceRecord.model_validate(data)

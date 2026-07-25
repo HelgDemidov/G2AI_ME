@@ -2,7 +2,7 @@
 # Операционное состояние — .state.yaml (локально); оригинал — raw.pdf; конвертация — doc.md.
 id: me-crps-registration-law-2025
 entity_id: me
-track: montenegro
+track: target-entity
 title: Zakon o registraciji privrednih i drugih subjekata
 issuer: Skupština Crne Gore
 issuer_type: government
@@ -38,7 +38,7 @@ relevance:
     2019/1151 — Art. 47, applicable from EU accession), directly tying this to
     Montenegro's EU-accession digital-alignment track. Not AI-specific, but genuine
     e-government legal/technical infrastructure (digital-registry pattern) —
-    relevant to the digital_sovereignty axis for the montenegro track. Confirmed
+    relevant to the digital_sovereignty axis for the target-entity track. Confirmed
     by text (doc.md, OCR path) — all 48 articles present, structure intact (VIII
     sections), readable Montenegrin despite OCR noise typical of a scanned gazette
     issue; also served as the first real-scan field test of convert-ocr (spec,

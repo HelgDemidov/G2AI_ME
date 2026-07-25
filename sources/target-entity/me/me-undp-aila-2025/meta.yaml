@@ -2,7 +2,7 @@
 # Операционное состояние — .state.yaml (локально); оригинал — raw.pdf; конвертация — doc.md.
 id: me-undp-aila-2025
 entity_id: me
-track: montenegro
+track: target-entity
 title: Artificial Intelligence Landscape Assessment (AILA) — Crna Gora, 2024
 issuer: United Nations Development Programme (UNDP) Montenegro
 issuer_type: igo
@@ -35,7 +35,7 @@ relevance:
   assessed_stage: confirmed
   rationale: 'First systematic assessment of Montenegro''s AI landscape (UNDP AILA methodology):
     government as AI user, government as ecosystem enabler, ethical AI development — direct
-    analytical input for the montenegro track (the very strategy-drafting need this corpus
+    analytical input for the target-entity track (the very strategy-drafting need this corpus
     serves). Primary on the digital_sovereignty axis: it maps the national baseline (institutions,
     data, skills, infrastructure) that any G2AI proposal must build on. Confirmed by text
     (doc.md, 2026-07-19): full Montenegrin edition converted cleanly (97 headings, section

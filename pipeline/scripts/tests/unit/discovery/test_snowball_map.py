@@ -114,11 +114,11 @@ def test_match_vocab_tags_case_insensitive() -> None:
 # --- apply_source_filter ---
 
 
-def _rec(id_: str, *, track: str = "montenegro", target_fit: str = "primary") -> schema.SourceRecord:
+def _rec(id_: str, *, track: str = "target-entity", target_fit: str = "primary") -> schema.SourceRecord:
     data = valid_record()
     data["id"] = id_
     data["track"] = track
-    data["entity_id"] = "me" if track == "montenegro" else "sg"
+    data["entity_id"] = "me" if track == "target-entity" else "sg"
     data["relevance"]["target_fit"] = target_fit
     return schema.SourceRecord.model_validate(data)
 
@@ -130,9 +130,9 @@ def test_apply_source_filter_empty_is_permissive() -> None:
 
 
 def test_apply_source_filter_tracks() -> None:
-    a = _rec("a-doc-one", track="montenegro")
+    a = _rec("a-doc-one", track="target-entity")
     b = _rec("b-doc-two", track="intl-xperience")
-    sf = SourceFilter(tracks=("montenegro",), target_fit=(), include_doc_ids=(), exclude_doc_ids=())
+    sf = SourceFilter(tracks=("target-entity",), target_fit=(), include_doc_ids=(), exclude_doc_ids=())
     assert apply_source_filter([a, b], sf) == [a]
 
 
@@ -195,7 +195,7 @@ def test_is_url_filtered_empty_filters_reject_nothing() -> None:
 
 def test_document_fingerprint_missing_state_and_md_uses_dash_literal(tmp_path: Path) -> None:
     rec = _rec("a-doc-one")
-    write_doc(tmp_path, valid_record() | {"id": "a-doc-one", "entity_id": "me", "track": "montenegro"})
+    write_doc(tmp_path, valid_record() | {"id": "a-doc-one", "entity_id": "me", "track": "target-entity"})
     fp = document_fingerprint(rec, tmp_path)
     expected = hashlib.sha256(b"-|-").hexdigest()
     assert fp == expected
@@ -203,7 +203,7 @@ def test_document_fingerprint_missing_state_and_md_uses_dash_literal(tmp_path: P
 
 def test_document_fingerprint_changes_with_raw_sha(tmp_path: Path) -> None:
     rec = _rec("a-doc-one")
-    data = valid_record() | {"id": "a-doc-one", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "a-doc-one", "entity_id": "me", "track": "target-entity"}
     write_doc(tmp_path, data, md="hello", state={"sha256": "a" * 64})
     fp1 = document_fingerprint(rec, tmp_path)
     write_doc(tmp_path, data, md="hello", state={"sha256": "b" * 64})
@@ -213,7 +213,7 @@ def test_document_fingerprint_changes_with_raw_sha(tmp_path: Path) -> None:
 
 def test_document_fingerprint_changes_with_doc_md_content(tmp_path: Path) -> None:
     rec = _rec("a-doc-one")
-    data = valid_record() | {"id": "a-doc-one", "entity_id": "me", "track": "montenegro"}
+    data = valid_record() | {"id": "a-doc-one", "entity_id": "me", "track": "target-entity"}
     write_doc(tmp_path, data, md="version one", state={"sha256": "a" * 64})
     fp1 = document_fingerprint(rec, tmp_path)
     write_doc(tmp_path, data, md="version two", state={"sha256": "a" * 64})
