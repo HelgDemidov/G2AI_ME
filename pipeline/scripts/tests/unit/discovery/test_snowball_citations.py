@@ -550,6 +550,48 @@ def test_save_leads_overwrites_not_appends(tmp_path: Path) -> None:
     assert loaded == [{"title": "Second run lead"}]
 
 
+def test_save_leads_separates_records_with_blank_line(tmp_path: Path) -> None:
+    """Лиды — вход РУЧНОЙ мини-кампании: слитное полотно записей нечитаемо
+    (тот же приём, что у store.save для кандидатов)."""
+    import yaml
+
+    leads = [
+        {"title": "First", "issuer": None, "year": None, "source_doc_id": "d1", "context": "a"},
+        {"title": "Second", "issuer": None, "year": None, "source_doc_id": "d1", "context": "b"},
+    ]
+    save_leads(leads, tmp_path)
+
+    text = (tmp_path / ".snowball_leads.yaml").read_text(encoding="utf-8")
+    assert "\n\n- " in text
+    assert yaml.safe_load(text) == leads  # round-trip не страдает
+
+
+def test_lead_context_is_single_line_without_markdown_breaks(tmp_path: Path) -> None:
+    """`context` лида не тащит markdown-структуру носителя: заголовки/пустые строки
+    между абзацами схлопнуты в пробелы, иначе YAML рвал запись пустыми строками, а
+    лимит CANDIDATE_SUMMARY_MAX тратился на пробелы вместо контента."""
+    md_path = tmp_path / "doc.md"
+    md_path.write_text(
+        "## References\n\n"
+        "###### 1. Introduction\n\n\n"
+        "> [Figure, p. 50 — VLM interpretation]\n\n\n"
+        "This figure shows two labels.\n\n"
+        "• Gov Agency, Undated Policy Report With No Link Anywhere\n",
+        encoding="utf-8",
+    )
+    fake = _FakeModel(
+        {"citations": [{"title": "Undated Policy Report With No Link Anywhere", "issuer": "Gov Agency", "year": None, "url": None}]}
+    )
+
+    _, leads = extract_text_citations(md_path, doc_id="doc-1", model="test/model", call_model=fake)
+
+    assert len(leads) == 1
+    context = leads[0].context
+    assert "\n" not in context
+    assert "  " not in context  # и никаких схлопнутых-но-двойных пробелов
+    assert "Introduction" in context and "This figure shows two labels." in context
+
+
 def test_save_leads_empty_list_still_writes_file(tmp_path: Path) -> None:
     save_leads([], tmp_path)
     assert (tmp_path / ".snowball_leads.yaml").exists()

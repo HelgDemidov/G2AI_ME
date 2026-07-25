@@ -163,6 +163,17 @@ class RawLink:
 # --- §2.4 шаг 4: санитизация одного URL (переиспользуется всеми экстракторами §2/§5) ---
 
 
+def normalize_whitespace(text: str) -> str:
+    """Схлопнуть ЛЮБЫЕ пробельные последовательности (включая переводы строк) в один пробел.
+
+    Единая нормализация текстовых полей, извлечённых из markdown-носителя: и anchor'а
+    URL-канала, и ``context`` текстовой цитаты. Без неё markdown-структура (заголовки,
+    пустые строки между абзацами, маркеры фигур) уезжает в YAML литеральными переводами
+    строк — запись раздувается и рвётся пустыми строками.
+    """
+    return " ".join(text.split())
+
+
 def sanitize_url(url: str | None) -> str | None:
     """Санитизировать один URL-кандидат (спек §2.4 шаг 4). ``None`` — мусор/отсев:
     не-http(s) схема (тем же путём отсеиваются ``mailto:``/``javascript:`` — §2.2/§2.3),
@@ -325,7 +336,7 @@ def extract_printed_urls(doc_md_path: Path, *, ocr_normalized: bool = False) -> 
             clean_url = sanitize_url(match.group(0))
             if clean_url is None:
                 continue
-            context = " ".join(line.split())
+            context = normalize_whitespace(line)
             links.append(RawLink(url=clean_url, anchor=context, ocr_text_url=ocr_normalized))
     return links
 
@@ -721,7 +732,13 @@ def extract_text_citations(
                         issuer=item.get("issuer"),
                         year=item.get("year"),
                         source_doc_id=doc_id,
-                        context=section[: schema.CANDIDATE_SUMMARY_MAX],
+                        # Пробелы схлопываются ДО усечения (та же нормализация, что у
+                        # anchor'а URL-канала выше): иначе markdown-разметка секции
+                        # (заголовки, пустые строки между абзацами, маркеры фигур)
+                        # уезжала в YAML литеральными переводами строк, лид разрывался
+                        # двойными пустыми строками и терял читаемость, а лимит
+                        # CANDIDATE_SUMMARY_MAX тратился на пробелы вместо контента.
+                        context=normalize_whitespace(section)[: schema.CANDIDATE_SUMMARY_MAX],
                     )
                 )
 
@@ -736,10 +753,15 @@ def save_leads(leads: list[dict[str, Any]], root: Path) -> None:
     каждым прогоном с ``--with-citations`` (не аппендится): лиды — сырьё СЛЕДУЮЩЕЙ
     directed-search мини-кампании, не постоянное состояние; известное ограничение —
     лиды документа, не пере-майненного в этом прогоне (курсор его пропустил), в
-    файл не попадают, пока документ не изменится или курсор не будет сброшен."""
-    fsio.atomic_write_text(
-        root / LEADS_FILENAME, yaml.safe_dump(leads, allow_unicode=True, sort_keys=False)
-    )
+    файл не попадают, пока документ не изменится или курсор не будет сброшен.
+
+    Каждый лид дампится отдельно, записи разделяются пустой строкой — тот же приём
+    человекочитаемости, что у ``store.save`` для кандидатов (YAML к пустой строке между
+    элементами верхнего уровня безразличен, а человеку файл читать глазами: лиды —
+    вход РУЧНОЙ мини-кампании, слитное полотно записей в нём нечитаемо).
+    """
+    parts = [yaml.safe_dump([lead], allow_unicode=True, sort_keys=False) for lead in leads]
+    fsio.atomic_write_text(root / LEADS_FILENAME, "\n".join(parts))
 
 
 # --- §4: discover_snowball() top-level ---
