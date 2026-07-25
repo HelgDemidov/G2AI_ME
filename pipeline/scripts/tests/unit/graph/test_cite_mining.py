@@ -48,6 +48,16 @@ def _place(root: Path, doc_id: str, md: str, *, url: str | None = None) -> Sourc
         ("Службени лист ЦГ бр. 12/2025", "SLCG:12/2025"),
         ("Službeni list CG br. 12/2025", "SLCG:12/2025"),
         ("Sluzbeni list CG, br 7/2024", "SLCG:7/2024"),
+        # Живая форма корпуса: кавычка после «CG» + двузначный год.
+        ('о привредним друштвима („Službeni list CG", br. 65/20)', "SLCG:65/2020"),
+        ("Regulation (EU) 2024/1689", "CELEX:32024R1689"),
+        ("Directive (EU) 2016/680", "CELEX:32016L0680"),
+        ("Decision (EU) 2020/1234", "CELEX:32020D1234"),
+        # Старая форма: числа в ОБРАТНОМ порядке относительно новой.
+        ("Regulation (EU) No 1025/2012", "CELEX:32012R1025"),
+        # ...и год в ней бывает двузначным — без разворота выходил CELEX:30091R3922.
+        ("Regulation (EEC) No 3922/91", "CELEX:31991R3922"),
+        ("Regulation (EEC) No 339/93", "CELEX:31993R0339"),
         ("соответствует ISO/IEC 42001:2023", "ISO/IEC 42001:2023"),
         ("ISO/IEC 23894", "ISO/IEC 23894"),
         ("ISO/IEC 27001-2:2022", "ISO/IEC 27001-2:2022"),
@@ -74,6 +84,23 @@ def test_patterns_extract_canonical_identifier(text: str, expected: str) -> None
 def test_patterns_reject_near_misses(text: str) -> None:
     """Ложное ребро в юридическом графе дороже пропущенного — границы важнее охвата."""
     assert cite_mining.extract_identifiers(text) == []
+
+
+def test_gazette_citation_lists_several_acts() -> None:
+    """Одна строка законно несёт НЕСКОЛЬКО актов — живая форма корпуса; терять хвост
+    списка значило бы молча потерять две связи из трёх."""
+    text = 'о привредним друштвима („Službeni list CG", br. 65/20, 146/21 i 4/24)'
+    assert [i for i, _ in cite_mining.extract_identifiers(text)] == [
+        "SLCG:146/2021", "SLCG:4/2024", "SLCG:65/2020",
+    ]
+
+
+def test_eu_act_and_compact_celex_share_identifier_space() -> None:
+    """Естественно-языковая ссылка и компактный CELEX дают ОДИН идентификатор — иначе
+    одна связь распалась бы на две записи справочника и два ребра."""
+    natural = cite_mining.extract_identifiers("Regulation (EU) 2024/1689")
+    compact = cite_mining.extract_identifiers("32024R1689")
+    assert natural[0][0] == compact[0][0] == "CELEX:32024R1689"
 
 
 def test_repeated_mention_gives_one_identifier() -> None:

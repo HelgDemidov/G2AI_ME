@@ -44,22 +44,60 @@ class CitePattern:
     ЗАПИСЬЮ, а не правкой ядра. Осознанная граница v1: сектор-3 CELEX покрыт типами
     актов L/R/D/E — рекомендации (H) и C-серия придут той же записью, когда встретятся
     в корпусе.
+
+    ``canonical`` возвращает СПИСОК: одна цитата законно несёт несколько актов
+    («Службени лист ЦГ бр. 65/20, 146/21 и 4/24» — три разных акта одной строкой).
     """
 
     name: str
     regex: re.Pattern[str]
-    canonical: Callable[[re.Match[str]], str]
+    canonical: Callable[[re.Match[str]], list[str]]
 
 
-def _celex(m: re.Match[str]) -> str:
-    return f"CELEX:{m.group(1).upper()}"
+def _celex(m: re.Match[str]) -> list[str]:
+    return [f"CELEX:{m.group(1).upper()}"]
 
 
-def _sluzbeni(m: re.Match[str]) -> str:
-    return f"SLCG:{int(m.group(1))}/{m.group(2)}"
+# Тип акта -> литера сектора-3 CELEX. Естественно-языковая ссылка канонизируется в ТО ЖЕ
+# пространство идентификаторов, что и компактная форма: «Regulation (EU) 2024/1689» и
+# «32024R1689» дают один идентификатор, одно ребро и одну строку identifiers.yaml.
+_EU_ACT_LETTER = {"regulation": "R", "directive": "L", "decision": "D"}
+# Гейт двузначных лет: «Службени лист ЦГ» существует только с 2006-го (независимость),
+# поэтому 2-значный год — всегда 20xx. Форма /99 под литерой «CG» существовать не может.
+_SLCG_CENTURY = 2000
 
 
-def _iso(m: re.Match[str]) -> str:
+def _eu_act(m: re.Match[str]) -> list[str]:
+    """«Regulation (EU) 2024/1689» / «Regulation (EEC) No 3922/91» -> CELEX.
+
+    Две ловушки, обе найдены живой сверкой с корпусом (2026-07-26), обе дают не пустой
+    результат, а НЕВЕРНУЮ связь — самый дорогой класс ошибки для юридического графа:
+
+    1. **Порядок чисел зависит от формы.** С 2015 года ЕС нумерует ``ГОД/номер``, до
+       того — ``No номер/ГОД``. Обе формы живут в корпусе одновременно (219 и 79
+       упоминаний), так что ветка не гипотетическая.
+    2. **Год в старой форме бывает двузначным** («No 3922/91» = 1991). Без разворота
+       получался ``CELEX:30091R3922`` — синтаксически правдоподобный, семантически
+       мусор. Двузначный год здесь всегда 19xx: четырёхзначная запись вошла в обиход
+       к концу 1990-х, а сама форма «No N/YY» после этого не использовалась.
+    """
+    first, second = int(m.group("first")), int(m.group("second"))
+    year, number = (second, first) if m.group("no") else (first, second)
+    if year < 100:
+        year += 1900
+    letter = _EU_ACT_LETTER[m.group("kind").lower()]
+    return [f"CELEX:3{year:04d}{letter}{number:04d}"]
+
+
+def _sluzbeni(m: re.Match[str]) -> list[str]:
+    idents: list[str] = []
+    for number, year in re.findall(r"(\d+)\s*/\s*(\d{2,4})", m.group("numbers")):
+        full_year = int(year) if len(year) == 4 else _SLCG_CENTURY + int(year)
+        idents.append(f"SLCG:{int(number)}/{full_year}")
+    return idents
+
+
+def _iso(m: re.Match[str]) -> list[str]:
     # Только именованные группы: смешение с позиционными уже давало сдвиг нумерации
     # (необязательная `/IEC` сама по себе — группа №1).
     ident = f"ISO/IEC {m.group('body')}" if m.group("iec") else f"ISO {m.group('body')}"
@@ -67,25 +105,38 @@ def _iso(m: re.Match[str]) -> str:
         ident += f"-{m.group('part')}"
     if m.group("year"):
         ident += f":{m.group('year')}"
-    return ident
+    return [ident]
 
 
-def _nist(m: re.Match[str]) -> str:
-    return f"NIST SP 800-{m.group('sp')}" if m.group("sp") else f"NIST AI {m.group('ai')}"
+def _nist(m: re.Match[str]) -> list[str]:
+    return [f"NIST SP 800-{m.group('sp')}"] if m.group("sp") else [f"NIST AI {m.group('ai')}"]
 
 
 _PATTERNS: dict[str, CitePattern] = {
     # Совпадает и в голом виде, и внутри ELI/URL-форм (`...uri=CELEX:32024R1689`) —
     # отдельный URL-паттерн не нужен.
     "celex": CitePattern("celex", re.compile(r"\b(3\d{4}[LRDE]\d{4})\b"), _celex),
+    # Живая калибровка по корпусу (2026-07-26): реальная форма несёт кавычку после «CG»
+    # и СПИСОК актов одной строкой — «(„Službeni list CG", br. 65/20, 146/21 i 4/24)».
     "sluzbeni_list_cg": CitePattern(
         "sluzbeni_list_cg",
         re.compile(
-            r"(?:Службени\s+лист\s+ЦГ|Slu[žz]beni\s+list\s+CG)\s*,?\s*"
-            r"(?:бр|br)\.?\s*(\d+)\s*/\s*(\d{2,4})",
+            r"(?:Службени\s+лист\s+ЦГ|Slu[žz]beni\s+list\s+CG)[\"“”„»']*\s*,?\s*"
+            r"(?:бр|br)\.?\s*"
+            r"(?P<numbers>\d+\s*/\s*\d{2,4}(?:\s*(?:,|и|i)\s*\d+\s*/\s*\d{2,4})*)",
             re.IGNORECASE,
         ),
         _sluzbeni,
+    ),
+    # Естественно-языковая ссылка на акт ЕС — доминирующая форма в конвертированном
+    # тексте (компактный CELEX в нём не встречается вовсе, 2026-07-26).
+    "eu_act": CitePattern(
+        "eu_act",
+        re.compile(
+            r"\b(?P<kind>Regulation|Directive|Decision)s?\s+\((?:EU|EC|EEC|Euratom)\)\s+"
+            r"(?P<no>No\s+)?(?P<first>\d{1,4})\s*/\s*(?P<second>\d{1,4})\b"
+        ),
+        _eu_act,
     ),
     "iso": CitePattern(
         "iso",
@@ -113,7 +164,8 @@ def extract_identifiers(text: str) -> list[tuple[str, str]]:
     for name in sorted(_PATTERNS):
         pattern = _PATTERNS[name]
         for match in pattern.regex.finditer(text):
-            seen.setdefault(pattern.canonical(match), name)
+            for ident in pattern.canonical(match):
+                seen.setdefault(ident, name)
     return sorted(seen.items())
 
 
