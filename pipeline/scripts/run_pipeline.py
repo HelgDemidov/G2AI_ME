@@ -267,6 +267,17 @@ def _do_download(
     state.fidelity = result.fidelity
     state.acquisition_checked = _dt.date.today()
     state.retrieved_snapshot_date = result.retrieved_snapshot_date
+    # Бутстрап валидаторов (spec post-acquisition-lifecycle §2) — ноль новых запросов,
+    # заголовки уже разобраны классификатором. Присваивание БЕЗУСЛОВНО (в т.ч. None):
+    # состояние описывает ТЕКУЩИЙ raw, и после передобычи через manual/archive прежние
+    # валидаторы официального URL к нашим байтам больше не относятся. Счётчик
+    # стабильности сбрасывается — «сколько раз подтверждён» считает только recheck.
+    if result.method in acquisition.VALIDATOR_CAPTURE_RUNGS:
+        state.etag = result.classified.etag
+        state.http_last_modified = result.classified.last_modified
+    else:
+        state.etag = state.http_last_modified = None
+    state.etag_confirms = 0
     schema.save_state(state_path, state)
     logger.info("  добыто %s: метод=%s fidelity=%s (.state.yaml обновлён)", rec.id, result.method.value, result.fidelity.value)
     if pause > 0:

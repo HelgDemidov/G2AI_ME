@@ -36,6 +36,13 @@ class ClassifiedResponse:
     outcome: AcquisitionOutcome
     http_status: int | None
     reason: str
+    # Серверные валидаторы ответа verbatim (spec post-acquisition-lifecycle §2).
+    # Заполняет ``classify_response`` из уже разобранных заголовков — ноль новых
+    # запросов: добыча и без того парсит ``curl -D``-дамп. Пути, не имеющие
+    # настоящего HTTP-ответа (watch-folder, синтетические заголовки браузерной
+    # ступени), оставляют None по построению.
+    etag: str | None = None
+    last_modified: str | None = None
 
 
 class AcquisitionBlocked(RuntimeError):
@@ -134,15 +141,22 @@ def classify_response(
     headers = _headers_from_text(headers_text)
 
     if status in DEAD_STATUS_CODES:
-        return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
+        result = ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
+    elif expected is schema.SourceFormat.html:
+        result = _classify_html(body, headers, status)
+    elif expected is schema.SourceFormat.docx:
+        result = _classify_docx(body, headers, status)
+    elif expected is schema.SourceFormat.xlsx:
+        result = _classify_xlsx(body, headers, status)
+    else:
+        result = _classify_pdf(body, headers, status)
 
-    if expected is schema.SourceFormat.html:
-        return _classify_html(body, headers, status)
-    if expected is schema.SourceFormat.docx:
-        return _classify_docx(body, headers, status)
-    if expected is schema.SourceFormat.xlsx:
-        return _classify_xlsx(body, headers, status)
-    return _classify_pdf(body, headers, status)
+    # Валидаторы навешиваются ЗДЕСЬ, а не в каждой формат-ветке: они не зависят от
+    # формата и не участвуют в самой классификации (спорный ответ остаётся спорным
+    # независимо от того, прислал ли сервер ETag).
+    result.etag = headers.get("etag")
+    result.last_modified = headers.get("last-modified")
+    return result
 
 
 def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
@@ -269,6 +283,15 @@ def fetch_and_classify(
     finally:
         headers_path.unlink(missing_ok=True)
 
+
+# Ступени, чьи валидаторы принадлежат ИЗДАТЕЛЮ и потому годятся для будущего
+# условного запроса (spec post-acquisition-lifecycle §2). Гейт обязателен: archive
+# отдаёт заголовки Wayback (recheck сравнивал бы ETag архива с ответом официального
+# сайта -> мусорный drift на каждой ротации), browser синтезирует заголовки сам,
+# manual вовсе не имеет HTTP-ответа.
+VALIDATOR_CAPTURE_RUNGS = frozenset(
+    {schema.AcquisitionMethod.direct, schema.AcquisitionMethod.official_alt}
+)
 
 # --- ladder routing (§2/§4/§9 of the spec) ---
 _FIDELITY_BY_AUTOMATIC_RUNG = {

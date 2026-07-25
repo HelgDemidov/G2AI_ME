@@ -383,6 +383,88 @@ def test_do_download_writes_state(tmp_path: Path, monkeypatch: Any) -> None:
     assert st.sha256 is not None
 
 
+def _fake_ladder(
+    method: schema.AcquisitionMethod,
+    fidelity: schema.Fidelity,
+    classified: ClassifiedResponse,
+    *,
+    body: bytes = b"%PDF-1.4 fake content",
+) -> Any:
+    """Подменить лестницу целиком: тест ступени/валидаторов не должен зависеть от
+    маршрутизации внутри run_ladder (она покрыта в test_acquisition.py)."""
+
+    def fake_run_ladder(rec_: SourceRecord, dest: Path, *, user_agent: str) -> Any:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(body)
+        return acquisition.LadderResult(method, fidelity, classified)
+
+    return fake_run_ladder
+
+
+def test_do_download_captures_validators_on_direct(tmp_path: Path, monkeypatch: Any) -> None:
+    """§2: успешная добыча с direct-ступени бутстрапит ETag/Last-Modified в .state.yaml —
+    без этого первый же recheck был бы безусловным полным GET."""
+    rec = make()
+    classified = ClassifiedResponse(
+        AcquisitionOutcome.ok, 200, "valid PDF", etag='"v1"', last_modified="Wed, 21 Oct 2026 07:28:00 GMT"
+    )
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(schema.AcquisitionMethod.direct, schema.Fidelity.live, classified),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.etag == '"v1"'
+    assert st.http_last_modified == "Wed, 21 Oct 2026 07:28:00 GMT"
+    assert st.etag_confirms == 0  # подтверждения считает только recheck, не добыча
+
+
+@pytest.mark.parametrize(
+    "method,fidelity",
+    [
+        (schema.AcquisitionMethod.archive, schema.Fidelity.archived_snapshot),
+        (schema.AcquisitionMethod.manual, schema.Fidelity.manual),
+        (schema.AcquisitionMethod.browser, schema.Fidelity.rendered),
+    ],
+)
+def test_do_download_does_not_capture_validators_off_publisher_rungs(
+    tmp_path: Path, monkeypatch: Any, method: schema.AcquisitionMethod, fidelity: schema.Fidelity
+) -> None:
+    """Гейт §2: заголовки Wayback/браузера/watch-folder издателю не принадлежат.
+    Записанные как валидаторы документа, они давали бы мусорный drift на КАЖДОЙ ротации
+    recheck — сравнение ETag архива с ответом официального сайта."""
+    rec = make()
+    classified = ClassifiedResponse(
+        AcquisitionOutcome.ok, 200, "ok", etag='"wayback-etag"', last_modified="Mon, 01 Jan 2024 00:00:00 GMT"
+    )
+    monkeypatch.setattr("acquire.acquisition.run_ladder", _fake_ladder(method, fidelity, classified))
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.acquisition_method is method
+    assert st.etag is None and st.http_last_modified is None
+
+
+def test_do_download_resets_stale_validators_and_confirms(tmp_path: Path, monkeypatch: Any) -> None:
+    """Передобыча через непубликаторскую ступень СТИРАЕТ прежние валидаторы: state
+    описывает текущий raw, а он больше не те байты официального URL."""
+    rec = make()
+    _place(rec, tmp_path, state={"etag": '"old"', "http_last_modified": "old-date", "etag_confirms": 5})
+    classified = ClassifiedResponse(AcquisitionOutcome.ok, 200, "manual acquisition via watch-folder")
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(schema.AcquisitionMethod.manual, schema.Fidelity.manual, classified),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    st = schema.load_state(schema.state_file(rec, tmp_path))
+    assert st.etag is None and st.http_last_modified is None and st.etag_confirms == 0
+
+
 def test_do_download_html_record_targets_raw_html(tmp_path: Path, monkeypatch: Any) -> None:
     """source_format=html -> цель скачивания raw.html, не raw.pdf (ext-маршрутизация)."""
     rec = make(source_format="html")
