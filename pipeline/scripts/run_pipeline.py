@@ -22,6 +22,11 @@ CLI::
     run_pipeline.py [sources_root] [--only ID] [--force] [--dry-run]
                     [--no-download] [--embed] [--graphml PATH] [--db PATH]
                     [--no-cloud] [--vlm-model MODEL]
+    run_pipeline.py --recheck [--recheck-limit N] [--recheck-deep]
+
+``--recheck`` — отдельный, взаимоисключимый со стадиями режим (spec
+post-acquisition-lifecycle): проверка живости источников условными запросами,
+см. ``acquire/recheck.py``.
 """
 from __future__ import annotations
 
@@ -38,7 +43,7 @@ from pathlib import Path
 
 import pdfplumber
 
-from acquire import acquisition
+from acquire import acquisition, recheck
 from convert import cloud_ocr, converters, figures_vlm, lint
 from graph import build_graph
 from index import corpus_index
@@ -397,6 +402,11 @@ def _do_download(
         state.snapshot_requested = None  # другие байты = другая редакция -> нужен новый снимок
     state.acquisition_failed = None      # добыли — backoff снят (§5)
     state.acquisition_failure_reason = None
+    # Передобыча — ОДИН из двух человеческих путей разрешения дрейфа (§6): раз новые
+    # байты у нас, флаг recheck отработал и снимается. Единственная точка очистки
+    # (кроме выхода записи из ротации по суперсидированию) — чистая проверка finding
+    # НЕ гасит, иначе непонятый дрейф «выздоравливал» бы сам собой.
+    state.recheck_finding = None
     _maybe_request_snapshot(rec, state)
     schema.save_state(state_path, state)
     logger.info("  добыто %s: метод=%s fidelity=%s (.state.yaml обновлён)", rec.id, result.method.value, result.fidelity.value)
@@ -811,6 +821,20 @@ def main(argv: list[str] | None = None) -> int:
         help="папка для ручного (manual) watch-folder пути; по умолчанию — системная папка загрузок",
     )
     parser.add_argument(
+        "--recheck", action="store_true",
+        help="режим проверки живости источников (spec post-acquisition-lifecycle): условные "
+             "запросы по самым давно не проверенным документам; стадии пайплайна не запускаются",
+    )
+    parser.add_argument(
+        "--recheck-limit", type=int, default=recheck.RECHECK_DEFAULT_LIMIT, metavar="N",
+        help="сколько документов проверить за прогон — НА ПОПУЛЯЦИЮ (записи с raw / недобытые)",
+    )
+    parser.add_argument(
+        "--recheck-deep", action="store_true",
+        help="полный GET + сверка дайджеста с эталоном вместо условного запроса (дорого; "
+             "для документов, чей сервер не отдаёт валидаторов)",
+    )
+    parser.add_argument(
         "--no-cloud", action="store_true",
         help="отключить облачный OCR/figures (spec convert-cloud-tier §6.3) — офлайн-режим, поведение до спека",
     )
@@ -840,6 +864,16 @@ def main(argv: list[str] | None = None) -> int:
         if not records:
             logger.error("документ с id %r не найден", args.only)
             return 2
+
+    # Recheck — ОТДЕЛЬНЫЙ режим, взаимоисключимый с прогоном стадий (spec §1): он не
+    # скачивает, не конвертирует и не трогает индекс, а только спрашивает издателей
+    # «изменилось ли». Возврат здесь и есть эта взаимоисключимость.
+    if args.recheck:
+        summary = recheck.run_recheck(
+            records, args.sources,
+            user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
+        )
+        return recheck.report(summary)
 
     # Синхронный manual watch-folder путь — только осмыслен для одно-документного
     # прогона (--only): пользователь реально сидит и ждёт клика (§6 спека, решение №2).

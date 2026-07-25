@@ -236,30 +236,45 @@ def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> 
 _CURL_UNREACHABLE_CODES = (6, 7)
 
 
-def fetch_and_classify(
+@dataclass
+class RawResponse:
+    """Ответ ДО интерпретации: тело + заголовочный дамп, без классификации.
+
+    Существует ради второго потребителя curl-обвязки — условного запроса
+    recheck-контура (spec post-acquisition-lifecycle §2), которому нужно выбрать
+    классификатор самому (форматный для записей корпуса, формат-агностичный для
+    кандидатов) и увидеть ``304``, у которого тела нет вовсе.
+    """
+
+    status: int | None
+    headers_text: str
+    body: bytes
+    unreachable_reason: str | None = None  # curl exit 6/7 — DNS/connect
+
+
+def fetch_raw(
     url: str,
     dest: Path,
     *,
     user_agent: str,
+    extra_headers: dict[str, str] | None = None,
     timeout: int = 30,
     total_timeout: int = 300,
-    expected: schema.SourceFormat = schema.SourceFormat.pdf,
-) -> ClassifiedResponse:
-    """Single download attempt (no ladder stepping — that's the caller's job).
+) -> RawResponse:
+    """Одна попытка скачивания без интерпретации результата.
 
     Deliberately omits ``-f``: a hard HTTP error (403/404) must still land its
-    status/body so ``classify_response`` can tell a block apart from a dead URL —
+    status/body so the caller's classifier can tell a block apart from a dead URL —
     with ``-f`` curl discards the response before we ever see it.
 
-    A network-level curl failure (exit 6/7 — DNS/connect unreachable) is
-    classified as ``dead`` directly: this is the single most common shape of
-    "the URL is gone" (a decommissioned government domain), and without this
-    check it would raise instead of routing to the archive rung. Offline-vs-
-    dead-domain is not disambiguated here — see design rationale in the spec:
-    the archive rung's own curl call fails the same way, so the worst case is
-    one wasted archive attempt, not silent corruption. ``--max-time`` bounds
-    the whole transfer (``--connect-timeout`` alone doesn't cap a stalled
-    transfer on a slow LTE link).
+    A network-level curl failure (exit 6/7 — DNS/connect unreachable) surfaces as
+    ``unreachable_reason`` rather than an exception: this is the single most common
+    shape of "the URL is gone" (a decommissioned government domain), and the ladder
+    must route it to the archive rung instead of crashing. Offline-vs-dead-domain is
+    not disambiguated here — see design rationale in the spec: the archive rung's own
+    curl call fails the same way, so the worst case is one wasted archive attempt, not
+    silent corruption. ``--max-time`` bounds the whole transfer (``--connect-timeout``
+    alone doesn't cap a stalled transfer on a slow LTE link).
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix="acq-headers-", suffix=".txt", delete=False) as tmp:
@@ -269,13 +284,14 @@ def fetch_and_classify(
             "curl", "-sSL", "--retry", "3", "--retry-delay", "2",
             "--connect-timeout", str(timeout), "--max-time", str(total_timeout),
             "-A", user_agent,
-            "-D", str(headers_path), "-o", str(dest), url,
         ]
+        for name, value in (extra_headers or {}).items():
+            cmd += ["-H", f"{name}: {value}"]
+        cmd += ["-D", str(headers_path), "-o", str(dest), url]
         proc = subprocess.run(cmd, check=False)
         if proc.returncode in _CURL_UNREACHABLE_CODES:
-            return ClassifiedResponse(
-                AcquisitionOutcome.dead, None,
-                f"curl exit {proc.returncode}: host unreachable (DNS/connect)",
+            return RawResponse(
+                None, "", b"", f"curl exit {proc.returncode}: host unreachable (DNS/connect)"
             )
         if proc.returncode != 0:
             # 28 = timeout after --retry already exhausted transients; anything
@@ -283,9 +299,26 @@ def fetch_and_classify(
             raise RuntimeError(f"curl failed (exit {proc.returncode}) for {url}")
         headers_text = headers_path.read_text(encoding="utf-8", errors="replace")
         body = dest.read_bytes() if dest.exists() else b""
-        return classify_response(body, headers_text, expected)
+        return RawResponse(_status_from_headers_text(headers_text), headers_text, body)
     finally:
         headers_path.unlink(missing_ok=True)
+
+
+def fetch_and_classify(
+    url: str,
+    dest: Path,
+    *,
+    user_agent: str,
+    timeout: int = 30,
+    total_timeout: int = 300,
+    expected: schema.SourceFormat = schema.SourceFormat.pdf,
+) -> ClassifiedResponse:
+    """Single download attempt (no ladder stepping — that's the caller's job):
+    ``fetch_raw`` + форматная классификация."""
+    raw = fetch_raw(url, dest, user_agent=user_agent, timeout=timeout, total_timeout=total_timeout)
+    if raw.unreachable_reason is not None:
+        return ClassifiedResponse(AcquisitionOutcome.dead, None, raw.unreachable_reason)
+    return classify_response(raw.body, raw.headers_text, expected)
 
 
 # Ступени, чьи валидаторы принадлежат ИЗДАТЕЛЮ и потому годятся для будущего
