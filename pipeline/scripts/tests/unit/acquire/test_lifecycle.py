@@ -75,6 +75,50 @@ def test_validator_capture_rungs_are_publisher_owned_only() -> None:
     }
 
 
+# --- AWS WAF: челлендж без тела (находка живой приёмки 2026-07-25) ---
+
+_AWS_CHALLENGE_HEADERS = (
+    "HTTP/1.1 202 Accepted\r\nServer: CloudFront\r\nContent-Length: 0\r\n"
+    "x-amzn-waf-action: challenge\r\nContent-Type: text/html; charset=UTF-8\r\n"
+)
+
+
+def test_aws_waf_challenge_detected_despite_empty_body() -> None:
+    """eur-lex.europa.eu переехал за CloudFront: HTTP 202, ПУСТОЕ тело, действие WAF
+    объявлено заголовком. Маркеры тела при таком ответе сработать не могут в принципе,
+    поэтому без отпечатка заголовка причина писалась бы как «unexpected content» —
+    исход верный, диагноз ложный, а он оседает в .state.yaml для куратора."""
+    result = acquisition.classify_response(b"", _AWS_CHALLENGE_HEADERS, expected=schema.SourceFormat.html)
+    assert result.outcome is acquisition.AcquisitionOutcome.blocked
+    assert result.reason == "WAF challenge signature detected"
+
+
+def test_aws_waf_header_without_challenge_action_is_not_a_fingerprint() -> None:
+    """Проверяется ЗНАЧЕНИЕ, а не наличие заголовка — тот же урок, что с `Server: BigIP`
+    (ложноположителен на реальном контенте нескольких гос-сайтов)."""
+    headers = (
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nx-amzn-waf-action: allow\r\n"
+    )
+    result = acquisition.classify_response(
+        b"<html>" + b"x" * 2000 + b"</html>", headers, expected=schema.SourceFormat.html
+    )
+    assert result.outcome is acquisition.AcquisitionOutcome.ok
+
+
+def test_aws_waf_challenge_detected_for_pdf_records_too() -> None:
+    result = acquisition.classify_response(b"", _AWS_CHALLENGE_HEADERS)
+    assert result.outcome is acquisition.AcquisitionOutcome.blocked
+    assert result.reason == "WAF challenge signature detected"
+
+
+def test_aws_waf_challenge_detected_by_format_agnostic_probe() -> None:
+    """Популяция (c) recheck пользуется тем же знанием — иначе недобываемый кандидат
+    за AWS WAF репортился бы «неожиданный ответ», а не «канал закрыт»."""
+    result = acquisition.classify_probe(b"", _AWS_CHALLENGE_HEADERS)
+    assert result.outcome is acquisition.AcquisitionOutcome.blocked
+    assert result.reason == "WAF challenge signature detected"
+
+
 # --- §4: SavePageNow — fire-and-forget, никогда не исключение ---
 
 

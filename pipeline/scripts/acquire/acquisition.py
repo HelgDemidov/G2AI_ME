@@ -123,10 +123,21 @@ def _headers_from_text(headers_text: str) -> dict[str, str]:
     return headers
 
 
-def _has_cloudflare_fingerprint(headers: dict[str, str]) -> bool:
+# AWS WAF (CloudFront) объявляет своё действие ОТДЕЛЬНЫМ заголовком и отдаёт челлендж
+# ПУСТЫМ телом с кодом 202 — маркеры тела при таком ответе не могут сработать в
+# принципе. Найдено живьём 2026-07-25 на eur-lex.europa.eu: `HTTP/1.1 202 Accepted`,
+# `Content-Length: 0`, `x-amzn-waf-action: challenge`. Значение проверяется, а не сам
+# факт наличия заголовка — тот же урок, что с `Server: BigIP` (ложноположителен на
+# реальном контенте).
+_AWS_WAF_ACTIONS = frozenset({"challenge", "captcha"})
+
+
+def _has_waf_header_fingerprint(headers: dict[str, str]) -> bool:
     if "cf-ray" in headers:
         return True
-    return "__cf_bm" in headers.get("set-cookie", "")
+    if "__cf_bm" in headers.get("set-cookie", ""):
+        return True
+    return headers.get("x-amzn-waf-action", "").strip().lower() in _AWS_WAF_ACTIONS
 
 
 def classify_response(
@@ -167,7 +178,7 @@ def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> C
     if body.startswith(b"%PDF"):
         return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid PDF")
 
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if len(body) < MIN_EXPECTED_PDF_SIZE:
@@ -181,7 +192,7 @@ def _classify_docx(body: bytes, headers: dict[str, str], status: int | None) -> 
     условие (любой zip пройдёт эту проверку) — терминальная страховка на
     неразличимость от честного docx здесь: mammoth/markdownify поднимут
     ``ConversionError`` при конвертации не-docx zip'а (см. ``convert/converters._convert_docx``)."""
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if status == 200 and body.startswith(DOCX_MAGIC) and len(body) >= MIN_EXPECTED_DOCX_SIZE:
@@ -197,7 +208,7 @@ def _classify_xlsx(body: bytes, headers: dict[str, str], status: int | None) -> 
     контейнер OOXML/zip, та же терминальная страховка (zip-магия — необходимое,
     НЕ достаточное условие; ``openpyxl`` поднимет ``ConversionError`` при
     конвертации не-xlsx zip'а, см. ``convert/converters._convert_xlsx``)."""
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if status == 200 and body.startswith(XLSX_MAGIC) and len(body) >= MIN_EXPECTED_XLSX_SIZE:
@@ -212,7 +223,7 @@ def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> 
     # WAF-challenge check comes BEFORE the content-type check: a challenge page
     # is itself served as "200 text/html" — a content-type-only check would wave
     # it straight through as "ok".
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if body.startswith(b"%PDF"):
@@ -245,7 +256,7 @@ def classify_probe(body: bytes, headers_text: str) -> ClassifiedResponse:
     status = _status_from_headers_text(headers_text)
     headers = _headers_from_text(headers_text)
 
-    if _has_cloudflare_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
+    if _has_waf_header_fingerprint(headers) or any(m in body for m in CHALLENGE_BODY_MARKERS):
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
     if status in DEAD_STATUS_CODES:
         return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
