@@ -73,15 +73,30 @@ def _bloc_node(key: str) -> str:
 
 
 def load_jurisdictions(path: Path = JURISDICTIONS_PATH) -> dict[str, dict[str, Any]]:
-    """``{bloc_key: {'label': str, 'members': set[str]}}`` из jurisdictions.yaml."""
+    """``{bloc_key: {'label': str, 'members': set[str]}}`` из jurisdictions.yaml.
+
+    Справочник БЕЗ гейта — деградация симметрична ``identifiers.yaml``/``load_aliases``
+    (knowledge-hardening §4): отсутствие файла/пустой файл/не-dict верхний уровень/
+    не-dict секция ``blocs`` -> пустой словарь. Отдельная повреждённая запись блока
+    (не-dict значение) пропускается с warning, не роняя остальные блоки и не роняя
+    сборку графа всего корпуса.
+    """
     if not path.exists():
         return {}
     data: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
-    blocs = data.get("blocs", {}) if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    blocs = data.get("blocs")
+    if not isinstance(blocs, dict):
+        return {}
     result: dict[str, dict[str, Any]] = {}
     for key, val in blocs.items():
+        if not isinstance(val, dict):
+            logger.warning("  ⚠ jurisdictions.yaml: блок %r повреждён (не словарь) — пропущен", key)
+            continue
         label = str(val.get("label", key))
-        members = {str(m).lower() for m in val.get("members", [])}
+        members_raw = val.get("members", [])
+        members = {str(m).lower() for m in members_raw} if isinstance(members_raw, list) else set()
         result[str(key)] = {"label": label, "members": members}
     return result
 

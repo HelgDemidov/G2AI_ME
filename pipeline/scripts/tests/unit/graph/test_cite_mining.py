@@ -450,10 +450,12 @@ def test_missing_or_malformed_vocab_degrades_to_empty(tmp_path: Path, content: s
 
 def test_shipped_aliases_point_at_known_identifier_space() -> None:
     """Алиас обязан давать КАНОНИЧЕСКИЙ идентификатор (то же пространство, что паттерны),
-    а не doc-id: иначе он молча минует канал резолюции и никогда не станет ребром."""
-    known_prefixes = ("CELEX:", "SLCG:", "ISO", "NIST ")
+    а не doc-id: иначе он молча минует канал резолюции и никогда не станет ребром.
+
+    Префиксы читаются из ``IDENTIFIER_PREFIXES`` (knowledge-hardening §4) — единого
+    реестра рядом с ``_PATTERNS``, не хардкода в тесте."""
     for alias, ident in cite_mining.load_aliases().items():
-        assert ident.startswith(known_prefixes), f"{alias} -> {ident}"
+        assert ident.startswith(cite_mining.IDENTIFIER_PREFIXES), f"{alias} -> {ident}"
 
 
 # --- state_dir: владелец переехал в core.schema (knowledge-hardening §2) ---
