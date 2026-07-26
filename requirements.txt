@@ -15,3 +15,5 @@ networkx==3.6.1       # гетерогенный граф знаний (build_gr
 tokenizers==0.23.1    # токенизатор bge-m3 для канонической чанковки (bge_tokenizer.py)
 numpy==2.5.1          # векторные операции (embed.py, vector_store.py)
 onnxruntime==1.27.0   # инференс bge-m3 int8 ONNX, CPU (embed.py)
+boto3==1.43.56        # клиент Cloudflare R2 (core/r2.py) — инфраструктура под миграцию хранения §9;
+                      # массовая заливка бэкапа остаётся на rclone (pipeline/tools/r2_backup.sh)

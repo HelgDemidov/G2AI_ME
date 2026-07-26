@@ -27,7 +27,7 @@ sources/candidates/<connector_id>.yaml  # слой кандидатов (Candida
 sources/.state/                     # операционное состояние КОРПУСА (НЕ в git): cursors.yaml (курсоры коннекторов), snowball_leads.yaml (лиды цитат без URL); каталог владеет store.state_dir, имя файла — писатель. Одно слово с пер-документным .state.yaml
 sources/triage_decisions.yaml       # решения батч-триажа (discover.py apply, decisions.yaml-конвенция, эфемерный; ВХОД ЧЕЛОВЕКА — поэтому НЕ в .state/) (НЕ в git)
 pipeline/scripts/                   # код пайплайна СЛОЕВЫМИ ПОДПАКЕТАМИ (repo-layout, 2026-07-16; см. «Слой знаний» ниже):
-#   ├─ core/     — schema/validate_sources (метаданные), fsio (staging/atomic-write), env (REPO_ROOT/.env)
+#   ├─ core/     — schema/validate_sources (метаданные), fsio (staging/atomic-write), env (REPO_ROOT/.env), r2 (клиент Cloudflare R2 — фундамент под миграцию хранения §9, пайплайном пока НЕ используется)
 #   ├─ discovery/— мультиконнекторное ядро генератора кандидатов (base/registry/dedup/store/orchestrate; PR #23, connector-agnostic) + manual.py (inject/worksheet/apply — ручной и directed-search каналы, PR #25) + registry_store.py (единый DuckDB bronze-слой архетипа registry, PR #36) + connectors/ (4 registry-коннектора: agora.py PR #36, eurlex.py PR #39, aiforgood.py PR #42, oecd.py PR #46; + snowball.py PR #43 — отдельный архетип, backward-snowball по своему корпусу, не registry — детали см. «Слой знаний» ниже; регистрация манифестом connectors/__init__.py, импортируемым из discover.py)
 #   ├─ acquire/  — acquisition (WAF-лестница добычи) + recheck (контур времени: живость источников после приёма)
 #   ├─ convert/  — реестр форматов (converters.py) + pdf_to_markdown/pdf_graphics.py (PDF+графика) + eli.py (HTML/ELI) + ocr_headings.py (OCR) + docx_groups.py (DOCX composite-группы/чарты) + xlsx_charts.py (XLSX встроенные чарты, детект-only) + chart_data.py/chart_render.py (container-agnostic data-driven извлечение нативных OOXML-чартов xlsx+docx: numCache→таблица+mermaid, mermaidx-валидация) + cloud_ocr.py/figures_vlm.py (облачный VLM-тир: скан-OCR + семантика PDF-фигур/docx-групп, БЕЗ чартов) + ocr_eval.py (A/B-харнесс качества OCR: эталон + расхождения кандидатов); см. «Слой конвертации» ниже
@@ -47,6 +47,7 @@ pipeline/config/discovery_eurlex.yaml # тюнинг-параметры конн
 pipeline/config/discovery_aiforgood.yaml # тюнинг-параметры коннектора aiforgood (exclude_groups/exclude_status_substrings/crawl_delay_seconds); ТРЕКАЕТСЯ, правится вручную
 requirements.txt, requirements-dev.txt, pyproject.toml  # зависимости (runtime/dev) и конфиг инструментов — в КОРНЕ репо
 .github/workflows/ci.yml            # CI: ruff/mypy/pytest/validate_sources (модель-тесты @model в CI пропускаются)
+pipeline/tools/r2_backup.sh         # операционные обёртки вокруг внешних бинарей (НЕ код пайплайна — вне ruff/mypy/coverage): offsite-бэкап всего sources/ в R2 через rclone ≥1.74 (`copy`, никогда `sync`; секреты из .env переменными окружения, не аргументами)
 pipeline/models/  pipeline/index/   # локальные, НЕ в git: скачанная модель bge-m3 / производный SQLite-индекс корпуса
 pipeline/discovery_cache/           # локальный, НЕ в git: bronze-кэш registry-коннекторов (zip-архивы источников + registry.duckdb)
 docs/                               # ВСЯ документация проекта (НЕ в git, кроме будущего корневого README):
