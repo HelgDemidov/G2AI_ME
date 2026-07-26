@@ -38,8 +38,18 @@ JURISDICTIONS_PATH = VOCAB_DIR / "jurisdictions.yaml"
 
 
 # --- идентификаторы узлов: префикс по типу, чтобы id разных типов не сталкивались ---
+DOC_PREFIX = "doc:"
+"""Единственное определение (knowledge-hardening §3) — ``graph.expand`` импортирует
+отсюда, а не держит свою копию строки. build_graph не импортирует expand — цикла нет."""
+
+
 def _doc_node(rec_id: str) -> str:
-    return f"doc:{rec_id}"
+    return f"{DOC_PREFIX}{rec_id}"
+
+
+def _doc_id(node: str) -> str:
+    """Обратная операция к ``_doc_node`` — снять префикс для выдачи наружу."""
+    return node[len(DOC_PREFIX):]
 
 
 def _pattern_node(pattern: str) -> str:
@@ -63,15 +73,30 @@ def _bloc_node(key: str) -> str:
 
 
 def load_jurisdictions(path: Path = JURISDICTIONS_PATH) -> dict[str, dict[str, Any]]:
-    """``{bloc_key: {'label': str, 'members': set[str]}}`` из jurisdictions.yaml."""
+    """``{bloc_key: {'label': str, 'members': set[str]}}`` из jurisdictions.yaml.
+
+    Справочник БЕЗ гейта — деградация симметрична ``identifiers.yaml``/``load_aliases``
+    (knowledge-hardening §4): отсутствие файла/пустой файл/не-dict верхний уровень/
+    не-dict секция ``blocs`` -> пустой словарь. Отдельная повреждённая запись блока
+    (не-dict значение) пропускается с warning, не роняя остальные блоки и не роняя
+    сборку графа всего корпуса.
+    """
     if not path.exists():
         return {}
     data: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
-    blocs = data.get("blocs", {}) if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    blocs = data.get("blocs")
+    if not isinstance(blocs, dict):
+        return {}
     result: dict[str, dict[str, Any]] = {}
     for key, val in blocs.items():
+        if not isinstance(val, dict):
+            logger.warning("  ⚠ jurisdictions.yaml: блок %r повреждён (не словарь) — пропущен", key)
+            continue
         label = str(val.get("label", key))
-        members = {str(m).lower() for m in val.get("members", [])}
+        members_raw = val.get("members", [])
+        members = {str(m).lower() for m in members_raw} if isinstance(members_raw, list) else set()
         result[str(key)] = {"label": label, "members": members}
     return result
 
@@ -110,17 +135,21 @@ def validity_intervals(records: list[SourceRecord]) -> dict[str, Validity]:
     (spec post-acquisition-lifecycle §7). Пересборка графа бесплатна, поля — нет.
     """
     starts = {rec.id: _valid_from(rec) for rec in records}
-    successors: dict[str, list[str]] = {rec.id: [] for rec in records}
+    # set, не list: одна связь легально оформляется С ОБОИХ концов (supersedes у
+    # преемника И superseded_by у предшественника — тот же паттерн, что нормализует
+    # schema.superseded_ids). Без дедупа такое двустороннее оформление давало бы
+    # ложный "несколько преемников (X, X)" на штатной, а не подозрительной топологии.
+    successors: dict[str, set[str]] = {rec.id: set() for rec in records}
     for rec in records:
         for rel in rec.relations:
             if rel.type is RelationType.supersedes:
-                successors.setdefault(rel.target, []).append(rec.id)   # rec заменяет target
+                successors.setdefault(rel.target, set()).add(rec.id)   # rec заменяет target
             elif rel.type is RelationType.superseded_by:
-                successors.setdefault(rec.id, []).append(rel.target)   # rec заменён target'ом
+                successors.setdefault(rec.id, set()).add(rel.target)   # rec заменён target'ом
 
     intervals: dict[str, Validity] = {}
     for rec in records:
-        heirs = successors.get(rec.id, [])
+        heirs = successors.get(rec.id, set())
         heir_dates = sorted(d for d in (starts.get(h) for h in heirs) if d is not None)
         # Порог по числу ПРЕЕМНИКОВ, а не датированных дат: подозрительна сама топология
         # (обычно это ошибка курирования), и молчать о ней, пока у второго преемника нет
@@ -157,7 +186,11 @@ def _as_graphml_date(value: _dt.date | None) -> str:
 
 
 def as_of(graph: nx.MultiDiGraph, date: _dt.date) -> list[str]:
-    """doc-узлы, действовавшие на ``date`` (spec graph-v2 §1).
+    """doc-УЗЛЫ (с ``DOC_PREFIX``, НЕ bare doc-id — knowledge-hardening §3), действовавшие
+    на ``date`` (spec graph-v2 §1). Отличие от ``docs_by_pattern``/``docs_in_bloc``/
+    ``lineage`` (те возвращают bare id) намеренное: выдача идёт напрямую в
+    ``graph.subgraph()`` вызывающей стороной (см. CLI ``main`` ниже), которому нужны
+    настоящие идентификаторы узлов графа, а не голые id документов.
 
     Границы: ``valid_from`` ВКЛЮЧИТЕЛЬНО (документ действует со дня вступления в силу),
     ``valid_to`` ИСКЛЮЧИТЕЛЬНО (в день начала преемника действует уже преемник) — иначе
@@ -165,6 +198,13 @@ def as_of(graph: nx.MultiDiGraph, date: _dt.date) -> list[str]:
 
     Документы с ``validity_known=False`` включаются ВСЕГДА: неизвестность — не повод
     молча удалить документ из среза, за который потом пишутся нормативные предложения.
+
+    ⚠ Расхождение с ``RetrievalFilters.include_superseded`` (retrieve.py) НА
+    НЕДАТИРОВАННОМ преемнике осознанное (knowledge-hardening §10): там дефолт
+    ИСКЛЮЧАЕТ такой документ («что актуально сейчас» — редакция существует, значит
+    предпочесть её), здесь ВКЛЮЧАЕТ («что действовало в дату Т» — датировать
+    закрытие нечем, значит честно «не знаем»). Разные вопросы, не два ответа на
+    один и тот же.
     """
     selected: list[str] = []
     for node, data in graph.nodes(data=True):
@@ -196,6 +236,13 @@ def build_graph(
     (``cites``). Каждое ребро несёт ``layer``: ``L0`` — курируемое (meta.yaml/vocab),
     ``L1`` — детерминированный автослой. Значение вводится сразу трёхзначным (L2 —
     будущая LLM-экстракция), чтобы она не потребовала миграции атрибутов.
+
+    ⚠ Контракт (knowledge-hardening §3): ``records`` предполагаются ПРОВАЛИДИРОВАННЫМИ
+    (``validate_sources`` держит ссылочную целостность ``relations`` в CLI-путях). На
+    невалидированном входе ``relations``-ребро на target вне переданного набора тихо
+    создаёт узел БЕЗ ``ntype`` — такой узел не считается документом ни одним запросом
+    этого модуля (``docs_by_pattern``/``docs_in_bloc``/``lineage``) и невидим для
+    ``graph.expand`` (``_is_document`` фильтрует по ``ntype``).
     """
     jurisdictions = jurisdictions or {}
     graph: nx.MultiDiGraph = nx.MultiDiGraph()
@@ -292,15 +339,18 @@ def build_corpus_graph(
 
 
 def docs_by_pattern(graph: nx.MultiDiGraph, pattern: str) -> list[str]:
-    """Документы, демонстрирующие данный G2AI-паттерн (кросс-страновой кластер)."""
+    """Документы (bare doc-id, без ``doc:``-префикса — knowledge-hardening §3),
+    демонстрирующие данный G2AI-паттерн (кросс-страновой кластер)."""
     node = _pattern_node(pattern)
     if node not in graph:
         return []
-    return sorted(u for u, _, d in graph.in_edges(node, data=True) if d.get("etype") == "exemplifies")
+    return sorted(
+        _doc_id(u) for u, _, d in graph.in_edges(node, data=True) if d.get("etype") == "exemplifies"
+    )
 
 
 def docs_in_bloc(graph: nx.MultiDiGraph, bloc_key: str) -> list[str]:
-    """Документы стран — членов блока (напр. все документы стран ЕС)."""
+    """Документы (bare doc-id) стран — членов блока (напр. все документы стран ЕС)."""
     bloc = _bloc_node(bloc_key)
     if bloc not in graph:
         return []
@@ -308,17 +358,19 @@ def docs_in_bloc(graph: nx.MultiDiGraph, bloc_key: str) -> list[str]:
     docs: set[str] = set()
     for country in countries:
         docs.update(
-            u for u, _, d in graph.in_edges(country, data=True) if d.get("etype") == "applies_to"
+            _doc_id(u) for u, _, d in graph.in_edges(country, data=True) if d.get("etype") == "applies_to"
         )
     return sorted(docs)
 
 
 def lineage(graph: nx.MultiDiGraph, doc_id: str, etype: str = "implements") -> list[str]:
-    """Исходящие документ->документ связи данного типа (родословная)."""
+    """Исходящие документ->документ связи данного типа (родословная), bare doc-id."""
     doc = _doc_node(doc_id)
     if doc not in graph:
         return []
-    return sorted(v for _, v, d in graph.out_edges(doc, data=True) if d.get("etype") == etype)
+    return sorted(
+        _doc_id(v) for _, v, d in graph.out_edges(doc, data=True) if d.get("etype") == etype
+    )
 
 
 def export_graphml(graph: nx.MultiDiGraph, path: Path) -> None:
@@ -379,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             data = graph.nodes[node]
             mark = "" if data.get("validity_known") else "  ⚠ валидность неизвестна"
             span = f"{data.get('valid_from') or '?'} → {data.get('valid_to') or '…'}"
-            print(f"  {node[len('doc:'):]}  [{span}]{mark}")
+            print(f"  {node[len(DOC_PREFIX):]}  [{span}]{mark}")
         if args.graphml is not None:
             export_graphml(graph.subgraph(docs).copy(), args.graphml)
             print(f"\nGraphML среза записан: {args.graphml}")

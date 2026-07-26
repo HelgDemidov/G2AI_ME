@@ -31,6 +31,13 @@ class RetrievalFilters:
     # Заменённые редакции по умолчанию НЕ выдаются (spec graph-v2 §2): устаревшая
     # редакция закона в top-k evidence-пака — тихая содержательная ошибка того же
     # класса, что «вектор указывает на чужой текст». История — по явному флагу.
+    #
+    # ⚠ Расхождение с build_graph.as_of() на недатированном преемнике ОСОЗНАННОЕ
+    # (knowledge-hardening §10, аудит-шов): это два РАЗНЫХ вопроса, не два ответа на
+    # один. Этот гейт — «что АКТУАЛЬНО сейчас» (редакция существует → предпочесть
+    # её, дефолт исключающий). as_of — «что ДЕЙСТВОВАЛО в дату Т» (датировать
+    # закрытие нечем → честное «не знаем», дефолт включающий). Разные задачи —
+    # разные дефолты для одной и той же неопределённости, не баг несогласованности.
     include_superseded: bool = False
 
 
@@ -64,10 +71,16 @@ def _searchable_doc_ids(conn: sqlite3.Connection) -> set[str]:
     return {str(r[0]) for r in rows}
 
 
-def _apply_superseded_gate(
+def apply_superseded_gate(
     conn: sqlite3.Connection, allowed: set[str] | None, include_superseded: bool
 ) -> set[str] | None:
     """Вычесть заменённые редакции из множества допустимых документов (spec graph-v2 §2).
+
+    Публичная (knowledge-hardening §6 — раньше приватная ``_apply_superseded_gate``):
+    ``ab_eval`` зовёт её напрямую, чтобы ``evaluate_fts``/``evaluate_vector`` видели ТУ
+    ЖЕ вселенную документов, что ``evaluate_hybrid`` через ``retrieve()`` — иначе с
+    первым ребром ``supersedes`` в корпусе A/B-режимы начали бы сравнивать разные
+    множества документов, и сравнение тихо перестало бы быть сравнением.
 
     Ключевое свойство: **пока в корпусе нет ни одного ребра supersedes, функция —
     полный no-op** (возвращает ``allowed`` как есть), поэтому выдача не меняется ни на
@@ -153,7 +166,7 @@ def retrieve(
     применялось бы ровно там, где ошибка тише всего.
     """
     filters = filters if filters is not None else RetrievalFilters()
-    allowed = _apply_superseded_gate(
+    allowed = apply_superseded_gate(
         conn, _resolve_filters(conn, filters), filters.include_superseded
     )
 

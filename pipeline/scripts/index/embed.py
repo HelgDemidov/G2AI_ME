@@ -42,6 +42,17 @@ DEFAULT_CLOUD_MODEL = "google/gemini-embedding-001"  # A/B-чекпоинт §1 
 DEFAULT_CLOUD_DIMS = 1024  # MRL-срез на клиенте (§2-bis): @1536 не дал ничего сверх @1024,
 # RAM-паритет с bge (643 МБ на целевых 157k чанков)
 
+CLOUD_MODEL_TOKEN_LIMITS: dict[str, int] = {
+    # Live-проверено 2026-07-26 (docs.cloud.google.com/gemini-enterprise-agent-platform):
+    # 2048 токенов на ОДИН входной текст, излишек ТИХО усекается (autoTruncate=true по
+    # умолчанию) — тот же класс молчаливого усечения, от которого check_chunk_budget
+    # защищает локальный путь. Приближение, не точная арифметика: бюджет чанка (512)
+    # считается токенизатором bge, лимит здесь — в токенах МОДЕЛИ; 4-кратный запас
+    # достаточен как sanity-гейт, тянуть токенизатор под каждую облачную модель
+    # несоразмерно (knowledge-hardening §7).
+    "google/gemini-embedding-001": 2048,
+}
+
 
 def l2_normalize(mat: FloatArray) -> FloatArray:
     """L2-нормализация по строкам (нулевые строки остаются нулевыми)."""
@@ -139,6 +150,12 @@ class OpenRouterEmbedder:
     кандидатов не влезают в бюджет 8ГБ-машины на масштабе целевого корпуса). Усечённые и
     полные векторы — РАЗНЫЕ неймспейсы (``name`` получает суффикс ``@<dims>``), иначе они
     бы смешались под одним ключом ``model`` в таблице ``vectors``.
+
+    ``embed()`` fail-fast, если ответ несёт МЕНЬШЕ измерений, чем запрошено ``dims``
+    (knowledge-hardening §7): без этой проверки неймспейс ``@1024`` мог бы тихо нести
+    векторы меньшей нативной размерности — имя лгало бы о содержимом. ``max_tokens`` —
+    из ``CLOUD_MODEL_TOKEN_LIMITS`` по имени модели (§7); неизвестная модель -> ``None``
+    (гейт ``check_chunk_budget`` честно неприменим, как раньше).
     """
 
     def __init__(
@@ -151,7 +168,7 @@ class OpenRouterEmbedder:
     ) -> None:
         self.name = f"{model}@{dims}" if dims is not None else model
         self.dim = 0  # станет известно после первого ответа
-        self.max_tokens: int | None = None  # облачный лимит не фиксирован здесь — гейт неприменим
+        self.max_tokens: int | None = CLOUD_MODEL_TOKEN_LIMITS.get(model)
         self._model = model
         self._dims = dims
         self._batch = batch_size
@@ -190,7 +207,10 @@ class OpenRouterEmbedder:
             try:
                 return self._request(batch)
             except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", "replace")
+                # Кап 500 символов — симметрично _InbandError.body ниже (knowledge-
+                # hardening §7): тело провайдерской ошибки не должно раздувать лог/
+                # сообщение об исключении без ограничения.
+                body = exc.read().decode("utf-8", "replace")[:500]
                 if exc.code != 429 and exc.code < 500:
                     raise RuntimeError(f"OpenRouter HTTP {exc.code}: {body}") from exc
                 reason = f"HTTP {exc.code}: {body}"
@@ -218,6 +238,14 @@ class OpenRouterEmbedder:
         for start in range(0, len(texts), self._batch):
             vecs.extend(self._request_with_retry(texts[start : start + self._batch]))
         mat = np.asarray(vecs, dtype=np.float32)
+        if self._dims is not None and mat.shape[1] < self._dims:
+            # Fail-fast ДО записи в БД (knowledge-hardening §7): неймспейс "@<dims>"
+            # обещает эту размерность каждому будущему запросу к vectors — молчаливо
+            # принять ответ короче было бы лживым контрактом, не деградацией.
+            raise RuntimeError(
+                f"OpenRouter {self._model}: ответ несёт {mat.shape[1]}-мерные векторы, "
+                f"запрошено dims={self._dims} — неймспейс {self.name} солгал бы о размерности"
+            )
         if self._dims is not None:
             mat = mat[:, : self._dims]
         self.dim = int(mat.shape[1])

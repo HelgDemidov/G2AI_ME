@@ -26,14 +26,14 @@ from typing import Any
 import yaml
 
 from core import fsio, schema
-from discovery import store
 
 logger = logging.getLogger("cite_mining")
 
 IDENTIFIERS_PATH = schema.VOCAB_DIR / "identifiers.yaml"
 CITE_LEADS_FILENAME = "cite_leads.yaml"
-"""Имя файла отчёта ВНУТРИ ``sources/.state/`` — каталогом владеет ``discovery/store.py``,
-имя файла принадлежит писателю (симметрия ``snowball_leads.yaml``)."""
+"""Имя файла отчёта ВНУТРИ ``sources/.state/`` — каталогом владеет ``core.schema``
+(``state_dir``, knowledge-hardening §2), имя файла принадлежит писателю (симметрия
+``snowball_leads.yaml``)."""
 
 
 @dataclass(frozen=True)
@@ -188,6 +188,12 @@ _PATTERNS: dict[str, CitePattern] = {
         _nist,
     ),
 }
+
+IDENTIFIER_PREFIXES = ("CELEX:", "SLCG:", "ISO", "NIST ")
+"""Префиксы канонических идентификаторов, эмитируемых канонизаторами ``_PATTERNS``
+выше — единственное определение (knowledge-hardening §4). Новая семья паттернов
+добавляется ЗАПИСЬЮ в ``_PATTERNS`` и, если у неё новый префикс, — записью здесь: одно
+место вместо рассинхронизируемой копии (раньше — рукописный кортеж в тесте алиасов)."""
 
 
 ALIAS_RULE = "alias"
@@ -393,7 +399,15 @@ def mine_corpus(
         md = schema.md_file(rec, root)
         if not md.exists():
             continue
-        for ident, rule in extract_identifiers(md.read_text(encoding="utf-8"), alias_map):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # Отказ ИЗОЛИРОВАН на документ (паттерн run_pipeline/discovery/apply):
+            # один битый doc.md не должен ронять граф всего корпуса. Майнинг
+            # реконсиляционен — починенный файл даст рёбра следующим прогоном.
+            logger.warning("  ⚠ %s: doc.md не читается (%s) — пропущен майнингом", rec.id, exc)
+            continue
+        for ident, rule in extract_identifiers(text, alias_map):
             target = resolved.get(ident)
             if target is None:
                 lead = unresolved.setdefault(
@@ -411,7 +425,7 @@ def mine_corpus(
 
 def leads_path(root: Path) -> Path:
     """Отчёт нерезолвнутых цитат: ``<root>/.state/cite_leads.yaml``."""
-    return store.state_dir(root) / CITE_LEADS_FILENAME
+    return schema.state_dir(root) / CITE_LEADS_FILENAME
 
 
 def save_leads(leads: list[dict[str, Any]], root: Path) -> None:

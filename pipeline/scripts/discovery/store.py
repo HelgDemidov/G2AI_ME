@@ -20,12 +20,11 @@
 
 **Операционное состояние уровня КОРПУСА живёт в ``sources/.state/``** (2026-07-25):
 курсоры коннекторов (``cursors.yaml``), лиды snowball (``snowball_leads.yaml``, пишет
-``connectors/snowball.py``), в будущем dangling-цитаты graph-v2. Каталог владеет ЭТОТ
-модуль (``state_dir``), имя файла — каждый писатель свой: store не должен знать о
-существовании snowball. Имя ``.state`` — то же слово, которым проект уже называет этот
-концепт на уровне ДОКУМЕНТА (``.state.yaml``/``OperationalState``): один концепт — одно
-слово на двух уровнях вложенности; точка-префикс сохраняет сигнал «операционное, не для
-просмотра человеком» и не мешается среди видимых треков корпуса.
+``connectors/snowball.py``), dangling-цитаты graph-v2 (``cite_leads.yaml``, пишет
+``graph/cite_mining.py``). Каталог перерос «владение» discovery (три писателя из ДВУХ
+слоёв) — владелец переехал в ``core.schema.state_dir`` (knowledge-hardening §2);
+``state_dir`` здесь — реэкспорт для обратной совместимости вызывающих (``connectors/
+snowball.py`` и др.), имя файла внутри остаётся за каждым писателем.
 """
 from __future__ import annotations
 
@@ -39,12 +38,13 @@ from core import fsio, schema
 
 CANDIDATES_DIRNAME = "candidates"
 LEGACY_CANDIDATES_FILENAME = "candidates.yaml"
-STATE_DIRNAME = ".state"
 CURSORS_FILENAME = "cursors.yaml"
 
 CANDIDATES_DIR = schema.DEFAULT_SOURCES / CANDIDATES_DIRNAME
 LEGACY_CANDIDATES_PATH = schema.DEFAULT_SOURCES / LEGACY_CANDIDATES_FILENAME
-STATE_DIR = schema.DEFAULT_SOURCES / STATE_DIRNAME
+state_dir = schema.state_dir
+"""Реэкспорт (knowledge-hardening §2) — владелец каталога переехал в ``core.schema``."""
+STATE_DIR = schema.state_dir(schema.DEFAULT_SOURCES)
 CURSORS_PATH = STATE_DIR / CURSORS_FILENAME
 """Операционное состояние корпуса — вне git по deny-default `/sources/**` (см. docstring модуля)."""
 
@@ -71,20 +71,9 @@ def legacy_candidates_path(root: Path = schema.DEFAULT_SOURCES) -> Path:
     return root / LEGACY_CANDIDATES_FILENAME
 
 
-def state_dir(root: Path = schema.DEFAULT_SOURCES) -> Path:
-    """Каталог операционного состояния корпуса: ``<root>/.state/`` (см. docstring модуля).
-
-    Владелец каталога — этот модуль; ИМЯ ФАЙЛА внутри принадлежит писателю
-    (``connectors/snowball.py`` — лиды, будущий cite-miner graph-v2 — dangling-цитаты):
-    store не знает о существовании конкретных коннекторов, а писатели не дублируют
-    знание о раскладке.
-    """
-    return root / STATE_DIRNAME
-
-
 def cursors_path(root: Path = schema.DEFAULT_SOURCES) -> Path:
     """Курсоры коннекторов: ``<root>/.state/cursors.yaml``."""
-    return state_dir(root) / CURSORS_FILENAME
+    return schema.state_dir(root) / CURSORS_FILENAME
 
 
 def shard_name(connector_id: str) -> str:

@@ -2,6 +2,10 @@
 
 Тонкий верхнеуровневый вход поверх ``analyze.retrieve.retrieve()`` (spec
 analyze-retrieval §5, чартер analyze §6). ``--backend none`` — FTS-only без модели.
+
+``--sources`` (knowledge-hardening §9) — advisory-сверка ``corpus_fingerprint``:
+предупреждает, если индекс собран до последней правки корпуса (напр. новое ребро
+``supersedes``), не блокирует поиск.
 """
 from __future__ import annotations
 
@@ -12,7 +16,8 @@ from pathlib import Path
 
 from analyze.retrieve import RetrievalFilters, retrieve
 from core.env import load_dotenv
-from index.corpus_index import DEFAULT_DB
+from core.schema import DEFAULT_SOURCES
+from index.corpus_index import DEFAULT_DB, corpus_fingerprint, read_meta
 from index.embed import DEFAULT_BACKEND, Embedder, get_embedder
 from index.vector_store import unembedded_count
 
@@ -24,6 +29,27 @@ def _make_embedder(backend: str, model: str | None) -> Embedder | None:
     if backend == "openrouter":
         return get_embedder("openrouter", **({"model": model} if model else {}))
     return get_embedder("bge")
+
+
+def _warn_if_stale(conn: sqlite3.Connection, sources_root: Path) -> None:
+    """Advisory-предупреждение о протухшем индексе (knowledge-hardening §9 — шов
+    аудита между графом и retrieval): граф читает ``meta.yaml`` живьём при каждом
+    вызове, ``doc_facets`` — только при прогоне индексации. Правка ребра
+    ``supersedes`` без прогона ``run_pipeline`` оставляла ``retrieve()`` молча
+    фильтровать по старому множеству — сверка дешёвая (``corpus_fingerprint`` —
+    только ``stat()``) и НЕ блокирует поиск, только предупреждает.
+
+    Несуществующий корень (запуск вне репо/без локального корпуса) — сверить
+    нечего, молча пропускаем, а не отказываем."""
+    if not sources_root.exists():
+        return
+    stored = read_meta(conn, "corpus_fingerprint")
+    if stored is not None and stored != corpus_fingerprint(sources_root):
+        print(
+            "⚠ индекс отстаёт от корпуса (corpus_fingerprint не совпадает) — "
+            "прогоните run_pipeline.py, иначе фасетные фильтры видят устаревшее состояние",
+            file=sys.stderr,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +68,10 @@ def main(argv: list[str] | None = None) -> int:
              "флаг нужен для исследования истории документа)",
     )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument(
+        "--sources", type=Path, default=DEFAULT_SOURCES,
+        help="корень корпуса — для staleness-сверки индекса (knowledge-hardening §9)",
+    )
     parser.add_argument(
         "--backend", choices=["bge", "openrouter", "none"], default=DEFAULT_BACKEND,
         help="openrouter — production-дефолт; bge — локальный фолбэк; none — FTS-only (офлайн)",
@@ -65,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     conn = sqlite3.connect(args.db)
+    _warn_if_stale(conn, args.sources)
     try:
         results = retrieve(conn, args.query, embedder, k=args.k, filters=filters)
     except sqlite3.OperationalError as exc:

@@ -819,3 +819,41 @@ def test_main_search_subcommand_dispatches(tmp_path: Path) -> None:
     conn.close()
 
     assert corpus_index.main(["--db", str(db), "search", "governance"]) == 0
+
+
+# --- счётчик легальных оверсайз-чанков в статусе (knowledge-hardening §8) ---
+
+_WIDE_ROW_BODY = "| a | b |\n| --- | --- |\n| word1 word2 word3 word4 word5 |"
+"""Одна строка таблицы шире _MAX=3 (7 "слов" считая |) — _split_table_paragraph
+оставляет её цельной поверх бюджета (целостность строки важнее лимита), легальный
+оверсайз, который раньше был виден только построчным чтением chunks."""
+
+
+def test_index_corpus_reports_oversize_count_on_incremental_path(tmp_path: Path) -> None:
+    """Первый прогон на свежей БД идёт ИНКРЕМЕНТАЛЬНЫМ путём (пустой doc_state) —
+    счётчик обязан работать и на нём, не только на force-rebuild."""
+    root = tmp_path / "src"
+    _doc(root, "doc-wide-2026", "wi", _WIDE_ROW_BODY)
+    conn = create_db(tmp_path / "c.db")
+    status = index_corpus(conn, root, _fake_counter, _MAX)
+    assert f"1 превышают {_MAX} ткн" in status
+    conn.close()
+
+
+def test_index_corpus_reports_oversize_count_on_full_rebuild(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-wide-2026", "wi", _WIDE_ROW_BODY)
+    conn = create_db(tmp_path / "c.db")
+    status = index_corpus(conn, root, _fake_counter, _MAX, force=True)
+    assert f"1 превышают {_MAX} ткн" in status
+    conn.close()
+
+
+def test_index_corpus_no_oversize_suffix_when_all_within_budget(tmp_path: Path) -> None:
+    """Регресс: корпус без легальных оверсайзов не получает суффикс вовсе."""
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    status = index_corpus(conn, root, _fake_counter, _MAX)
+    assert "превышают" not in status
+    conn.close()

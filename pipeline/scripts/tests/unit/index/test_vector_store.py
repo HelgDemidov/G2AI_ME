@@ -24,8 +24,10 @@ from index.vector_store import (
     check_chunk_budget,
     chunk_hashes,
     confidential_doc_ids,
+    drop_model,
     embed_and_store,
     gc_vectors,
+    list_models,
     load_vectors,
     semantic_search,
     store_vectors,
@@ -780,3 +782,105 @@ def test_embed_and_store_restart_after_failure_completes_without_duplicates(tmp_
     assert len(pending_hashes) == 86  # 150 - 64, без дублей уже сохранённых
     embed_and_store(conn, _WorkingEmbedder(), pending_hashes, pending_texts, batch=64)
     assert _vec_count(conn, "flaky2") == 150
+
+
+# --- гигиена неймспейсов: models / drop-model (knowledge-hardening §9) ---
+
+
+def test_list_models_empty_db_returns_empty_list(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    assert list_models(conn) == []
+
+
+def test_list_models_groups_by_model_with_counts_and_bytes(tmp_path: Path) -> None:
+    """gc_vectors чистит только СВОЮ модель — брошенные A/B-неймспейсы иначе никак
+    не видны. list_models — первый обзор всех неймспейсов сразу."""
+    conn = _setup(tmp_path)
+    store_vectors(conn, ["h1", "h2"], l2_normalize(np.ones((2, 3), dtype=np.float32)), "model-a")
+    store_vectors(conn, ["h3"], l2_normalize(np.ones((1, 5), dtype=np.float32)), "model-b")
+
+    infos = {i.model: i for i in list_models(conn)}
+    assert set(infos) == {"model-a", "model-b"}
+    assert infos["model-a"].n_vectors == 2
+    assert infos["model-b"].n_vectors == 1
+    assert infos["model-a"].total_bytes == 2 * 3 * 4  # float32 = 4 байта
+    assert infos["model-b"].total_bytes == 1 * 5 * 4
+
+
+def test_drop_model_removes_only_target_model(tmp_path: Path) -> None:
+    conn = _setup(tmp_path)
+    store_vectors(conn, ["h1"], l2_normalize(np.ones((1, 3), dtype=np.float32)), "model-a")
+    store_vectors(conn, ["h2"], l2_normalize(np.ones((1, 3), dtype=np.float32)), "model-b")
+
+    removed = drop_model(conn, "model-a")
+
+    assert removed == 1
+    assert _vec_count(conn, "model-a") == 0
+    assert _vec_count(conn, "model-b") == 1
+
+
+def test_drop_model_missing_model_is_noop(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    assert drop_model(conn, "no-such-model") == 0
+
+
+def test_cmd_models_prints_summary(tmp_path: Path, capsys: Any) -> None:
+    from index.vector_store import _cmd_models
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    store_vectors(conn, ["h1"], l2_normalize(np.ones((1, 3), dtype=np.float32)), "model-a")
+    conn.close()
+
+    args = argparse.Namespace(db=db)
+    assert _cmd_models(args) == 0
+    out = capsys.readouterr().out
+    assert "model-a: 1 векторов" in out
+
+
+def test_cmd_models_reports_empty(tmp_path: Path, capsys: Any) -> None:
+    from index.vector_store import _cmd_models
+
+    db = tmp_path / "c.db"
+    create_db(db).close()
+    assert _cmd_models(argparse.Namespace(db=db)) == 0
+    assert "векторов нет" in capsys.readouterr().out
+
+
+def test_cmd_models_missing_db_reports_error(tmp_path: Path, capsys: Any) -> None:
+    from index.vector_store import _cmd_models
+
+    assert _cmd_models(argparse.Namespace(db=tmp_path / "absent.db")) == 2
+    assert "нет БД" in capsys.readouterr().err
+
+
+def test_cmd_drop_model_prints_confirmation(tmp_path: Path, capsys: Any) -> None:
+    from index.vector_store import _cmd_drop_model
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    store_vectors(conn, ["h1"], l2_normalize(np.ones((1, 3), dtype=np.float32)), "model-a")
+    conn.close()
+
+    args = argparse.Namespace(db=db, model="model-a")
+    assert _cmd_drop_model(args) == 0
+    out = capsys.readouterr().out
+    assert "model-a: удалено 1 векторов" in out
+
+
+def test_main_models_and_drop_model_subcommands_dispatch(tmp_path: Path, capsys: Any) -> None:
+    from index.vector_store import main as vs_main
+
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    store_vectors(conn, ["h1"], l2_normalize(np.ones((1, 3), dtype=np.float32)), "model-a")
+    conn.close()
+
+    assert vs_main(["models", "--db", str(db)]) == 0
+    assert "model-a" in capsys.readouterr().out
+
+    assert vs_main(["drop-model", "model-a", "--db", str(db)]) == 0
+    assert "удалено 1" in capsys.readouterr().out
+
+    conn2 = sqlite3.connect(db)
+    assert _vec_count(conn2, "model-a") == 0

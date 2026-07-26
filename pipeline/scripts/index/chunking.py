@@ -22,7 +22,13 @@ TokenCounter = Callable[[str], int]
 
 _FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
 _PARA_RE = re.compile(r"\n\s*\n")
-_SENT_RE = re.compile(r"(?<=[.!?;])\s+|\n")
+_SENT_RE = re.compile(r"(?<=[.!?;])\s+|(?<=[。！？；])\s*|\n")
+# Вторая альтернатива — CJK-пунктуация (knowledge-hardening §8): в пробельных
+# языках граница предложения требует \s+ ПОСЛЕ знака, но CJK-текст пробелов
+# между предложениями не ставит вовсе — с \s+ эта форма никогда не совпадала бы,
+# и весь абзац оставался бы одним «предложением» (живой замер: 1140-токенный
+# CJK-абзац -> один чанк 2.2× бюджета). \s* (не \s+) даёт пустое совпадение сразу
+# после знака — разрез происходит независимо от наличия пробела.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
@@ -120,6 +126,50 @@ def _sections(text: str) -> list[tuple[str, list[str]]]:
     return sections
 
 
+def _split_by_chars(text: str, count_tokens: TokenCounter, max_tokens: int) -> list[str]:
+    """Разрез БЕСПРОБЕЛЬНОЙ строки по символам — фолбэк ``_hard_split`` для текста
+    без словных границ (knowledge-hardening §8): сплошной CJK-абзац токенизатор
+    ``str.split()`` видит как ОДНО «слово» размером с абзац, и без этого фолбэка
+    оно принималось бы целиком поверх лимита (эмбеддер молча усекал бы чанк —
+    подтверждено живым запуском, 1140-токенный абзац -> один чанк 2.2× бюджета).
+
+    Тот же приём, что у словного пути выше: дёшевая посимвольная сумма + бинарный
+    поиск точки разреза при расхождении оценки. Разрез по индексу Python ``str``
+    НИКОГДА не рвёт кодовую точку посередине (в отличие от UTF-16, Python хранит
+    строки как последовательность code point'ов, не суррогатных пар) — граница
+    чанка может лишь разделить пару «базовый символ + комбинирующийся диакритик»,
+    что не создаёт невалидный текст, только менее удачную визуальную границу.
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        j, budget = i, 0
+        while j < n:
+            c_tokens = count_tokens(text[j])
+            if budget + c_tokens > max_tokens and j > i:
+                break
+            budget += c_tokens
+            j += 1
+        candidate = text[i:j]
+        if j == i + 1 or count_tokens(candidate) <= max_tokens:
+            out.append(candidate)
+            i = j
+            continue
+        lo, hi, best = i + 1, j, i + 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if count_tokens(text[i:mid]) <= max_tokens:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        out.append(text[i:best])
+        i = best
+    return out
+
+
 def _hard_split(text: str, count_tokens: TokenCounter, max_tokens: int) -> list[str]:
     """Жёсткая нарезка по словам для аномально длинных предложений (типовой выход
     pdf_to_markdown на дампах диаграмм/таблиц без пунктуации).
@@ -133,6 +183,11 @@ def _hard_split(text: str, count_tokens: TokenCounter, max_tokens: int) -> list[
     словам, чем реальный совместный счёт) — бинарный поиск точки разреза (O(log n)
     энкодов). Свойство «чанк <= max_tokens» — точное (финальная верификация),
     меняется только СТОИМОСТЬ его достижения.
+
+    Единственное «слово» (нет пробелов вовсе — беспробельный язык, напр. сплошной
+    CJK-текст) больше лимита — фолбэк ``_split_by_chars`` (knowledge-hardening §8),
+    а не молчаливое принятие поверх бюджета: без него граница чанка была видна
+    только эмбеддеру, который её просто тихо усекал.
     """
     words = text.split()
     if not words:
@@ -148,9 +203,15 @@ def _hard_split(text: str, count_tokens: TokenCounter, max_tokens: int) -> list[
             budget += w_tokens
             j += 1
         candidate = " ".join(words[i:j])
-        if j == i + 1 or count_tokens(candidate) <= max_tokens:
-            # одно слово (дальше резать некуда, даже если оно само больше лимита)
-            # либо честная проверка подтвердила оценку — принимаем как есть
+        if j == i + 1:
+            if count_tokens(candidate) <= max_tokens:
+                out.append(candidate)
+            else:
+                out.extend(_split_by_chars(candidate, count_tokens, max_tokens))
+            i = j
+            continue
+        if count_tokens(candidate) <= max_tokens:
+            # честная проверка подтвердила оценку — принимаем как есть
             out.append(candidate)
             i = j
             continue
