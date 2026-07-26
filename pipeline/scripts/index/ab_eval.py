@@ -26,9 +26,15 @@ import yaml
 
 from analyze.retrieve import retrieve
 from index.corpus_index import DEFAULT_DB, fts_search, sanitize_fts_query
-from index.embed import DEFAULT_CLOUD_MODEL, Embedder, get_embedder
+from index.embed import DEFAULT_CLOUD_MODEL, Embedder, OpenRouterEmbedder, get_embedder
 from core.env import REPO_ROOT, load_dotenv
-from index.vector_store import check_chunk_budget, chunk_hashes, embed_and_store, semantic_search
+from index.vector_store import (
+    check_chunk_budget,
+    chunk_hashes,
+    confidential_doc_ids,
+    embed_and_store,
+    semantic_search,
+)
 
 DEFAULT_EVAL_QUERIES = REPO_ROOT / "pipeline" / "config" / "eval_queries.yaml"
 PRECISION_AT_K = 5  # глубина precision@5; поисковые вызовы ниже берут max(k, это)
@@ -332,16 +338,35 @@ def main(argv: list[str] | None = None) -> int:
             # (spec embed-local-swap §4); намеренно без try/except — несовместимость
             # чанков с бюджетом сравниваемой модели должна остановить прогон, не спрятаться.
             check_chunk_budget(conn, embedder.max_tokens)
+            # sensitivity-гейт (knowledge-hardening §5): третья дверь облачного эмбеддинга
+            # (первые две — vector_store embed-corpus и run_pipeline --embed) была БЕЗ
+            # фильтра — облачный эталон в A/B эмбеддил бы confidential-only чанки.
+            # isinstance, не строка backend'а: ab_eval сравнивает ГЕТЕРОГЕННЫЙ список
+            # уже сконструированных Embedder (--backends + опциональный --reference-model),
+            # а не один backend по имени, как в run_pipeline/vector_store.
+            exclude = confidential_doc_ids(conn) if isinstance(embedder, OpenRouterEmbedder) else None
             # инкрементально ПО КАЖДОМУ эмбеддеру (spec embed-local-swap §5): разные
             # модели держат разные множества уже заэмбедженных хэшей; повторный A/B
             # той же моделью не пере-считает уже посчитанное.
-            hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)
+            if exclude:
+                all_pending, _ = chunk_hashes(conn, not_embedded_for=embedder.name)
+                hashes, texts = chunk_hashes(
+                    conn, not_embedded_for=embedder.name, exclude_all_carriers_in=exclude
+                )
+                skipped = len(all_pending) - len(hashes)
+            else:
+                hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)
+                skipped = 0
             if "vector" in modes:
                 results.append(evaluate_vector(conn, embedder, hashes, texts, queries, args.k))
             else:
                 embed_and_store(conn, embedder, hashes, texts)  # hybrid тоже нужен
             if "hybrid" in modes:
                 results.append(evaluate_hybrid(conn, embedder, queries, args.k))
+            if skipped:
+                # stdout, не stderr — это статусная строка (как у vector_store._cmd_embed),
+                # не ошибка.
+                print(f"  {embedder.name}: {skipped} чанков только-confidential пропущены облачным эмбеддером")
 
     conn.close()
     _report(results, args.k, len(queries))

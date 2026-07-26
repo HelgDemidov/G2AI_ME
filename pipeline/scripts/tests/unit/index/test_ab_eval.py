@@ -2,6 +2,7 @@
 сети, CI-safe (эмбеддер — фейк, реальный OpenRouter/bge-m3 не задействован)."""
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 import yaml
 
+from core.schema import SourceRecord
 from index.ab_eval import (
     DEFAULT_EVAL_QUERIES,
     PRECISION_AT_K,
@@ -24,7 +26,8 @@ from index.ab_eval import (
 )
 from index.chunking import Chunk
 from index.corpus_index import create_db, fts5_available, index_chunks
-from index.embed import FloatArray
+from index.embed import FloatArray, OpenRouterEmbedder
+from tests.support import valid_record
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="sqlite без FTS5")
 
@@ -390,3 +393,85 @@ def test_report_prints_mrr_and_precision5_in_header(capsys: Any) -> None:
     _report([res], k=3, n_queries=1)
     out = capsys.readouterr().out
     assert f"MRR=1.000   precision@{PRECISION_AT_K}=60%" in out
+
+
+# --- sensitivity-гейт: третья дверь облачного эмбеддинга (knowledge-hardening §5) ---
+
+
+def _sensitive_record(id_: str, *, sensitivity: str = "normal") -> SourceRecord:
+    rec_dict = valid_record()
+    rec_dict["id"] = id_
+    rec_dict["sensitivity"] = sensitivity
+    return SourceRecord.model_validate(rec_dict)
+
+
+def _vec_count(conn: sqlite3.Connection, model: str) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM vectors WHERE model=?", (model,)).fetchone()[0])
+
+
+def test_main_vector_mode_applies_sensitivity_gate_to_real_openrouter_embedder(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """ab_eval была ЕДИНСТВЕННОЙ из трёх дверей облачного эмбеддинга без sensitivity-
+    гейта (vector_store embed-corpus и run_pipeline --embed его уже применяли).
+    Гейт различает бэкенды через ``isinstance(embedder, OpenRouterEmbedder)`` — ab_eval
+    сравнивает гетерогенный список уже сконструированных эмбеддеров, а не один backend
+    по строке, поэтому фейк, не наследующий реальный класс, гейт корректно НЕ триггерит
+    (см. другие тесты этого файла с ``_FakeEmbedder``) — здесь нужен настоящий экземпляр."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "confidential only text", 3), Chunk("doc-pub", 0, "public text", 2)],
+        records=[
+            _sensitive_record("doc-conf", sensitivity="confidential"),
+            _sensitive_record("doc-pub"),
+        ],
+    )
+    conn.close()
+    q = _write_queries(tmp_path / "q.yaml")
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    real = OpenRouterEmbedder(model="cloud-model", dims=2)
+    monkeypatch.setattr(
+        OpenRouterEmbedder, "_request", lambda self, batch: [[1.0, 2.0] for _ in batch]
+    )
+    monkeypatch.setattr("index.ab_eval.get_embedder", lambda backend, **kw: real)
+    monkeypatch.setattr("index.ab_eval.load_dotenv", lambda: None)
+
+    argv = [
+        "--db", str(db), "--eval-queries", str(q), "--mode", "vector", "--k", "1",
+        "--no-reference", "--backends", "openrouter:cloud-model",
+    ]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "1 чанков только-confidential" in out
+
+    conn2 = sqlite3.connect(db)
+    assert _vec_count(conn2, real.name) == 1  # только публичный чанк заэмбеджен облаком
+
+
+def test_main_vector_mode_fake_embedder_bypasses_sensitivity_gate(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """Регресс: локальный/фейковый эмбеддер (не OpenRouterEmbedder) НЕ триггерит гейт —
+    поведение существующих тестов ``_FakeEmbedder`` не должно измениться."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(
+        conn,
+        [Chunk("doc-conf", 0, "confidential only text", 3)],
+        records=[_sensitive_record("doc-conf", sensitivity="confidential")],
+    )
+    conn.close()
+    q = _write_queries(tmp_path / "q.yaml")
+    monkeypatch.setattr("index.ab_eval.get_embedder", lambda backend, **kw: _FakeEmbedder())
+    monkeypatch.setattr("index.ab_eval.load_dotenv", lambda: None)
+
+    argv = ["--db", str(db), "--eval-queries", str(q), "--mode", "vector", "--k", "1", "--no-reference"]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "только-confidential" not in out
+
+    conn2 = sqlite3.connect(db)
+    assert _vec_count(conn2, "fake-model") == 1  # confidential-чанк заэмбеджен как обычно
