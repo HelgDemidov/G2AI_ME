@@ -402,8 +402,8 @@ def test_curated_edges_keep_l0_tag(tmp_path: Path) -> None:
 
 
 def test_leads_written_to_corpus_state_dir(tmp_path: Path) -> None:
-    """Отчёт живёт в `.state/` рядом с лидами snowball — каталогом владеет store,
-    имя файла принадлежит писателю."""
+    """Отчёт живёт в `.state/` рядом с лидами snowball — каталогом владеет
+    core.schema (knowledge-hardening §2), имя файла принадлежит писателю."""
     citing = _place(tmp_path, "me-law-2025", "см. ISO/IEC 42001:2023\n")
     _graph, mining = build_corpus_graph([citing], tmp_path)
 
@@ -454,3 +454,20 @@ def test_shipped_aliases_point_at_known_identifier_space() -> None:
     known_prefixes = ("CELEX:", "SLCG:", "ISO", "NIST ")
     for alias, ident in cite_mining.load_aliases().items():
         assert ident.startswith(known_prefixes), f"{alias} -> {ident}"
+
+
+# --- state_dir: владелец переехал в core.schema (knowledge-hardening §2) ---
+
+
+def test_leads_path_matches_schema_state_dir(tmp_path: Path) -> None:
+    """Путь отчёта не изменился при переезде владельца каталога discovery -> schema."""
+    assert cite_mining.leads_path(tmp_path) == schema.state_dir(tmp_path) / "cite_leads.yaml"
+
+
+def test_cite_mining_does_not_import_discovery() -> None:
+    """graph — не должен зависеть от discovery ради path-хелпера: единственная
+    межслойная зависимость (``from discovery import store``) снята переездом
+    ``state_dir`` в ``core.schema``."""
+    assert not hasattr(cite_mining, "store")
+    source = Path(cite_mining.__file__).read_text(encoding="utf-8")
+    assert "import discovery" not in source and "from discovery" not in source

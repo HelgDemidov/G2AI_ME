@@ -471,6 +471,26 @@ def state_file(rec: SourceRecord, root: Path) -> Path:
     return doc_dir(rec, root) / ".state.yaml"
 
 
+STATE_DIRNAME = ".state"
+
+
+def state_dir(root: Path = DEFAULT_SOURCES) -> Path:
+    """Каталог операционного состояния КОРПУСА (в отличие от ``state_file`` выше —
+    пер-документного): ``<root>/.state/``. Тот же концепт («операционное, не для
+    курирования человеком»), что и ``.state.yaml``, — одно слово на двух уровнях
+    вложенности.
+
+    Владелец каталога — этот модуль (``core.schema``, куда переехало со дня
+    введения понятия в ``discovery/store.py`` — knowledge-hardening §2: у каталога
+    уже три писателя из ДВУХ слоёв — ``discovery/store.py`` курсоры,
+    ``connectors/snowball.py`` лиды, ``graph/cite_mining.py`` dangling-цитаты —
+    он перерос «владение» discovery). ИМЯ ФАЙЛА внутри принадлежит писателю: этот
+    модуль не знает о существовании конкретных коннекторов/майнеров, а писатели не
+    дублируют знание о раскладке.
+    """
+    return root / STATE_DIRNAME
+
+
 def check_layout(meta_path: Path, rec: SourceRecord, seen_ids: set[str]) -> list[str]:
     """Чистые инварианты раскладки corpus-layout-v2: папка документа == ``id``;
     папка сущности == ``entity_id``; верхняя папка == ``track``; глобальная
