@@ -36,6 +36,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--authority", help="фильтр по authority")
     parser.add_argument("--axis", help="фильтр по оси relevance (agentic_g2ai|digital_sovereignty)")
     parser.add_argument("--tier", dest="target_fit", help="фильтр по target_fit (primary|context|background)")
+    parser.add_argument(
+        "--include-superseded", action="store_true",
+        help="не скрывать заменённые редакции (по умолчанию выдаются только действующие; "
+             "флаг нужен для исследования истории документа)",
+    )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument(
         "--backend", choices=["bge", "openrouter", "none"], default=DEFAULT_BACKEND,
@@ -56,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         topic=args.topic,
         axis=args.axis,
         target_fit=args.target_fit,
+        include_superseded=args.include_superseded,
     )
 
     conn = sqlite3.connect(args.db)

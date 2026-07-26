@@ -28,6 +28,10 @@ class RetrievalFilters:
     topic: str | None = None  # membership в topics_map
     axis: str | None = None
     target_fit: str | None = None
+    # Заменённые редакции по умолчанию НЕ выдаются (spec graph-v2 §2): устаревшая
+    # редакция закона в top-k evidence-пака — тихая содержательная ошибка того же
+    # класса, что «вектор указывает на чужой текст». История — по явному флагу.
+    include_superseded: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,11 +45,50 @@ class ScoredChunk:
     vec_rank: int | None
 
 
-def _resolve_filters(conn: sqlite3.Connection, filters: RetrievalFilters | None) -> set[str] | None:
+def _superseded_doc_ids(conn: sqlite3.Connection) -> set[str]:
+    """doc_id заменённых редакций (фасет ``superseded``; ``schema.superseded_ids`` считал
+    его при индексации). Отсутствие колонки/таблицы — легаси-БД до graph-v2: пустое
+    множество, поведение прежнее."""
+    try:
+        rows = conn.execute("SELECT doc_id FROM doc_facets WHERE superseded = 1").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(r[0]) for r in rows}
+
+
+def _searchable_doc_ids(conn: sqlite3.Connection) -> set[str]:
+    """Вселенная поиска — то, что реально проиндексировано (``chunks``), а НЕ
+    ``doc_facets``: фасеты могут быть пусты (индекс собран без записей), и брать
+    «все документы» оттуда значило бы схлопнуть выдачу в ноль."""
+    rows = conn.execute("SELECT DISTINCT doc_id FROM chunks").fetchall()
+    return {str(r[0]) for r in rows}
+
+
+def _apply_superseded_gate(
+    conn: sqlite3.Connection, allowed: set[str] | None, include_superseded: bool
+) -> set[str] | None:
+    """Вычесть заменённые редакции из множества допустимых документов (spec graph-v2 §2).
+
+    Ключевое свойство: **пока в корпусе нет ни одного ребра supersedes, функция —
+    полный no-op** (возвращает ``allowed`` как есть), поэтому выдача не меняется ни на
+    бит до появления данных; включение произойдёт само, данными. Ради этого гейт
+    выражен ВЫЧИТАНИЕМ, а не условием в SQL фасетов: последнее превратило бы
+    ``allowed=None`` («весь корпус») в конкретное множество из ``doc_facets`` и
+    обнулило бы выдачу на БД, где фасеты не наполнены.
+    """
+    if include_superseded:
+        return allowed
+    superseded = _superseded_doc_ids(conn)
+    if not superseded:
+        return allowed
+    if allowed is None:
+        return _searchable_doc_ids(conn) - superseded
+    return allowed - superseded
+
+
+def _resolve_filters(conn: sqlite3.Connection, filters: RetrievalFilters) -> set[str] | None:
     """SELECT doc_id из ``doc_facets`` [+ JOIN ``topics_map`` при ``topic``]; все
     условия — AND. ``None`` при пустых фильтрах (весь корпус доступен обоим каналам)."""
-    if filters is None:
-        return None
     conditions: list[str] = []
     params: list[str] = []
     for column, value in (
@@ -103,8 +146,16 @@ def retrieve(
     — ``None``): нужна CI/свежей БД без векторов и CLI ``--backend none``. Санитизация
     запроса — ВНУТРИ (фасад для аналитика; сырой FTS5-синтаксис остаётся у
     ``corpus_index.py search --raw``).
+
+    ``filters=None`` НОРМАЛИЗУЕТСЯ к ``RetrievalFilters()``, а не обходит фасетный слой
+    (spec graph-v2 §2, контракт дефолта): это самый частый путь вызова, и именно на нём
+    «дефолт в dataclass» не сработал бы — исключение заменённых редакций молча не
+    применялось бы ровно там, где ошибка тише всего.
     """
-    allowed = _resolve_filters(conn, filters)
+    filters = filters if filters is not None else RetrievalFilters()
+    allowed = _apply_superseded_gate(
+        conn, _resolve_filters(conn, filters), filters.include_superseded
+    )
 
     fts_hits: list[SearchHit] = fts_search(conn, sanitize_fts_query(query), POOL, allowed_doc_ids=allowed)
     vec_hits: list[VecHit] = []
