@@ -160,6 +160,89 @@ def test_iso_number_lengths_property(number: int) -> None:
     assert cite_mining.extract_identifiers(f"ISO/IEC {number}") == [(f"ISO/IEC {number}", "iso")]
 
 
+# --- курируемый алиас-канал (spec graph-hardening §2) ---
+
+
+_AI_ACT = {"EU AI Act": "CELEX:32024R1689"}
+
+
+def test_alias_extracts_identifier_absent_from_text() -> None:
+    """Живой случай `oxford-insights-gairi-2025`: акт цитируется ТОЛЬКО алиасом, формального
+    идентификатора в тексте нет вовсе — регекс-майнер такую связь не видит в принципе."""
+    text = "Components of the EU AI Act entered into force throughout 2025."
+    assert cite_mining.extract_identifiers(text) == []                       # паттерны молчат
+    assert cite_mining.extract_identifiers(text, _AI_ACT) == [("CELEX:32024R1689", "alias")]
+
+
+def test_extract_identifiers_is_pattern_only_by_default() -> None:
+    """Контракт голден-теста: дефолт БЕЗ алиасов — стабильность регексов не должна
+    зависеть от файла, который куратор законно правит в любой момент."""
+    text = "the EU AI Act and 32016R0679"
+    assert cite_mining.extract_identifiers(text) == [("CELEX:32016R0679", "celex")]
+
+
+@pytest.mark.parametrize(
+    "text,found",
+    [
+        ("primjena GDPR-om u praksi", True),      # флексия — границы слов дают её даром
+        ("usklađen sa GDPR.", True),
+        ("(GDPR)", True),
+        ("the gdpr regime", True),                # регистр плавает по вёрстке и OCR
+        ("GDPRX", False),                         # подстрока внутри слова — не цитата
+        ("pre-GDPRish", False),
+    ],
+)
+def test_alias_word_boundaries(text: str, found: bool) -> None:
+    hits = cite_mining.extract_identifiers(text, {"GDPR": "CELEX:32016R0679"})
+    assert bool(hits) is found
+
+
+def test_alias_does_not_match_other_jurisdictions_act() -> None:
+    """⚠ Ловушка, подтверждённая живьём в `oxford-insights-gairi-2025`: голый «AI Act» —
+    это ещё и корейский «Basic AI Act», и тайваньский. Различающая форма обязана
+    промолчать на чужих актах, иначе канал строит ложные рёбра пачками."""
+    for foreign in ["South Korea's Basic AI Act", "a draft bill of its AI Act",
+                    "the comprehensive Australia AI Act"]:
+        assert cite_mining.extract_identifiers(foreign, _AI_ACT) == []
+
+
+def test_pattern_wins_rule_tag_over_alias() -> None:
+    """Формальная цитата — более сильное свидетельство: при совпадении идентификатора
+    правилом остаётся паттерн, алиасу достаётся только ненайденное."""
+    text = "the EU AI Act, formally 32024R1689"
+    assert cite_mining.extract_identifiers(text, _AI_ACT) == [("CELEX:32024R1689", "celex")]
+
+
+def test_blank_alias_is_ignored() -> None:
+    """Опечатка `"": doc-id` в YAML иначе совпала бы в КАЖДОМ документе корпуса."""
+    assert cite_mining.extract_identifiers("любой текст", {"": "CELEX:32024R1689", "  ": "X"}) == []
+
+
+def test_alias_hit_goes_through_normal_resolution(tmp_path: Path) -> None:
+    """Алиас сам по себе ребра не строит — он даёт идентификатор, который проходит ту же
+    резолюцию: есть запись справочника — ребро, нет — обычный лид."""
+    cited = _place(tmp_path, "eu-ai-act-2024", "# акт\n")
+    citing = _place(tmp_path, "oxford-2025", "following the EU AI Act closely\n")
+    result = cite_mining.mine_corpus(
+        [cited, citing], tmp_path,
+        identifiers={"CELEX:32024R1689": "eu-ai-act-2024"}, aliases=_AI_ACT,
+    )
+    assert [(e.source_id, e.target_id, e.rule) for e in result.edges] == [
+        ("oxford-2025", "eu-ai-act-2024", "alias")
+    ]
+
+    unresolved = cite_mining.mine_corpus([citing], tmp_path, identifiers={}, aliases=_AI_ACT)
+    assert unresolved.edges == []
+    assert [lead["identifier"] for lead in unresolved.leads] == ["CELEX:32024R1689"]
+
+
+def test_explicit_empty_aliases_keeps_test_hermetic(tmp_path: Path) -> None:
+    """Явный словарь (в т.ч. пустой) отключает чтение диска: правка курируемого файла
+    не должна менять исход юнит-теста."""
+    citing = _place(tmp_path, "oxford-2025", "following the EU AI Act closely\n")
+    assert cite_mining.mine_corpus([citing], tmp_path, identifiers={}, aliases={}).leads == []
+
+
 # --- резолюция ---
 
 
@@ -333,5 +416,15 @@ def test_build_corpus_graph_can_skip_disk_write(tmp_path: Path) -> None:
 
 def test_shipped_identifiers_vocab_is_wellformed() -> None:
     """Файл в репозитории обязан парситься даже пустым — иначе первая же сборка графа
-    на свежем клоне падает."""
-    assert isinstance(cite_mining.load_identifiers(), dict)
+    на свежем клоне падает. Обе секции — независимые словари строк."""
+    for section in (cite_mining.load_identifiers(), cite_mining.load_aliases()):
+        assert isinstance(section, dict)
+        assert all(isinstance(k, str) and isinstance(v, str) for k, v in section.items())
+
+
+def test_shipped_aliases_point_at_known_identifier_space() -> None:
+    """Алиас обязан давать КАНОНИЧЕСКИЙ идентификатор (то же пространство, что паттерны),
+    а не doc-id: иначе он молча минует канал резолюции и никогда не станет ребром."""
+    known_prefixes = ("CELEX:", "SLCG:", "ISO", "NIST ")
+    for alias, ident in cite_mining.load_aliases().items():
+        assert ident.startswith(known_prefixes), f"{alias} -> {ident}"
