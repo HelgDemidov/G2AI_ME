@@ -20,6 +20,11 @@
 CLI:
   embed-corpus [--backend bge|openrouter] — доэмбеддить новые чанки корпуса + GC.
   vsearch <запрос> [--backend ...]        — семантический поиск.
+  models                                  — список неймспейсов векторов в БД
+                                             (knowledge-hardening §9: gc_vectors
+                                             чистит только СВОЮ модель, брошенные
+                                             A/B-неймспейсы иначе копятся вечно).
+  drop-model <имя>                        — удалить ВСЕ векторы неймспейса целиком.
 """
 from __future__ import annotations
 
@@ -297,6 +302,39 @@ def gc_vectors(conn: sqlite3.Connection, model: str) -> int:
     return int(cur.rowcount)
 
 
+@dataclass(frozen=True)
+class ModelInfo:
+    model: str
+    n_vectors: int
+    total_bytes: int
+
+
+def list_models(conn: sqlite3.Connection) -> list[ModelInfo]:
+    """Неймспейсы векторов, присутствующие в БД (knowledge-hardening §9).
+
+    ``gc_vectors`` чистит только осиротевшие векторы СВОЕЙ модели — брошенные
+    неймспейсы (сравнительные A/B-прогоны, смена эмбеддера) в остальном копятся в
+    БД вечно, ни одна команда до сих пор их не показывала."""
+    ensure_schema(conn)
+    rows = conn.execute(
+        "SELECT model, COUNT(*), COALESCE(SUM(LENGTH(vec)), 0) FROM vectors "
+        "GROUP BY model ORDER BY model"
+    ).fetchall()
+    return [ModelInfo(str(r[0]), int(r[1]), int(r[2])) for r in rows]
+
+
+def drop_model(conn: sqlite3.Connection, model: str) -> int:
+    """Удалить ВСЕ векторы неймспейса целиком (не только осиротевшие, как
+    ``gc_vectors``) — явная команда куратора для брошенного эксперимента.
+    Восстановимо повторным ``embed-corpus`` за минуты/копейки, поэтому без
+    интерактивного подтверждения (тот же принцип, что у ``discover apply``:
+    явный аргумент команды и есть намерение)."""
+    ensure_schema(conn)
+    cur = conn.execute("DELETE FROM vectors WHERE model = ?", (model,))
+    conn.commit()
+    return int(cur.rowcount)
+
+
 def unembedded_count(conn: sqlite3.Connection, model: str) -> int:
     """Сколько уникальных хэшей чанков ещё без вектора данной модели (missing-репорт
     vsearch)."""
@@ -398,6 +436,33 @@ def _cmd_vsearch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_models(args: argparse.Namespace) -> int:
+    if not args.db.exists():
+        print(f"нет БД {args.db}", file=sys.stderr)
+        return 2
+    conn = sqlite3.connect(args.db)
+    infos = list_models(conn)
+    conn.close()
+    if not infos:
+        print("векторов нет")
+        return 0
+    for info in infos:
+        mib = info.total_bytes / (1024 * 1024)
+        print(f"{info.model}: {info.n_vectors} векторов, {mib:.1f} МиБ")
+    return 0
+
+
+def _cmd_drop_model(args: argparse.Namespace) -> int:
+    if not args.db.exists():
+        print(f"нет БД {args.db}", file=sys.stderr)
+        return 2
+    conn = sqlite3.connect(args.db)
+    removed = drop_model(conn, args.model)
+    conn.close()
+    print(f"{args.model}: удалено {removed} векторов")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -419,6 +484,19 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int, default=10)
     p_search.set_defaults(func=_cmd_vsearch)
+
+    p_models = sub.add_parser(
+        "models", help="список неймспейсов векторов в БД (гигиена A/B-экспериментов)"
+    )
+    p_models.add_argument("--db", type=Path, default=DEFAULT_DB)
+    p_models.set_defaults(func=_cmd_models)
+
+    p_drop = sub.add_parser(
+        "drop-model", help="удалить ВСЕ векторы указанного неймспейса целиком"
+    )
+    p_drop.add_argument("--db", type=Path, default=DEFAULT_DB)
+    p_drop.add_argument("model")
+    p_drop.set_defaults(func=_cmd_drop_model)
 
     args = parser.parse_args(argv)
     result: int = args.func(args)
