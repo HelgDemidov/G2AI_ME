@@ -5,12 +5,21 @@ from collections.abc import Callable
 
 from index.chunking import (
     _hard_split,
+    _split_by_chars,
     _split_table_paragraph,
     _table_header,
     chunk_text,
     embed_input,
     strip_frontmatter,
 )
+
+
+def char_len(text: str) -> int:
+    """Стаб-счётчик по числу СИМВОЛОВ, не слов — приближение реального
+    токенизатора для беспробельных языков (CJK: ~1 токен/иероглиф), где стаб
+    ``wc`` выше не годится (он видит целый CJK-абзац как одно «слово» и всегда
+    считает его за 1)."""
+    return len(text)
 
 
 def wc(text: str) -> int:
@@ -379,3 +388,83 @@ def test_short_table_stays_intact_as_single_chunk() -> None:
     chunks = chunk_text(text, wc, max_tokens=50)
     assert len(chunks) == 1
     assert chunks[0].text == text
+
+
+# --- беспробельные языки (CJK): _SENT_RE-пунктуация + _split_by_chars фолбэк
+# (knowledge-hardening §8) ---
+
+
+def test_cjk_sentence_punctuation_splits_without_whitespace() -> None:
+    """Живой замер аудита: сплошной CJK-абзац без пробелов между предложениями —
+    без CJK-пунктуации в _SENT_RE весь абзац оставался бы ОДНИМ «предложением»
+    (1140-токенный кейс -> один чанк 2.2× бюджета). Здесь — тот же паттерн на
+    меньшем масштабе, с точным счётчиком (char_len), не моделью."""
+    para = "人工智能治理框架的实施需要跨部门协调。" * 20  # ~400 символов, без единого пробела
+    chunks = chunk_text(para, char_len, max_tokens=50)
+    assert all(c.n_tokens <= 50 for c in chunks)
+    assert len(chunks) > 1  # реально разрезан, не один переросший чанк
+    # Упаковка предложений внутри чанка склеивает их " ".join (существующее
+    # поведение _split_long_paragraph, не часть этого фикса) — сравниваем контент
+    # без учёта этих вставленных разделителей, не побайтово.
+    assert "".join(c.text for c in chunks).replace(" ", "") == para
+
+
+def test_cjk_semicolon_and_all_three_terminators_split() -> None:
+    """。！？ и ； (CJK-точка-с-запятой) — все четыре знака из §8 дают границу
+    без пробела после них."""
+    para = "句子一。句子二！句子三？句子四；句子五"
+    chunks = chunk_text(para, char_len, max_tokens=5)
+    assert all(c.n_tokens <= 5 for c in chunks)
+    assert len(chunks) >= 4
+
+
+def test_latin_sentence_splitting_unaffected_by_cjk_addition() -> None:
+    """Регресс: добавление CJK-альтернативы в _SENT_RE не должно менять разбиение
+    латинских текстов (мёртвая альтернатива на них)."""
+    para = "one two three. four five six! seven eight nine?"
+    chunks = chunk_text(para, wc, max_tokens=4)
+    assert len(chunks) == 3
+    assert all(c.n_tokens <= 4 for c in chunks)
+
+
+# --- _split_by_chars: фолбэк _hard_split для единственного «слова» без пробелов ---
+
+
+def test_split_by_chars_respects_budget() -> None:
+    text = "a" * 12
+    chunks = _split_by_chars(text, char_len, max_tokens=5)
+    assert all(char_len(c) <= 5 for c in chunks)
+    assert "".join(chunks) == text
+
+
+def test_split_by_chars_empty_text() -> None:
+    assert _split_by_chars("", char_len, max_tokens=5) == []
+
+
+def test_split_by_chars_binary_search_when_sum_undercounts() -> None:
+    """Симметрично словному пути (test_hard_split_respects_max_tokens_when_word_sum_undercounts):
+    посимвольная сумма может ЗАНИЗИТЬ реальный совместный счёт — бинарный поиск
+    обязан поймать это и не нарушить лимит."""
+
+    def joiny_chars(text: str) -> int:
+        return len(text) + (1 if len(text) > 1 else 0)  # +1 "токен склейки" при объединении
+
+    chunks = _split_by_chars("abcdefgh", joiny_chars, max_tokens=3)
+    assert all(joiny_chars(c) <= 3 for c in chunks)
+    assert "".join(chunks) == "abcdefgh"
+
+
+def test_hard_split_falls_back_to_chars_when_single_word_exceeds_budget() -> None:
+    """knowledge-hardening §8: беспробельная строка (CJK-предложение как ОДНО
+    «слово» по str.split()) больше лимита резалась бы по символам, а не
+    принималась целиком поверх бюджета, как раньше."""
+    word = "a" * 12  # одно "слово" без пробелов, длиннее лимита по char_len
+    chunks = _hard_split(word, char_len, max_tokens=5)
+    assert all(char_len(c) <= 5 for c in chunks)
+    assert "".join(chunks) == word
+
+
+def test_hard_split_single_word_within_budget_stays_whole() -> None:
+    """Регресс: слово В БЮДЖЕТЕ не должно уходить в посимвольный фолбэк."""
+    chunks = _hard_split("short", char_len, max_tokens=10)
+    assert chunks == ["short"]

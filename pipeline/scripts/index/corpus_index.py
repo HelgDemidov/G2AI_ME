@@ -443,6 +443,24 @@ def index_corpus_incremental(
     return len(changed), len(vanished)
 
 
+def _count_oversize_chunks(conn: sqlite3.Connection, max_tokens: int) -> int:
+    """Чанки, чей ``n_tokens > max_tokens`` (knowledge-hardening §8). Легальный
+    оверсайз существует по построению — целостность строки/слова важнее строгого
+    лимита (``_split_table_paragraph``/``_hard_split``/``_split_by_chars``: одна
+    аномально широкая строка таблицы или неразрезаемое слово остаются цельными
+    поверх бюджета), но эмбеддер такой чанк молча усечёт — счётчик делает это
+    видимым в статусе индексации, не только для CJK-триггера, который его нашёл."""
+    row = conn.execute("SELECT COUNT(*) FROM chunks WHERE n_tokens > ?", (max_tokens,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _oversize_suffix(conn: sqlite3.Connection, max_tokens: int) -> str:
+    oversize = _count_oversize_chunks(conn, max_tokens)
+    if not oversize:
+        return ""
+    return f" (⚠ {oversize} превышают {max_tokens} ткн — эмбеддер усечёт)"
+
+
 def index_corpus(
     conn: sqlite3.Connection,
     sources_root: Path,
@@ -467,11 +485,12 @@ def index_corpus(
             records=list(load_records(sources_root)),
         )
         _rebuild_doc_state(conn, sources_root)
-        return f"полная пересборка: {len(chunks)} чанков"
+        return f"полная пересборка: {len(chunks)} чанков" + _oversize_suffix(conn, max_tokens)
     changed, vanished = index_corpus_incremental(conn, sources_root, count_tokens, max_tokens)
     row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
     total = int(row[0]) if row else 0
-    return f"инкремент: изменено {changed}, удалено {vanished}; всего {total} чанков"
+    status = f"инкремент: изменено {changed}, удалено {vanished}; всего {total} чанков"
+    return status + _oversize_suffix(conn, max_tokens)
 
 
 def sanitize_fts_query(q: str) -> str:
