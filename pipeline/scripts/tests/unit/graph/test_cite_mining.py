@@ -422,6 +422,17 @@ def test_shipped_identifiers_vocab_is_wellformed() -> None:
         assert all(isinstance(k, str) and isinstance(v, str) for k, v in section.items())
 
 
+@pytest.mark.parametrize("content", [None, "- список, а не отображение\n", "", "identifiers: 42\n"])
+def test_missing_or_malformed_vocab_degrades_to_empty(tmp_path: Path, content: str | None) -> None:
+    """Справочник БЕЗ гейта: его отсутствие (свежий клон, tmp-корень) и любая порча
+    формата обязаны дать пустой словарь, а не уронить сборку графа всего корпуса."""
+    path = tmp_path / "identifiers.yaml"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    assert cite_mining.load_identifiers(path) == {}
+    assert cite_mining.load_aliases(path) == {}
+
+
 def test_shipped_aliases_point_at_known_identifier_space() -> None:
     """Алиас обязан давать КАНОНИЧЕСКИЙ идентификатор (то же пространство, что паттерны),
     а не doc-id: иначе он молча минует канал резолюции и никогда не станет ребром."""
