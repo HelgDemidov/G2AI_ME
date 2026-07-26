@@ -387,6 +387,14 @@ def mine_corpus(
 
     ``identifiers``/``aliases`` — обе секции курируемого справочника; ``None`` читает их
     с диска, явный словарь (в т.ч. пустой) отключает чтение, чтобы тест был герметичен.
+
+    Экстракция идёт по ТЕЛУ документа: frontmatter снимается (spec
+    convert-knowledge-seam-hardening §6) — он производная ``meta.yaml``, а не текст
+    издателя, и его ``title``/``source_url`` законно несут номер ЧУЖОГО акта («Guidance
+    on applying Regulation (EU) 2016/679…» — штатная форма заголовка в реестрах ЕС).
+    Ребро ``cites`` из курируемых метаданных подменило бы основание L1-слоя
+    («документ цитирует в своём тексте»); заодно определение «тела» становится общим с
+    chunking/lint, а не расходящимся у каждого потребителя ``doc.md``.
     """
     resolved, dangling = _resolution_map(
         records, identifiers if identifiers is not None else load_identifiers()
@@ -407,7 +415,7 @@ def mine_corpus(
             # реконсиляционен — починенный файл даст рёбра следующим прогоном.
             logger.warning("  ⚠ %s: doc.md не читается (%s) — пропущен майнингом", rec.id, exc)
             continue
-        for ident, rule in extract_identifiers(text, alias_map):
+        for ident, rule in extract_identifiers(schema.strip_frontmatter(text), alias_map):
             target = resolved.get(ident)
             if target is None:
                 lead = unresolved.setdefault(

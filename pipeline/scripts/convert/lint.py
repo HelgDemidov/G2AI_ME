@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from index.chunking import strip_frontmatter
+from core.schema import strip_frontmatter
 
 LINT_MIN_TEXT_RATIO = 0.5   # doc.md должен сохранить >= половины извлекаемых символов raw
 

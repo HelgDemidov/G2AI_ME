@@ -473,3 +473,30 @@ def test_cite_mining_does_not_import_discovery() -> None:
     assert not hasattr(cite_mining, "store")
     source = Path(cite_mining.__file__).read_text(encoding="utf-8")
     assert "import discovery" not in source and "from discovery" not in source
+
+
+# --- frontmatter не участвует в экстракции (spec convert-knowledge-seam-hardening §6) ---
+
+
+def test_frontmatter_metadata_does_not_create_edges(tmp_path: Path) -> None:
+    """Курируемые метаданные — не текст издателя: акт, названный только в ``title``
+    frontmatter'а, ребра ``cites`` не даёт (штатная форма заголовка в реестрах ЕС —
+    «Guidance on applying Regulation (EU) …»), а тот же акт в ТЕЛЕ — даёт."""
+    cited = _place(tmp_path, "gdpr-2016", "# GDPR\n")
+    citing = _place(tmp_path, "guidance-doc-2025", "Тело без формальных ссылок.\n")
+    md = schema.md_file(citing, tmp_path)
+    md.write_text(
+        "---\ntitle: Guidance on applying Regulation (EU) 2016/679 to AI\n---\n\n"
+        + md.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    identifiers = {"CELEX:32016R0679": "gdpr-2016"}
+
+    result = cite_mining.mine_corpus([cited, citing], tmp_path, identifiers=identifiers, aliases={})
+    assert result.edges == []
+
+    md.write_text(
+        md.read_text(encoding="utf-8") + "\nсогласно Regulation (EU) 2016/679\n", encoding="utf-8"
+    )
+    result = cite_mining.mine_corpus([cited, citing], tmp_path, identifiers=identifiers, aliases={})
+    assert [(e.source_id, e.target_id) for e in result.edges] == [("guidance-doc-2025", "gdpr-2016")]

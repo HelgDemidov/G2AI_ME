@@ -55,7 +55,11 @@ def _extract_pattern_only(doc_id: str) -> dict[str, str] | None:
         md = schema.md_file(rec, schema.DEFAULT_SOURCES)
         if not md.exists():
             return None
-        return dict(cite_mining.extract_identifiers(md.read_text(encoding="utf-8")))
+        # strip_frontmatter — как в продакшне (mine_corpus, spec
+        # convert-knowledge-seam-hardening §6): голден обязан сторожить регексы на ТОМ ЖЕ
+        # входе, что реально майнится, иначе он перестаёт быть сторожем продакшн-пути.
+        body = schema.strip_frontmatter(md.read_text(encoding="utf-8"))
+        return dict(cite_mining.extract_identifiers(body))
     return None
 
 

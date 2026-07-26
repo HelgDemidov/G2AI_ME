@@ -8,6 +8,7 @@ g2ai_pattern) и ссылочной целостности ``relations`` вын�
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -742,3 +743,22 @@ def render_frontmatter(rec: SourceRecord) -> str:
     present = {k: v for k, v in fields.items() if v not in (None, [], "")}
     body = yaml.safe_dump(present, allow_unicode=True, sort_keys=False)
     return f"---\n{body}---\n"
+
+
+# Якорь ``^`` без re.MULTILINE — совпадает ТОЛЬКО в начале строки-документа, поэтому
+# горизонтальная линейка ``---`` в теле (markdownify эмитит её для docx ``<hr>``)
+# отдельным фронтматтером не станет.
+_FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
+
+
+def strip_frontmatter(md: str) -> str:
+    """Снять YAML-frontmatter в начале ``.md`` (если он есть) — обратная сторона
+    ``render_frontmatter``.
+
+    Живёт ЗДЕСЬ, а не в ``index.chunking`` (spec convert-knowledge-seam-hardening §6):
+    пишущая и снимающая половины одной грамматики принадлежат одному модулю, иначе
+    потребители «тела документа» из разных слоёв тянут зависимость вверх по конвейеру
+    (``convert.lint`` -> ``index``) — тот же класс, что переезд ``state_dir``
+    (knowledge-hardening §2). ``index.chunking`` реэкспортирует имя для совместимости.
+    """
+    return _FRONTMATTER_RE.sub("", md, count=1)

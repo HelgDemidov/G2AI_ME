@@ -18,9 +18,16 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from core import schema
+
 TokenCounter = Callable[[str], int]
 
-_FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
+strip_frontmatter = schema.strip_frontmatter
+"""Реэкспорт (spec convert-knowledge-seam-hardening §6): грамматика frontmatter живёт
+в ``core.schema`` РЯДОМ с порождающей её ``render_frontmatter``; имя остаётся здесь для
+существующих потребителей (``corpus_index``/``run_pipeline``), как ``store.state_dir``
+после переезда в schema (knowledge-hardening §2)."""
+
 _PARA_RE = re.compile(r"\n\s*\n")
 _SENT_RE = re.compile(r"(?<=[.!?;])\s+|(?<=[。！？；])\s*|\n")
 # Вторая альтернатива — CJK-пунктуация (knowledge-hardening §8): в пробельных
@@ -47,11 +54,6 @@ class Chunk:
     text: str
     n_tokens: int
     breadcrumb: str = ""
-
-
-def strip_frontmatter(md: str) -> str:
-    """Убрать YAML-frontmatter в начале .md (если он есть)."""
-    return _FRONTMATTER_RE.sub("", md, count=1)
 
 
 def _paragraphs(text: str) -> list[str]:
