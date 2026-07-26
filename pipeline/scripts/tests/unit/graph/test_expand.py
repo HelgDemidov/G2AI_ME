@@ -13,7 +13,7 @@ import pytest
 
 from core.schema import SourceRecord
 from graph.build_graph import build_graph
-from graph.expand import Neighbor, expand, personalized_rank
+from graph.expand import Link, Neighbor, expand, personalized_rank
 from tests.support import valid_record
 
 
@@ -43,14 +43,59 @@ def _chain() -> nx.MultiDiGraph:
 
 def test_expand_returns_direct_typed_neighbours() -> None:
     result = expand(_chain(), ["a-doc-2026"])
-    assert result == [Neighbor("b-doc-2025", "implements", "L0", "out", 1)]
+    assert result == [Neighbor("b-doc-2025", (Link("implements", "L0", "out"),), 1)]
+
+
+def test_expand_keeps_every_parallel_link() -> None:
+    """Пара документов законно связана несколькими рёбрами сразу: новая редакция и
+    заменяет предшественника (курируемый L0), и цитирует его номер газеты (L1).
+    Одна причина из двух сделала бы досье тихо неполным."""
+    from graph.cite_mining import CiteEdge
+
+    graph = build_graph(
+        [_rec("b-doc-2025", relations=[{"type": "supersedes", "target": "a-doc-2020"}]),
+         _rec("a-doc-2020")],
+        cites=[CiteEdge("b-doc-2025", "a-doc-2020", "SLCG:65/2020", "sluzbeni_list_cg")],
+    )
+    (neighbor,) = expand(graph, ["b-doc-2025"])
+    assert neighbor.doc_id == "a-doc-2020"
+    assert neighbor.links == (
+        Link("cites", "L1", "out"), Link("supersedes", "L0", "out"),
+    )
+    assert neighbor.etypes == ("cites", "supersedes")
+
+
+def test_expand_merges_links_of_both_directions() -> None:
+    """Взаимные ссылки — тоже две разные причины, а не одна: «А цитирует Б» и
+    «Б цитирует А» обязаны остаться различимыми внутри одного соседа."""
+    graph = build_graph([
+        _rec("a-doc-2026", relations=[{"type": "cites", "target": "b-doc-2025"}]),
+        _rec("b-doc-2025", relations=[{"type": "references", "target": "a-doc-2026"}]),
+    ])
+    (neighbor,) = expand(graph, ["a-doc-2026"])
+    assert neighbor.links == (
+        Link("cites", "L0", "out"), Link("references", "L0", "in"),
+    )
+
+
+def test_expand_keeps_only_nearest_distance_links() -> None:
+    """Рёбра, найденные дальше ближайшего расстояния, описывают уже другой путь —
+    сосед фигурирует в досье один раз, со связями своего ближайшего шага."""
+    graph = build_graph([
+        _rec("a-doc-2026", relations=[{"type": "cites", "target": "c-doc-2024"}]),
+        _rec("b-doc-2025", relations=[{"type": "implements", "target": "c-doc-2024"}]),
+        _rec("c-doc-2024", relations=[{"type": "references", "target": "b-doc-2025"}]),
+    ])
+    result = {n.doc_id: n for n in expand(graph, ["a-doc-2026"], hops=2)}
+    assert result["c-doc-2024"].hops == 1
+    assert result["c-doc-2024"].links == (Link("cites", "L0", "out"),)  # без 2-шаговых
 
 
 def test_expand_is_undirected_but_keeps_direction() -> None:
     """Цитирующий и цитируемый одинаково интересны досье, но «А цитирует Б» и «Б
     цитируется А» — разные утверждения, терять направление нельзя."""
     result = expand(_chain(), ["b-doc-2025"])
-    assert {(n.doc_id, n.direction) for n in result} == {
+    assert {(n.doc_id, link.direction) for n in result for link in n.links} == {
         ("c-doc-2024", "out"), ("a-doc-2026", "in"),
     }
 
@@ -91,6 +136,15 @@ def test_expand_filters_by_etype() -> None:
     assert [n.doc_id for n in result] == ["c-doc-2024"]
 
 
+def test_etype_filter_gates_traversal_not_just_output() -> None:
+    """Семантика фильтра — «путь целиком из рёбер этих типов»: сосед за неподходящим
+    первым ребром недостижим и на втором шаге. Намеренно, но неочевидно — пиним."""
+    assert expand(_chain(), ["a-doc-2026"], hops=2, etypes={"cites"}) == []
+    assert [n.doc_id for n in expand(_chain(), ["a-doc-2026"], hops=2)] == [
+        "b-doc-2025", "c-doc-2024",
+    ]
+
+
 def test_expand_exposes_layer_of_each_link() -> None:
     """Потребитель обязан видеть, курируемая связь или автоматическая."""
     from graph.cite_mining import CiteEdge
@@ -99,8 +153,8 @@ def test_expand_exposes_layer_of_each_link() -> None:
         [_rec("a-doc-2026"), _rec("b-doc-2025")],
         cites=[CiteEdge("a-doc-2026", "b-doc-2025", "CELEX:32024R1689", "celex")],
     )
-    assert [(n.doc_id, n.etype, n.layer) for n in expand(graph, ["a-doc-2026"])] == [
-        ("b-doc-2025", "cites", "L1")
+    assert [(n.doc_id, n.links) for n in expand(graph, ["a-doc-2026"])] == [
+        ("b-doc-2025", (Link("cites", "L1", "out"),))
     ]
 
 

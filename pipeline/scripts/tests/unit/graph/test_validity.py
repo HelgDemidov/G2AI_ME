@@ -81,6 +81,45 @@ def test_multiple_successors_earliest_closes_and_warns(caplog: Any) -> None:
     assert "несколько преемников" in caplog.text
 
 
+def test_multiple_successors_warn_even_when_undated(caplog: Any) -> None:
+    """Порог — по числу ПРЕЕМНИКОВ, не датированных дат: подозрительна сама топология,
+    и молчать о ней, пока у второго преемника нет даты, значило бы прятать развилку
+    ровно в самом мутном случае."""
+    old = make("me-law-2024", published="2024-01-01")
+    dated = make("me-law-2025", published="2025-01-01", relations=[_sup("me-law-2024")])
+    undated = make("me-law-2026", published=None, relations=[_sup("me-law-2024")])
+
+    with caplog.at_level("WARNING", logger="build_graph"):
+        iv = validity_intervals([old, dated, undated])
+
+    assert iv["me-law-2024"].valid_to == dt.date(2025, 1, 1)
+    assert "несколько преемников" in caplog.text
+
+
+def test_successor_earlier_than_predecessor_warns(caplog: Any) -> None:
+    """Пустой интервал — единственное место, где документ исчезал из ВСЕХ as_of-срезов
+    молча, вопреки обещанию слоя. Данные не «чиним» (нечем выбрать неверную дату из
+    двух), но кричим: почти всегда это ошибка курирования."""
+    old = make("me-law-2024", published="2024-06-01")
+    heir = make("me-law-2025", published="2020-01-01", relations=[_sup("me-law-2024")])
+
+    with caplog.at_level("WARNING", logger="build_graph"):
+        iv = validity_intervals([old, heir])
+
+    assert "РАНЬШЕ начала самого документа" in caplog.text
+    assert iv["me-law-2024"] == Validity(dt.date(2024, 6, 1), dt.date(2020, 1, 1), True)
+
+
+def test_normal_interval_is_silent(caplog: Any) -> None:
+    """Обратная сторона: штатная цепочка редакций не должна сыпать предупреждениями,
+    иначе куратор перестанет их читать."""
+    old = make("me-law-2024", published="2024-01-01")
+    heir = make("me-law-2025", published="2025-01-01", relations=[_sup("me-law-2024")])
+    with caplog.at_level("WARNING", logger="build_graph"):
+        validity_intervals([old, heir])
+    assert caplog.text == ""
+
+
 def test_amends_does_not_close_interval() -> None:
     """Поправка МЕНЯЕТ документ, а не заменяет его — закрывать интервал нечем."""
     base = make("me-law-2024", published="2024-01-01")

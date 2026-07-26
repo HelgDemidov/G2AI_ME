@@ -122,16 +122,30 @@ def validity_intervals(records: list[SourceRecord]) -> dict[str, Validity]:
     for rec in records:
         heirs = successors.get(rec.id, [])
         heir_dates = sorted(d for d in (starts.get(h) for h in heirs) if d is not None)
-        if len(heir_dates) > 1:
+        # Порог по числу ПРЕЕМНИКОВ, а не датированных дат: подозрительна сама топология
+        # (обычно это ошибка курирования), и молчать о ней, пока у второго преемника нет
+        # даты, значило бы прятать её ровно в самом мутном случае.
+        if len(heirs) > 1:
             logger.warning(
-                "  ⚠ %s: несколько преемников с датами (%s) — интервал закрывает самый ранний",
-                rec.id, ", ".join(d.isoformat() for d in heir_dates),
+                "  ⚠ %s: несколько преемников (%s) — интервал закрывает самый ранний из "
+                "датированных (%s)",
+                rec.id, ", ".join(sorted(heirs)),
+                ", ".join(d.isoformat() for d in heir_dates) or "ни одного",
             )
         valid_to = heir_dates[0] if heir_dates else None
         start = starts[rec.id]
         # Преемник есть, но датировать закрытие нечем -> честное «не знаем», а не
         # молчаливый вывод «действует до сих пор».
         known = start is not None and (not heirs or valid_to is not None)
+        if start is not None and valid_to is not None and valid_to < start:
+            # Пустой интервал: документ исчезает из ВСЕХ as_of-срезов молча — ровно то,
+            # что этот слой обещает не делать. Данные не «чиним» (угадывать, какая из
+            # двух дат неверна, нечем), но кричим: почти всегда это ошибка курирования.
+            logger.warning(
+                "  ⚠ %s: преемник начинается (%s) РАНЬШЕ начала самого документа (%s) — "
+                "интервал пуст, документ выпадет из любого среза as_of",
+                rec.id, valid_to.isoformat(), start.isoformat(),
+            )
         intervals[rec.id] = Validity(start, valid_to, known)
     return intervals
 
