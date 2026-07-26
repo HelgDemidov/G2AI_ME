@@ -45,11 +45,12 @@ def test_doc_concept_edges() -> None:
 
 
 def test_shared_pattern_cluster() -> None:
+    """docs_by_pattern возвращает bare doc-id, без doc:-префикса (knowledge-hardening §3)."""
     a = make()
     b = make(id="eu-ec-ai-act-2024", entity_id="de")
     graph = build_graph([a, b], JUR)
     docs = docs_by_pattern(graph, "agent-governance-framework")
-    assert set(docs) == {"doc:sg-imda-mgf-agentic-2026", "doc:eu-ec-ai-act-2024"}
+    assert set(docs) == {"sg-imda-mgf-agentic-2026", "eu-ec-ai-act-2024"}
 
 
 def test_member_of_only_for_present_countries() -> None:
@@ -59,15 +60,17 @@ def test_member_of_only_for_present_countries() -> None:
 
 
 def test_docs_in_bloc() -> None:
+    """bare doc-id (knowledge-hardening §3)."""
     graph = build_graph([make()], JUR)
-    assert docs_in_bloc(graph, "asean") == ["doc:sg-imda-mgf-agentic-2026"]
+    assert docs_in_bloc(graph, "asean") == ["sg-imda-mgf-agentic-2026"]
 
 
 def test_relations_lineage() -> None:
+    """bare doc-id (knowledge-hardening §3)."""
     a = make(relations=[{"type": "implements", "target": "eu-ec-ai-act-2024"}])
     b = make(id="eu-ec-ai-act-2024")
     graph = build_graph([a, b], JUR)
-    assert lineage(graph, "sg-imda-mgf-agentic-2026", "implements") == ["doc:eu-ec-ai-act-2024"]
+    assert lineage(graph, "sg-imda-mgf-agentic-2026", "implements") == ["eu-ec-ai-act-2024"]
 
 
 def test_missing_pattern_returns_empty() -> None:
