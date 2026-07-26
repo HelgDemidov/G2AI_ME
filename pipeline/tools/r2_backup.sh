@@ -23,6 +23,20 @@
 # 3. `no_check_bucket=true` обязателен: токен намеренно сужен до `Object Read & Write`
 #    на один бакет, поэтому проверка уровня бакета возвращает 403. Это признак
 #    правильного скоупа, а не ошибка (ListBuckets так же отдаёт 403 — так и задумано).
+# 4. `no_head=true` — иначе КАЖДЫЙ файл даёт ложную ошибку (найдено живым прогоном
+#    2026-07-26). Механика: R2 возвращает на успешный PUT заголовок `x-amz-version-id`,
+#    rclone 1.60 честно использует его в проверочном `HEAD ?versionId=...`, а чтение по
+#    версии R2 не реализует -> 501 Not Implemented -> rclone считает передачу
+#    неудавшейся и ретраит транзакцию целиком. Файлы при этом заливались (со второй
+#    попытки), то есть симптом — шум из ошибок при формально успешном результате.
+#    Целостность от этого НЕ страдает: rclone шлёт `Content-MD5` в самом PUT, и R2
+#    проверяет его на стороне сервера, так что битая загрузка отвергается независимо
+#    от HEAD. Сверить копию можно в любой момент:
+#      rclone check sources/ r2:g2ai-corpus-raw/sources/ --one-way
+#
+# ACL здесь СОЗНАТЕЛЬНО не задаётся: R2 не поддерживает ACL вообще, параметр был бы
+# молчаливым no-op, создающим ложное впечатление настроенного доступа. Приватность
+# бакета обеспечивается тем, что публичный доступ (r2.dev/custom domain) не включён.
 #
 # Конфиг rclone (`~/.config/rclone/rclone.conf`) НЕ создаётся: секрет остаётся ровно в
 # одном месте — в `.env`.
@@ -40,15 +54,22 @@ for var in R2_S3_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
     [[ -n "${!var:-}" ]] || { echo "в .env не задан $var (см. .env.example)" >&2; exit 1; }
 done
 
-export RCLONE_CONFIG_R2_TYPE=s3 \
+# Пустой конфиг ЯВНО: иначе rclone на каждый запуск печатает NOTICE об отсутствии
+# ~/.config/rclone/rclone.conf — файла, которого здесь не должно быть по построению.
+export RCLONE_CONFIG=/dev/null \
+       RCLONE_CONFIG_R2_TYPE=s3 \
        RCLONE_CONFIG_R2_PROVIDER=Cloudflare \
        RCLONE_CONFIG_R2_REGION=auto \
        RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
        RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
        RCLONE_CONFIG_R2_ENDPOINT="$R2_S3_ENDPOINT" \
        RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true \
-       RCLONE_CONFIG_R2_ACL=private
+       RCLONE_CONFIG_R2_NO_HEAD=true
+
+# Живой прогресс — только в интерактивном терминале; при перенаправлении в файл/пайп он
+# превращается в километр перерисовок, поэтому там одна строка статистики.
+if [[ -t 1 ]]; then PROGRESS=(--progress); else PROGRESS=(--stats-one-line); fi
 
 # --transfers 2 вместо дефолтных 4 — рабочий канал LTE, полная параллельность его забивает.
 # Все аргументы скрипта пробрасываются в rclone: `--dry-run`, `-v`, `--exclude` и т.п.
-exec rclone copy sources/ "r2:${BUCKET}/sources/" --transfers 2 --progress "$@"
+exec rclone copy sources/ "r2:${BUCKET}/sources/" --transfers 2 "${PROGRESS[@]}" "$@"
