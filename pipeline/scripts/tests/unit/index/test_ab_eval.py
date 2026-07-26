@@ -451,6 +451,61 @@ def test_main_vector_mode_applies_sensitivity_gate_to_real_openrouter_embedder(
     assert _vec_count(conn2, real.name) == 1  # только публичный чанк заэмбеджен облаком
 
 
+def _mark_for(out: str, section_header: str, query_text: str) -> str:
+    """Символ-маркер (✓/~/✗) строки данного запроса внутри секции отчёта."""
+    start = out.index(section_header)
+    end = out.index("\n\n", start) if "\n\n" in out[start:] else len(out)
+    for line in out[start:end].splitlines():
+        stripped = line.strip()
+        if stripped.endswith(query_text):
+            return stripped[0]
+    raise AssertionError(f"запрос {query_text!r} не найден в секции {section_header!r}")
+
+
+def test_main_all_modes_exclude_superseded_document_uniformly(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """С первым ребром supersedes fts/vector/hybrid обязаны согласованно исключать
+    предшественника (knowledge-hardening §6) — до фикса evaluate_vector/evaluate_fts
+    не гейтились вовсе, и с этим ребром режимы начали бы сравнивать разные вселенные
+    документов, тихо переставая быть сравнением одного и того же."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    old = valid_record() | {"id": "me-law-2024"}
+    new = valid_record() | {
+        "id": "me-law-2025",
+        "relations": [{"type": "supersedes", "target": "me-law-2024"}],
+    }
+    index_chunks(
+        conn,
+        [
+            Chunk("me-law-2024", 0, "legacy predecessor unique-term-alpha text", 6),
+            Chunk("me-law-2025", 0, "current successor unique-term-beta text", 6),
+        ],
+        records=[SourceRecord.model_validate(old), SourceRecord.model_validate(new)],
+    )
+    conn.close()
+    q = _write_yaml(
+        tmp_path / "q.yaml",
+        {
+            "queries": [
+                {"query": "unique-term-alpha", "expect": ["unique-term-alpha"]},
+                {"query": "unique-term-beta", "expect": ["unique-term-beta"]},
+            ]
+        },
+    )
+    monkeypatch.setattr("index.ab_eval.get_embedder", lambda backend, **kw: _FakeEmbedder())
+    monkeypatch.setattr("index.ab_eval.load_dotenv", lambda: None)
+
+    argv = ["--db", str(db), "--eval-queries", str(q), "--mode", "all", "--k", "1", "--no-reference"]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+
+    for header in ("### fts", "fake-model · vector", "fake-model · hybrid"):
+        assert _mark_for(out, header, "unique-term-alpha") == "✗"  # предшественник исключён
+        assert _mark_for(out, header, "unique-term-beta") == "✓"   # преемник виден
+
+
 def test_main_vector_mode_fake_embedder_bypasses_sensitivity_gate(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:

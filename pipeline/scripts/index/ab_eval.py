@@ -24,7 +24,7 @@ from typing import Any
 
 import yaml
 
-from analyze.retrieve import retrieve
+from analyze.retrieve import apply_superseded_gate, retrieve
 from index.corpus_index import DEFAULT_DB, fts_search, sanitize_fts_query
 from index.embed import DEFAULT_CLOUD_MODEL, Embedder, OpenRouterEmbedder, get_embedder
 from core.env import REPO_ROOT, load_dotenv
@@ -135,13 +135,28 @@ def _summarize(name: str, outcomes: list[QueryOutcome], n_queries: int) -> Model
     )
 
 
-def evaluate_fts(conn: sqlite3.Connection, queries: list[ControlQuery], k: int = 3) -> ModelResult:
+def evaluate_fts(
+    conn: sqlite3.Connection,
+    queries: list[ControlQuery],
+    k: int = 3,
+    *,
+    allowed_doc_ids: set[str] | None = None,
+) -> ModelResult:
     """fts-режим: ранжированные ПОЛНЫЕ тексты (не snippet) из ``fts_search`` —
-    модель-независим, вычисляется один раз вне зависимости от выбора эмбеддера."""
+    модель-независим, вычисляется один раз вне зависимости от выбора эмбеддера.
+
+    ``allowed_doc_ids`` (knowledge-hardening §6) — та же вселенная документов, что
+    ``evaluate_hybrid`` получает через ``retrieve()``: без этого fts/vector-режимы
+    сравнивали бы КОРПУС ЦЕЛИКОМ, а hybrid — корпус за вычетом заменённых редакций,
+    и с первым ребром ``supersedes`` A/B тихо перестало бы быть сравнением одного и
+    того же.
+    """
     outcomes: list[QueryOutcome] = []
     search_depth = max(k, PRECISION_AT_K)
     for cq in queries:
-        hits = fts_search(conn, sanitize_fts_query(cq.query), search_depth)
+        hits = fts_search(
+            conn, sanitize_fts_query(cq.query), search_depth, allowed_doc_ids=allowed_doc_ids
+        )
         ranked = []
         for h in hits:
             row = conn.execute(
@@ -170,18 +185,25 @@ def evaluate_vector(
     texts: list[str],
     queries: list[ControlQuery],
     k: int = 3,
+    *,
+    allowed_doc_ids: set[str] | None = None,
 ) -> ModelResult:
     """vector-режим: доэмбеддивает переданные (инкрементальные — только НЕ
     заэмбедженные этой моделью, spec embed-local-swap §5) хэши батчами через
     ``embed_and_store`` — уже посчитанное в предыдущих прогонах A/B не считается
     заново, — затем ``semantic_search`` (по ВСЕМ векторам модели в БД, не только
-    только что добавленным) на запрос."""
+    только что добавленным) на запрос.
+
+    ``allowed_doc_ids`` — см. docstring ``evaluate_fts`` (единая вселенная документов
+    со всеми режимами, knowledge-hardening §6)."""
     embed_and_store(conn, embedder, hashes, texts)
     outcomes: list[QueryOutcome] = []
     search_depth = max(k, PRECISION_AT_K)
     for cq in queries:
         query_vec = embedder.embed([cq.query], kind="query")
-        hits = semantic_search(conn, query_vec[0], embedder.name, search_depth)
+        hits = semantic_search(
+            conn, query_vec[0], embedder.name, search_depth, allowed_doc_ids=allowed_doc_ids
+        )
         ranked = [h.text for h in hits]
         outcomes.append(
             QueryOutcome(
@@ -310,9 +332,13 @@ def main(argv: list[str] | None = None) -> int:
     conn = sqlite3.connect(args.db)
     modes = ["fts", "vector", "hybrid"] if args.mode == "all" else [args.mode]
     results: list[ModelResult] = []
+    # Единая вселенная документов для fts/vector — та же, что retrieve() применяет
+    # внутри evaluate_hybrid (knowledge-hardening §6); один расчёт на прогон, не
+    # на запрос — множество заменённых редакций не меняется внутри одного A/B.
+    allowed = apply_superseded_gate(conn, None, include_superseded=False)
 
     if "fts" in modes:
-        results.append(evaluate_fts(conn, queries, args.k))
+        results.append(evaluate_fts(conn, queries, args.k, allowed_doc_ids=allowed))
 
     if "vector" in modes or "hybrid" in modes:
         total_row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
@@ -358,7 +384,11 @@ def main(argv: list[str] | None = None) -> int:
                 hashes, texts = chunk_hashes(conn, not_embedded_for=embedder.name)
                 skipped = 0
             if "vector" in modes:
-                results.append(evaluate_vector(conn, embedder, hashes, texts, queries, args.k))
+                results.append(
+                    evaluate_vector(
+                        conn, embedder, hashes, texts, queries, args.k, allowed_doc_ids=allowed
+                    )
+                )
             else:
                 embed_and_store(conn, embedder, hashes, texts)  # hybrid тоже нужен
             if "hybrid" in modes:
