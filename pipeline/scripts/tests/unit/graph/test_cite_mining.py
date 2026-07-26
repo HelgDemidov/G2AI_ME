@@ -58,6 +58,11 @@ def _place(root: Path, doc_id: str, md: str, *, url: str | None = None) -> Sourc
         # ...и год в ней бывает двузначным — без разворота выходил CELEX:30091R3922.
         ("Regulation (EEC) No 3922/91", "CELEX:31991R3922"),
         ("Regulation (EEC) No 339/93", "CELEX:31993R0339"),
+        # Третья форма: без скобочной юрисдикции, зато с суффиксом в конце.
+        ("Directive 2000/31/EC", "CELEX:32000L0031"),
+        ("Directive 95/46/EC", "CELEX:31995L0046"),
+        ("Decision 2000/520/EC", "CELEX:32000D0520"),
+        ("Directive 2019/790/EU", "CELEX:32019L0790"),
         ("соответствует ISO/IEC 42001:2023", "ISO/IEC 42001:2023"),
         ("ISO/IEC 23894", "ISO/IEC 23894"),
         ("ISO/IEC 27001-2:2022", "ISO/IEC 27001-2:2022"),
@@ -92,6 +97,25 @@ def test_gazette_citation_lists_several_acts() -> None:
     text = 'о привредним друштвима („Službeni list CG", br. 65/20, 146/21 i 4/24)'
     assert [i for i, _ in cite_mining.extract_identifiers(text)] == [
         "SLCG:146/2021", "SLCG:4/2024", "SLCG:65/2020",
+    ]
+
+
+def test_three_eu_forms_collapse_to_one_identifier() -> None:
+    """Три живые формы ссылки на ОДИН акт дают один идентификатор. Иначе одна связь
+    рассыпалась бы на три записи справочника и три ребра к одному документу."""
+    forms = ["Regulation (EU) 2016/679", "32016R0679"]
+    idents = {cite_mining.extract_identifiers(f)[0][0] for f in forms}
+    assert idents == {"CELEX:32016R0679"}
+    slash = {cite_mining.extract_identifiers(f)[0][0]
+             for f in ["Directive 2016/680/EU", "32016L0680"]}
+    assert slash == {"CELEX:32016L0680"}
+
+
+def test_slash_form_does_not_shadow_parenthesised_form() -> None:
+    """Паттерны не должны перехватывать чужую форму: у «Directive (EU) 2016/680»
+    порядок чисел тот же, но разбирает её eu_act, и результат обязан совпасть."""
+    assert cite_mining.extract_identifiers("Directive (EU) 2016/680") == [
+        ("CELEX:32016L0680", "eu_act")
     ]
 
 

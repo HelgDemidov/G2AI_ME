@@ -89,6 +89,21 @@ def _eu_act(m: re.Match[str]) -> list[str]:
     return [f"CELEX:3{year:04d}{letter}{number:04d}"]
 
 
+def _eu_act_slash(m: re.Match[str]) -> list[str]:
+    """«Directive 2000/31/EC», «Directive 95/46/EC» -> CELEX.
+
+    Третья живая форма ссылки на акт ЕС: БЕЗ скобочной юрисдикции после типа акта,
+    зато с её суффиксом в конце. Порядок здесь всегда ``ГОД/номер`` (в отличие от
+    формы ``No номер/ГОД``), год бывает двузначным. Замер на корпусе 2026-07-26: 40
+    уникальных актов в этой форме не распознавались вовсе — треть всех EU-ссылок.
+    """
+    year, number = int(m.group("year")), int(m.group("number"))
+    if year < 100:
+        year += 1900
+    letter = _EU_ACT_LETTER[m.group("kind").lower()]
+    return [f"CELEX:3{year:04d}{letter}{number:04d}"]
+
+
 def _sluzbeni(m: re.Match[str]) -> list[str]:
     idents: list[str] = []
     for number, year in re.findall(r"(\d+)\s*/\s*(\d{2,4})", m.group("numbers")):
@@ -137,6 +152,17 @@ _PATTERNS: dict[str, CitePattern] = {
             r"(?P<no>No\s+)?(?P<first>\d{1,4})\s*/\s*(?P<second>\d{1,4})\b"
         ),
         _eu_act,
+    ),
+    # Та же семья, что eu_act, но без скобочной юрисдикции: «Directive 2000/31/EC».
+    # Отдельная запись, а не ветка в eu_act: реестр на то и реестр — форма своя,
+    # разбор своей группы, ноль условий в общем коде.
+    "eu_act_slash": CitePattern(
+        "eu_act_slash",
+        re.compile(
+            r"\b(?P<kind>Directive|Decision|Regulation)s?\s+"
+            r"(?P<year>\d{2,4})\s*/\s*(?P<number>\d{1,4})\s*/\s*(?:EC|EEC|EU|Euratom)\b"
+        ),
+        _eu_act_slash,
     ),
     "iso": CitePattern(
         "iso",
