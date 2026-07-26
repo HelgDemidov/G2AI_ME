@@ -14,7 +14,13 @@ from typing import Any
 import numpy as np
 import pytest
 
-from index.embed import RETRY_SCHEDULE, OnnxBgeEmbedder, OpenRouterEmbedder, get_embedder
+from index.embed import (
+    CLOUD_MODEL_TOKEN_LIMITS,
+    RETRY_SCHEDULE,
+    OnnxBgeEmbedder,
+    OpenRouterEmbedder,
+    get_embedder,
+)
 
 
 def _make_embedder(monkeypatch: Any, **kwargs: Any) -> OpenRouterEmbedder:
@@ -84,6 +90,21 @@ def test_non_retryable_4xx_raises_immediately_without_sleep(monkeypatch: Any) ->
     assert sleeps == []
 
 
+def test_http_error_body_capped_at_500_chars(monkeypatch: Any) -> None:
+    """Симметрично _InbandError.body (уже капалось до 500) — knowledge-hardening §7:
+    тело провайдерской ошибки не должно раздувать сообщение исключения без предела."""
+    embedder = _make_embedder(monkeypatch, dims=None)
+    long_body = ("x" * 1000).encode("utf-8")
+
+    def fake_urlopen(req: Any, timeout: int = 120) -> Any:
+        raise _http_error(400, long_body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError) as exc_info:
+        embedder.embed(["a"])
+    assert len(str(exc_info.value)) < 600  # 500 тела + служебный префикс
+
+
 def test_network_errors_exhaust_schedule_and_raise_with_fallback_hint(monkeypatch: Any) -> None:
     embedder = _make_embedder(monkeypatch, dims=None)
     sleeps: list[float] = []
@@ -140,6 +161,57 @@ def test_dims_never_sent_in_request_payload(monkeypatch: Any) -> None:
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
         embedder.embed(["a"])
         assert "dimensions" not in captured["body"]
+
+
+def test_dims_underflow_raises_before_storing(monkeypatch: Any) -> None:
+    """knowledge-hardening §7: ответ короче запрошенного dims — неймспейс
+    "@1024" солгал бы о размерности всех будущих запросов к vectors. Fail-fast
+    в embed(), ДО того как caller успеет записать вектор в БД."""
+    embedder = _make_embedder(monkeypatch, dims=1024)
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=120: _FakeResponse(_payload(768)),
+    )
+    with pytest.raises(RuntimeError, match="768"):
+        embedder.embed(["a"])
+
+
+def test_dims_underflow_message_names_model_and_requested_dims(monkeypatch: Any) -> None:
+    embedder = _make_embedder(monkeypatch, model="some/short-model", dims=1024)
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=120: _FakeResponse(_payload(512)),
+    )
+    with pytest.raises(RuntimeError, match=r"some/short-model.*512.*1024"):
+        embedder.embed(["a"])
+
+
+def test_dims_matching_response_does_not_raise(monkeypatch: Any) -> None:
+    """Граница: ответ РОВНО в размер dims — не underflow, штатное усечение."""
+    embedder = _make_embedder(monkeypatch, dims=1024)
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=120: _FakeResponse(_payload(1024)),
+    )
+    out = embedder.embed(["a"])
+    assert out.shape == (1, 1024)
+
+
+# --- max_tokens: лимит облачной модели (knowledge-hardening §7) ---
+
+
+def test_max_tokens_known_model_uses_cloud_limit(monkeypatch: Any) -> None:
+    """gemini-embedding-001: 2048 токенов на вход, live-проверено 2026-07-26
+    (docs.cloud.google.com) — check_chunk_budget больше не полностью слеп на
+    облачном пути для дефолтной production-модели."""
+    embedder = _make_embedder(monkeypatch, model="google/gemini-embedding-001")
+    assert embedder.max_tokens == CLOUD_MODEL_TOKEN_LIMITS["google/gemini-embedding-001"] == 2048
+
+
+def test_max_tokens_unknown_model_stays_none(monkeypatch: Any) -> None:
+    """Модель вне карты — гейт честно неприменим (прежнее поведение), не угадывается."""
+    embedder = _make_embedder(monkeypatch, model="some/unknown-model")
+    assert embedder.max_tokens is None
 
 
 # --- ошибка в теле HTTP-200 (OpenRouter заворачивает провайдерские отказы) ---
