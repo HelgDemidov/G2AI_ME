@@ -67,6 +67,21 @@ def test_reverse_edge_direction_is_normalised() -> None:
     assert validity_intervals([old, new])["me-law-2024"].valid_to == dt.date(2025, 1, 1)
 
 
+def test_bidirectional_edge_is_not_multiple_successors(caplog: Any) -> None:
+    """Одна связь, оформленная С ОБОИХ концов (supersedes у преемника И
+    superseded_by у предшественника — легальная двусторонняя бухгалтерия),
+    не должна давать ложный warning «несколько преемников (X, X)»."""
+    old = make("me-law-2024", published="2024-01-01",
+               relations=[{"type": "superseded_by", "target": "me-law-2025"}])
+    new = make("me-law-2025", published="2025-01-01", relations=[_sup("me-law-2024")])
+
+    with caplog.at_level("WARNING", logger="build_graph"):
+        iv = validity_intervals([old, new])
+
+    assert iv["me-law-2024"].valid_to == dt.date(2025, 1, 1)
+    assert caplog.text == ""
+
+
 def test_multiple_successors_earliest_closes_and_warns(caplog: Any) -> None:
     """Подозрительная топология (обычно ошибка курирования) — закрываем самым ранним,
     но молчать нельзя: человек должен увидеть, что развилка вообще есть."""

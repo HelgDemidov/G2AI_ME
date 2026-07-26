@@ -393,7 +393,15 @@ def mine_corpus(
         md = schema.md_file(rec, root)
         if not md.exists():
             continue
-        for ident, rule in extract_identifiers(md.read_text(encoding="utf-8"), alias_map):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # Отказ ИЗОЛИРОВАН на документ (паттерн run_pipeline/discovery/apply):
+            # один битый doc.md не должен ронять граф всего корпуса. Майнинг
+            # реконсиляционен — починенный файл даст рёбра следующим прогоном.
+            logger.warning("  ⚠ %s: doc.md не читается (%s) — пропущен майнингом", rec.id, exc)
+            continue
+        for ident, rule in extract_identifiers(text, alias_map):
             target = resolved.get(ident)
             if target is None:
                 lead = unresolved.setdefault(

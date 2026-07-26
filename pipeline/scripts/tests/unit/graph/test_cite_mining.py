@@ -14,6 +14,7 @@ import pytest
 import yaml
 from hypothesis import given, strategies as st
 
+from core import schema
 from core.schema import SourceRecord
 from graph import cite_mining
 from graph.build_graph import build_corpus_graph, build_graph
@@ -356,6 +357,20 @@ def test_document_without_md_is_skipped(tmp_path: Path) -> None:
     write_doc(tmp_path, data)  # без doc.md
     rec = SourceRecord.model_validate(data)
     assert cite_mining.mine_corpus([rec], tmp_path, identifiers={}).edges == []
+
+
+def test_unreadable_doc_is_isolated_not_fatal(tmp_path: Path, caplog: Any) -> None:
+    """Один битый doc.md (не-UTF-8, напр. после сбоя диска) не должен ронять граф
+    всего корпуса — паттерн изоляции отказа тот же, что в run_pipeline/discovery/apply."""
+    broken = _place(tmp_path, "broken-doc-2025", "placeholder\n")
+    schema.md_file(broken, tmp_path).write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+    healthy = _place(tmp_path, "healthy-doc-2025", "см. ISO/IEC 42001:2023\n")
+
+    with caplog.at_level("WARNING", logger="cite_mining"):
+        result = cite_mining.mine_corpus([broken, healthy], tmp_path, identifiers={})
+
+    assert [lead["identifier"] for lead in result.leads] == ["ISO/IEC 42001:2023"]
+    assert "broken-doc-2025" in caplog.text
 
 
 # --- layer-теги и отчёт ---

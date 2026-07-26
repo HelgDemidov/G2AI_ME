@@ -110,17 +110,21 @@ def validity_intervals(records: list[SourceRecord]) -> dict[str, Validity]:
     (spec post-acquisition-lifecycle §7). Пересборка графа бесплатна, поля — нет.
     """
     starts = {rec.id: _valid_from(rec) for rec in records}
-    successors: dict[str, list[str]] = {rec.id: [] for rec in records}
+    # set, не list: одна связь легально оформляется С ОБОИХ концов (supersedes у
+    # преемника И superseded_by у предшественника — тот же паттерн, что нормализует
+    # schema.superseded_ids). Без дедупа такое двустороннее оформление давало бы
+    # ложный "несколько преемников (X, X)" на штатной, а не подозрительной топологии.
+    successors: dict[str, set[str]] = {rec.id: set() for rec in records}
     for rec in records:
         for rel in rec.relations:
             if rel.type is RelationType.supersedes:
-                successors.setdefault(rel.target, []).append(rec.id)   # rec заменяет target
+                successors.setdefault(rel.target, set()).add(rec.id)   # rec заменяет target
             elif rel.type is RelationType.superseded_by:
-                successors.setdefault(rec.id, []).append(rel.target)   # rec заменён target'ом
+                successors.setdefault(rec.id, set()).add(rel.target)   # rec заменён target'ом
 
     intervals: dict[str, Validity] = {}
     for rec in records:
-        heirs = successors.get(rec.id, [])
+        heirs = successors.get(rec.id, set())
         heir_dates = sorted(d for d in (starts.get(h) for h in heirs) if d is not None)
         # Порог по числу ПРЕЕМНИКОВ, а не датированных дат: подозрительна сама топология
         # (обычно это ошибка курирования), и молчать о ней, пока у второго преемника нет
