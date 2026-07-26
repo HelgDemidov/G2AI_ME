@@ -41,14 +41,33 @@ def _is_document(graph: nx.MultiDiGraph, node: str) -> bool:
 
 
 @dataclass(frozen=True)
-class Neighbor:
-    """Сосед документа: чем связан, каким слоем и на каком расстоянии."""
+class Link:
+    """Одно ребро между парой документов: чем связаны, каким слоем, в какую сторону."""
 
-    doc_id: str
     etype: str
     layer: str
     direction: str  # "out" — исходящее ребро от seed'а, "in" — входящее
+
+
+@dataclass(frozen=True)
+class Neighbor:
+    """Сосед документа: ВСЕ связи с ним на ближайшем расстоянии.
+
+    ``links`` — множественное не для красоты: пара документов законно связана
+    несколькими рёбрами сразу (новая редакция и ``supersedes`` предшественника из
+    курируемого L0, и ``cites`` его газетного номера из L1). Контракт с
+    ``analyze-evidence`` — «показать, ПОЧЕМУ документ приложен»; одна причина из двух
+    сделала бы досье тихо неполным, поэтому здесь список, а не скаляр.
+    """
+
+    doc_id: str
+    links: tuple[Link, ...]
     hops: int
+
+    @property
+    def etypes(self) -> tuple[str, ...]:
+        """Типы всех связей — частый случай «просто перечислить, чем связаны»."""
+        return tuple(link.etype for link in self.links)
 
 
 def expand(
@@ -65,11 +84,19 @@ def expand(
 
     Возвращаются только документы, которых нет среди ``doc_ids`` (seed'ы — уже
     найденное retrieval'ом, дублировать их в расширении незачем). Ближайшая связь
-    выигрывает: документ, достижимый и за 1, и за 2 шага, попадает как 1-шаговый.
+    выигрывает: документ, достижимый и за 1, и за 2 шага, попадает как 1-шаговый — но
+    на своём ближайшем расстоянии он несёт ВСЕ параллельные рёбра пары, а не первое
+    попавшееся (spec graph-hardening §5).
+
+    ⚠ ``etypes`` гейтит ОБХОД, а не только выдачу: сосед за неподходящим первым ребром
+    недостижим и на втором шаге. Семантика намеренная — «путь, целиком собранный из
+    рёбер этих типов», — но неочевидная, поэтому названа здесь явно.
     """
     seeds = [DOC_PREFIX + d for d in doc_ids if DOC_PREFIX + d in graph]
+    seed_set = set(seeds)
     seen: set[str] = set(seeds)
-    found: dict[str, Neighbor] = {}
+    links: dict[str, set[Link]] = {}
+    depths: dict[str, int] = {}
     queue: deque[tuple[str, int]] = deque((s, 0) for s in seeds)
 
     while queue:
@@ -87,16 +114,25 @@ def expand(
             if other not in seen:
                 seen.add(other)
                 queue.append((other, depth + 1))
-            if other in set(seeds) or other in found:
+            if other in seed_set:
                 continue
-            found[other] = Neighbor(
-                doc_id=_doc_id(other),
-                etype=etype,
-                layer=str(data.get("layer", "")),
-                direction=direction,
-                hops=depth + 1,
+            # Копим связи только для БЛИЖАЙШЕГО расстояния: рёбра, найденные дальше,
+            # описывают уже другой путь, а сосед в досье фигурирует один раз.
+            if depths.setdefault(other, depth + 1) < depth + 1:
+                continue
+            links.setdefault(other, set()).add(
+                Link(etype=etype, layer=str(data.get("layer", "")), direction=direction)
             )
-    return sorted(found.values(), key=lambda n: (n.hops, n.doc_id))
+
+    found = [
+        Neighbor(
+            doc_id=_doc_id(node),
+            links=tuple(sorted(edge_links, key=lambda link: (link.etype, link.layer, link.direction))),
+            hops=depths[node],
+        )
+        for node, edge_links in links.items()
+    ]
+    return sorted(found, key=lambda n: (n.hops, n.doc_id))
 
 
 @dataclass(frozen=True)

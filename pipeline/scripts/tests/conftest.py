@@ -21,6 +21,15 @@ import pytest
 _HEAVY_MARKERS = ("model", "corpus", "ocr", "libreoffice", "mermaid", "browser")
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """``--regenerate-cite-golden`` — осознанная перезапись эталона цитат (goldens не
+    самообновляются: молча перезаписанный эталон перестаёт быть сторожем)."""
+    parser.addoption(
+        "--regenerate-cite-golden", action="store_true", default=False,
+        help="перегенерировать tests/fixtures/cite_golden.yaml по локальному корпусу",
+    )
+
+
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if any(item.get_closest_marker(name) is not None for name in _HEAVY_MARKERS):

@@ -84,6 +84,10 @@ def test_patterns_extract_canonical_identifier(text: str, expected: str) -> None
         "ISO 42",                            # слишком короткий номер
         "NIST SP 500-53",                    # не серия 800
         "Службени лист РС бр. 12/2025",      # другая юрисдикция
+        # Год-гейт: номер стоит на месте года — «поправить» такое нельзя, только молчать.
+        "Decision 768/2008/EC",
+        "Regulation (EU) 3922/91",           # OCR потерял «No» -> год 3922
+        "Directive 1234/5678/EU",
     ],
 )
 def test_patterns_reject_near_misses(text: str) -> None:
@@ -156,6 +160,89 @@ def test_iso_number_lengths_property(number: int) -> None:
     assert cite_mining.extract_identifiers(f"ISO/IEC {number}") == [(f"ISO/IEC {number}", "iso")]
 
 
+# --- курируемый алиас-канал (spec graph-hardening §2) ---
+
+
+_AI_ACT = {"EU AI Act": "CELEX:32024R1689"}
+
+
+def test_alias_extracts_identifier_absent_from_text() -> None:
+    """Живой случай `oxford-insights-gairi-2025`: акт цитируется ТОЛЬКО алиасом, формального
+    идентификатора в тексте нет вовсе — регекс-майнер такую связь не видит в принципе."""
+    text = "Components of the EU AI Act entered into force throughout 2025."
+    assert cite_mining.extract_identifiers(text) == []                       # паттерны молчат
+    assert cite_mining.extract_identifiers(text, _AI_ACT) == [("CELEX:32024R1689", "alias")]
+
+
+def test_extract_identifiers_is_pattern_only_by_default() -> None:
+    """Контракт голден-теста: дефолт БЕЗ алиасов — стабильность регексов не должна
+    зависеть от файла, который куратор законно правит в любой момент."""
+    text = "the EU AI Act and 32016R0679"
+    assert cite_mining.extract_identifiers(text) == [("CELEX:32016R0679", "celex")]
+
+
+@pytest.mark.parametrize(
+    "text,found",
+    [
+        ("primjena GDPR-om u praksi", True),      # флексия — границы слов дают её даром
+        ("usklađen sa GDPR.", True),
+        ("(GDPR)", True),
+        ("the gdpr regime", True),                # регистр плавает по вёрстке и OCR
+        ("GDPRX", False),                         # подстрока внутри слова — не цитата
+        ("pre-GDPRish", False),
+    ],
+)
+def test_alias_word_boundaries(text: str, found: bool) -> None:
+    hits = cite_mining.extract_identifiers(text, {"GDPR": "CELEX:32016R0679"})
+    assert bool(hits) is found
+
+
+def test_alias_does_not_match_other_jurisdictions_act() -> None:
+    """⚠ Ловушка, подтверждённая живьём в `oxford-insights-gairi-2025`: голый «AI Act» —
+    это ещё и корейский «Basic AI Act», и тайваньский. Различающая форма обязана
+    промолчать на чужих актах, иначе канал строит ложные рёбра пачками."""
+    for foreign in ["South Korea's Basic AI Act", "a draft bill of its AI Act",
+                    "the comprehensive Australia AI Act"]:
+        assert cite_mining.extract_identifiers(foreign, _AI_ACT) == []
+
+
+def test_pattern_wins_rule_tag_over_alias() -> None:
+    """Формальная цитата — более сильное свидетельство: при совпадении идентификатора
+    правилом остаётся паттерн, алиасу достаётся только ненайденное."""
+    text = "the EU AI Act, formally 32024R1689"
+    assert cite_mining.extract_identifiers(text, _AI_ACT) == [("CELEX:32024R1689", "celex")]
+
+
+def test_blank_alias_is_ignored() -> None:
+    """Опечатка `"": doc-id` в YAML иначе совпала бы в КАЖДОМ документе корпуса."""
+    assert cite_mining.extract_identifiers("любой текст", {"": "CELEX:32024R1689", "  ": "X"}) == []
+
+
+def test_alias_hit_goes_through_normal_resolution(tmp_path: Path) -> None:
+    """Алиас сам по себе ребра не строит — он даёт идентификатор, который проходит ту же
+    резолюцию: есть запись справочника — ребро, нет — обычный лид."""
+    cited = _place(tmp_path, "eu-ai-act-2024", "# акт\n")
+    citing = _place(tmp_path, "oxford-2025", "following the EU AI Act closely\n")
+    result = cite_mining.mine_corpus(
+        [cited, citing], tmp_path,
+        identifiers={"CELEX:32024R1689": "eu-ai-act-2024"}, aliases=_AI_ACT,
+    )
+    assert [(e.source_id, e.target_id, e.rule) for e in result.edges] == [
+        ("oxford-2025", "eu-ai-act-2024", "alias")
+    ]
+
+    unresolved = cite_mining.mine_corpus([citing], tmp_path, identifiers={}, aliases=_AI_ACT)
+    assert unresolved.edges == []
+    assert [lead["identifier"] for lead in unresolved.leads] == ["CELEX:32024R1689"]
+
+
+def test_explicit_empty_aliases_keeps_test_hermetic(tmp_path: Path) -> None:
+    """Явный словарь (в т.ч. пустой) отключает чтение диска: правка курируемого файла
+    не должна менять исход юнит-теста."""
+    citing = _place(tmp_path, "oxford-2025", "following the EU AI Act closely\n")
+    assert cite_mining.mine_corpus([citing], tmp_path, identifiers={}, aliases={}).leads == []
+
+
 # --- резолюция ---
 
 
@@ -163,6 +250,47 @@ def test_resolution_from_source_url() -> None:
     """URL, несущий идентификатор БУКВАЛЬНО, резолвится автоматически."""
     rec = _rec("eu-act-2024", url="https://eur-lex.europa.eu/eli/reg/2024/1689/oj?uri=CELEX:32024R1689")
     assert cite_mining.identifiers_from_urls([rec]) == {"CELEX:32024R1689": "eu-act-2024"}
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        # Форма, которую строит сам коннектор eurlex (`_build_source_url`).
+        ("https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:52026DC0577",
+         ["CELEX:52026DC0577"]),
+        # Сектор 5 + двухбуквенный тип; сектор 3 с литерой вне LRDE прозаической границы.
+        ("https://x.example/?uri=CELEX:32026H0123", ["CELEX:32026H0123"]),
+        ("https://x.example/?uri=CELEX:62012CJ0123", ["CELEX:62012CJ0123"]),
+        # Номер длиннее четырёх цифр.
+        ("https://x.example/?uri=CELEX:32024R123456", ["CELEX:32024R123456"]),
+        # Скопировано из браузера: двоеточие процент-энкодировано, регистр «плавает».
+        ("https://x.example/?uri=celex%3A32024r1689", ["CELEX:32024R1689"]),
+        # Хвосты: консолидированная версия и corrigendum — часть идентификатора, иначе
+        # поправка резолвилась бы в базовый акт (неверная связь).
+        ("https://x.example/?uri=CELEX:02016R0679-20160504", ["CELEX:02016R0679-20160504"]),
+        ("https://x.example/?uri=CELEX:32004L0018R(01)", ["CELEX:32004L0018R(01)"]),
+        # Без якоря догадки не строятся — OJ-форма остаётся нерезолвнутой.
+        ("https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=OJ:L_202401689", []),
+    ],
+)
+def test_url_anchor_reads_celex_verbatim(url: str, expected: list[str]) -> None:
+    """Префикс `CELEX:` снимает неоднозначность формы полностью — сектор/литеры/длину
+    гадать не нужно, поэтому URL-канал шире прозаической границы v1 сознательно."""
+    assert cite_mining.identifiers_from_url(url) == expected
+
+
+def test_url_anchor_grammar_stays_out_of_prose() -> None:
+    """⚠ Расширение — ТОЛЬКО в URL-канале: в прозе за recall платят ложными рёбрами.
+    Та же строка, что резолвится по якорю, из голого текста не извлекается."""
+    assert cite_mining.extract_identifiers("документ 52026DC0577 в тексте") == []
+    assert cite_mining.identifiers_from_url("?uri=CELEX:52026DC0577") == ["CELEX:52026DC0577"]
+
+
+def test_sector_five_url_resolves_to_record() -> None:
+    """Замер, ради которого правка и делалась: 79% живых eurlex-CELEX — сектор 5,
+    и до якоря ни один из них не резолвился (граница v1 знала только сектор 3)."""
+    rec = _rec("eu-com-2026", url="https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:52026DC0577")
+    assert cite_mining.identifiers_from_urls([rec]) == {"CELEX:52026DC0577": "eu-com-2026"}
 
 
 def test_oj_form_url_is_not_guessed() -> None:
@@ -288,5 +416,26 @@ def test_build_corpus_graph_can_skip_disk_write(tmp_path: Path) -> None:
 
 def test_shipped_identifiers_vocab_is_wellformed() -> None:
     """Файл в репозитории обязан парситься даже пустым — иначе первая же сборка графа
-    на свежем клоне падает."""
-    assert isinstance(cite_mining.load_identifiers(), dict)
+    на свежем клоне падает. Обе секции — независимые словари строк."""
+    for section in (cite_mining.load_identifiers(), cite_mining.load_aliases()):
+        assert isinstance(section, dict)
+        assert all(isinstance(k, str) and isinstance(v, str) for k, v in section.items())
+
+
+@pytest.mark.parametrize("content", [None, "- список, а не отображение\n", "", "identifiers: 42\n"])
+def test_missing_or_malformed_vocab_degrades_to_empty(tmp_path: Path, content: str | None) -> None:
+    """Справочник БЕЗ гейта: его отсутствие (свежий клон, tmp-корень) и любая порча
+    формата обязаны дать пустой словарь, а не уронить сборку графа всего корпуса."""
+    path = tmp_path / "identifiers.yaml"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    assert cite_mining.load_identifiers(path) == {}
+    assert cite_mining.load_aliases(path) == {}
+
+
+def test_shipped_aliases_point_at_known_identifier_space() -> None:
+    """Алиас обязан давать КАНОНИЧЕСКИЙ идентификатор (то же пространство, что паттерны),
+    а не doc-id: иначе он молча минует канал резолюции и никогда не станет ребром."""
+    known_prefixes = ("CELEX:", "SLCG:", "ISO", "NIST ")
+    for alias, ident in cite_mining.load_aliases().items():
+        assert ident.startswith(known_prefixes), f"{alias} -> {ident}"
