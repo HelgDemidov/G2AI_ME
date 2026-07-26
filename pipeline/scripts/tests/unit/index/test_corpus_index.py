@@ -857,3 +857,88 @@ def test_index_corpus_no_oversize_suffix_when_all_within_budget(tmp_path: Path) 
     status = index_corpus(conn, root, _fake_counter, _MAX)
     assert "превышают" not in status
     conn.close()
+
+
+# --- изоляция битого doc.md (spec convert-knowledge-seam-hardening §4) ---
+
+
+def _break_doc_md(doc_dir: Path) -> None:
+    """Сделать doc.md нечитаемым как UTF-8 — класс «сбой диска/обрыв записи»."""
+    (doc_dir / "doc.md").write_bytes(b"# Heading\n\n\xff\xfe not valid utf-8 \x80\x81")
+
+
+def test_incremental_isolates_unreadable_doc(tmp_path: Path, caplog: Any) -> None:
+    """Один битый doc.md не роняет переиндексацию всего корпуса (зеркало изоляции
+    mine_corpus, knowledge-hardening §1): здоровый документ индексируется, битый —
+    пропускается с предупреждением."""
+    root = tmp_path / "src"
+    dir_broken = _doc(root, "doc-broken-2026", "br", _A_BODY)
+    _doc(root, "doc-healthy-2026", "he", _B_BODY)
+    _break_doc_md(dir_broken)
+    conn = create_db(tmp_path / "c.db")
+
+    with caplog.at_level("WARNING", logger="corpus_index"):
+        changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (1, 0)  # считаются РЕАЛЬНО переиндексированные
+    assert _fts_docs(conn, "monitoring") == {("doc-healthy-2026", 0)}
+    assert "doc-broken-2026" in caplog.text
+    conn.close()
+
+
+def test_incremental_keeps_previous_generation_of_broken_doc(tmp_path: Path) -> None:
+    """Порча УЖЕ проиндексированного документа не стирает его прежние чанки и не
+    двигает его doc_state — последнее хорошее поколение остаётся в выдаче, а починка
+    файла (новый mtime) вернёт документ в changed следующим прогоном."""
+    root = tmp_path / "src"
+    dir_a = _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    before = _chunk_rows(conn)
+    fp_before = dict(conn.execute("SELECT doc_id, fingerprint FROM doc_state").fetchall())
+
+    time.sleep(0.01)
+    _break_doc_md(dir_a)
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (0, 0)
+    assert _chunk_rows(conn) == before  # чанки прежнего поколения на месте
+    assert dict(conn.execute("SELECT doc_id, fingerprint FROM doc_state").fetchall()) == fp_before
+    assert _fts_docs(conn, "governance") == {("doc-alpha-2026", 0)}
+
+    # починка -> следующий прогон подхватывает документ штатно
+    (dir_a / "doc.md").write_text("alpha governance\n\nrepaired body", encoding="utf-8")
+    changed, _ = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    assert changed == 1
+    assert _fts_docs(conn, "repaired") == {("doc-alpha-2026", 1)}
+    conn.close()
+
+
+def test_chunks_from_corpus_isolates_unreadable_doc(tmp_path: Path, caplog: Any) -> None:
+    """Полная пересборка: битый документ пропускается с предупреждением, чанки
+    остальных собираются (до фикса — UnicodeDecodeError ронял весь вызов)."""
+    root = tmp_path / "src"
+    dir_broken = _doc(root, "doc-broken-2026", "br", _A_BODY)
+    _doc(root, "doc-healthy-2026", "he", _B_BODY)
+    _break_doc_md(dir_broken)
+
+    with caplog.at_level("WARNING", logger="corpus_index"):
+        chunks = corpus_index.chunks_from_corpus(root, _fake_counter, _MAX)
+
+    assert {c.doc_id for c in chunks} == {"doc-healthy-2026"}
+    assert "doc-broken-2026" in caplog.text
+
+
+def test_index_corpus_force_rebuild_survives_unreadable_doc(tmp_path: Path) -> None:
+    """Сквозной путь force-пересборки: отказ одного документа не рвёт стадию индекса."""
+    root = tmp_path / "src"
+    dir_broken = _doc(root, "doc-broken-2026", "br", _A_BODY)
+    _doc(root, "doc-healthy-2026", "he", _B_BODY)
+    _break_doc_md(dir_broken)
+    conn = create_db(tmp_path / "c.db")
+
+    status = index_corpus(conn, root, _fake_counter, _MAX, force=True)
+
+    assert "полная пересборка" in status
+    assert _fts_docs(conn, "monitoring") == {("doc-healthy-2026", 0)}
+    conn.close()

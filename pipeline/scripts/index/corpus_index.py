@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from index.chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
 from core.env import REPO_ROOT
 from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, md_file
 from core.schema import superseded_ids as schema_superseded_ids
+
+logger = logging.getLogger("corpus_index")
 
 DEFAULT_DB = REPO_ROOT / "pipeline" / "index" / "corpus.db"
 
@@ -407,6 +410,14 @@ def index_corpus_incremental(
     и порвал бы атомарность. ``corpus_fingerprint`` — ЕДИНАЯ meta-aware функция
     (та же, что глобальный гейт ``run_pipeline``), не локальная пересборка из
     per-doc частей — иначе форматы разошлись бы (spec analyze-retrieval §2.3).
+
+    Чтение ``doc.md`` вынесено ДО транзакции (spec convert-knowledge-seam-hardening §4):
+    битый файл (не-UTF-8 после сбоя диска) исключается из поколения, а не роняет
+    переиндексацию ВСЕГО корпуса — тот же паттерн «отказ документа не рвёт батч», что в
+    ``run_pipeline``/``discovery``/``mine_corpus``. Прежние чанки такого документа при
+    этом НЕ удаляются и ``doc_state`` НЕ обновляется: последнее хорошее поколение
+    остаётся в выдаче, а починка файла сдвинет mtime и вернёт документ в ``changed``
+    следующим прогоном. Возвращаемое «изменено» считает РЕАЛЬНО переиндексированные.
     """
     all_records = list(load_records(sources_root))
     current: dict[str, tuple[str, Path]] = {}
@@ -421,14 +432,25 @@ def index_corpus_incremental(
 
     changed = [doc_id for doc_id, (fp, _) in current.items() if stored.get(doc_id) != fp]
     vanished = [doc_id for doc_id in stored if doc_id not in current]
+
+    pending: list[tuple[str, str, str]] = []  # (doc_id, fingerprint, тело без frontmatter)
+    for doc_id in changed:
+        fp, md = current[doc_id]
+        try:
+            text = md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "  ⚠ %s: doc.md не читается (%s) — документ пропущен переиндексацией", doc_id, exc
+            )
+            continue
+        pending.append((doc_id, fp, strip_frontmatter(text)))
+
     corpus_fp = corpus_fingerprint(sources_root)
 
     with conn:  # атомарно: либо всё новое поколение, либо ничего
-        for doc_id in (*changed, *vanished):
+        for doc_id in (*(p[0] for p in pending), *vanished):
             _delete_doc_chunks(conn, doc_id)
-        for doc_id in changed:
-            fp, md = current[doc_id]
-            text = strip_frontmatter(md.read_text(encoding="utf-8"))
+        for doc_id, fp, text in pending:
             _insert_doc_chunks(conn, chunk_text(text, count_tokens, max_tokens, doc_id=doc_id))
             conn.execute(
                 "INSERT INTO doc_state (doc_id, fingerprint) VALUES (?, ?) "
@@ -440,7 +462,7 @@ def index_corpus_incremental(
         _rebuild_facets(conn, all_records)
         write_meta(conn, "corpus_fingerprint", corpus_fp)
         write_meta(conn, "chunk_max_tokens", str(max_tokens))
-    return len(changed), len(vanished)
+    return len(pending), len(vanished)
 
 
 def _count_oversize_chunks(conn: sqlite3.Connection, max_tokens: int) -> int:
@@ -549,15 +571,29 @@ def chunks_from_corpus(
     count_tokens: TokenCounter,
     max_tokens: int = EMBED_MAX_TOKENS,
 ) -> list[Chunk]:
-    """Собрать канонические чанки всех doc.md корпуса (пути выводятся из папки-документа)."""
+    """Собрать канонические чанки всех doc.md корпуса (пути выводятся из папки-документа).
+
+    Нечитаемый ``doc.md`` пропускается с предупреждением, а не роняет сборку всего
+    корпуса (spec convert-knowledge-seam-hardening §4). ⚠ В отличие от инкрементального
+    пути, здесь пропуск означает ОТСУТСТВИЕ документа в новом поколении индекса — это
+    полная пересборка, прежних чанков она не сохраняет ни для кого."""
     chunks: list[Chunk] = []
     for rec in load_records(sources_root):
         md = md_file(rec, sources_root)
         if not md.exists():
             print(f"  пропуск {rec.id}: нет файла {md}", file=sys.stderr)
             continue
-        text = strip_frontmatter(md.read_text(encoding="utf-8"))
-        chunks.extend(chunk_text(text, count_tokens, max_tokens, doc_id=rec.id))
+        try:
+            raw_text = md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "  ⚠ %s: doc.md не читается (%s) — документ не войдёт в пересобранный индекс",
+                rec.id, exc,
+            )
+            continue
+        chunks.extend(
+            chunk_text(strip_frontmatter(raw_text), count_tokens, max_tokens, doc_id=rec.id)
+        )
     return chunks
 
 
