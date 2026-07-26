@@ -84,6 +84,10 @@ def test_patterns_extract_canonical_identifier(text: str, expected: str) -> None
         "ISO 42",                            # слишком короткий номер
         "NIST SP 500-53",                    # не серия 800
         "Службени лист РС бр. 12/2025",      # другая юрисдикция
+        # Год-гейт: номер стоит на месте года — «поправить» такое нельзя, только молчать.
+        "Decision 768/2008/EC",
+        "Regulation (EU) 3922/91",           # OCR потерял «No» -> год 3922
+        "Directive 1234/5678/EU",
     ],
 )
 def test_patterns_reject_near_misses(text: str) -> None:
@@ -163,6 +167,47 @@ def test_resolution_from_source_url() -> None:
     """URL, несущий идентификатор БУКВАЛЬНО, резолвится автоматически."""
     rec = _rec("eu-act-2024", url="https://eur-lex.europa.eu/eli/reg/2024/1689/oj?uri=CELEX:32024R1689")
     assert cite_mining.identifiers_from_urls([rec]) == {"CELEX:32024R1689": "eu-act-2024"}
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        # Форма, которую строит сам коннектор eurlex (`_build_source_url`).
+        ("https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:52026DC0577",
+         ["CELEX:52026DC0577"]),
+        # Сектор 5 + двухбуквенный тип; сектор 3 с литерой вне LRDE прозаической границы.
+        ("https://x.example/?uri=CELEX:32026H0123", ["CELEX:32026H0123"]),
+        ("https://x.example/?uri=CELEX:62012CJ0123", ["CELEX:62012CJ0123"]),
+        # Номер длиннее четырёх цифр.
+        ("https://x.example/?uri=CELEX:32024R123456", ["CELEX:32024R123456"]),
+        # Скопировано из браузера: двоеточие процент-энкодировано, регистр «плавает».
+        ("https://x.example/?uri=celex%3A32024r1689", ["CELEX:32024R1689"]),
+        # Хвосты: консолидированная версия и corrigendum — часть идентификатора, иначе
+        # поправка резолвилась бы в базовый акт (неверная связь).
+        ("https://x.example/?uri=CELEX:02016R0679-20160504", ["CELEX:02016R0679-20160504"]),
+        ("https://x.example/?uri=CELEX:32004L0018R(01)", ["CELEX:32004L0018R(01)"]),
+        # Без якоря догадки не строятся — OJ-форма остаётся нерезолвнутой.
+        ("https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=OJ:L_202401689", []),
+    ],
+)
+def test_url_anchor_reads_celex_verbatim(url: str, expected: list[str]) -> None:
+    """Префикс `CELEX:` снимает неоднозначность формы полностью — сектор/литеры/длину
+    гадать не нужно, поэтому URL-канал шире прозаической границы v1 сознательно."""
+    assert cite_mining.identifiers_from_url(url) == expected
+
+
+def test_url_anchor_grammar_stays_out_of_prose() -> None:
+    """⚠ Расширение — ТОЛЬКО в URL-канале: в прозе за recall платят ложными рёбрами.
+    Та же строка, что резолвится по якорю, из голого текста не извлекается."""
+    assert cite_mining.extract_identifiers("документ 52026DC0577 в тексте") == []
+    assert cite_mining.identifiers_from_url("?uri=CELEX:52026DC0577") == ["CELEX:52026DC0577"]
+
+
+def test_sector_five_url_resolves_to_record() -> None:
+    """Замер, ради которого правка и делалась: 79% живых eurlex-CELEX — сектор 5,
+    и до якоря ни один из них не резолвился (граница v1 знала только сектор 3)."""
+    rec = _rec("eu-com-2026", url="https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:52026DC0577")
+    assert cite_mining.identifiers_from_urls([rec]) == {"CELEX:52026DC0577": "eu-com-2026"}
 
 
 def test_oj_form_url_is_not_guessed() -> None:

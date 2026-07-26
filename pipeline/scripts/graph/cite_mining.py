@@ -62,6 +62,12 @@ def _celex(m: re.Match[str]) -> list[str]:
 # пространство идентификаторов, что и компактная форма: «Regulation (EU) 2024/1689» и
 # «32024R1689» дают один идентификатор, одно ребро и одну строку identifiers.yaml.
 _EU_ACT_LETTER = {"regulation": "R", "directive": "L", "decision": "D"}
+# Правдоподобный диапазон года акта ЕС (ЕЭС основано в 1957-м; верхняя граница — запас на
+# будущие акты). Вне диапазона совпадение отбрасывается ЦЕЛИКОМ, а не «поправляется»:
+# «Decision 768/2008/EC» (номер/год/юрисдикция) без гейта давал `CELEX:30768D2008` —
+# синтаксически правдоподобный мусор. Рёбер он не строит (резолюция не совпадёт), но
+# отравляет `cite_leads.yaml`, который куратор читает при discovery-кампаниях.
+_EU_YEAR_MIN, _EU_YEAR_MAX = 1950, 2049
 # Гейт двузначных лет: «Службени лист ЦГ» существует только с 2006-го (независимость),
 # поэтому 2-значный год — всегда 20xx. Форма /99 под литерой «CG» существовать не может.
 _SLCG_CENTURY = 2000
@@ -85,6 +91,8 @@ def _eu_act(m: re.Match[str]) -> list[str]:
     year, number = (second, first) if m.group("no") else (first, second)
     if year < 100:
         year += 1900
+    if not _EU_YEAR_MIN <= year <= _EU_YEAR_MAX:
+        return []   # см. `_EU_YEAR_MIN`: не гадать, а промолчать
     letter = _EU_ACT_LETTER[m.group("kind").lower()]
     return [f"CELEX:3{year:04d}{letter}{number:04d}"]
 
@@ -100,6 +108,8 @@ def _eu_act_slash(m: re.Match[str]) -> list[str]:
     year, number = int(m.group("year")), int(m.group("number"))
     if year < 100:
         year += 1900
+    if not _EU_YEAR_MIN <= year <= _EU_YEAR_MAX:
+        return []   # «Decision 768/2008/EC» — номер на месте года; см. `_EU_YEAR_MIN`
     letter = _EU_ACT_LETTER[m.group("kind").lower()]
     return [f"CELEX:3{year:04d}{letter}{number:04d}"]
 
@@ -207,20 +217,50 @@ def load_identifiers(path: Path = IDENTIFIERS_PATH) -> dict[str, str]:
     return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
 
 
+# Якорная форма CELEX в URL: `?uri=CELEX:52026DC0577` (и `%3A`-энкодинг двоеточия у
+# ссылок, скопированных куратором из браузера). Здесь грамматика НАМЕРЕННО шире границы
+# прозаического реестра (сектор 3 + LRDE + 4 цифры): префикс `CELEX:` снимает
+# неоднозначность формы ПОЛНОСТЬЮ, гадать сектор/литеру/длину не нужно — а 79% живых
+# CELEX это сектор 5 (`52026DC0577`, подготовительные акты), плюс литеры H/B/C/G/Y и
+# номера в 5 и 8 цифр. Расширять так ПРОЗАИЧЕСКИЙ регекс запрещено: там за recall
+# платят ложными рёбрами, а ложное ребро в юридическом графе дороже пропущенного.
+# Хвосты: `-YYYYMMDD` — консолидированная версия, `R(NN)` — corrigendum; оба входят в
+# идентификатор, иначе поправка резолвилась бы в базовый акт (неверная связь).
+_URL_CELEX_ANCHOR = re.compile(
+    r"CELEX(?::|%3A)(?P<celex>\d{5}[A-Z]{1,3}\d{2,8}(?:R\(\d{2}\))?(?:-\d{8})?)",
+    re.IGNORECASE,
+)
+
+
+def identifiers_from_url(url: str) -> list[str]:
+    """CELEX-идентификаторы, которые URL несёт БУКВАЛЬНО, по якорю ``CELEX:``.
+
+    Проверено по коду коннектора (``eurlex._build_source_url``): он строит
+    ``…/TXT/HTML/?uri=CELEX:{celex}`` без энкодинга, поэтому якорь покрывает все его
+    допуски; ``%3A``-ветка нужна ссылкам, вставленным вручную из браузера.
+    """
+    return [f"CELEX:{m.group('celex').upper()}" for m in _URL_CELEX_ANCHOR.finditer(url)]
+
+
 def identifiers_from_urls(records: list[schema.SourceRecord]) -> dict[str, str]:
     """Авто-резолюция из ``source_url`` — ТОЛЬКО для URL, несущих идентификатор БУКВАЛЬНО.
 
+    Два канала: якорь ``CELEX:`` (``identifiers_from_url``, широкая грамматика) и общий
+    реестр паттернов (компактный CELEX без префикса и прочие формы в теле ссылки).
+
     ⚠ Проверено на собственном корпусе: у ``eu-ai-act-2024`` ``source_url`` — OJ-форма
     (`uri=OJ:L_202401689`), из которой литера типа акта (R/L) НЕ выводится надёжно.
-    Здесь эвристика честно ПАСУЕТ (регекс не совпадает) вместо того, чтобы угадать
-    CELEX и связать документы неверно. Такие случаи закрывает справочник.
+    Здесь эвристика честно ПАСУЕТ (ни один канал не совпадает) вместо того, чтобы
+    угадать CELEX и связать документы неверно. Такие случаи закрывает справочник.
 
     Несколько записей на один идентификатор — идентификатор пропускается целиком:
     угадывать, какая из них «та самая», хуже, чем не построить ребро.
     """
     found: dict[str, set[str]] = {}
     for rec in records:
-        for ident, _rule in extract_identifiers(rec.source_url):
+        idents = identifiers_from_url(rec.source_url)
+        idents += [ident for ident, _rule in extract_identifiers(rec.source_url)]
+        for ident in idents:
             found.setdefault(ident, set()).add(rec.id)
     resolved: dict[str, str] = {}
     for ident, doc_ids in found.items():
