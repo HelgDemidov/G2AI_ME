@@ -35,7 +35,7 @@ from typing import Any
 import pdfplumber
 import yaml
 
-from convert import chart_render, docx_groups, lint, pdf_graphics, pdf_to_markdown
+from convert import chart_render, docx_groups, lint, pdf_graphics, pdf_to_markdown, zipsafe
 from core import fsio, markers, openrouter
 
 logger = logging.getLogger(__name__)
@@ -548,6 +548,10 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> tuple[bool, l
     docx_group_matches = list(_DOCX_GROUP_MARKER_RE.finditer(text))
     if not any((figure_matches, image_matches, docx_image_matches, docx_group_matches)):
         return False, []
+    if docx_image_matches or docx_group_matches:
+        # Отдельная стадия — отдельный вход в архив, отдельный гейт (spec
+        # convert-knowledge-seam-hardening §8). Для pdf-маркеров raw не zip вовсе.
+        zipsafe.check_archive(raw)
 
     # Ключ требуется ЛЕНИВО — только когда реально нужен облачный вызов (cache-miss,
     # см. _require_key ниже): реинъекция с тёплым кэшем полностью офлайн и работает

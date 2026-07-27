@@ -23,7 +23,7 @@ from xml.etree import ElementTree
 
 import pdfplumber
 
-from convert import cloud_ocr, html_preprocess, ocr_headings
+from convert import cloud_ocr, html_preprocess, ocr_headings, zipsafe
 from convert.pdf_to_markdown import convert as pdf_convert
 from core import fsio, schema
 from core.env import load_dotenv
@@ -436,6 +436,10 @@ def _convert_docx(
 
     from convert import docx_groups
 
+    # Потолок разжатия ДО первого чтения парта (spec convert-knowledge-seam-hardening
+    # §8): гейт стоит на ЕДИНСТВЕННОМ входе формата, поэтому все внутренние z.read
+    # (docx_groups, mammoth, _docx_image_markers) им покрыты — до них не доходит.
+    zipsafe.check_archive(raw)
     rewritten, groups = docx_groups.extract_and_strip_groups(raw)
 
     class _DocxMarkdownify(MarkdownConverter):
@@ -544,6 +548,8 @@ def _convert_xlsx(
     from openpyxl.utils.cell import coordinate_to_tuple
 
     from convert import xlsx_charts
+
+    zipsafe.check_archive(raw)  # см. _convert_docx (spec convert-knowledge-seam-hardening §8)
 
     wb = openpyxl.load_workbook(raw, data_only=True, read_only=False)
     # Метаданные И roots нужны ОБА (группировка/сортировка по листу+якорю,
