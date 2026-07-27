@@ -150,3 +150,20 @@ def test_hsearch_no_warning_when_index_meta_has_no_fingerprint(tmp_path: Path, c
 
     assert main(["governance", "--db", str(db), "--sources", str(sources), "--backend", "none"]) == 0
     assert "отстаёт" not in capsys.readouterr().err
+
+
+def test_hsearch_annotates_reconstruction(tmp_path: Path, capsys: Any) -> None:
+    """Машинная реконструкция фигуры выглядит в выдаче как обычная проза документа —
+    до пометки аналитик не мог отличить её ничем (аудит шва Б1)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [
+        Chunk("doc-a", 0, "figure shows governance layers", 4, "", True),
+        Chunk("doc-b", 0, "governance framework verbatim", 4, "", False),
+    ])
+    conn.close()
+
+    assert main(["governance", "--db", str(db), "--backend", "none"]) == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert any("doc-a" in ln and "⚠ reconstruction" in ln for ln in lines)
+    assert any("doc-b" in ln and "⚠ reconstruction" not in ln for ln in lines)

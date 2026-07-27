@@ -18,7 +18,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from core import schema
+from core import markers, schema
 
 TokenCounter = Callable[[str], int]
 
@@ -47,6 +47,10 @@ class Chunk:
 
     ``breadcrumb`` — цепочка заголовков-предков (`"H1 › H2 › H3"`), "" для текста
     до первого заголовка или документа без заголовков вовсе.
+
+    ``reconstruction`` — чанк несёт машинную реконструкцию (VLM-описание фигуры), а не
+    verbatim-текст издателя (spec convert-knowledge-seam-hardening §2). Смешанный чанк
+    считается реконструированным: занизить доверие честнее, чем завысить.
     """
 
     doc_id: str
@@ -54,6 +58,7 @@ class Chunk:
     text: str
     n_tokens: int
     breadcrumb: str = ""
+    reconstruction: bool = False
 
 
 def _paragraphs(text: str) -> list[str]:
@@ -98,7 +103,37 @@ def _sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENT_RE.split(text) if s.strip()]
 
 
-def _sections(text: str) -> list[tuple[str, list[str]]]:
+def _tag_reconstruction(paras: list[str]) -> list[tuple[str, bool]]:
+    """Пометить абзацы, принадлежащие блоку VLM-инъекции (spec §2).
+
+    Границы читаются ИЗ САМОГО ТЕКСТА (``core.markers``), а не восстанавливаются по
+    кэшу ``.figures.yaml``: сайдкар принадлежит слою convert, и лезть в него из индекса
+    значило бы завести ту самую межслойную связь, которую спек снимает, — плюс матчинг
+    по подстроке хрупок (текст чанка — нормализованная проекция, Б21).
+
+    Легаси-блок БЕЗ терминатора (инъекции до этого спека, живут до первой реконверсии)
+    закрывается на ближайшем заголовке: пометить до конца документа было бы
+    неоправданно широко, а не пометить вовсе — вернуть исходный дефект.
+    """
+    out: list[tuple[str, bool]] = []
+    inside = False
+    for para in paras:
+        first = para.split("\n", 1)[0]
+        if markers.is_injection_open(first):
+            inside = True
+            out.append((para, True))
+        elif markers.is_injection_end(first):
+            inside = False
+            out.append((para, True))
+        elif _HEADING_RE.match(first.strip()):
+            inside = False  # страховка для легаси-блоков без терминатора
+            out.append((para, False))
+        else:
+            out.append((para, inside))
+    return out
+
+
+def _sections(text: str) -> list[tuple[str, list[tuple[str, bool]]]]:
     """Разбить абзацы текста на секции по строкам-заголовкам.
 
     Заголовок = абзац, чья ПЕРВАЯ строка матчит ``^#{1,6}\\s+.*$`` (pdf_to_markdown
@@ -106,12 +141,15 @@ def _sections(text: str) -> list[tuple[str, list[str]]]:
     уровни >= N, затем пишет себя; breadcrumb секции = "› "-цепочка стека. Строка
     заголовка остаётся первым абзацем своей секции (искомый контент, не только
     метаданные). Документ без заголовков -> одна секция с breadcrumb "".
+
+    Абзацы идут парами ``(текст, реконструкция)`` — флаг едет рядом до самого чанка,
+    не влияя на packing (границы чанков байт-в-байт те же, что до §2).
     """
-    sections: list[tuple[str, list[str]]] = []
+    sections: list[tuple[str, list[tuple[str, bool]]]] = []
     stack: list[tuple[int, str]] = []
     breadcrumb = ""
-    current: list[str] = []
-    for para in _paragraphs(text):
+    current: list[tuple[str, bool]] = []
+    for para, reconstructed in _tag_reconstruction(_paragraphs(text)):
         m = _HEADING_RE.match(para.splitlines()[0])
         if m:
             if current:
@@ -120,9 +158,9 @@ def _sections(text: str) -> list[tuple[str, list[str]]]:
             stack = [(lv, t) for lv, t in stack if lv < level]
             stack.append((level, title))
             breadcrumb = " › ".join(t for _, t in stack)
-            current = [para]
+            current = [(para, reconstructed)]
         else:
-            current.append(para)
+            current.append((para, reconstructed))
     if current:
         sections.append((breadcrumb, current))
     return sections
@@ -303,28 +341,40 @@ def _split_long_paragraph(para: str, count_tokens: TokenCounter, max_tokens: int
     return out
 
 
-def _pack_paragraphs(paras: list[str], count_tokens: TokenCounter, max_tokens: int) -> list[str]:
+def _pack_paragraphs(
+    paras: list[tuple[str, bool]], count_tokens: TokenCounter, max_tokens: int
+) -> list[tuple[str, bool]]:
     """Упаковать абзацы ОДНОЙ секции в чанки <= max_tokens, стараясь не резать
-    абзацы/предложения (packing-логика, вынесена из ``chunk_text`` для секционирования)."""
-    raw: list[str] = []
-    current: list[str] = []
+    абзацы/предложения (packing-логика, вынесена из ``chunk_text`` для секционирования).
+
+    Флаг реконструкции (spec §2) едет РЯДОМ с текстом и в решения упаковки не входит:
+    сам текст чанка собирается ровно теми же операциями над теми же строками, что до
+    введения флага, поэтому границы чанков (а значит ``content_hash`` и векторы)
+    побитово те же. Чанк реконструирован, если реконструирован ЛЮБОЙ его абзац;
+    разрезанный оверсайз-абзац передаёт свой флаг всем кускам.
+    """
+    raw: list[tuple[str, bool]] = []
+    current: list[tuple[str, bool]] = []
     current_tokens = 0
 
     def flush() -> None:
         nonlocal current, current_tokens
         if current:
-            raw.append("\n\n".join(current))
+            raw.append(("\n\n".join(text for text, _ in current), any(flag for _, flag in current)))
             current, current_tokens = [], 0
 
-    for para in paras:
+    for para, reconstructed in paras:
         n = count_tokens(para)
         if n > max_tokens:
             flush()
-            raw.extend(_split_long_paragraph(para, count_tokens, max_tokens))
+            raw.extend(
+                (piece, reconstructed)
+                for piece in _split_long_paragraph(para, count_tokens, max_tokens)
+            )
             continue
         if current and current_tokens + n > max_tokens:
             flush()
-        current.append(para)
+        current.append((para, reconstructed))
         current_tokens += n
     flush()
     return raw
@@ -341,10 +391,10 @@ def chunk_text(
     Секционируется ПЕРЕД packing (см. ``_sections``): чанк никогда не пересекает
     границу секции, у каждого чанка breadcrumb секции, к которой он принадлежит.
     """
-    raw: list[tuple[str, str]] = [
-        (breadcrumb, chunk)
+    raw: list[tuple[str, str, bool]] = [
+        (breadcrumb, chunk, reconstructed)
         for breadcrumb, paras in _sections(text)
-        for chunk in _pack_paragraphs(paras, count_tokens, max_tokens)
+        for chunk, reconstructed in _pack_paragraphs(paras, count_tokens, max_tokens)
     ]
     # count_tokens(chunk) здесь пересчитывает готовый текст ЗАНОВО, хотя суммы уже
     # накапливались по пути (_pack_paragraphs/_split_long_paragraph) — избыточно, но
@@ -354,9 +404,41 @@ def chunk_text(
     # должны были бы возвращать (text, n_tokens) вместо str — не стоит сложности
     # ради устранения уже-линейной работы (см. spec code-consolidation §5).
     return [
-        Chunk(doc_id, i, chunk, count_tokens(chunk), breadcrumb)
-        for i, (breadcrumb, chunk) in enumerate(raw)
+        Chunk(doc_id, i, chunk, count_tokens(chunk), breadcrumb, reconstructed)
+        for i, (breadcrumb, chunk, reconstructed) in enumerate(raw)
     ]
+
+
+_MARKUP_LINE_RE = re.compile(r"^\s*(\||```|> \[)")
+MARKUP_HEAVY_RATIO = 0.6
+"""Доля строк-разметки, выше которой чанк считается markup-heavy (spec §2, Б18).
+Живой замер аудита: 172 из 768 чанков корпуса (22%) — таблицы/фенсы/маркеры. Это не
+дефект (табличный контент легитимен), но и не проза: счётчик делает класс видимым, а
+будущий table-retrieval — измеримым."""
+
+
+def is_markup_heavy(text: str) -> bool:
+    """Чанк состоит преимущественно из разметки (строки таблиц, код-фенсы, маркеры),
+    а не из прозы — наблюдаемость формы чанков, не фильтр.
+
+    Содержимое код-фенса считается разметкой ЦЕЛИКОМ: тело ```mermaid — исходник
+    диаграммы, прозой он не является ни в каком прочтении (иначе фенс из четырёх строк
+    давал бы ровно 50% и не проходил порог из-за собственных ограничителей)."""
+    markup = total = 0
+    in_fence = False
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        total += 1
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            markup += 1
+            continue
+        if in_fence or _MARKUP_LINE_RE.match(line):
+            markup += 1
+    if not total:
+        return False
+    return markup / total > MARKUP_HEAVY_RATIO
 
 
 def embed_input(breadcrumb: str, text: str) -> str:

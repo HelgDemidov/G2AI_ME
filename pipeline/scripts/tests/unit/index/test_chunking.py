@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from core import markers
 from index.chunking import (
     _hard_split,
     _split_by_chars,
@@ -10,6 +11,7 @@ from index.chunking import (
     _table_header,
     chunk_text,
     embed_input,
+    is_markup_heavy,
     strip_frontmatter,
 )
 
@@ -468,3 +470,82 @@ def test_hard_split_single_word_within_budget_stays_whole() -> None:
     """Регресс: слово В БЮДЖЕТЕ не должно уходить в посимвольный фолбэк."""
     chunks = _hard_split("short", char_len, max_tokens=10)
     assert chunks == ["short"]
+
+
+# --- chunk-провенанс: reconstruction/markup_heavy (spec convert-knowledge-seam-hardening §2) ---
+
+_OPEN = markers.injection_open("Figure, p. 6, region abc123def456", "some/model")
+_END = markers.injection_end("region abc123def456")
+
+
+def test_reconstruction_tags_only_injected_block() -> None:
+    """Флаг стоит на абзацах ВНУТРИ блока (включая оба маркера) и не течёт наружу:
+    verbatim-текст издателя после терминатора остаётся непомеченным."""
+    text = f"Verbatim before.\n\n{_OPEN}\n\nVLM prose about the figure.\n\n{_END}\n\nVerbatim after."
+    chunks = chunk_text(text, wc, 4)
+
+    flagged = [c.text for c in chunks if c.reconstruction]
+    clean = [c.text for c in chunks if not c.reconstruction]
+    assert any("VLM prose" in t for t in flagged)
+    assert all("Verbatim before" not in t for t in flagged)
+    assert all("Verbatim after" not in t for t in flagged)
+    assert any("Verbatim after" in t for t in clean)
+
+
+def test_reconstruction_marks_mixed_chunk() -> None:
+    """Смешанный чанк (verbatim + реконструкция под одним бюджетом) считается
+    реконструированным: занизить доверие честнее, чем завысить."""
+    text = f"{_OPEN}\n\nprose\n\n{_END}\n\ntail"
+    chunks = chunk_text(text, wc, 10_000)  # всё влезает в один чанк
+    assert len(chunks) == 1
+    assert chunks[0].reconstruction is True
+
+
+def test_legacy_injection_without_terminator_stops_at_heading() -> None:
+    """Инъекции до этого спека терминатора не несут (живут до первой реконверсии):
+    флаг закрывается ближайшим заголовком, а не течёт до конца документа."""
+    text = f"{_OPEN}\n\nVLM prose.\n\n# Real heading\n\nDocument body."
+    chunks = chunk_text(text, wc, 4)
+
+    assert any(c.reconstruction and "VLM prose" in c.text for c in chunks)
+    assert all(not c.reconstruction for c in chunks if "Document body" in c.text)
+    assert all(not c.reconstruction for c in chunks if c.text.startswith("# Real heading"))
+
+
+def test_reconstruction_flag_does_not_change_chunk_boundaries() -> None:
+    """Инвариант §2: тегирование едет РЯДОМ с текстом и в packing не входит — тексты и
+    границы чанков побитово те же, что и без предшествующего блока инъекции.
+
+    Секция ``# H`` пакуется независимо от того, что было до неё, поэтому сравнение
+    честно изолирует именно влияние флага (полная сверка по всему корпусу — живым
+    прогоном: множества content_hash до и после введения флага совпали побитово)."""
+    section = "# H\n\nalpha beta\n\ngamma delta\n\nepsilon zeta\n\neta theta"
+    plain = [(c.text, c.breadcrumb) for c in chunk_text(section, wc, 4)]
+    wrapped = [
+        (c.text, c.breadcrumb)
+        for c in chunk_text(f"{_OPEN}\n\nvlm prose\n\n{_END}\n\n{section}", wc, 4)
+        if c.breadcrumb == "H"
+    ]
+    assert wrapped == plain
+    assert all(not c.reconstruction for c in chunk_text(f"{_OPEN}\n\nv\n\n{_END}\n\n{section}", wc, 4) if c.breadcrumb == "H")
+
+
+def test_no_reconstruction_flag_on_ordinary_text() -> None:
+    chunks = chunk_text("# Title\n\nOrdinary prose.\n\n> [Figure, p. 1, region abc — structure not reconstructed]", wc, 50)
+    assert all(c.reconstruction is False for c in chunks)
+
+
+def test_is_markup_heavy_detects_tables_fences_markers() -> None:
+    table = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    fence = "```mermaid\npie title X\n    \"A\" : 1\n```"
+    prose = "Обычный абзац прозы без единой строки разметки, просто текст."
+    assert is_markup_heavy(table) is True
+    assert is_markup_heavy(fence) is True
+    assert is_markup_heavy(prose) is False
+    assert is_markup_heavy("") is False
+
+
+def test_is_markup_heavy_mixed_block_below_threshold() -> None:
+    """Абзац прозы с одной таблицей-строкой — не markup-heavy (порог по доле строк)."""
+    mixed = "Prose line one.\nProse line two.\nProse line three.\n| a | b |"
+    assert is_markup_heavy(mixed) is False

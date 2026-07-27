@@ -119,7 +119,11 @@ def main(argv: list[str] | None = None) -> int:
     for r in results:
         preview = r.text[:120].replace("\n", " ")
         crumb = f" · {r.breadcrumb}" if r.breadcrumb else ""
-        print(f"[{r.rrf_score:.4f}] {r.doc_id} #{r.chunk_index}{crumb}: {preview}…")
+        # Провенанс чанка (spec convert-knowledge-seam-hardening §2): машинная
+        # реконструкция фигуры выглядит как обычная проза документа — до этой пометки
+        # аналитик не мог отличить её в выдаче вообще ничем.
+        provenance = " · ⚠ reconstruction" if r.reconstruction else ""
+        print(f"[{r.rrf_score:.4f}] {r.doc_id} #{r.chunk_index}{crumb}{provenance}: {preview}…")
     return 0
 
 

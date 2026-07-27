@@ -30,6 +30,7 @@ from index.corpus_index import (
     sanitize_fts_query,
     write_meta,
 )
+from core import markers
 from core.schema import SourceRecord
 from tests.support import valid_record, write_doc
 
@@ -941,4 +942,97 @@ def test_index_corpus_force_rebuild_survives_unreadable_doc(tmp_path: Path) -> N
 
     assert "полная пересборка" in status
     assert _fts_docs(conn, "monitoring") == {("doc-healthy-2026", 0)}
+    conn.close()
+
+
+# --- chunk-провенанс в индексе (spec convert-knowledge-seam-hardening §2) ---
+
+_RECON_BODY = (
+    f"{markers.injection_open('Figure, p. 1, region abc123def456', 'some/model')}\n\n"
+    "vlm prose about the figure\n\n"
+    f"{markers.injection_end('region abc123def456')}\n\n"
+    "verbatim publisher text"
+)
+
+
+def _flag_rows(conn: sqlite3.Connection, column: str) -> dict[tuple[str, int], int]:
+    return {
+        (str(r[0]), int(r[1])): int(r[2])
+        for r in conn.execute(f"SELECT doc_id, chunk_index, {column} FROM chunks")
+    }
+
+
+def test_reconstruction_column_written_on_full_rebuild(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-recon-2026", "re", _RECON_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, 10_000, force=True)
+
+    flags = _flag_rows(conn, "reconstruction")
+    assert any(v == 1 for v in flags.values())
+    conn.close()
+
+
+def test_reconstruction_column_written_on_incremental(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-recon-2026", "re", _RECON_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+
+    assert any(v == 1 for v in _flag_rows(conn, "reconstruction").values())
+    conn.close()
+
+
+def test_markup_heavy_column_written(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-table-2026", "ta", "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |")
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, 10_000, force=True)
+
+    assert any(v == 1 for v in _flag_rows(conn, "markup_heavy").values())
+    conn.close()
+
+
+def test_provenance_columns_backfilled_on_legacy_v3_db(tmp_path: Path) -> None:
+    """Аддитивная миграция БЕЗ бампа SCHEMA_VERSION: БД, собранная до этого спека,
+    получает колонки, а её векторы переживают (бамп версии дропнул бы vectors)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, sample_chunks())
+    conn.execute("CREATE TABLE IF NOT EXISTS vectors (content_hash TEXT, model TEXT, vec BLOB)")
+    conn.execute("INSERT INTO vectors VALUES ('h1', 'm', X'00')")
+    conn.commit()
+    # откат к форме до §2
+    conn.execute("ALTER TABLE chunks DROP COLUMN reconstruction")
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+    assert {"reconstruction", "markup_heavy"} <= cols
+    assert conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0] == 1
+    conn.close()
+
+
+def test_status_reports_reconstruction_and_markup_counters(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-recon-2026", "re", _RECON_BODY)
+    _doc(root, "doc-table-2026", "ta", "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |")
+    conn = create_db(tmp_path / "c.db")
+
+    status = index_corpus(conn, root, _fake_counter, 10_000, force=True)
+
+    assert "реконструированных" in status
+    assert "markup-heavy" in status
+    conn.close()
+
+
+def test_status_has_no_provenance_suffix_on_plain_corpus(tmp_path: Path) -> None:
+    """Регресс: обычный прозаический корпус не получает суффикса вовсе."""
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    status = index_corpus(conn, root, _fake_counter, 10_000)
+    assert "(" not in status
     conn.close()

@@ -36,7 +36,7 @@ import pdfplumber
 import yaml
 
 from convert import chart_render, docx_groups, pdf_graphics, pdf_to_markdown
-from core import fsio, openrouter
+from core import fsio, markers, openrouter
 
 logger = logging.getLogger(__name__)
 
@@ -408,15 +408,8 @@ def _find_raster_image(
 
 # --- грамматика инъекции: ОГРАНИЧЕННЫЙ блок (spec convert-knowledge-seam-hardening §1) ---
 #
-# До этого спека инъекция была «маркер + сырой markdown» без закрывающей границы:
-# где кончается машинная реконструкция и возобновляется verbatim-текст издателя, не
-# определялось НИЧЕМ. Чанковка пакует абзацы независимо, поэтому маркер оставался в
-# одном чанке, а хвост реконструкции уезжал в следующий — 16 из 74 чанков корпуса с
-# VLM-текстом шли в выдачу без единого признака происхождения (аудит шва, Б1, живой
-# замер). Терминатор делает границу явной и машинно читаемой — на нём стоит
-# chunk-провенанс (``index.chunking``).
-INJECTION_END_PREFIX = "> [/VLM interpretation "
-
+# Сами литералы маркеров живут в ``core.markers`` — их читает ``index.chunking``
+# (chunk-провенанс §2), и грамматика ниже обоих слоёв (см. докстроку того модуля).
 _VLM_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$")
 _MERMAID_FENCE_RE = re.compile(r"^```mermaid[ \t]*\n(?P<code>.*?)^```[ \t]*$", re.MULTILINE | re.DOTALL)
 
@@ -475,9 +468,9 @@ def _render_injected(head: str, address: str, model: str, markdown: str) -> str:
     терминатор. ``head`` — адрес для человека («Figure, p. 6, region abc…»),
     ``address`` — тот же адрес без класса объекта («region abc…») для терминатора."""
     return (
-        f"> [{head} — VLM interpretation ({model}); reconstruction, verify against original]\n\n"
+        f"{markers.injection_open(head, model)}\n\n"
         f"{sanitize_vlm_markdown(markdown)}\n\n"
-        f"{INJECTION_END_PREFIX}{address}]"
+        f"{markers.injection_end(address)}"
     )
 
 

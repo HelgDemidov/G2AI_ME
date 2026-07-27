@@ -1,10 +1,14 @@
 """Единый SQLite-индекс корпуса: канонические чанки + полнотекстовый поиск FTS5.
 
 Схема (одна БД, векторный слой в vector_store.py):
-  chunks(chunk_id, doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb)
+  chunks(chunk_id, doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb,
+         reconstruction, markup_heavy)
     content_hash = sha256(breadcrumb + text) — стабильный «адрес» СОДЕРЖИМОГО чанка: к
     нему привязан вектор (vector_store), поэтому пере-чанковка не осиротит эмбеддинги
     неизменившихся чанков, а старый вектор физически не может указать на чужой текст.
+    reconstruction/markup_heavy — провенанс и форма чанка (spec
+    convert-knowledge-seam-hardening §2): в content_hash НЕ входят, поэтому их
+    появление не осиротило ни одного вектора.
   chunks_fts — внешне-контентная FTS5 над chunks.text + chunks.breadcrumb, tokenize=unicode61.
   doc_facets(doc_id, ...) / topics_map(doc_id, topic) — фасеты метаданных для retrieval-
     фильтров (spec analyze-retrieval §2.3); полная перезапись при каждой индексации.
@@ -27,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from index.bge_tokenizer import EMBED_MAX_TOKENS, token_counter
-from index.chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
+from index.chunking import Chunk, TokenCounter, chunk_text, is_markup_heavy, strip_frontmatter
 from core.env import REPO_ROOT
 from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, md_file
 from core.schema import superseded_ids as schema_superseded_ids
@@ -49,13 +53,15 @@ _DERIVED_TABLES = ("chunks_fts", "chunks", "doc_state", "vectors", "doc_facets",
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id     INTEGER PRIMARY KEY,
-    doc_id       TEXT    NOT NULL,
-    chunk_index  INTEGER NOT NULL,
-    text         TEXT    NOT NULL,
-    n_tokens     INTEGER NOT NULL,
-    content_hash TEXT    NOT NULL,
-    breadcrumb   TEXT    NOT NULL DEFAULT ''
+    chunk_id       INTEGER PRIMARY KEY,
+    doc_id         TEXT    NOT NULL,
+    chunk_index    INTEGER NOT NULL,
+    text           TEXT    NOT NULL,
+    n_tokens       INTEGER NOT NULL,
+    content_hash   TEXT    NOT NULL,
+    breadcrumb     TEXT    NOT NULL DEFAULT '',
+    reconstruction INTEGER NOT NULL DEFAULT 0,
+    markup_heavy   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc  ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(content_hash);
@@ -209,26 +215,35 @@ def _reset_derived_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_facet_column(conn: sqlite3.Connection, column: str, ddl: str) -> None:
-    """Аддитивная миграция колонки ``doc_facets`` БЕЗ бампа ``SCHEMA_VERSION`` (тот
-    дропнул бы ``vectors``, запрещено). Свежие/мигрированные БД получают колонку прямо
-    из ``_SCHEMA``; эта функция бэкфиллит её на уже существующей v3 ``doc_facets``, где
-    колонки ещё нет. Идемпотентна; отсутствие таблицы (легаси до v3, ещё будет создана
-    ниже) — no-op.
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Аддитивная миграция колонки БЕЗ бампа ``SCHEMA_VERSION`` (тот дропнул бы
+    ``vectors``, запрещено). Свежие/мигрированные БД получают колонку прямо из
+    ``_SCHEMA``; эта функция бэкфиллит её на уже существующей v3-таблице, где колонки
+    ещё нет. Идемпотентна; отсутствие таблицы (легаси до v3, ещё будет создана ниже) —
+    no-op.
 
-    Обобщена на втором применении (``sensitivity`` — spec embed-api-first §3.1,
-    ``superseded`` — spec graph-v2 §2): третья аддитивная колонка добавляется строкой
-    в ``_ensure_facet_columns``, а не копией функции.
+    Обобщена по таблицам на ЧЕТВЁРТОМ применении (spec convert-knowledge-seam-hardening
+    §2 добавляет колонки в ``chunks``, а не только в ``doc_facets``): раньше имя таблицы
+    было зашито в функцию, и второй адресат потребовал бы её копии — тот самый класс,
+    который проект закрывает реестрами.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if cols and column not in cols:
-        conn.execute(f"ALTER TABLE doc_facets ADD COLUMN {column} {ddl}")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def _ensure_facet_columns(conn: sqlite3.Connection) -> None:
-    """Все аддитивные колонки ``doc_facets``, добавленные после введения схемы v3."""
-    _ensure_facet_column(conn, "sensitivity", "TEXT NOT NULL DEFAULT 'public'")
-    _ensure_facet_column(conn, "superseded", "INTEGER NOT NULL DEFAULT 0")
+    """Все аддитивные колонки, добавленные после введения схемы v3.
+
+    ``doc_facets``: ``sensitivity`` (spec embed-api-first §3.1), ``superseded``
+    (graph-v2 §2). ``chunks``: ``reconstruction``/``markup_heavy``
+    (convert-knowledge-seam-hardening §2) — провенанс и форма чанка; ``content_hash``
+    от них НЕ зависит, поэтому уже посчитанные векторы переживают миграцию.
+    """
+    _ensure_column(conn, "doc_facets", "sensitivity", "TEXT NOT NULL DEFAULT 'public'")
+    _ensure_column(conn, "doc_facets", "superseded", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "chunks", "reconstruction", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "chunks", "markup_heavy", "INTEGER NOT NULL DEFAULT 0")
 
 
 def create_db(db_path: Path) -> sqlite3.Connection:
@@ -318,10 +333,14 @@ def index_chunks(
     conn.execute(_META_SCHEMA)  # defensive — index_meta может не существовать без create_db
     conn.execute("DELETE FROM chunks")
     conn.executemany(
-        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chunks "
+        "(doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb, reconstruction, markup_heavy) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb), c.breadcrumb)
+            (
+                c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb),
+                c.breadcrumb, int(c.reconstruction), int(is_markup_heavy(c.text)),
+            )
             for c in chunks
         ],
     )
@@ -365,9 +384,13 @@ def _insert_doc_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
     ТЕ ЖЕ text/breadcrumb (инвариант для последующего ``_delete_doc_chunks``)."""
     for c in chunks:
         cur = conn.execute(
-            "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb), c.breadcrumb),
+            "INSERT INTO chunks "
+            "(doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb, reconstruction, markup_heavy) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb),
+                c.breadcrumb, int(c.reconstruction), int(is_markup_heavy(c.text)),
+            ),
         )
         conn.execute(
             "INSERT INTO chunks_fts (rowid, text, breadcrumb) VALUES (?, ?, ?)",
@@ -476,11 +499,30 @@ def _count_oversize_chunks(conn: sqlite3.Connection, max_tokens: int) -> int:
     return int(row[0]) if row else 0
 
 
+def _count_flagged_chunks(conn: sqlite3.Connection, column: str) -> int:
+    row = conn.execute(f"SELECT COUNT(*) FROM chunks WHERE {column} = 1").fetchone()
+    return int(row[0]) if row else 0
+
+
 def _oversize_suffix(conn: sqlite3.Connection, max_tokens: int) -> str:
+    """Хвост статус-строки индексации: что в собранном поколении стоит увидеть глазами.
+
+    Оверсайзы (knowledge-hardening §8) + провенанс/форма чанков (spec
+    convert-knowledge-seam-hardening §2): доля машинной реконструкции в выдаче и доля
+    чанков-разметки — величины, которые аудит пришлось мерить ad-hoc скриптом; счётчик
+    делает их штатно наблюдаемыми.
+    """
+    parts: list[str] = []
     oversize = _count_oversize_chunks(conn, max_tokens)
-    if not oversize:
-        return ""
-    return f" (⚠ {oversize} превышают {max_tokens} ткн — эмбеддер усечёт)"
+    if oversize:
+        parts.append(f"⚠ {oversize} превышают {max_tokens} ткн — эмбеддер усечёт")
+    reconstruction = _count_flagged_chunks(conn, "reconstruction")
+    if reconstruction:
+        parts.append(f"{reconstruction} реконструированных")
+    markup_heavy = _count_flagged_chunks(conn, "markup_heavy")
+    if markup_heavy:
+        parts.append(f"{markup_heavy} markup-heavy")
+    return f" ({'; '.join(parts)})" if parts else ""
 
 
 def index_corpus(
