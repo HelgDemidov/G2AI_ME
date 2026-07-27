@@ -9,10 +9,42 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from typing import Any
 
 from core.env import REPO_ROOT
 
 _SCRIPTS_DIR = REPO_ROOT / "pipeline" / "scripts"
+
+
+# --- _load_all: изоляция отказа загрузки одного коннектора (spec discovery-
+# acquire-seam-hardening §7, Г6) ---
+
+
+def test_load_all_isolates_broken_connector_module(monkeypatch: Any, caplog: Any) -> None:
+    """Опечатка в ЛЮБОМ из пяти ``discovery_*.yaml`` (файлы правятся руками по
+    назначению — это тюнинг-конфиги) раньше валила ВЕСЬ импорт пакета
+    ``discovery.connectors`` — тщательно выстроенная изоляция отказов оркестратора
+    (``orchestrate.discover``) обходилась этажом ниже, на импорт-тайме. Прецедент —
+    stevedore (OpenStack): битый плагин репортится ``on_load_failure_callback`` и
+    изолируется, не валя приложение."""
+    import importlib
+
+    from discovery import connectors, registry
+
+    real_import = importlib.import_module
+
+    def fake_import(name: str) -> Any:
+        if name.endswith(".broken_connector"):
+            raise RuntimeError("YAML синтаксис сломан")
+        return real_import(name)
+
+    monkeypatch.setattr("discovery.connectors.importlib.import_module", fake_import)
+
+    with caplog.at_level("WARNING", logger="discovery.connectors"):
+        connectors._load_all(("broken_connector", "agora"))
+
+    assert any("broken_connector" in r.message for r in caplog.records)
+    assert "agora" in registry.CONNECTORS  # остальные коннекторы регистрируются штатно
 
 
 def _run_check(code: str) -> subprocess.CompletedProcess[str]:
