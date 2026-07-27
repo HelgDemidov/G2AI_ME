@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -242,6 +243,9 @@ _WORKSHEET_HEADER = """\
 - `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf`; опущенный ключ резолвится
   подсказкой кандидата (колонка `format_hint` в таблице ждущих), а без неё — дефолтом `pdf`
   (сводка эхнёт «по дефолту: …», когда сработала подсказка); сверить с квотой форматов волны.
+- `official_alt_url` (опционально) — вторая ступень лестницы добычи (`https?://`); суждение об
+  официальности зеркала вносит куратор сам, коннекторы этого знания не несут (накопленные
+  зеркала недобываемых видны в секции ниже — `alternate_urls`, но перенос в это поле не автомат).
 - Непустой `supersedes` в строке = НОВАЯ РЕДАКЦИЯ документа, уже лежащего в корпусе (тот же
   URL — нормальное состояние для законов), а НЕ дубль: `reject` здесь потерял бы редакцию.
   Ребро `supersedes` в meta.yaml проставит `apply` сам — вписывать его в `relations` руками
@@ -501,6 +505,13 @@ def _build_admit_record(
     else:
         source_format = schema.SourceFormat.pdf
 
+    # official_alt_url (spec discovery-acquire-seam-hardening §9, Г13): вторая
+    # ступень лестницы через дверь промоушена — суждение об официальности зеркала
+    # куратор вносит явно, ни один коннектор этого знания не несёт (rationale спека).
+    official_alt_url = decision.get("official_alt_url")
+    if official_alt_url is not None and not re.match(r"^https?://", official_alt_url):
+        raise ValueError(f"admit: official_alt_url не похож на URL: {official_alt_url!r}")
+
     relations_raw = decision.get("relations")
     rec = schema.promote_candidate(
         cand,
@@ -513,6 +524,7 @@ def _build_admit_record(
         authority=authority,
         relevance=schema.Relevance.model_validate(decision["relevance"]),
         source_format=source_format,
+        official_alt_url=official_alt_url,
         topics=decision.get("topics"),
         g2ai_pattern=decision.get("g2ai_pattern"),
         summary=decision.get("summary"),

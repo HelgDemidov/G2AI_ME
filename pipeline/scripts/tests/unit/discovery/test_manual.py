@@ -494,6 +494,44 @@ def test_apply_admit_explicit_source_format_wins_over_hint(tmp_path: Path) -> No
     assert schema.load_records(tmp_path)[0].source_format == schema.SourceFormat.docx
 
 
+# --- official_alt_url через admit-решение (spec discovery-acquire-seam-hardening §9, Г13) ---
+
+
+def test_apply_admit_official_alt_url_reaches_meta_yaml(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path)
+
+    decision = _admit_decision("b" * 64, official_alt_url="https://mirror.example.org/doc.pdf")
+    summary = manual.apply_decisions([decision], root=tmp_path)
+
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].official_alt_url == "https://mirror.example.org/doc.pdf"
+
+
+def test_apply_admit_invalid_official_alt_url_fails_without_aborting_batch(tmp_path: Path) -> None:
+    bad_cand = _candidate(raw_hash="b" * 64)
+    ok_cand = _candidate(raw_hash="c" * 64)
+    store.save([bad_cand, ok_cand], tmp_path)
+
+    bad_decision = _admit_decision("b" * 64, official_alt_url="not-a-url")
+    ok_decision = _admit_decision(
+        "c" * 64, id="me-example-strategy-2027", official_alt_url="https://mirror.example.org/doc.pdf"
+    )
+    summary = manual.apply_decisions([bad_decision, ok_decision], root=tmp_path)
+
+    assert len(summary.errors) == 1
+    records = {r.id: r for r in schema.load_records(tmp_path)}
+    assert "me-example-strategy-2026" not in records  # плохое решение не применилось
+    assert records["me-example-strategy-2027"].official_alt_url == "https://mirror.example.org/doc.pdf"
+
+
+def test_apply_admit_without_official_alt_url_is_prior_behavior(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path)
+    manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert schema.load_records(tmp_path)[0].official_alt_url is None
+
+
 def test_render_worksheet_includes_format_hint_column() -> None:
     cand = _candidate(native_format_hint="html")
     text = manual.render_worksheet([cand])

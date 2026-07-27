@@ -716,6 +716,7 @@ def promote_candidate(
     summary: str | None = None,
     relations: list[Relation] | None = None,
     language: str | None = None,
+    official_alt_url: str | None = None,
 ) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
@@ -746,6 +747,12 @@ def promote_candidate(
     ``relations`` — без дублей по ключу ``(type, target)``: куратор, вписавший то же ребро
     руками в decisions.yaml, не получает двойного. Потребитель ребра — вывод валидности
     (спек graph-v2): именно из него следует, что предшественник больше не действует.
+
+    ``official_alt_url`` (v5, spec discovery-acquire-seam-hardening §9, Г13) — вторая
+    ступень лестницы добычи; НЕ приходит от кандидата (ни один существующий коннектор
+    не знает про альтернативный хост) — суждение об официальности зеркала куратор
+    вносит САМ в admit-решение. ``None`` -> прежнее поведение (поле ``SourceRecord``
+    уже существовало, просто не имело двери промоушена).
     """
     title, issuer, source_url = cand.title, cand.issuer, cand.source_url
     resolved_language = language if language is not None else cand.language
@@ -787,6 +794,7 @@ def promote_candidate(
         doc_type=doc_type,
         authority=authority,
         source_url=source_url,
+        official_alt_url=official_alt_url,
         source_format=source_format,
         rights=cand.rights or Rights.unknown,
         sensitivity=cand.sensitivity or Sensitivity.normal,
