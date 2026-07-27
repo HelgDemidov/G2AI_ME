@@ -16,7 +16,7 @@ from pathlib import Path
 
 from analyze.retrieve import RetrievalFilters, retrieve
 from core.env import load_dotenv
-from core.schema import DEFAULT_SOURCES
+from core.schema import DEFAULT_SOURCES, load_vocab
 from index.corpus_index import DEFAULT_DB, corpus_fingerprint, read_meta
 from index.embed import DEFAULT_BACKEND, Embedder, get_embedder
 from index.vector_store import unembedded_count
@@ -88,8 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--topic", help="фильтр по topics (topics_map)")
     parser.add_argument("--doc-type", dest="doc_type", help="фильтр по doc_type")
     parser.add_argument("--authority", help="фильтр по authority")
-    parser.add_argument("--axis", help="фильтр по оси relevance (agentic_g2ai|digital_sovereignty)")
-    parser.add_argument("--tier", dest="target_fit", help="фильтр по target_fit (primary|context|background)")
+    axis_terms = "|".join(sorted(load_vocab("axes")))  # живой словарь, не хардкод набора
+    parser.add_argument("--axis", help=f"фильтр по оси admission ({axis_terms})")
     parser.add_argument(
         "--include-superseded", action="store_true",
         help="не скрывать заменённые редакции (по умолчанию выдаются только действующие; "
@@ -118,7 +118,6 @@ def main(argv: list[str] | None = None) -> int:
         authority=args.authority,
         topic=args.topic,
         axis=args.axis,
-        target_fit=args.target_fit,
         include_superseded=args.include_superseded,
     )
 

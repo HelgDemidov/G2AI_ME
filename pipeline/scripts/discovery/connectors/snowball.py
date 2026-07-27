@@ -58,7 +58,6 @@ class SourceFilter:
     """Какие документы корпуса майнить (спек §3). Пустые кортежи — разрешающие (без фильтра)."""
 
     tracks: tuple[str, ...]
-    target_fit: tuple[str, ...]
     include_doc_ids: tuple[str, ...]
     exclude_doc_ids: tuple[str, ...]
 
@@ -126,7 +125,6 @@ def load_config(path: Path = CONFIG_PATH) -> SnowballConfig:
         enabled=bool(raw["enabled"]),
         source_filter=SourceFilter(
             tracks=_tuple_of_str(source_filter_raw, "tracks"),
-            target_fit=_tuple_of_str(source_filter_raw, "target_fit"),
             include_doc_ids=_tuple_of_str(source_filter_raw, "include_doc_ids"),
             exclude_doc_ids=_tuple_of_str(source_filter_raw, "exclude_doc_ids"),
         ),
@@ -358,12 +356,6 @@ def apply_source_filter(
         result = [r for r in result if r.id not in source_filter.exclude_doc_ids]
     if source_filter.tracks:
         result = [r for r in result if r.track.value in source_filter.tracks]
-    if source_filter.target_fit:
-        result = [
-            r
-            for r in result
-            if r.relevance is not None and r.relevance.target_fit.value in source_filter.target_fit
-        ]
     return result
 
 

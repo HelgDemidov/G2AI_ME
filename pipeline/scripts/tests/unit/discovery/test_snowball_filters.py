@@ -18,7 +18,7 @@ from tests.support import build_pdf, valid_record, write_doc
 def _base_config() -> snowball.SnowballConfig:
     return snowball.SnowballConfig(
         enabled=True,
-        source_filter=snowball.SourceFilter(tracks=(), target_fit=(), include_doc_ids=(), exclude_doc_ids=()),
+        source_filter=snowball.SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=()),
         url_filter=snowball.UrlFilter(exclude_domains=(), exclude_url_substrings=()),
         emit=snowball.EmitConfig(
             pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=False
@@ -33,7 +33,6 @@ def _args(**overrides: Any) -> argparse.Namespace:
     defaults = {
         "doc": None,
         "track": None,
-        "tier": None,
         "exclude_domain": None,
         "with_citations": False,
         "max_candidates": None,
@@ -63,11 +62,6 @@ def test_doc_flag_overrides_include_doc_ids(_patched_load_config: snowball.Snowb
 def test_track_flag_overrides_tracks(_patched_load_config: snowball.SnowballConfig) -> None:
     merged = discover._build_snowball_config_override(_args(track=["target-entity", "research-papers"]))
     assert merged.source_filter.tracks == ("target-entity", "research-papers")
-
-
-def test_tier_flag_overrides_target_fit(_patched_load_config: snowball.SnowballConfig) -> None:
-    merged = discover._build_snowball_config_override(_args(tier=["primary"]))
-    assert merged.source_filter.target_fit == ("primary",)
 
 
 def test_exclude_domain_flag_overrides_url_filter(_patched_load_config: snowball.SnowballConfig) -> None:
@@ -126,7 +120,7 @@ def test_emit_toggle_disables_pdf_annotations_extractor(tmp_path: Path) -> None:
 
     cfg_off = snowball.SnowballConfig(
         enabled=True,
-        source_filter=snowball.SourceFilter(tracks=(), target_fit=(), include_doc_ids=(), exclude_doc_ids=()),
+        source_filter=snowball.SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=()),
         url_filter=snowball.UrlFilter(exclude_domains=(), exclude_url_substrings=()),
         emit=snowball.EmitConfig(
             pdf_annotations=False, html_hrefs=True, printed_urls=True, text_citations=False
@@ -159,7 +153,7 @@ def test_emit_toggle_disables_html_hrefs_extractor(tmp_path: Path) -> None:
 
     cfg_off = snowball.SnowballConfig(
         enabled=True,
-        source_filter=snowball.SourceFilter(tracks=(), target_fit=(), include_doc_ids=(), exclude_doc_ids=()),
+        source_filter=snowball.SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=()),
         url_filter=snowball.UrlFilter(exclude_domains=(), exclude_url_substrings=()),
         emit=snowball.EmitConfig(
             pdf_annotations=True, html_hrefs=False, printed_urls=True, text_citations=False

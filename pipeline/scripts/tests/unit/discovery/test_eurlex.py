@@ -573,12 +573,9 @@ def test_candidate_promotable_without_language_override() -> None:
         geo_scope=schema.GeoScope.regional,
         doc_type="legislation",
         authority="binding_law",
-        relevance=schema.Relevance(
-            target_fit=schema.TargetFit.primary,
+        admission=schema.Admission(
             axis="digital_sovereignty",
-            assessed_stage=schema.AssessedStage.triage,
             rationale="test",
-            assessed_date=dt.date(2026, 7, 23),
         ),
         source_format=schema.SourceFormat.html,
     )

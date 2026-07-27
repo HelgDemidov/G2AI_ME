@@ -313,8 +313,7 @@ _DECISIONS_YAML = """\
   geo_scope: national
   doc_type: national_strategy
   authority: soft_law
-  relevance: {{target_fit: primary, axis: agentic_g2ai, assessed_stage: triage,
-              rationale: "matches axis", assessed_date: 2026-07-21}}
+  admission: {{axis: agentic_g2ai, rationale: "matches axis"}}
 """
 
 
@@ -402,8 +401,7 @@ _DECISIONS_YAML_BAD_AXIS = """\
   geo_scope: national
   doc_type: national_strategy
   authority: soft_law
-  relevance: {{target_fit: primary, axis: economy, assessed_stage: triage,
-              rationale: "matches axis", assessed_date: 2026-07-21}}
+  admission: {{axis: economy, rationale: "matches axis"}}
 """
 
 
@@ -438,7 +436,7 @@ def test_apply_subcommand_flags_invalid_axis_after_batch(
     assert code == 1
     out = capsys.readouterr().out
     assert "невалиден" in out
-    assert "relevance.axis" in out and "вне словаря" in out
+    assert "admission.axis" in out and "вне словаря" in out
     # meta.yaml уже записан — гейт здесь постфактум, не блокирует запись (см. rationale)
     assert (tmp_path / "target-entity" / "me" / "me-example-strategy-2026" / "meta.yaml").exists()
 

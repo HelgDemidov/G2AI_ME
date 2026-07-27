@@ -15,7 +15,7 @@ from discovery.connectors.snowball import (
 )
 from tests.support import build_pdf, valid_record, write_doc
 
-_PERMISSIVE_FILTER = SourceFilter(tracks=(), target_fit=(), include_doc_ids=(), exclude_doc_ids=())
+_PERMISSIVE_FILTER = SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=())
 _PERMISSIVE_URL_FILTER = UrlFilter(exclude_domains=(), exclude_url_substrings=())
 
 

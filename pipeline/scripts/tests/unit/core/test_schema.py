@@ -19,7 +19,7 @@ from core.schema import (
     ENTITY_PATTERN,
     VOCAB_DIR,
     AcquisitionMethod,
-    AssessedStage,
+    Admission,
     CandidateRecord,
     Fidelity,
     GeoScope,
@@ -27,12 +27,10 @@ from core.schema import (
     OperationalState,
     Relation,
     RelationType,
-    Relevance,
     Rights,
     Sensitivity,
     SourceFormat,
     SourceRecord,
-    TargetFit,
     Track,
     check_layout,
     doc_dir,
@@ -244,50 +242,47 @@ def test_rights_parse() -> None:
     assert rec.rights == Rights.cc_by
 
 
-def test_relevance_parse() -> None:
+def test_admission_parse() -> None:
     rec = SourceRecord.model_validate(valid_record())
-    assert rec.relevance is not None
-    assert rec.relevance.target_fit == TargetFit.primary
-    assert rec.relevance.axis == "agentic_g2ai"
-    assert rec.relevance.assessed_stage == AssessedStage.confirmed
+    assert rec.admission is not None
+    assert rec.admission.axis == "agentic_g2ai"
+    assert rec.admission.rationale
 
 
-def test_relevance_default_none() -> None:
-    """Обратная совместимость: запись без relevance парсится (Optional на pydantic-уровне)."""
+def test_admission_default_none() -> None:
+    """Обратная совместимость: запись без admission парсится (Optional на pydantic-уровне)."""
     data = valid_record()
-    del data["relevance"]
+    del data["admission"]
     rec = SourceRecord.model_validate(data)
-    assert rec.relevance is None
+    assert rec.admission is None
 
 
-@pytest.mark.parametrize("drop", ["rationale", "assessed_date"])
-def test_relevance_missing_required_rejected(drop: str) -> None:
+@pytest.mark.parametrize("drop", ["axis", "rationale"])
+def test_admission_missing_required_rejected(drop: str) -> None:
     data = valid_record()
-    del data["relevance"][drop]
+    del data["admission"][drop]
     with pytest.raises(ValidationError):
         SourceRecord.model_validate(data)
 
 
-@pytest.mark.parametrize(
-    "field,bad",
-    [("target_fit", "core"), ("assessed_stage", "final")],
-)
-def test_relevance_bad_enum_rejected(field: str, bad: str) -> None:
+def test_admission_rejects_old_relevance_key() -> None:
+    """spec drop-relevance-tier: миграция ключа `relevance:` -> `admission:` не может
+    быть забыта молча — `extra="forbid"` отвергает старое имя как неизвестное поле."""
     data = valid_record()
-    data["relevance"][field] = bad
+    data["relevance"] = data.pop("admission")
     with pytest.raises(ValidationError):
         SourceRecord.model_validate(data)
 
 
-def test_relevance_axis_accepts_any_nonempty_string() -> None:
+def test_admission_axis_accepts_any_nonempty_string() -> None:
     """Ось — словарь (validate_sources.py), не enum: pydantic принимает любую непустую строку."""
     data = valid_record()
-    data["relevance"]["axis"] = "economy"
+    data["admission"]["axis"] = "economy"
     rec = SourceRecord.model_validate(data)
-    assert rec.relevance is not None
-    assert rec.relevance.axis == "economy"
+    assert rec.admission is not None
+    assert rec.admission.axis == "economy"
 
-    data["relevance"]["axis"] = ""
+    data["admission"]["axis"] = ""
     with pytest.raises(ValidationError):
         SourceRecord.model_validate(data)
 
@@ -419,16 +414,8 @@ def test_load_candidates_empty(tmp_path: Path) -> None:
     assert load_candidates(path) == []
 
 
-def _relevance() -> Relevance:
-    return Relevance.model_validate(
-        {
-            "target_fit": "primary",
-            "axis": "agentic_g2ai",
-            "assessed_stage": "triage",
-            "rationale": "ok",
-            "assessed_date": "2026-07-15",
-        }
-    )
+def _admission() -> Admission:
+    return Admission.model_validate({"axis": "agentic_g2ai", "rationale": "ok"})
 
 
 def test_promote_candidate_success() -> None:
@@ -443,6 +430,7 @@ def test_promote_candidate_success() -> None:
         sensitivity="confidential",
     )
     cand = CandidateRecord.model_validate(data)
+    admission = _admission()
     rec = promote_candidate(
         cand,
         id="ae-cabinet-agentic-2026",
@@ -452,7 +440,7 @@ def test_promote_candidate_success() -> None:
         geo_scope=GeoScope.national,
         doc_type="framework",
         authority="soft_law",
-        relevance=_relevance(),
+        admission=admission,
     )
     assert isinstance(rec, SourceRecord)
     assert rec.id == "ae-cabinet-agentic-2026"
@@ -461,7 +449,7 @@ def test_promote_candidate_success() -> None:
     assert rec.dates.published is not None
     assert rec.rights == Rights.cc_by  # перенесён с кандидата
     assert rec.sensitivity == Sensitivity.confidential
-    assert rec.relevance is not None and rec.relevance.target_fit == TargetFit.primary
+    assert rec.admission == admission  # промоушен переносит вердикт триажа как есть
     assert rec.source_format == SourceFormat.pdf  # дефолт, если не передан явно
 
 
@@ -478,7 +466,7 @@ def test_promote_candidate_source_format_passthrough() -> None:
         geo_scope=GeoScope.regional,
         doc_type="legislation",
         authority="binding_law",
-        relevance=_relevance(),
+        admission=_admission(),
         source_format=SourceFormat.html,
     )
     assert rec.source_format == SourceFormat.html
@@ -499,7 +487,7 @@ def test_promote_candidate_official_alt_url_passthrough() -> None:
         geo_scope=GeoScope.regional,
         doc_type="legislation",
         authority="binding_law",
-        relevance=_relevance(),
+        admission=_admission(),
         official_alt_url="https://mirror.example.org/d.pdf",
     )
     assert rec.official_alt_url == "https://mirror.example.org/d.pdf"
@@ -518,7 +506,7 @@ def test_promote_candidate_official_alt_url_none_is_prior_behavior() -> None:
         geo_scope=GeoScope.regional,
         doc_type="legislation",
         authority="binding_law",
-        relevance=_relevance(),
+        admission=_admission(),
     )
     assert rec.official_alt_url is None
 
@@ -536,7 +524,7 @@ def test_promote_candidate_v2_analytics_fields_populated() -> None:
         geo_scope=GeoScope.national,
         doc_type="strategy",
         authority="official",
-        relevance=_relevance(),
+        admission=_admission(),
         topics=["ai-governance"],
         g2ai_pattern=["agent-governance-framework"],
         summary="2-3 sentences EN",
@@ -562,7 +550,7 @@ def test_promote_candidate_v2_fields_default_empty_when_omitted() -> None:
         geo_scope=GeoScope.national,
         doc_type="strategy",
         authority="official",
-        relevance=_relevance(),
+        admission=_admission(),
     )
     assert rec.topics == []
     assert rec.g2ai_pattern == []
@@ -584,7 +572,7 @@ def test_promote_candidate_missing_source_url_raises() -> None:
             geo_scope=GeoScope.national,
             doc_type="framework",
             authority="soft_law",
-            relevance=_relevance(),
+            admission=_admission(),
         )
 
 
@@ -604,7 +592,7 @@ def test_promote_candidate_language_override_success() -> None:
         geo_scope=GeoScope.national,
         doc_type="framework",
         authority="soft_law",
-        relevance=_relevance(),
+        admission=_admission(),
         language="en",
     )
     assert rec.language == "en"
@@ -625,7 +613,7 @@ def test_promote_candidate_language_override_none_and_candidate_none_raises() ->
             geo_scope=GeoScope.national,
             doc_type="framework",
             authority="soft_law",
-            relevance=_relevance(),
+            admission=_admission(),
         )
 
 
@@ -643,7 +631,7 @@ def test_promote_candidate_language_on_candidate_wins_without_override() -> None
         geo_scope=GeoScope.national,
         doc_type="framework",
         authority="soft_law",
-        relevance=_relevance(),
+        admission=_admission(),
     )
     assert rec.language == "cnr"
 

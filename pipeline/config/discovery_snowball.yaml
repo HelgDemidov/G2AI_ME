@@ -11,7 +11,6 @@ enabled: true
 
 source_filter:            # какие документы корпуса майнить; пусто = все
   tracks: []               # intl-xperience | target-entity | research-papers | tech-standards
-  target_fit: []            # primary | context | background
   include_doc_ids: []       # явный allowlist (если непуст — майнятся ТОЛЬКО эти doc_id)
   exclude_doc_ids: []
 

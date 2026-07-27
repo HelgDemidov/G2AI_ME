@@ -1,9 +1,9 @@
 """Валидатор корпуса G2AI — дерево ``sources/**/meta.yaml`` (corpus-layout-v2).
 
 Проверяет: (1) структуру каждой записи через pydantic-схему; (2) принадлежность
-``doc_type``/``authority``/``topics``/``g2ai_pattern``/``relevance.axis`` контролируемым словарям;
+``doc_type``/``authority``/``topics``/``g2ai_pattern``/``admission.axis`` контролируемым словарям;
 (3) уникальность ``id``; (4) ссылочную целостность ``relations`` (цель — существующий id);
-(5) наличие ``relevance`` (каждая запись корпуса — допущенная триажем; см.
+(5) наличие ``admission`` (каждая запись корпуса — допущенная триажем; см.
 source-relevance-triage); (6) инварианты папок — ``schema.check_layout`` (папка
 документа == ``id``, папка сущности == ``entity_id``, верхняя == ``track``);
 (7) для ``geo_scope: national`` — ``entity_id`` имеет форму iso2 (2 буквы);
@@ -85,9 +85,9 @@ def validate_sources(
             if pattern not in vocabs["g2ai_pattern"]:
                 errors.append(f"запись '{rec.id}': g2ai_pattern '{pattern}' вне словаря")
 
-        if rec.relevance is not None and rec.relevance.axis not in vocabs["axis"]:
+        if rec.admission is not None and rec.admission.axis not in vocabs["axis"]:
             errors.append(
-                f"запись '{rec.id}': relevance.axis '{rec.relevance.axis}' вне словаря"
+                f"запись '{rec.id}': admission.axis '{rec.admission.axis}' вне словаря"
             )
 
         if rec.geo_scope is GeoScope.national and not _ISO2_RE.fullmatch(rec.entity_id):
@@ -96,9 +96,9 @@ def validate_sources(
                 f"(2 буквы), получено '{rec.entity_id}'"
             )
 
-        if rec.relevance is None:
+        if rec.admission is None:
             errors.append(
-                f"запись '{rec.id}': отсутствует relevance "
+                f"запись '{rec.id}': отсутствует admission "
                 "(обязателен для допущенной записи — прошла триаж)"
             )
 

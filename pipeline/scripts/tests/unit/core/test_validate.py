@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from core.schema import VOCAB_DIR
+from core.schema import VOCAB_DIR, load_vocab
 from tests.support import valid_record, write_doc
 from core.validate_sources import main, validate_sources
 
@@ -67,27 +67,27 @@ def test_authority_not_in_vocab(tmp_path: Path) -> None:
 
 def test_axis_not_in_vocab(tmp_path: Path) -> None:
     rec = valid_record()
-    rec["relevance"]["axis"] = "economy"
+    rec["admission"]["axis"] = "economy"
     write_doc(tmp_path, rec)
     errors = _errors(tmp_path)
     assert len(errors) == 1
-    assert "relevance.axis" in errors[0] and "вне словаря" in errors[0]
+    assert "admission.axis" in errors[0] and "вне словаря" in errors[0]
 
 
 def test_axis_valid_passes(tmp_path: Path) -> None:
-    for axis in ("agentic_g2ai", "digital_sovereignty"):
+    for axis in load_vocab("axes"):  # весь живой словарь, не хардкод конкретных терминов
         rec = valid_record()
-        rec["relevance"]["axis"] = axis
+        rec["admission"]["axis"] = axis
         write_doc(tmp_path, rec)
         assert _errors(tmp_path) == []
 
 
-def test_missing_relevance_does_not_crash_axis_check(tmp_path: Path) -> None:
+def test_missing_admission_does_not_crash_axis_check(tmp_path: Path) -> None:
     rec = valid_record()
-    rec["relevance"] = None
+    rec["admission"] = None
     write_doc(tmp_path, rec)
     errors = _errors(tmp_path)
-    assert any("отсутствует relevance" in e for e in errors)
+    assert any("отсутствует admission" in e for e in errors)
     assert not any("axis" in e for e in errors)
 
 
@@ -124,11 +124,11 @@ def test_folder_invariant_violation(tmp_path: Path) -> None:
     assert any("entity_id" in e for e in _errors(tmp_path))
 
 
-def test_missing_relevance_rejected(tmp_path: Path) -> None:
+def test_missing_admission_rejected(tmp_path: Path) -> None:
     rec = valid_record()
-    del rec["relevance"]
+    del rec["admission"]
     write_doc(tmp_path, rec)
-    assert any("relevance" in e for e in _errors(tmp_path))
+    assert any("admission" in e for e in _errors(tmp_path))
 
 
 def test_national_entity_id_iso2_form_accepted(tmp_path: Path) -> None:
@@ -172,10 +172,10 @@ def test_validate_sources_returns_parsed_records_sorted_by_id(tmp_path: Path) ->
 
 def test_validate_sources_records_present_even_with_errors(tmp_path: Path) -> None:
     rec = valid_record()
-    del rec["relevance"]
+    del rec["admission"]
     write_doc(tmp_path, rec)
     errors, records = validate_sources(tmp_path, VOCAB_DIR)
-    assert errors  # структурно распарсилась, но relevance отсутствует
+    assert errors  # структурно распарсилась, но admission отсутствует
     assert len(records) == 1  # структурно валидная запись всё равно возвращается
 
 

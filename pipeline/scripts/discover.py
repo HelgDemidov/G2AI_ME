@@ -131,8 +131,6 @@ def _build_snowball_config_override(args: argparse.Namespace) -> snowball.Snowba
         source_filter = dataclasses.replace(source_filter, include_doc_ids=tuple(args.doc))
     if args.track:
         source_filter = dataclasses.replace(source_filter, tracks=tuple(args.track))
-    if args.tier:
-        source_filter = dataclasses.replace(source_filter, target_fit=tuple(args.tier))
 
     url_filter = base.url_filter
     if args.exclude_domain:
@@ -256,9 +254,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_snowball.add_argument("--doc", nargs="+", default=None, metavar="ID", help="сузить до этих doc_id")
     p_snowball.add_argument("--track", nargs="+", default=None, metavar="TRACK")
-    p_snowball.add_argument(
-        "--tier", nargs="+", default=None, metavar="TIER", choices=[t.value for t in schema.TargetFit]
-    )
     p_snowball.add_argument("--exclude-domain", nargs="+", default=None, metavar="DOMAIN")
     p_snowball.add_argument(
         "--with-citations", action="store_true", help="включить LLM-стадию текстовых цитат (§5)"

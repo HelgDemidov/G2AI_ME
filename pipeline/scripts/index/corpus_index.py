@@ -44,8 +44,9 @@ DEFAULT_DB = REPO_ROOT / "pipeline" / "index" / "corpus.db"
 # старой БД (create_db) пересоздаёт производные таблицы с нуля (артефакт производный,
 # цена нулевая на текущем корпусе). v1 = vectors на chunk_id, chunks без content_hash;
 # v2 = content_hash в chunks + doc_state + vectors на content_hash (spec index-incremental);
-# v3 = breadcrumb в chunks/FTS + doc_facets/topics_map (spec analyze-retrieval).
-SCHEMA_VERSION = "3"
+# v3 = breadcrumb в chunks/FTS + doc_facets/topics_map (spec analyze-retrieval);
+# v4 = убраны target_fit/assessed_stage из doc_facets (spec drop-relevance-tier).
+SCHEMA_VERSION = "4"
 
 # Производные (пересоздаваемые) таблицы — дропаются при миграции легаси-БД. Порядок
 # важен: FTS5-таблица внешнего контента дропается ДО своей content-таблицы chunks.
@@ -88,8 +89,6 @@ CREATE TABLE IF NOT EXISTS doc_facets (
     authority      TEXT NOT NULL,
     language       TEXT NOT NULL,
     axis           TEXT,
-    target_fit     TEXT,
-    assessed_stage TEXT,
     sensitivity    TEXT NOT NULL DEFAULT 'public',
     superseded     INTEGER NOT NULL DEFAULT 0,
     fidelity       TEXT,
@@ -350,9 +349,8 @@ def _rebuild_facets(
     conn: sqlite3.Connection, records: list[SourceRecord], sources_root: Path | None = None
 ) -> None:
     """Перезаписать ``doc_facets``/``topics_map`` из курируемых записей (полная
-    перезапись — O(сотен строк), дешевле любой инкрементальности diff'а). ``axis``/
-    ``target_fit``/``assessed_stage`` — ``None``, если у записи ещё нет ``relevance``
-    (spec analyze-retrieval §2.3).
+    перезапись — O(сотен строк), дешевле любой инкрементальности diff'а). ``axis`` —
+    ``None``, если у записи ещё нет ``admission`` (spec analyze-retrieval §2.3).
 
     ``superseded`` (spec graph-v2 §2) — кросс-документный фасет: считается общим
     ``schema.superseded_ids`` (тем же, которым recheck-контур исключает записи из
@@ -372,9 +370,9 @@ def _rebuild_facets(
     conn.execute("DELETE FROM topics_map")
     conn.executemany(
         "INSERT INTO doc_facets "
-        "(doc_id, entity_id, track, doc_type, authority, language, axis, target_fit, "
-        "assessed_stage, sensitivity, superseded, fidelity, ocr_model, quality_flags) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(doc_id, entity_id, track, doc_type, authority, language, axis, "
+        "sensitivity, superseded, fidelity, ocr_model, quality_flags) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 rec.id,
@@ -383,9 +381,7 @@ def _rebuild_facets(
                 rec.doc_type,
                 rec.authority,
                 rec.language,
-                rec.relevance.axis if rec.relevance else None,
-                rec.relevance.target_fit.value if rec.relevance else None,
-                rec.relevance.assessed_stage.value if rec.relevance else None,
+                rec.admission.axis if rec.admission else None,
                 rec.sensitivity.value,
                 int(rec.id in superseded),
                 *provenance[rec.id],

@@ -209,12 +209,9 @@ def _promote(cand: schema.CandidateRecord, **kwargs: object) -> schema.SourceRec
         geo_scope=schema.GeoScope.national,
         doc_type="legislation",
         authority="binding_law",
-        relevance=schema.Relevance(
-            target_fit=schema.TargetFit.primary,
+        admission=schema.Admission(
             axis="digital_sovereignty",
-            assessed_stage=schema.AssessedStage.triage,
             rationale="new edition of a corpus record",
-            assessed_date=dt.date(2026, 7, 25),
         ),
         **kwargs,  # type: ignore[arg-type]
     )

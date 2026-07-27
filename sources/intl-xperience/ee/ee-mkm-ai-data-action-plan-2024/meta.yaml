@@ -25,12 +25,9 @@ summary: >-
   Estonia's national AI and data action plan 2024-2026 (Ministry of Economic
   Affairs and Communications): AI adoption across the public sector and economy,
   data governance, language technology, and EU alignment.
-relevance:
-  target_fit: context
+admission:
   axis: digital_sovereignty
-  assessed_stage: triage
   rationale: >-
     Pre-frontier (2024) national AI/data adoption plan; context on the
     digital_sovereignty axis (X-Road / data governance / language tech), not
     agentic-primary (freshness signal: 2024 < frontier_year 2025).
-  assessed_date: 2026-07-15

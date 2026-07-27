@@ -136,20 +136,20 @@ def test_results_sorted_score_desc_then_key_asc(tmp_path: Path) -> None:
 # --- фасетные фильтры (spec analyze-retrieval §4.1) ---
 
 
-def _record(id_: str, entity_id: str, topics: list[str], axis: str, target_fit: str) -> SourceRecord:
+def _record(id_: str, entity_id: str, topics: list[str], axis: str) -> SourceRecord:
     rec = valid_record()
     rec["id"] = id_
     rec["entity_id"] = entity_id
     rec["topics"] = topics
-    rec["relevance"]["axis"] = axis
-    rec["relevance"]["target_fit"] = target_fit
+    rec["admission"]["axis"] = axis
     return SourceRecord.model_validate(rec)
 
 
 def test_filters_narrow_results_by_entity_topic_axis(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
-    rec_sg = _record("sg-doc-2026", "sg", ["agentic-ai"], "agentic_g2ai", "primary")
-    rec_ee = _record("ee-doc-2026", "ee", ["digital-id"], "digital_sovereignty", "context")
+    sg_axis = "agentic_g2ai"
+    rec_sg = _record("sg-doc-2026", "sg", ["agentic-ai"], sg_axis)
+    rec_ee = _record("ee-doc-2026", "ee", ["digital-id"], "digital_sovereignty")
     _rebuild_facets(conn, [rec_sg, rec_ee])
     index_chunks(conn, [
         Chunk(rec_sg.id, 0, "shared governance term", 4),
@@ -165,13 +165,13 @@ def test_filters_narrow_results_by_entity_topic_axis(tmp_path: Path) -> None:
     by_topic = retrieve(conn, "governance", None, k=10, filters=RetrievalFilters(topic="digital-id"))
     assert {r.doc_id for r in by_topic} == {rec_ee.id}
 
-    by_axis = retrieve(conn, "governance", None, k=10, filters=RetrievalFilters(axis="agentic_g2ai"))
+    by_axis = retrieve(conn, "governance", None, k=10, filters=RetrievalFilters(axis=sg_axis))
     assert {r.doc_id for r in by_axis} == {rec_sg.id}
 
 
 def test_filters_empty_match_returns_empty_list(tmp_path: Path) -> None:
     conn = create_db(tmp_path / "c.db")
-    rec = _record("sg-doc-2026", "sg", ["agentic-ai"], "agentic_g2ai", "primary")
+    rec = _record("sg-doc-2026", "sg", ["agentic-ai"], "agentic_g2ai")
     _rebuild_facets(conn, [rec])
     index_chunks(conn, [Chunk(rec.id, 0, "governance text", 3)])
     results = retrieve(conn, "governance", None, k=10, filters=RetrievalFilters(entity_id="nowhere"))

@@ -210,12 +210,9 @@ _WORKSHEET_HEADER = """\
   geo_scope: national
   doc_type: national_strategy
   source_format: pdf
-  relevance:
-    target_fit: primary
+  admission:
     axis: agentic_g2ai
-    assessed_stage: triage
-    rationale: "ONLY the relevance factors for this tier/axis — do NOT restate the summary"
-    assessed_date: 2026-07-21
+    rationale: "ONLY the relevance factors for this axis — do NOT restate the summary"
   topics: [ai-governance]
   summary: "2-3 sentences EN — what the document IS"
   relations:
@@ -237,7 +234,7 @@ _WORKSHEET_HEADER = """\
 
 Заполняя `admit`:
 - `rationale` ≠ `summary`: summary описывает документ, rationale — ТОЛЬКО факторы релевантности
-  (почему этот тир по этой оси); не дублировать одно в другом.
+  (почему эта ось); не дублировать одно в другом.
 - Дефолты (сводка apply напечатает, во что развернулись; RAG/фасеты видят полные значения):
   `authority` — из doc_type: legislation→binding_law, regulation→regulation,
   report/academic_paper→report, guidance/framework/national_strategy→soft_law,
@@ -394,7 +391,7 @@ _ADMIT_REQUIRED = (
     "issuer_type",
     "geo_scope",
     "doc_type",
-    "relevance",
+    "admission",
 )
 
 # Дефолты admit-решения (ревью 2026-07-21): куратор в типовом решении НЕ пишет
@@ -546,7 +543,7 @@ def _build_admit_record(
         geo_scope=schema.GeoScope(decision["geo_scope"]),
         doc_type=decision["doc_type"],
         authority=authority,
-        relevance=schema.Relevance.model_validate(decision["relevance"]),
+        admission=schema.Admission.model_validate(decision["admission"]),
         source_format=source_format,
         official_alt_url=official_alt_url,
         topics=decision.get("topics"),

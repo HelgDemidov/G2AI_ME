@@ -315,12 +315,9 @@ def _admit_decision(raw_hash: str, **overrides: object) -> dict[str, object]:
         "geo_scope": "national",
         "doc_type": "national_strategy",
         "authority": "soft_law",
-        "relevance": {
-            "target_fit": "primary",
+        "admission": {
             "axis": "agentic_g2ai",
-            "assessed_stage": "triage",
             "rationale": "matches axis",
-            "assessed_date": "2026-07-21",
         },
     }
     data.update(overrides)
@@ -421,7 +418,7 @@ def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Pa
     store.save([good, bad], tmp_path)
 
     incomplete = _admit_decision("c" * 64)
-    del incomplete["relevance"]
+    del incomplete["admission"]
     summary = manual.apply_decisions([_admit_decision("b" * 64), incomplete], root=tmp_path)
 
     assert len(summary.errors) == 1

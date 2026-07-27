@@ -180,21 +180,6 @@ class Rights(str, Enum):
     all_rights_reserved = "all_rights_reserved"
 
 
-class TargetFit(str, Enum):
-    """Тир целевого соответствия документа оси анализа (source-relevance-triage §2.2)."""
-
-    primary = "primary"
-    context = "context"
-    background = "background"
-
-
-class AssessedStage(str, Enum):
-    """Докуда дошла оценка: дешёвый триаж по метаданным vs подтверждение по тексту."""
-
-    triage = "triage"
-    confirmed = "confirmed"
-
-
 class ConnectorKind(str, Enum):
     """Архетип discovery-коннектора, породившего кандидата (discovery/architecture.md §3).
 
@@ -260,16 +245,13 @@ class Dates(BaseModel):
     # ``OperationalState.acquisition_checked`` — машиннописаный курсор recheck-контура.
 
 
-class Relevance(BaseModel):
-    """Вердикт триажа релевантности (source-relevance-triage). Присваивает ТОЛЬКО триаж."""
+class Admission(BaseModel):
+    """Вердикт допуска в корпус (source-relevance-triage). Присваивает ТОЛЬКО триаж."""
 
     model_config = ConfigDict(extra="forbid")
 
-    target_fit: TargetFit
     axis: str = Field(min_length=1)  # словарь — validate_sources.py (vocab_axes)
-    assessed_stage: AssessedStage
     rationale: str = Field(min_length=1)
-    assessed_date: _dt.date
 
 
 class OperationalState(BaseModel):
@@ -408,7 +390,7 @@ class SourceRecord(BaseModel):
     g2ai_pattern: list[str] = Field(default_factory=list)    # словарь; только матрично-релевантные
     summary: str | None = None                               # 2–3 предложения, EN
     relations: list[Relation] = Field(default_factory=list)
-    relevance: Relevance | None = None       # вердикт триажа; обязателен — правило validate_sources
+    admission: Admission | None = None       # вердикт триажа; обязателен — правило validate_sources
     # Поля ``in_force`` здесь БОЛЬШЕ НЕТ (spec post-acquisition-lifecycle §7): ручной
     # bool «действует ли закон» на сотнях записей обречён протухнуть, и ни один
     # потребитель его не читал. Валидность ВЫВОДИТСЯ из рёбер ``supersedes``
@@ -456,7 +438,7 @@ class CandidateRecord(BaseModel):
     native_summary: str | None = Field(default=None, max_length=CANDIDATE_SUMMARY_MAX)
     native_id: str | None = None
     native_tags: list[str] | None = None
-    # дешёвый pre-signal (НЕ вердикт — target_fit присваивает только триаж)
+    # дешёвый pre-signal (НЕ вердикт — ось присваивает только триаж)
     matched_query: str | None = None
     matched_vocab_tags: list[str] | None = None
     # Подсказка формата (spec discovery-acquire-seam-hardening §8, Г7) — НЕ вердикт:
@@ -709,7 +691,7 @@ def promote_candidate(
     geo_scope: GeoScope,
     doc_type: str,
     authority: str,
-    relevance: Relevance,
+    admission: Admission,
     source_format: SourceFormat = SourceFormat.pdf,
     topics: list[str] | None = None,
     g2ai_pattern: list[str] | None = None,
@@ -721,7 +703,7 @@ def promote_candidate(
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
     Издательские/классификационные решения (``id``/``entity_id``/``track``/``issuer_type``/
-    ``geo_scope``/``doc_type``/``authority``) и вердикт ``relevance`` — аргументы (решение
+    ``geo_scope``/``doc_type``/``authority``) и вердикт ``admission`` — аргументы (решение
     триажа), не выводятся из кандидата. Обязательные поля, которых у кандидата может не быть
     (``title``/``issuer``/``language``/``source_url``), берутся из кандидата и обязаны
     присутствовать — иначе ``ValueError``. Провенанс добычи остаётся в ``candidates.yaml``
@@ -731,7 +713,8 @@ def promote_candidate(
     аналитика в то же одно касание документа (нужно для manual-каналов, где Стадии триажа слиты,
     второго прохода по документу не будет; ``relations`` дополнительно — pre-wave требование
     graph-v2). ``None`` -> прежние пустые дефолты (обратная совместимость); для батч-каналов
-    опустить эти аргументы по-прежнему штатно — ленивая Стадия 2 доберёт (triage-channel-policy §2).
+    опустить эти аргументы по-прежнему штатно — заполняются позже, при первом аналитическом
+    использовании документа (не формальная стадия, а естественный момент готовности).
     Словарную принадлежность ``topics``/``g2ai_pattern`` эта функция не проверяет — как и раньше,
     это ``validate_sources.py`` (schema словарей не грузит).
 
@@ -798,7 +781,7 @@ def promote_candidate(
         source_format=source_format,
         rights=cand.rights or Rights.unknown,
         sensitivity=cand.sensitivity or Sensitivity.normal,
-        relevance=relevance,
+        admission=admission,
         topics=topics or [],
         g2ai_pattern=g2ai_pattern or [],
         summary=summary,
