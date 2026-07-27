@@ -235,7 +235,9 @@ def _chart_refs(chart_root: Any) -> list[tuple[str, str]]:
 
 
 def render_chart_marker(chart: XlsxChart) -> str:
-    caption_line = "; ".join(chart.captions) if chart.captions else "(нет текста)"
+    # Английский литерал — см. docx_groups._render_group_marker (Б17, spec
+    # convert-knowledge-seam-hardening §1): текст маркера индексируется.
+    caption_line = "; ".join(chart.captions) if chart.captions else "(no captions)"
     return (
         f"> [Figure, xlsx chart {chart.id12} on {chart.sheet}!{chart.anchor_cell} — "
         f"chart content not analyzed]\n"

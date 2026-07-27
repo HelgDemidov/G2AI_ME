@@ -274,7 +274,11 @@ def extract_group_docx(raw: Path, id12: str) -> bytes | None:
 
 
 def _render_group_marker(id12: str, captions: tuple[str, ...], kind: str = "group") -> str:
-    caption_line = "; ".join(captions) if captions else "(нет текста)"
+    # Литерал английский, как вся остальная маркерная грамматика (spec
+    # convert-knowledge-seam-hardening §1, Б17): текст маркера попадает в doc.md,
+    # значит — в FTS-токены и в вектор чанка; язык куратора там был бы примесью,
+    # машинный контракт корпуса одноязычен. Русский остаётся в логах/CLI.
+    caption_line = "; ".join(captions) if captions else "(no captions)"
     noun = "composite" if kind == "group" else "chart"
     return (
         f"\n\n> [Figure, docx {kind} {id12} — {noun} content not analyzed]\n"

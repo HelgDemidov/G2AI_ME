@@ -35,7 +35,7 @@ from typing import Any
 import pdfplumber
 import yaml
 
-from convert import docx_groups, pdf_graphics, pdf_to_markdown
+from convert import chart_render, docx_groups, pdf_graphics, pdf_to_markdown
 from core import fsio, openrouter
 
 logger = logging.getLogger(__name__)
@@ -406,32 +406,101 @@ def _find_raster_image(
     return next((img for img in targets if pdf_graphics.image_id(img, page_num) == marker_id), None)
 
 
-def _render_injected_figure(page: int, region_id: str, model: str, markdown: str) -> str:
+# --- грамматика инъекции: ОГРАНИЧЕННЫЙ блок (spec convert-knowledge-seam-hardening §1) ---
+#
+# До этого спека инъекция была «маркер + сырой markdown» без закрывающей границы:
+# где кончается машинная реконструкция и возобновляется verbatim-текст издателя, не
+# определялось НИЧЕМ. Чанковка пакует абзацы независимо, поэтому маркер оставался в
+# одном чанке, а хвост реконструкции уезжал в следующий — 16 из 74 чанков корпуса с
+# VLM-текстом шли в выдачу без единого признака происхождения (аудит шва, Б1, живой
+# замер). Терминатор делает границу явной и машинно читаемой — на нём стоит
+# chunk-провенанс (``index.chunking``).
+INJECTION_END_PREFIX = "> [/VLM interpretation "
+
+_VLM_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$")
+_MERMAID_FENCE_RE = re.compile(r"^```mermaid[ \t]*\n(?P<code>.*?)^```[ \t]*$", re.MULTILINE | re.DOTALL)
+
+
+def _demote_headings(md: str) -> str:
+    """``#``-заголовки VLM-ответа -> bold (spec §1): структура документа принадлежит
+    конвертеру, а не модели. Заголовок внутри инъекции переподчинил бы себе ВСЁ дерево
+    секций до конца документа (``chunking._sections`` ведёт стек по уровням), то есть
+    одна фигура молча переписала бы breadcrumb'ы половины корпуса. Сегодня модель
+    заголовков не эмитит (0 из 73 живых ответов) — но это дисциплина промпта, которую
+    не гарантирует ни один гейт, а смена ``--vlm-model`` её не наследует.
+
+    Строки внутри код-фенса не трогаются (``# comment`` — не заголовок)."""
+    out: list[str] = []
+    in_fence = False
+    for line in md.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        m = None if in_fence else _VLM_HEADING_RE.match(stripped)
+        out.append(f"**{m.group(1)}**" if m is not None else line)
+    return "\n".join(out)
+
+
+def _gate_mermaid_fences(md: str) -> str:
+    """Каждый ```mermaid-фенс ответа проходит НАСТОЯЩИЙ рендер (``chart_render.
+    mermaid_renders``); не отрендерившийся деградирует в ```text — проза сохраняется,
+    ложное обещание «это валидная диаграмма» снимается.
+
+    Та же дисциплина, что у data-driven чартов (chart-data-extraction): там гейт
+    признан обязательным, потому что синтаксическая валидность не равна принятию
+    реальным рендерером — у VLM-вывода оснований доверять не больше, а меньше."""
+
+    def _replace(m: re.Match[str]) -> str:
+        if chart_render.mermaid_renders(m.group("code").rstrip("\n")):
+            return m.group(0)
+        return m.group(0).replace("```mermaid", "```text", 1)
+
+    return _MERMAID_FENCE_RE.sub(_replace, md)
+
+
+def sanitize_vlm_markdown(md: str) -> str:
+    """Санитизация ответа модели перед инъекцией в ``doc.md`` (spec §1).
+
+    Применяется при КАЖДОЙ инъекции, включая cache-hit: ``.figures.yaml`` хранит СЫРОЙ
+    ответ (кэш — запись о том, что сказала модель), санитизация живёт на выходе, поэтому
+    уже оплаченные ответы получают её без единого нового вызова. Идемпотентна:
+    заголовки уже сняты, а деградировавший фенс больше не ```mermaid."""
+    return _gate_mermaid_fences(_demote_headings(md))
+
+
+def _render_injected(head: str, address: str, model: str, markdown: str) -> str:
+    """Ограниченный блок инъекции: открывающий маркер, санитизированное тело,
+    терминатор. ``head`` — адрес для человека («Figure, p. 6, region abc…»),
+    ``address`` — тот же адрес без класса объекта («region abc…») для терминатора."""
     return (
-        f"> [Figure, p. {page}, region {region_id} — VLM interpretation ({model}); "
-        f"reconstruction, verify against original]\n\n{markdown}"
+        f"> [{head} — VLM interpretation ({model}); reconstruction, verify against original]\n\n"
+        f"{sanitize_vlm_markdown(markdown)}\n\n"
+        f"{INJECTION_END_PREFIX}{address}]"
+    )
+
+
+def _render_injected_figure(page: int, region_id: str, model: str, markdown: str) -> str:
+    return _render_injected(
+        f"Figure, p. {page}, region {region_id}", f"region {region_id}", model, markdown
     )
 
 
 def _render_injected_image(page: int, marker_id: str, model: str, markdown: str) -> str:
-    return (
-        f"> [Image, p. {page}, image {marker_id} — VLM interpretation ({model}); "
-        f"reconstruction, verify against original]\n\n{markdown}"
+    return _render_injected(
+        f"Image, p. {page}, image {marker_id}", f"image {marker_id}", model, markdown
     )
 
 
 def _render_injected_docx_image(marker_id: str, model: str, markdown: str) -> str:
-    return (
-        f"> [Image, docx media {marker_id} — VLM interpretation ({model}); "
-        f"reconstruction, verify against original]\n\n{markdown}"
+    return _render_injected(
+        f"Image, docx media {marker_id}", f"docx media {marker_id}", model, markdown
     )
 
 
 def _render_injected_docx_group(id12: str, model: str, markdown: str) -> str:
-    return (
-        f"> [Figure, docx group {id12} — VLM interpretation ({model}); "
-        f"reconstruction, verify against original]\n\n{markdown}"
-    )
+    return _render_injected(f"Figure, docx group {id12}", f"docx group {id12}", model, markdown)
 
 
 def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:

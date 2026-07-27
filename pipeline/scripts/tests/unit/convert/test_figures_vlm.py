@@ -879,3 +879,133 @@ def test_apply_figures_pass_docx_group_idempotent_second_run(tmp_path: Path, mon
     )
     assert apply_figures_pass(md, raw, model="m") is False
     assert md.read_text(encoding="utf-8") == once
+
+
+# --- ограниченная грамматика инъекции + санитизация (spec convert-knowledge-seam-hardening §1) ---
+
+
+def _mermaid_always(monkeypatch: Any, ok: bool) -> None:
+    """Гейт mermaid — детерминированная заглушка: реальный рендер (QuickJS) в юните
+    не нужен и стоит секунды; его собственная работа покрыта тестами chart_render."""
+    monkeypatch.setattr("convert.figures_vlm.chart_render.mermaid_renders", lambda code: ok)
+
+
+def test_injection_is_bounded_by_terminator(tmp_path: Path, monkeypatch: Any) -> None:
+    """Блок инъекции закрыт терминатором с ТЕМ ЖЕ адресом: без него граница
+    «здесь кончилась реконструкция» не определялась ничем, и хвост VLM-текста уезжал в
+    чанк без маркера провенанса (аудит шва Б1, 16 из 74 чанков корпуса)."""
+    md, raw = _write_doc(tmp_path, FIGURE_MD)
+    _patch_key(monkeypatch)
+    _mermaid_always(monkeypatch, True)
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({"6eb947f5358b": {"model": "m", "markdown": "Prose about the figure.", "requested": "x"}}),
+        encoding="utf-8",
+    )
+
+    assert apply_figures_pass(md, raw, model="m") is True
+
+    text = md.read_text(encoding="utf-8")
+    assert "> [/VLM interpretation region 6eb947f5358b]" in text
+    start = text.index("> [Figure, p. 6, region 6eb947f5358b — VLM interpretation")
+    end = text.index("> [/VLM interpretation region 6eb947f5358b]")
+    assert "Prose about the figure." in text[start:end]
+    assert "Body text follows." not in text[start:end]  # verbatim-текст ВНЕ блока
+
+
+def test_injection_terminator_address_matches_marker_class(tmp_path: Path, monkeypatch: Any) -> None:
+    """Адрес терминатора повторяет адрес открывающего маркера для каждого класса
+    объекта — иначе вложенные/соседние блоки было бы не сопоставить."""
+    md, raw = _write_doc(tmp_path, IMAGE_MD)
+    _patch_key(monkeypatch)
+    _mermaid_always(monkeypatch, True)
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({"bbde82b91e13": {"model": "m", "markdown": "Chart prose.", "requested": "x"}}),
+        encoding="utf-8",
+    )
+
+    apply_figures_pass(md, raw, model="m")
+    assert "> [/VLM interpretation image bbde82b91e13]" in md.read_text(encoding="utf-8")
+
+
+def test_injected_block_is_not_a_bare_marker(tmp_path: Path, monkeypatch: Any) -> None:
+    """Идемпотентность сохранена: инъецированный блок (с терминатором) не считается
+    необработанным маркером — повторный прогон его не тронет."""
+    md, raw = _write_doc(tmp_path, FIGURE_MD)
+    _patch_key(monkeypatch)
+    _mermaid_always(monkeypatch, True)
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({"6eb947f5358b": {"model": "m", "markdown": "Prose.", "requested": "x"}}),
+        encoding="utf-8",
+    )
+    apply_figures_pass(md, raw, model="m")
+    injected = md.read_text(encoding="utf-8")
+
+    assert has_bare_markers(injected) is False
+    assert apply_figures_pass(md, raw, model="m") is False
+    assert md.read_text(encoding="utf-8") == injected
+
+
+def test_sanitize_demotes_headings_outside_fences() -> None:
+    """``#`` VLM-ответа -> bold: заголовок внутри инъекции переподчинил бы себе весь
+    остаток дерева секций документа (chunking._sections ведёт стек по уровням)."""
+    from convert.figures_vlm import sanitize_vlm_markdown
+
+    md = "## Invented Heading\n\nProse line.\n\n```text\n# not a heading, a comment\n```\n"
+    out = sanitize_vlm_markdown(md)
+
+    assert out == "**Invented Heading**\n\nProse line.\n\n```text\n# not a heading, a comment\n```\n"
+
+
+def test_sanitize_degrades_unrenderable_mermaid_to_text(monkeypatch: Any) -> None:
+    """Не отрендерившийся фенс становится ```text: проза сохраняется, ложное обещание
+    «валидная диаграмма» снимается — та же дисциплина, что у data-driven чартов."""
+    from convert import figures_vlm
+
+    monkeypatch.setattr("convert.figures_vlm.chart_render.mermaid_renders", lambda code: False)
+    md = "Prose.\n\n```mermaid\npie title Broken\n```\n"
+    out = figures_vlm.sanitize_vlm_markdown(md)
+
+    assert "```text\npie title Broken\n```" in out
+    assert "```mermaid" not in out
+
+
+def test_sanitize_keeps_renderable_mermaid(monkeypatch: Any) -> None:
+    from convert import figures_vlm
+
+    monkeypatch.setattr("convert.figures_vlm.chart_render.mermaid_renders", lambda code: True)
+    md = "Prose.\n\n```mermaid\npie title Fine\n```\n"
+    assert figures_vlm.sanitize_vlm_markdown(md) == md
+
+
+def test_sanitize_is_idempotent(monkeypatch: Any) -> None:
+    """Санитизация живёт на ВЫХОДЕ (кэш хранит сырой ответ), поэтому применяется к
+    одному и тому же ответу на каждой реинъекции — второй проход обязан быть no-op."""
+    from convert import figures_vlm
+
+    monkeypatch.setattr("convert.figures_vlm.chart_render.mermaid_renders", lambda code: False)
+    md = "# H\n\nProse.\n\n```mermaid\nbroken\n```\n"
+    once = figures_vlm.sanitize_vlm_markdown(md)
+    assert figures_vlm.sanitize_vlm_markdown(once) == once
+
+
+def test_cached_raw_answer_is_sanitized_on_reinjection(tmp_path: Path, monkeypatch: Any) -> None:
+    """Уже оплаченный (сырой) ответ в .figures.yaml получает санитизацию без единого
+    нового вызова — гейт применяется к кэш-хиту, а не только к свежему ответу."""
+    md, raw = _write_doc(tmp_path, FIGURE_MD)
+    _patch_key(monkeypatch)
+    _mermaid_always(monkeypatch, False)
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump(
+            {"6eb947f5358b": {"model": "m", "markdown": "# Cached Heading\n\n```mermaid\nx\n```", "requested": "x"}}
+        ),
+        encoding="utf-8",
+    )
+
+    apply_figures_pass(md, raw, model="m")
+    text = md.read_text(encoding="utf-8")
+
+    assert "**Cached Heading**" in text
+    assert "```mermaid" not in text
+    # кэш остался СЫРЫМ — санитизация не переписывает запись о том, что сказала модель
+    cached = yaml.safe_load((raw.parent / ".figures.yaml").read_text(encoding="utf-8"))
+    assert cached["6eb947f5358b"]["markdown"].startswith("# Cached Heading")

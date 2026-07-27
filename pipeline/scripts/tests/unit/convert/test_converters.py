@@ -684,13 +684,13 @@ def test_convert_xlsx_chart_with_numcache_renders_data_driven_block(tmp_path: Pa
     out = tmp_path / "out.md"
     _convert_xlsx(raw, out, "en")
     text = out.read_text(encoding="utf-8")
-    assert "> лист Data, якорь D2" in text
+    assert "> sheet Data, anchor D2" in text
     assert "```mermaid\nxychart-beta" in text
     assert "| Category | Val |" in text
     assert "| A | 42.0% |" in text
     assert "| B | 87.0% |" in text
     assert "[Figure, xlsx chart" not in text
-    assert text.index("| Cat | Val |") < text.index("> лист Data") < text.index("```mermaid")
+    assert text.index("| Cat | Val |") < text.index("> sheet Data") < text.index("```mermaid")
 
 
 # --- _tesseract_langs: rec.language -> tesseract -l аргумент ---

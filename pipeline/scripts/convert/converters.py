@@ -519,7 +519,10 @@ def _render_xlsx_chart_block(chart: Any, chart_root: Any) -> str:
     rendered = chart_render.render_chart(chart_data.parse_chart(chart_root))
     if rendered is None:
         return xlsx_charts.render_chart_marker(chart)
-    provenance = f"> лист {chart.sheet}, якорь {chart.anchor_cell}"
+    # Английская провенанс-строка (Б17, spec convert-knowledge-seam-hardening §1):
+    # строка живёт в doc.md рядом с англоязычной маркерной грамматикой и попадает в
+    # FTS/вектор — язык корпусных артефактов один.
+    provenance = f"> sheet {chart.sheet}, anchor {chart.anchor_cell}"
     return f"{provenance}\n\n{rendered}"
 
 
@@ -578,11 +581,17 @@ def _convert_xlsx(
     out.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
 
 
+# Бамп версии = авто-реконверсия формата при следующем прогоне (needed_stages). Для
+# convert-knowledge-seam-hardening §1 это ЕДИНСТВЕННЫЙ механизм миграции корпуса на
+# ограниченную грамматику VLM-инъекции: реконверсия регенерирует голые маркеры, а
+# figures-пасс реинъецирует их из тёплого кэша офлайн уже в новой форме. У pdf при этом
+# сам конвертер не изменился — версия двигается ради миграции его doc.md; у docx/xlsx
+# изменился и вывод (англизация маркеров/провенанса, Б17).
 _CONVERTERS: dict[str, Converter] = {
-    "pdf": Converter("pdf", "5", _convert_pdf),  # v5: raster region-id (convert-cloud-tier §4)
+    "pdf": Converter("pdf", "6", _convert_pdf),  # v6: миграция грамматики инъекции (seam §1)
     "html": Converter("html", "1", _convert_html),
-    "docx": Converter("docx", "4", _convert_docx),  # v4: data-driven чарты (chart-data-extraction §4.2)
-    "xlsx": Converter("xlsx", "2", _convert_xlsx),  # v2: data-driven чарты (chart-data-extraction §4.1)
+    "docx": Converter("docx", "5", _convert_docx),  # v5: англизация маркеров + миграция (seam §1)
+    "xlsx": Converter("xlsx", "3", _convert_xlsx),  # v3: англизация маркера/провенанса (seam §1)
 }
 
 
