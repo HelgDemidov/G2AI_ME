@@ -420,11 +420,28 @@ def _convert_wait_note(rec: schema.SourceRecord, root: Path) -> str | None:
     Только для записей С raw и непогашенным ``convert_failed`` — по построению
     взаимоисключимо с ``_acquisition_wait_note`` (та требует ОТСУТСТВИЕ raw), поэтому
     оба можно проверить безусловно и использовать тот, что не None.
+
+    Нота показывается, только когда деферрал РЕАЛЬНО действует (тот же
+    ``convert_deferred``-предикат, что и в планировании): непогашенное трио само по
+    себе не означает «отложено» — после провала ``--force``-реконверта поверх живого
+    актуального ``doc.md`` планированию делать нечего БЕЗ участия backoff'а, и с
+    истечением окна документ обязан вернуться в класс «актуально», а не висеть в
+    «⏳» вечно (зеркальный guard ``_acquisition_wait_note`` — «документ с raw штатно
+    живёт дальше» — здесь выражен предикатом, не наличием файла).
     """
-    if schema.raw_file(rec, root) is None:
+    raw = schema.raw_file(rec, root)
+    if raw is None:
         return None
     state = schema.load_state(schema.state_file(rec, root))
     if state.convert_failed is None:
+        return None
+    # resolve_converter не может поднять UnsupportedFormat: вызывающая сторона доходит
+    # сюда только после needed_stages, чей инвариант формата (§4) уже гарантирует
+    # зарегистрированное расширение; иной вызывающий изолируется planning-try.
+    conv = converters.resolve_converter(raw)
+    st = raw.stat()
+    raw_stat_matches = st.st_size == state.raw_size and st.st_mtime_ns == state.raw_mtime_ns
+    if not convert_deferred(state, f"{conv.name}@{conv.version}", raw_stat_matches):
         return None
     reason = state.convert_failure_reason or "конвертация провалилась"
     return f"с {state.convert_failed.isoformat()}: {reason}"
@@ -555,6 +572,15 @@ def _do_download(
         # байтах (живой репро аудита). Следующая OCR-нормализация (если нужна) перезахватит
         # честно — once-if-None в _capture_original_sha256 не мешает: поле уже None.
         state.original_sha256 = None
+        # Новые байты = новый вход конвертации (§8, В11): отказ прошлой попытки описывал
+        # ПРЕЖНИЙ raw — трио сбрасывается ЗДЕСЬ, а не только успешным _do_convert. Иначе
+        # краш между стадиями download и convert оставил бы свежий raw под чужим
+        # backoff'ом до RETRY_BACKOFF_DAYS: guard-тройку обновила сама эта функция,
+        # stat-пирсер convert_deferred расхождения уже не увидит. Байт-идентичная
+        # передобыча трио сознательно НЕ трогает — тот же вход, отказ всё ещё в силе.
+        state.convert_failed = None
+        state.convert_failure_reason = None
+        state.convert_failed_converter = None
     state.acquisition_failed = None      # добыли — backoff снят (§5)
     state.acquisition_failure_reason = None
     # Передобыча — ОДИН из двух человеческих путей разрешения дрейфа (§6): раз новые
@@ -1018,7 +1044,15 @@ def _run_lock_path(sources_root: Path) -> Path:
     прочие операционные артефакты КОРПУСА (``schema.state_dir``). Скоуп — РОВНО
     писатели ``.state.yaml``: штатный прогон стадий и ``--recheck``. ``discover.py``/
     ``vector_store.py`` этот лок не берут — они не пишут ``.state.yaml`` (кандидаты —
-    свой слой со своей save-семантикой; индекс — SQLite с собственным локингом)."""
+    свой слой со своей save-семантикой; индекс — SQLite с собственным локингом).
+
+    Честная граница скоупа (ревью PR #53): ``--recheck`` пишет и слой КАНДИДАТОВ
+    (популяция (c) — probe-поля/revive), который делит с ``discover.py``; эта пара
+    писателей локом сознательно НЕ покрыта — save шардов кандидатов есть полная
+    перезапись файла, одновременные ``--recheck`` и ``discover`` могут потерять
+    запись друг друга (last-writer-wins). Принятый остаточный риск: обе — ручные
+    команды куратора, одновременный запуск маловероятен; расширение скоупа лока на
+    ``discover.py`` — при первом живом инциденте, не превентивно."""
     return schema.state_dir(sources_root) / "run_pipeline.lock"
 
 

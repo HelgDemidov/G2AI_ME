@@ -17,6 +17,7 @@ from convert.converters import (
     ConversionError,
     NeedsOCR,
     UnsupportedFormat,
+    _CONVERTERS,
     _cached_or_call_cloud,
     _capture_original_sha256,
     _check_langs_available,
@@ -46,6 +47,17 @@ from tests.support import (
     build_minimal_docx,
     valid_record,
 )
+
+
+def test_converters_register_every_source_format() -> None:
+    """Sync-тест полноты (ревью PR #53, находка 4 — двойник
+    test_format_profiles_registers_every_source_format на acquire-стороне шва):
+    «UnsupportedFormat невозможен здесь» и assert conv is not None в needed_stages
+    (run_pipeline.py) опираются ровно на этот кросс-модульный инвариант — каждый член
+    SourceFormat зарегистрирован в _CONVERTERS. Равенство, не подмножество: конвертер
+    без члена SourceFormat недостижим по построению (расширение raw.* диктуется
+    курируемым source_format) — осиротевшая запись тоже дрейф."""
+    assert set(_CONVERTERS) == {fmt.value for fmt in schema.SourceFormat}
 
 
 def test_resolve_converter_pdf(tmp_path: Path) -> None:

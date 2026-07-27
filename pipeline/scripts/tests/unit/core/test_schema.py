@@ -176,7 +176,13 @@ def test_sensitivity_confidential_compared_only_in_schema_module() -> None:
     красный. ``index/vector_store.py::confidential_doc_ids`` — единственное
     санкционированное ВТОРОЕ определение (SQL по doc_facets, записей в руках нет),
     исключено явным путём в скане ниже (в её коде нет ни одного ``Attribute``-узла
-    ``Sensitivity.confidential`` — только SQL-строковый литерал, AST его не видит)."""
+    ``Sensitivity.confidential`` — только SQL-строковый литерал, AST его не видит).
+
+    Граница guard'а (ревью PR #53, находка 5): ловится только идиоматичная
+    атрибутная форма ``Sensitivity.confidential`` — сравнение со строковым литералом
+    (``rec.sensitivity.value == "confidential"`` и т.п.) AST-скан не видит. Это
+    сознательный компромисс, а не герметичная гарантия: строковая форма в этом
+    коде нигде не используется и на ревью читается как аномалия сама по себе."""
     violations: dict[str, list[int]] = {}
     for path in sorted(_PIPELINE_DIR.rglob("*.py")):
         rel = path.relative_to(_PIPELINE_DIR)

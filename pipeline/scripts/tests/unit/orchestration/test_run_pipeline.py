@@ -1111,6 +1111,78 @@ def test_do_convert_success_clears_prior_failure_trio(tmp_path: Path, monkeypatc
     assert state.convert_failed_converter is None
 
 
+def test_do_download_new_bytes_clear_convert_failure_trio(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ревью PR #53, находка 1 — недописанный К2-assert спека (§2/§8 требовали, реализация
+    не делала): новые байты = новый вход конвертации, трио отказа сбрасывает САМА добыча,
+    не только успешный _do_convert. Иначе краш между стадиями download и convert оставлял
+    бы свежий raw под backoff'ом прежнего входа до RETRY_BACKOFF_DAYS: guard-тройку
+    обновил сам _do_download, stat-пирсер convert_deferred расхождения уже не увидит."""
+    rec = make()
+    _place(rec, tmp_path, state=_convert_failed_state(1))
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=b"%PDF-1.4 fresh bytes",
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed is None
+    assert state.convert_failure_reason is None
+    assert state.convert_failed_converter is None
+
+
+def test_do_download_same_bytes_preserve_convert_failure_trio(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Обратная сторона (К2: «с теми же байтами — сохраняет»): байт-идентичная передобыча
+    не меняет вход конвертации — прошлый отказ всё ещё описывает текущее состояние,
+    backoff продолжает действовать."""
+    rec = make()
+    body = b"%PDF-1.4 same pathological scan"
+    _place(
+        rec, tmp_path,
+        state={**_convert_failed_state(1), "sha256": hashlib.sha256(body).hexdigest()},
+    )
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=body,
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed is not None
+    assert state.convert_failed_converter == _pdf_converter_key()
+
+
+def test_process_docs_reports_up_to_date_when_convert_backoff_no_longer_applies(
+    tmp_path: Path,
+) -> None:
+    """Ревью PR #53, находка 2: непогашенное трио при живом актуальном doc.md и истёкшем
+    окне (след провала --force-реконверта поверх хорошего поколения) — планированию
+    делать нечего БЕЗ участия backoff'а, и документ обязан репортиться «актуально»,
+    а не вечной «⏳ конвертация отложена». _convert_wait_note показывает ноту только
+    когда деферрал реально действует (тот же convert_deferred-предикат, что в
+    планировании)."""
+    rec = make()
+    _place(
+        rec, tmp_path, raw=b"pdf", md=_compose_md(rec, ""),
+        state={**_current_converter_state(), **_convert_failed_state(RETRY_BACKOFF_DAYS)},
+    )
+
+    results = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+
+    assert results[0].waiting_convert is None
+    assert results[0].up_to_date is True
+
+
 def test_process_docs_reports_waiting_class_not_error(tmp_path: Path, caplog: Any) -> None:
     """«Ждут добычи» — третий класс сводки: не «актуально» (иначе недобытые растворились
     бы) и не «ошибка» (exit-код прогона не портится — источник закрыт обстоятельствами)."""
