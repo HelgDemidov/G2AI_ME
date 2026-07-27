@@ -325,6 +325,40 @@ def test_probe_url_uses_format_agnostic_classifier_when_expected_none(monkeypatc
     assert probe.classified.outcome is acquisition.AcquisitionOutcome.ok
 
 
+def _fake_fetch_raw_capturing_byte_cap(
+    monkeypatch: Any, response: acquisition.RawResponse
+) -> list[int | None]:
+    """Перехватить ``byte_cap``, с которым ушёл запрос."""
+    captured: list[int | None] = []
+
+    def fake(url: str, dest: Path, **kw: Any) -> acquisition.RawResponse:
+        captured.append(kw.get("byte_cap"))
+        return response
+
+    monkeypatch.setattr(acquisition, "fetch_raw", fake)
+    return captured
+
+
+def test_probe_url_passes_byte_cap_for_format_agnostic_population_c(monkeypatch: Any) -> None:
+    """spec discovery-acquire-seam-hardening §11, Г12: только формат-агностичный
+    probe (популяция (c), ``expected=None``) получает потолок байтов."""
+    captured = _fake_fetch_raw_capturing_byte_cap(
+        monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", b"<html>page</html>")
+    )
+    recheck.probe_url("https://e.gov/page", user_agent="ua", expected=None)
+    assert captured == [recheck.PROBE_BYTE_CAP]
+
+
+def test_probe_url_omits_byte_cap_for_formatted_populations(monkeypatch: Any) -> None:
+    """Популяции (a)/(b) — форматные ok-ветки статус-чувствительны (``status ==
+    200``, которого 206 сломал бы), капа не получают."""
+    captured = _fake_fetch_raw_capturing_byte_cap(
+        monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", b"%PDF body")
+    )
+    recheck.probe_url("https://e.gov/d.pdf", user_agent="ua", expected=schema.SourceFormat.pdf)
+    assert captured == [None]
+
+
 # --- §2: выбор URL проверки ---
 
 

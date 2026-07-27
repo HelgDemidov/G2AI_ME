@@ -318,6 +318,11 @@ def classify_probe(body: bytes, headers_text: str) -> ClassifiedResponse:
 
     Порядок проверок повторяет форматные классификаторы: challenge ПЕРЕД статусом —
     заглушка WAF сама приходит как ``200``.
+
+    ``status in (200, 206)`` (spec discovery-acquire-seam-hardening §11, Г12):
+    ``206 Partial Content`` — штатный ответ сервера на Range-запрос
+    (``fetch_raw(byte_cap=...)``, которым эта функция обслуживает популяцию (c)) —
+    живой канал, не аномалия.
     """
     status = _status_from_headers_text(headers_text)
     headers = _headers_from_text(headers_text)
@@ -326,8 +331,8 @@ def classify_probe(body: bytes, headers_text: str) -> ClassifiedResponse:
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
     if status in DEAD_STATUS_CODES:
         return ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
-    if status == 200 and body:
-        return ClassifiedResponse(AcquisitionOutcome.ok, status, f"HTTP 200, тело {len(body)} Б")
+    if status in (200, 206) and body:
+        return ClassifiedResponse(AcquisitionOutcome.ok, status, f"HTTP {status}, тело {len(body)} Б")
     return ClassifiedResponse(
         AcquisitionOutcome.blocked, status, f"неожиданный ответ (HTTP {status}, тело {len(body)} Б)"
     )
@@ -363,6 +368,7 @@ def fetch_raw(
     extra_headers: dict[str, str] | None = None,
     timeout: int = 30,
     total_timeout: int = 300,
+    byte_cap: int | None = None,
 ) -> RawResponse:
     """Одна попытка скачивания без интерпретации результата.
 
@@ -378,6 +384,12 @@ def fetch_raw(
     curl call fails the same way, so the worst case is one wasted archive attempt, not
     silent corruption. ``--max-time`` bounds the whole transfer (``--connect-timeout``
     alone doesn't cap a stalled transfer on a slow LTE link).
+
+    ``byte_cap`` (spec discovery-acquire-seam-hardening §11, Г12) — best-effort
+    ``curl -r 0-{cap-1}`` (Range-запрос): сервер вправе проигнорировать и отдать
+    полное тело (поведение прежнее, никакого дополнительного парсинга ответа не
+    требуется — статус ``206``/``200`` классификатор уже различает). Опущено
+    (``None``) — прежнее поведение без потолка байтов.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix="acq-headers-", suffix=".txt", delete=False) as tmp:
@@ -388,6 +400,8 @@ def fetch_raw(
             "--connect-timeout", str(timeout), "--max-time", str(total_timeout),
             "-A", user_agent,
         ]
+        if byte_cap is not None:
+            cmd += ["-r", f"0-{byte_cap - 1}"]
         for name, value in (extra_headers or {}).items():
             cmd += ["-H", f"{name}: {value}"]
         cmd += ["-D", str(headers_path), "-o", str(dest), url]

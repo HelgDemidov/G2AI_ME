@@ -342,3 +342,15 @@ def test_classify_probe_404_is_dead() -> None:
 def test_classify_probe_empty_200_is_blocked() -> None:
     result = acquisition.classify_probe(b"", "HTTP/1.1 200 OK\r\n")
     assert result.outcome is acquisition.AcquisitionOutcome.blocked
+
+
+def test_classify_probe_206_partial_content_is_acquirable() -> None:
+    """spec discovery-acquire-seam-hardening §11, Г12: 206 — штатный ответ на
+    Range-запрос (byte_cap probe), не аномалия."""
+    result = acquisition.classify_probe(b"<html>real content</html>", "HTTP/1.1 206 Partial Content\r\n")
+    assert result.outcome is acquisition.AcquisitionOutcome.ok
+
+
+def test_classify_probe_206_empty_body_is_blocked() -> None:
+    result = acquisition.classify_probe(b"", "HTTP/1.1 206 Partial Content\r\n")
+    assert result.outcome is acquisition.AcquisitionOutcome.blocked

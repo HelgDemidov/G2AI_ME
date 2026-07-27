@@ -1092,7 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--recheck-limit", type=int, default=recheck.RECHECK_DEFAULT_LIMIT, metavar="N",
-        help="сколько документов проверить за прогон — НА ПОПУЛЯЦИЮ (записи с raw / недобытые)",
+        help="сколько документов проверить за прогон — НА ПОПУЛЯЦИЮ (записи с raw / недобытые); "
+             "с --only популяция недобываемых кандидатов не затрагивается вовсе",
     )
     parser.add_argument(
         "--recheck-deep", action="store_true",
@@ -1142,10 +1143,18 @@ def main(argv: list[str] | None = None) -> int:
             # означал бы «нельзя», а не «покажи»): план строится из тех же чистых
             # функций отбора, что и боевой прогон (due_records/due_candidates), лок
             # не берётся, сеть/.state.yaml/store не трогаются.
-            candidates = store.load(args.sources)
-            registered = manual.registered_pairs(records)
+            # Г11: --only сужает популяции (a)/(b) до одного документа (records уже
+            # отфильтрован выше) — популяция (c) не связана ни с одним документом,
+            # поэтому "одно-документная" команда не должна пробивать её полным
+            # лимитом (20 сетевых GET неожиданно для --only).
+            due_c: list[schema.CandidateRecord] = []
+            if not args.only:
+                plan_candidates = store.load(args.sources)
+                plan_registered = manual.registered_pairs(records)
+                due_c = recheck.due_candidates(
+                    plan_candidates, limit=args.recheck_limit, registered=plan_registered
+                )
             with_raw, without_raw = recheck.due_records(records, args.sources, limit=args.recheck_limit)
-            due_c = recheck.due_candidates(candidates, limit=args.recheck_limit, registered=registered)
             mode = "deep" if args.recheck_deep else "conditional"
             logger.info("Recheck (dry-run, %s) — кого проверил бы этот прогон:", mode)
             for rec in with_raw:
@@ -1177,13 +1186,18 @@ def main(argv: list[str] | None = None) -> int:
                 # популяции (c) с реестром (spec discovery-acquire-seam-hardening §4,
                 # Г3) — тоже забота оркестратора: пары считает manual.registered_pairs
                 # (discovery), acquire остаётся discovery-агностичным (plain-data параметр).
-                candidates = store.load(args.sources)
+                # Г11: --only — явное намерение куратора проверить ОДИН документ, populяция
+                # (c) с ним не связана — не грузим/не трогаем её вовсе (20 сетевых GET от
+                # «одно-документной» команды удивили бы куратора).
+                candidates = None if args.only else store.load(args.sources)
+                registered = None if args.only else manual.registered_pairs(records)
                 summary = recheck.run_recheck(
                     records, args.sources,
                     user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
-                    candidates=candidates, registered=manual.registered_pairs(records),
+                    candidates=candidates, registered=registered,
                 )
                 if summary.candidates_changed:
+                    assert candidates is not None
                     store.save(candidates, args.sources)
                 return recheck.report(summary)
         except fsio.AlreadyLocked as exc:

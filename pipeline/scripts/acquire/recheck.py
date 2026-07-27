@@ -42,6 +42,14 @@ RECHECK_DEFAULT_LIMIT = 20
 # калибровать по доле ложных drift на первых живых прогонах, не заранее.
 HTML_STABLE_CONFIRMS = 2
 
+# Потолок байтов probe-тела популяции (c) (spec discovery-acquire-seam-hardening §11,
+# Г12): челлендж-маркеры и признаки живого/мёртвого канала — в начале тела; без капа
+# 100-МБ PDF на LTE-канале — полторы минуты трафика на выброс ради классификации,
+# которой хватает первых десятков КБ. ТОЛЬКО для формат-агностичного probe
+# (``expected=None``) — форматные ok-ветки (a)/(b) статус-чувствительны (``status ==
+# 200``, которого 206 сломал бы), а --recheck-deep нужен полный дайджест.
+PROBE_BYTE_CAP = 65536
+
 
 @dataclass(frozen=True)
 class ProbeOutcome:
@@ -88,6 +96,8 @@ def probe_url(
 
     ``expected=None`` — формат-агностичная классификация (``acquisition.classify_probe``)
     для популяции (c): у кандидата слоя discovery ``source_format`` ещё не объявлен.
+    Она же гейтит потолок байтов (``PROBE_BYTE_CAP``, spec §11, Г12) — только формат-
+    агностичный probe его получает, форматные (a)/(b) качают тело полностью.
 
     Тело пишется во временный каталог ВНЕ папки документа — не в ``raw.*``: контур не
     мутирует оригинал ни при каком исходе.
@@ -101,7 +111,10 @@ def probe_url(
 
     with tempfile.TemporaryDirectory(prefix="recheck-") as workdir:
         dest = Path(workdir) / "probe.bin"
-        raw = acquisition.fetch_raw(url, dest, user_agent=user_agent, extra_headers=headers)
+        byte_cap = PROBE_BYTE_CAP if expected is None else None
+        raw = acquisition.fetch_raw(
+            url, dest, user_agent=user_agent, extra_headers=headers, byte_cap=byte_cap
+        )
         if raw.unreachable_reason is not None:
             return ProbeOutcome(
                 not_modified=False,

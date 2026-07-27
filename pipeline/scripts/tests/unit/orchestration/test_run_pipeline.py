@@ -2094,6 +2094,50 @@ def test_main_recheck_dry_run_prints_all_three_populations(tmp_path: Path, caplo
     assert "(c) " + "c" * 12 in text
 
 
+# --- --only сужает популяцию (c) (spec discovery-acquire-seam-hardening §11, Г11) ---
+
+
+def test_main_recheck_dry_run_only_omits_population_c_from_plan(tmp_path: Path, caplog: Any) -> None:
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        rc = main([str(sources), "--recheck", "--dry-run", "--only", "aa-recheck-a-2026"])
+
+    assert rc == 0
+    assert "(a) aa-recheck-a-2026" in caplog.text
+    assert "  (c) " not in caplog.text  # ни одной per-item строки популяции (c)
+    assert "Итого (dry-run, ничего не записано): (a) 1 | (b) 0 | (c) 0" in caplog.text
+
+
+def test_main_recheck_dry_run_only_skips_loading_candidates_store(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("--recheck --dry-run --only не должен грузить слой кандидатов")
+
+    monkeypatch.setattr(store, "load", boom)
+
+    assert main([str(sources), "--recheck", "--dry-run", "--only", "aa-recheck-a-2026"]) == 0
+
+
+def test_main_recheck_only_skips_loading_candidates_store(tmp_path: Path, monkeypatch: Any) -> None:
+    """«Одно-документная» команда не должна давать неожиданный сетевой трафик по
+    недобываемым кандидатам (популяция (c) с --only никак не связана)."""
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("--recheck --only не должен грузить слой кандидатов (популяция c)")
+
+    monkeypatch.setattr(store, "load", boom)
+
+    assert main([str(sources), "--recheck", "--only", "aa-recheck-a-2026"]) == 0
+
+
 def test_main_recheck_dry_run_not_blocked_while_lock_held(tmp_path: Path) -> None:
     """dry-run обязан быть no-op и не мешать живому прогону — удержанный лок ему не
     помеха (симметрично штатному --dry-run)."""
