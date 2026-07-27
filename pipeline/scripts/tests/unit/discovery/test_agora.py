@@ -6,6 +6,9 @@ Fetch/parse РАЗДЕЛЕНЫ (чартер, тест-принципы): эти
 """
 from __future__ import annotations
 
+import dataclasses
+import inspect
+import re
 import zipfile
 from pathlib import Path
 
@@ -17,6 +20,27 @@ from discovery import registry_store
 from discovery.connectors import agora
 
 
+# --- регресс-guard: каждое поле AgoraConfig используется вне load_config
+# (spec discovery-acquire-seam-hardening §10) ---
+
+
+def test_every_agora_config_field_is_used_outside_load_config() -> None:
+    """Урок orphan-конфига (agora, PR #36, удалённый `non_us_include_all` не
+    читался ни одной веткой): текстовый скан по образцу sync-теста oecd —
+    ``load_config``/само определение ``AgoraConfig`` — единственные легитимные
+    места, где поле упоминается ТОЛЬКО в парсинге/декларации; регрессия сюда
+    (новое поле без реального потребителя) должна ломать тест, а не проходить
+    ревью молча."""
+    module_source = inspect.getsource(agora)
+    class_source = inspect.getsource(agora.AgoraConfig)
+    load_config_source = inspect.getsource(agora.load_config)
+    outside = module_source.replace(class_source, "").replace(load_config_source, "")
+
+    field_names = [f.name for f in dataclasses.fields(agora.AgoraConfig)]
+    orphaned = [name for name in field_names if not re.search(rf"\b{re.escape(name)}\b", outside)]
+    assert not orphaned, f"поля AgoraConfig не используются вне load_config: {orphaned}"
+
+
 # --- load_config / frontier_year / resolve_min_year ---
 
 
@@ -25,7 +49,6 @@ def test_load_config_reads_real_tracked_config() -> None:
     config = agora.load_config()
     assert config.enabled is True
     assert config.zenodo_doi == "10.5281/zenodo.13883066"
-    assert config.non_us_include_all is True
     assert config.us_probe_limit == 50
     assert config.us_probe_min_year is None
     assert "agent" in config.us_probe_match_terms
@@ -38,7 +61,6 @@ def test_load_config_custom_path(tmp_path: Path) -> None:
             {
                 "enabled": False,
                 "zenodo_doi": "10.5281/zenodo.999",
-                "non_us": {"include_all": True},
                 "us_axis_probe": {"limit": 10, "min_year": 2020, "match_terms": ["agent"]},
             }
         ),
@@ -57,7 +79,7 @@ def test_frontier_year_reads_real_tracked_triage_config() -> None:
 
 def test_resolve_min_year_override_wins(tmp_path: Path) -> None:
     config = agora.AgoraConfig(
-        enabled=True, zenodo_doi="10.5281/zenodo.1", non_us_include_all=True,
+        enabled=True, zenodo_doi="10.5281/zenodo.1",
         us_probe_limit=50, us_probe_min_year=2019, us_probe_match_terms=("agent",),
     )
     assert agora.resolve_min_year(config) == 2019
@@ -65,7 +87,7 @@ def test_resolve_min_year_override_wins(tmp_path: Path) -> None:
 
 def test_resolve_min_year_null_reads_frontier_year() -> None:
     config = agora.AgoraConfig(
-        enabled=True, zenodo_doi="10.5281/zenodo.1", non_us_include_all=True,
+        enabled=True, zenodo_doi="10.5281/zenodo.1",
         us_probe_limit=50, us_probe_min_year=None, us_probe_match_terms=("agent",),
     )
     assert agora.resolve_min_year(config) == agora.frontier_year()
@@ -427,7 +449,6 @@ def _fake_config(**overrides: object) -> agora.AgoraConfig:
     base = dict(
         enabled=True,
         zenodo_doi="10.5281/zenodo.13883066",
-        non_us_include_all=True,
         us_probe_limit=50,
         us_probe_min_year=2025,
         us_probe_match_terms=_MATCH_TERMS,
