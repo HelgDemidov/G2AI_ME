@@ -147,24 +147,18 @@ def classify_response(
     decide whether the download is a real document, a WAF block, or a dead URL.
 
     ``expected`` dispatches to a format-specific ok-branch (§3.2 of the convert
-    chartier); ``expected=pdf`` is the default so every pre-existing caller keeps
-    its exact behaviour unchanged. A previous ``expect_pdf: bool = True`` parameter
-    was dead generality (no caller ever passed ``False``) — this is the real
-    multi-format classifier that generality was waiting for.
+    chartier) via ``_FORMAT_PROFILES`` (spec acquire-convert-seam-hardening §6, В6:
+    a registry mirroring convert's ``_CONVERTERS``, not an if/elif chain — a new
+    format is one dict entry, not edits scattered across the module); ``expected=pdf``
+    is the default so every pre-existing caller keeps its exact behaviour unchanged.
     """
     status = _status_from_headers_text(headers_text)
     headers = _headers_from_text(headers_text)
 
     if status in DEAD_STATUS_CODES:
         result = ClassifiedResponse(AcquisitionOutcome.dead, status, f"HTTP {status}")
-    elif expected is schema.SourceFormat.html:
-        result = _classify_html(body, headers, status)
-    elif expected is schema.SourceFormat.docx:
-        result = _classify_docx(body, headers, status)
-    elif expected is schema.SourceFormat.xlsx:
-        result = _classify_xlsx(body, headers, status)
     else:
-        result = _classify_pdf(body, headers, status)
+        result = _FORMAT_PROFILES[expected].classify(body, headers, status)
 
     # Валидаторы навешиваются ЗДЕСЬ, а не в каждой формат-ветке: они не зависят от
     # формата и не участвуют в самой классификации (спорный ответ остаётся спорным
@@ -239,6 +233,53 @@ def _classify_html(body: bytes, headers: dict[str, str], status: int | None) -> 
     return ClassifiedResponse(
         AcquisitionOutcome.blocked, status, "unexpected content (not the expected HTML document)"
     )
+
+
+@dataclass(frozen=True)
+class FormatProfile:
+    """Формат-пакет добычи: диспетчер классификации + CDX-mimetype + флаги двух
+    формат-специфичных ступеней лестницы, ОДНА запись на формат (spec
+    acquire-convert-seam-hardening §6, В6) — зеркало convert-слоя ``_CONVERTERS``
+    (Strategy-реестр по расширению raw.*). До этого спека формат-ось acquire-стороны
+    была асимметрична: if/elif в ``classify_response`` + четыре отдельные россыпи
+    (``MIN_EXPECTED_*``/магии в самих ``_classify_*``, ``_CDX_MIMETYPE_BY_FORMAT``,
+    PDF-only гейт watch-folder, HTML-only гейт browser-ступени в ``run_ladder``) —
+    новый формат требовал ~6 правок в разных местах модуля.
+
+    Behavior-preserving by design: ``classify`` указывает на СУЩЕСТВУЮЩИЕ
+    ``_classify_pdf/html/docx/xlsx``, которые НЕ нормализованы под общую форму —
+    у pdf магия проверяется ДО WAF-отпечатка, у html/docx/xlsx WAF-отпечаток ПЕРВЫЙ
+    (реальное поведение, не стилистическая разница; общая форма либо сломала бы
+    его, либо обросла бы флагами до нечитаемости). Реестр лишь диспетчеризует
+    существующие функции по формату, байт-идентично прежнему if/elif.
+    """
+
+    classify: Callable[[bytes, dict[str, str], int | None], ClassifiedResponse]
+    cdx_mimetype: str
+    watch_folder: bool  # manual watch-folder способен принять формат (v1: только pdf)
+    browser_rung: bool  # рендер-дамп — легитимный финальный артефакт (v1: только html)
+
+
+_FORMAT_PROFILES: dict[schema.SourceFormat, FormatProfile] = {
+    schema.SourceFormat.pdf: FormatProfile(
+        classify=_classify_pdf, cdx_mimetype="application/pdf",
+        watch_folder=True, browser_rung=False,
+    ),
+    schema.SourceFormat.html: FormatProfile(
+        classify=_classify_html, cdx_mimetype="text/html",
+        watch_folder=False, browser_rung=True,
+    ),
+    schema.SourceFormat.docx: FormatProfile(
+        classify=_classify_docx,
+        cdx_mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        watch_folder=False, browser_rung=False,
+    ),
+    schema.SourceFormat.xlsx: FormatProfile(
+        classify=_classify_xlsx,
+        cdx_mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        watch_folder=False, browser_rung=False,
+    ),
+}
 
 
 def classify_probe(body: bytes, headers_text: str) -> ClassifiedResponse:
@@ -467,7 +508,7 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
         if nxt is schema.AcquisitionMethod.manual:
             if (
                 classified.outcome is AcquisitionOutcome.blocked
-                and rec.source_format is schema.SourceFormat.html
+                and _FORMAT_PROFILES[rec.source_format].browser_rung
                 and browser_resolver.is_available()
             ):
                 # Заблокированный HTML — единственный формат/исход, где ступень
@@ -478,7 +519,7 @@ def run_ladder(rec: schema.SourceRecord, dest: Path, *, user_agent: str) -> Ladd
                 if browser_classified.outcome is AcquisitionOutcome.ok:
                     return LadderResult(schema.AcquisitionMethod.browser, schema.Fidelity.rendered, browser_classified)
                 classified = browser_classified  # несём вперёд ПОСЛЕДНЮЮ причину (браузерную), не устаревшую curl-причину
-            if rec.source_format is not schema.SourceFormat.pdf:
+            if not _FORMAT_PROFILES[rec.source_format].watch_folder:
                 # manual watch-folder matching (title_matcher, PDF-magic sniff) is
                 # PDF-only in v1 — a non-PDF record can't ride that path (§3 of
                 # convert-html spec); adoption via --no-download still works.
@@ -758,13 +799,6 @@ def request_snapshot(url: str, *, timeout: int = SPN_TIMEOUT_SECONDS) -> bool:
     return True
 
 
-_CDX_MIMETYPE_BY_FORMAT = {
-    schema.SourceFormat.html: "text/html",
-    schema.SourceFormat.docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    schema.SourceFormat.xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-}  # SourceFormat.pdf (и любой будущий формат без записи) -> дефолт "application/pdf" ниже
-
-
 def fetch_from_archive(rec: schema.SourceRecord, dest: Path, *, user_agent: str, timeout: int = 30) -> LadderResult:
     """Last rung of the ladder: only ever reached for a confirmed-dead source_url
     (never for a block — see §2/§9; sensitivity=confidential never reaches here,
@@ -778,7 +812,10 @@ def fetch_from_archive(rec: schema.SourceRecord, dest: Path, *, user_agent: str,
     """
     if not schema.external_disclosure_allowed(rec.sensitivity):
         raise RuntimeError(f"{rec.id}: archive-ступень недоступна для sensitivity=confidential")
-    mimetype = _CDX_MIMETYPE_BY_FORMAT.get(rec.source_format, "application/pdf")
+    # spec acquire-convert-seam-hardening §6, В6: реестр вместо .get(..., "application/pdf") —
+    # новый член SourceFormat без зарегистрированного профиля даёт громкий KeyError
+    # ("забыли добавить формат"), а не тихо-неверный CDX-mimetype-фильтр.
+    mimetype = _FORMAT_PROFILES[rec.source_format].cdx_mimetype
     snapshot = find_wayback_snapshot(rec.source_url, mimetype=mimetype, timeout=timeout)
     if snapshot is None:
         raise ArchiveUnavailable(f"нет снимка Wayback для {rec.source_url}")
