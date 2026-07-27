@@ -1121,3 +1121,20 @@ def test_corpus_fingerprint_is_state_aware(tmp_path: Path) -> None:
 def test_corpus_fingerprint_stable_without_state_change(tmp_path: Path) -> None:
     _write_corpus_doc(tmp_path)
     assert corpus_fingerprint(tmp_path) == corpus_fingerprint(tmp_path)
+
+
+def test_fts_folds_balkan_diacritics() -> None:
+    """Фиксация невидимого инварианта (аудит шва Б14): ``unicode61`` по умолчанию
+    снимает диакритику (``remove_diacritics=1``), поэтому известное ограничение OCR
+    («систематически теряет čćžšđ», convert-ocr §3.1) для лексического канала
+    безвредно — «Član» и «Clan» находят друг друга.
+
+    Комплементарность СЛУЧАЙНА: она держится на дефолте SQLite, который никто не
+    выбирал осознанно. Тест — сторож на случай миграции токенизатора (напр. вторая
+    FTS-таблица ``trigram`` для CJK, §27): свойство надо будет сохранить или снять
+    осознанно, а не потерять молча."""
+    conn = create_db(Path(":memory:"))
+    index_chunks(conn, [Chunk("me-law", 0, "Član 19 Službeni list Crne Gore", 6)])
+    for query in ('"Član"', '"Clan"', '"Sluzbeni"', '"Službeni"'):
+        assert [h.doc_id for h in fts_search(conn, query)] == ["me-law"], query
+    conn.close()

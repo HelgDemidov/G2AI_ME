@@ -13,6 +13,7 @@ import pytest
 
 from convert.converters import (
     DOCX_IMAGE_MIN_BYTES,
+    TESSERACT_LANGS,
     ConversionError,
     NeedsOCR,
     UnsupportedFormat,
@@ -1295,3 +1296,20 @@ def test_convert_pdf_cloud_failure_falls_back_to_local_with_ocr_headings(
     out = tmp_path / "out.md"
     _convert_pdf(tmp_path / "raw.pdf", out, "en", record=_record())
     assert out.read_text(encoding="utf-8") == "# ANNEX I\nBody.\n"  # локальный фолбэк + ocr_headings, без краха
+
+
+# --- языковые карты OCR: два словаря-близнеца (spec convert-knowledge-seam-hardening §11, Б6) ---
+
+
+def test_ocr_language_maps_cover_the_same_codes() -> None:
+    """``TESSERACT_LANGS`` (код tesseract) и ``cloud_ocr.CLOUD_LANG_NAMES`` (имя языка
+    для промпта) — разные по НАЗНАЧЕНИЮ словари с обязательно совпадающим множеством
+    ключей: язык, поддержанный локальным путём, но неизвестный облачному, тихо
+    деградирует до 'the source language' в промпте (и наоборот — до eng).
+
+    Слияние словарей отложено до языкового пакета §27 (назначения разные); до тех пор
+    синхронность держит этот тест, а не дисциплина — класс «строка в N копиях»
+    подтверждён в проекте четырежды."""
+    from convert.cloud_ocr import CLOUD_LANG_NAMES
+
+    assert set(TESSERACT_LANGS) == set(CLOUD_LANG_NAMES)
