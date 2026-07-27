@@ -1048,6 +1048,23 @@ def test_fetch_from_archive_success(tmp_path: Path, monkeypatch: Any) -> None:
     assert result.retrieved_snapshot_date == dt.date(2022, 8, 6)
 
 
+def test_fetch_from_archive_raises_for_confidential_defense_in_depth(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """spec acquire-convert-seam-hardening §5, В5: next_rung уже маршрутизирует
+    confidential мимо archive (см. test_run_ladder_dead_confidential_raises_blocked_not_dead),
+    но эта функция — единственная в модуле, реально раскрывающая байты третьей
+    стороне (Wayback) — несёт собственный head-guard на случай будущего вызывающего,
+    добравшегося сюда иным путём."""
+    called: list[str] = []
+    monkeypatch.setattr(
+        "acquire.acquisition.find_wayback_snapshot", lambda *a, **kw: called.append("called")
+    )
+    with pytest.raises(RuntimeError, match="confidential"):
+        fetch_from_archive(_rec(sensitivity="confidential"), tmp_path / "doc.pdf", user_agent="test-ua")
+    assert called == []  # ни одного сетевого похода — отказ ДО CDX-запроса
+
+
 def test_fetch_from_archive_raises_when_no_snapshot(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setattr(
         "acquire.acquisition.subprocess.run", lambda cmd, check, capture_output, text: _FakeCompletedProcess("")

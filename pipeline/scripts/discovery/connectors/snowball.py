@@ -849,7 +849,7 @@ def discover_snowball(
             found = extract_printed_urls(md_path, ocr_normalized=ocr_flag)
             per_extractor["printed_urls"] += len(found)
             raw_links.extend((link, "md") for link in found)
-        if cfg.emit.text_citations and rec.sensitivity != schema.Sensitivity.confidential:
+        if cfg.emit.text_citations and schema.external_disclosure_allowed(rec.sensitivity):
             cite_links, cite_leads = extract_text_citations(
                 md_path,
                 doc_id=rec.id,

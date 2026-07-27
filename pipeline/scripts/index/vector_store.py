@@ -237,7 +237,16 @@ def confidential_doc_ids(conn: sqlite3.Connection) -> set[str]:
     такие документы не должны покидать машину через облачный эмбеддинг — тот же
     принцип, что у archive-ступени добычи и перевода. Легаси-БД без таблицы/колонки
     ``doc_facets.sensitivity`` -> пустое множество (не исключение): неизвестность не
-    повод отказывать облачному эмбеддингу того, что раньше про sensitivity не знало."""
+    повод отказывать облачному эмбеддингу того, что раньше про sensitivity не знало.
+
+    Санкционированный ВТОРОЙ (после ``core.schema.external_disclosure_allowed``,
+    spec acquire-convert-seam-hardening §5) источник этой политики: тот предикат
+    берёт ``Sensitivity`` из живой записи, а здесь только строки SQLite (``doc_facets``,
+    записей в руках нет) — слияние невозможно без похода в реестр на каждый ряд.
+    Оба определения обязаны означать одно и то же; guard-тест единого предиката
+    сканирует код вне ``core/schema.py`` на прямое сравнение с
+    ``Sensitivity.confidential`` — эта функция намеренно исключена из скана (SQL-
+    литерал, не атрибут enum)."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
     if "sensitivity" not in cols:
         return set()

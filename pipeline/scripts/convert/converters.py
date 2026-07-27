@@ -251,12 +251,13 @@ def set_cloud_disabled(disabled: bool) -> None:
 
 def cloud_allowed(record: schema.SourceRecord | None) -> bool:
     """Гейты §6 спека convert-cloud-tier — единый предикат для scan-OCR и (позже)
-    figures-VLM: --no-cloud -> sensitivity (ЛАТЕНТНЫЙ режим, один предикат) ->
-    ключ. Порядок — от дешёвой проверки к дорогой (файл .env)."""
+    figures-VLM: --no-cloud -> sensitivity (spec acquire-convert-seam-hardening §5:
+    schema.external_disclosure_allowed, ЕДИНЫЙ предикат политики раскрытия, не
+    только этой функции) -> ключ. Порядок — от дешёвой проверки к дорогой (файл .env)."""
     global _CLOUD_KEY_WARNED
     if _CLOUD_DISABLED:
         return False
-    if record is not None and record.sensitivity is schema.Sensitivity.confidential:
+    if record is not None and not schema.external_disclosure_allowed(record.sensitivity):
         return False
     load_dotenv()
     if not os.environ.get("OPENROUTER_API_KEY"):

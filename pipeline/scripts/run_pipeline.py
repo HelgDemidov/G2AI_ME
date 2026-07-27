@@ -318,7 +318,7 @@ def _maybe_request_snapshot(rec: schema.SourceRecord, state: schema.OperationalS
     исходов. Смена байт raw сбрасывает поле у вызывающей стороны — новая редакция
     получает собственный снимок.
     """
-    if rec.sensitivity is schema.Sensitivity.confidential:
+    if not schema.external_disclosure_allowed(rec.sensitivity):
         return
     if state.fidelity not in _SNAPSHOT_FIDELITIES or state.snapshot_requested is not None:
         return
@@ -848,7 +848,7 @@ def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tupl
                 continue  # облако отработало
             if converters.cloud_allowed(rec):
                 fallback += 1
-            elif rec.sensitivity is schema.Sensitivity.confidential:
+            elif not schema.external_disclosure_allowed(rec.sensitivity):
                 confidential += 1
         except Exception:  # noqa: BLE001 — диагностический проход не должен ронять сводку прогона
             logger.warning("  ⚠ %s: не удалось оценить OCR-фолбэк для сводки", rec.id, exc_info=True)

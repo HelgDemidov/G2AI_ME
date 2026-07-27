@@ -146,6 +146,31 @@ class Sensitivity(str, Enum):
     confidential = "confidential"
 
 
+def external_disclosure_allowed(sensitivity: Sensitivity | None) -> bool:
+    """Единый предикат политики «confidential не раскрывается третьим сторонам»
+    (spec acquire-convert-seam-hardening §5, В5).
+
+    До этого спека политика была реализована 8 независимыми точками ветвления в
+    7 модулях (лестница добычи/SPN×2/облачный OCR-VLM/эмбеддинг×3/snowball-цитаты) —
+    булев близнец класса «строка в N копиях»: новый внешний touchpoint должен САМ
+    вспомнить про гейт, а забытая копия не падает, а молча раскрывает. Единая точка
+    не устраняет необходимость КАЖДОЙ точке её вызвать, но делает нарушение видимым
+    (guard-тест: прямое сравнение с ``Sensitivity.confidential`` вне этого модуля —
+    красный тест).
+
+    ``None`` == ``normal``-семантика (best-effort записи слоя discovery, где
+    ``CandidateRecord.sensitivity`` ещё не финализирован триажем) — раскрытие
+    разрешено, симметрично дефолту ``SourceRecord.sensitivity = Sensitivity.normal``.
+
+    Граница политики (важно для корректного применения): «третья сторона» — любой
+    сервис, НЕ являющийся самим издателем документа (облачный API эмбеддинга/OCR/VLM,
+    Wayback CDX/SavePageNow, LLM-стадия snowball). Условный GET recheck-контура к
+    ОФИЦИАЛЬНОМУ URL издателя этим предикатом НЕ гейтится — третьих сторон там нет
+    (spec post-acquisition-lifecycle §1: confidential сознательно остаётся в
+    ротации (a), в отличие от archive-ступени лестницы и SPN)."""
+    return sensitivity is not Sensitivity.confidential
+
+
 class Rights(str, Enum):
     """Режим прав на переиздание документа (закрытое множество).
 

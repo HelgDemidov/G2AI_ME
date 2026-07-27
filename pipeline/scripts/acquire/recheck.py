@@ -420,7 +420,7 @@ def _recheck_one(
         verdict.finding is not None
         and verdict.finding != previous_finding
         and verdict.finding.startswith("drift:")
-        and rec.sensitivity is not schema.Sensitivity.confidential
+        and schema.external_disclosure_allowed(rec.sensitivity)
     ):
         acquisition.request_snapshot(rec.source_url)
     schema.save_state(state_path, state)

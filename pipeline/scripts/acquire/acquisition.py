@@ -391,7 +391,7 @@ def next_rung(
     if outcome is AcquisitionOutcome.ok:
         return None
     if outcome is AcquisitionOutcome.dead:
-        if sensitivity is schema.Sensitivity.confidential:
+        if not schema.external_disclosure_allowed(sensitivity):
             return schema.AcquisitionMethod.manual
         return schema.AcquisitionMethod.archive
     # blocked
@@ -769,7 +769,15 @@ def fetch_from_archive(rec: schema.SourceRecord, dest: Path, *, user_agent: str,
     """Last rung of the ladder: only ever reached for a confirmed-dead source_url
     (never for a block — see §2/§9; sensitivity=confidential never reaches here,
     ``next_rung`` routes those to manual instead).
+
+    Defense-in-depth guard (spec acquire-convert-seam-hardening §5, В5): routing
+    through ``next_rung`` already excludes confidential records, but this is the
+    ONLY function in the module that actually discloses bytes to a third party
+    (Wayback) — worth a head-guard against a future caller that reaches here by a
+    path other than ``next_rung``, not just documentation of the current one.
     """
+    if not schema.external_disclosure_allowed(rec.sensitivity):
+        raise RuntimeError(f"{rec.id}: archive-ступень недоступна для sensitivity=confidential")
     mimetype = _CDX_MIMETYPE_BY_FORMAT.get(rec.source_format, "application/pdf")
     snapshot = find_wayback_snapshot(rec.source_url, mimetype=mimetype, timeout=timeout)
     if snapshot is None:
