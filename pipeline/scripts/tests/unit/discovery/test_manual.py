@@ -275,6 +275,22 @@ def test_render_worksheet_escapes_pipe_in_unacquirable_row() -> None:
     assert lines[0].count(" | ") == 6  # 7 колонок таблицы unacquirable
 
 
+def test_render_worksheet_flattens_newline_in_cell() -> None:
+    """Найдено живьём на боевом store (2026-07-27): два кандидата ``aiforgood`` несут
+    ``\\n`` внутри ``title`` — титул стандарта ITU-T, перенесённый в исходном каталоге.
+    Строка таблицы разваливалась на ДВЕ физические, что хуже неэкранированного ``|``:
+    тот добавляет колонку, а разрыв строки делает из хвоста ячейки псевдо-строку.
+    Экранировать перевод строки в GFM-таблице нечем — ячейка однострочна по грамматике."""
+    cand = _candidate(title="ITU-T FG-AI4A WG Roadmap:\nStandardization gaps\r\nand roadmap")
+    text = manual.render_worksheet([cand])
+
+    rows = [line for line in text.splitlines() if line.startswith("| ") and line.endswith(" |")]
+    body = [line for line in rows if cand.raw_hash[:12] in line]
+    assert len(body) == 1  # одна физическая строка, а не три
+    assert body[0].count(" | ") == 9  # 10 колонок таблицы pending
+    assert "Standardization gaps" in body[0]  # текст не потерян, только схлопнут
+
+
 # --- authority-map ⊆ vocab_doc_types (spec discovery-acquire-seam-hardening §12) ---
 
 
