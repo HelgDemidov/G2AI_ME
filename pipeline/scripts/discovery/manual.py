@@ -118,16 +118,18 @@ def inject(
     )
 
     existing = store.load(root)
-    fresh, absorbed = dedup.dedup([cand], existing)
-    store.save(existing + fresh, root)
+    outcome = dedup.dedup([cand], existing)
+    store.save(existing + outcome.fresh, root)
 
-    if fresh:
+    if outcome.fresh:
         return cand, True
-    matched = next(
-        (c for c in existing if (c.normalized_url, c.supersedes) == (normalized, supersedes)), None
-    )
-    assert absorbed  # dedup гарантирует: не fresh -> поглощён кем-то из existing
-    return matched or cand, False
+    # spec discovery-acquire-seam-hardening §5, Г4: поглотитель берётся из
+    # absorptions (реальный, любой из трёх стратегий) — не поиском по URL-паре,
+    # который находил бы None и при поглощении стратегией 2/3 давал куратору
+    # ложное «уже есть» без причины отказа.
+    assert outcome.absorptions  # dedup гарантирует: не fresh -> поглощён кем-то из existing
+    _, absorber = outcome.absorptions[0]
+    return absorber, False
 
 
 def registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
@@ -331,17 +333,21 @@ def render_worksheet(
         )
     if unacquirable:
         lines.append(_UNACQUIRABLE_SECTION_HEADER)
-        lines.append("| raw_hash | title | issuer | probe_checked | probe_finding | source_url |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append(
+            "| raw_hash | title | issuer | probe_checked | probe_finding | source_url | alternate_urls |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
         for cand in unacquirable:
+            alternates = ", ".join(getattr(cand, "alternate_source_urls", None) or [])
             lines.append(
-                "| {} | {} | {} | {} | {} | {} |".format(
+                "| {} | {} | {} | {} | {} | {} | {} |".format(
                     cand.raw_hash[:12],
                     cand.title or "",
                     cand.issuer or "",
                     cand.probe_checked.isoformat() if cand.probe_checked else "—",
                     cand.probe_finding or "—",
                     cand.source_url or "",
+                    alternates or "—",
                 )
             )
     return "\n".join(lines) + "\n"

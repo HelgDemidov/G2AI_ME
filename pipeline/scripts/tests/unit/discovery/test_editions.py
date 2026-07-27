@@ -73,10 +73,10 @@ def test_edition_not_absorbed_by_predecessor_candidate_same_url() -> None:
     predecessor_cand = _candidate(raw_hash="p" * 64)
     edition = _candidate(raw_hash="e" * 64, supersedes="sg-imda-mgf-agentic-2026")
 
-    fresh, absorbed = dedup([edition], existing=[predecessor_cand])
+    outcome = dedup([edition], existing=[predecessor_cand])
 
-    assert fresh == [edition]
-    assert absorbed == 0
+    assert outcome.fresh == [edition]
+    assert outcome.absorbed == 0
 
 
 def test_edition_not_absorbed_by_match_key_strategy() -> None:
@@ -88,10 +88,10 @@ def test_edition_not_absorbed_by_match_key_strategy() -> None:
         raw_hash="e" * 64, normalized_url=None, doc_date=same_date, supersedes="sg-imda-mgf-agentic-2026"
     )
 
-    fresh, absorbed = dedup([edition], existing=[predecessor_cand])
+    outcome = dedup([edition], existing=[predecessor_cand])
 
-    assert fresh == [edition]
-    assert absorbed == 0
+    assert outcome.fresh == [edition]
+    assert outcome.absorbed == 0
 
 
 def test_edition_not_absorbed_by_content_hash_strategy() -> None:
@@ -101,10 +101,10 @@ def test_edition_not_absorbed_by_content_hash_strategy() -> None:
         supersedes="sg-imda-mgf-agentic-2026",
     )
 
-    fresh, absorbed = dedup([edition], existing=[predecessor_cand])
+    outcome = dedup([edition], existing=[predecessor_cand])
 
-    assert fresh == [edition]
-    assert absorbed == 0
+    assert outcome.fresh == [edition]
+    assert outcome.absorbed == 0
 
 
 def test_same_edition_twice_is_still_deduplicated() -> None:
@@ -114,10 +114,10 @@ def test_same_edition_twice_is_still_deduplicated() -> None:
         connector_id="search:wb", raw_hash="f" * 64, supersedes="sg-imda-mgf-agentic-2026"
     )
 
-    fresh, absorbed = dedup([second], existing=[first])
+    outcome = dedup([second], existing=[first])
 
-    assert fresh == []
-    assert absorbed == 1
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
 
 
 def test_rejected_edition_is_not_resurrected() -> None:
@@ -129,10 +129,10 @@ def test_rejected_edition_is_not_resurrected() -> None:
         connector_id="search:wb", raw_hash="f" * 64, supersedes="sg-imda-mgf-agentic-2026"
     )
 
-    fresh, absorbed = dedup([again], existing=[rejected])
+    outcome = dedup([again], existing=[rejected])
 
-    assert fresh == []
-    assert absorbed == 1
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
 
 
 # --- inject: валидация предшественника ------------------------------------------------

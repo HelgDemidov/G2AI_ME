@@ -73,9 +73,9 @@ def test_normalized_title_diacritics_preserved_as_letters() -> None:
 def test_dedup_no_duplicates_passthrough() -> None:
     a = _candidate(raw_hash="ha", title="Doc A", issuer="Gov")
     b = _candidate(raw_hash="hb", title="Doc B", issuer="Gov")
-    fresh, absorbed = dedup([a, b], existing=[])
-    assert fresh == [a, b]
-    assert absorbed == 0
+    outcome = dedup([a, b], existing=[])
+    assert outcome.fresh == [a, b]
+    assert outcome.absorbed == 0
 
 
 def test_dedup_matches_by_normalized_url_against_existing() -> None:
@@ -87,9 +87,9 @@ def test_dedup_matches_by_normalized_url_against_existing() -> None:
         connector_id="manual", raw_hash="hb",
         normalized_url=normalize_url("http://EXAMPLE.gov/doc/"),
     )
-    fresh, absorbed = dedup([new_cand], existing=[existing_cand])
-    assert fresh == []
-    assert absorbed == 1
+    outcome = dedup([new_cand], existing=[existing_cand])
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
     assert existing_cand.merged_connector_ids == ["manual"]  # type: ignore[attr-defined]
 
 
@@ -102,9 +102,9 @@ def test_dedup_matches_by_issuer_title_date_when_no_url_key() -> None:
         connector_id="manual", raw_hash="hb",
         title="ai-governance framework", issuer="MinDigital", doc_date=dt.date(2026, 1, 1),
     )
-    fresh, absorbed = dedup([new_cand], existing=[existing_cand])
-    assert fresh == []
-    assert absorbed == 1
+    outcome = dedup([new_cand], existing=[existing_cand])
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
 
 
 def test_dedup_rejected_existing_not_resurrected() -> None:
@@ -118,9 +118,9 @@ def test_dedup_rejected_existing_not_resurrected() -> None:
         connector_id="manual", raw_hash="hb",
         normalized_url=normalize_url("https://example.gov/doc"),
     )
-    fresh, absorbed = dedup([new_cand], existing=[rejected])
-    assert fresh == []
-    assert absorbed == 1
+    outcome = dedup([new_cand], existing=[rejected])
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
     assert rejected.rejected_reason == "вне обеих осей"  # неприкосновенно
 
 
@@ -140,9 +140,9 @@ def test_dedup_within_new_batch_first_wins() -> None:
         connector_id="search:test",
         raw_hash="hb", title="same doc", issuer="Gov",
     )
-    fresh, absorbed = dedup([a, b], existing=[])
-    assert fresh == [a]
-    assert absorbed == 1
+    outcome = dedup([a, b], existing=[])
+    assert outcome.fresh == [a]
+    assert outcome.absorbed == 1
     assert a.merged_connector_ids == ["search:test"]  # type: ignore[attr-defined]
 
 
@@ -156,18 +156,96 @@ def test_dedup_same_connector_rediscovery_does_not_self_reference() -> None:
         connector_id="agora", raw_hash="hb",
         normalized_url=normalize_url("https://example.gov/doc"),
     )
-    fresh, absorbed = dedup([dup_same_connector], existing=[existing_cand])
-    assert fresh == []
-    assert absorbed == 1
+    outcome = dedup([dup_same_connector], existing=[existing_cand])
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
     assert getattr(existing_cand, "merged_connector_ids", None) is None
 
 
 def test_dedup_content_hash_fallback_when_no_url_or_title() -> None:
     existing_cand = _candidate(raw_hash="ha", content_hash="deadbeef")
     dup = _candidate(connector_id="agora", raw_hash="hb", content_hash="deadbeef")
-    fresh, absorbed = dedup([dup], existing=[existing_cand])
-    assert fresh == []
-    assert absorbed == 1
+    outcome = dedup([dup], existing=[existing_cand])
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
+
+
+# --- DedupOutcome.absorptions / alternate_source_urls (spec discovery-acquire-
+# seam-hardening §5, Г4) ---
+
+
+def test_dedup_absorptions_pairs_dup_with_real_absorber() -> None:
+    """``absorptions`` несёт пары (дубль, поглотитель) — честный ответ вызывающей
+    стороне (``inject``), а не только счётчик."""
+    existing_cand = _candidate(
+        connector_id="agora", raw_hash="ha",
+        normalized_url=normalize_url("https://example.gov/doc"),
+    )
+    dup = _candidate(
+        connector_id="manual", raw_hash="hb",
+        normalized_url=normalize_url("https://example.gov/doc"),
+    )
+    outcome = dedup([dup], existing=[existing_cand])
+    assert outcome.absorptions == [(dup, existing_cand)]
+
+
+def test_merge_provenance_accumulates_alternate_source_url_on_mismatch() -> None:
+    """Живой сценарий (Г4): зеркало WAF-заблокированного первоисточника поглощается
+    стратегией issuer+title+date — рабочий URL зеркала не должен теряться."""
+    existing_cand = _candidate(
+        connector_id="agora", raw_hash="ha",
+        title="AI Governance Framework", issuer="MinDigital", doc_date=dt.date(2026, 1, 1),
+        source_url="https://blocked.gov/doc.pdf",
+        normalized_url=normalize_url("https://blocked.gov/doc.pdf"),
+    )
+    mirror = _candidate(
+        connector_id="manual", raw_hash="hb",
+        title="ai-governance framework", issuer="MinDigital", doc_date=dt.date(2026, 1, 1),
+        source_url="https://mirror.example.org/doc.pdf",
+        normalized_url=normalize_url("https://mirror.example.org/doc.pdf"),
+    )
+    dedup([mirror], existing=[existing_cand])
+    assert existing_cand.alternate_source_urls == ["https://mirror.example.org/doc.pdf"]  # type: ignore[attr-defined]
+
+
+def test_merge_provenance_no_alternate_when_url_matches() -> None:
+    """Поглощение по самому URL (стратегия 1) — дубль и поглотитель уже несут ОДИН
+    URL, копить его же в alternate_source_urls незачем."""
+    existing_cand = _candidate(
+        connector_id="agora", raw_hash="ha",
+        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
+    )
+    dup = _candidate(
+        connector_id="manual", raw_hash="hb",
+        normalized_url=normalize_url("http://EXAMPLE.gov/doc/"),
+        source_url="http://EXAMPLE.gov/doc/",
+    )
+    dedup([dup], existing=[existing_cand])
+    assert getattr(existing_cand, "alternate_source_urls", None) is None
+
+
+def test_merge_provenance_deduplicates_repeated_alternate_url() -> None:
+    existing_cand = _candidate(
+        connector_id="agora", raw_hash="ha",
+        title="Doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
+        source_url="https://blocked.gov/doc.pdf",
+        normalized_url=normalize_url("https://blocked.gov/doc.pdf"),
+    )
+    mirror_a = _candidate(
+        connector_id="manual", raw_hash="hb",
+        title="doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
+        source_url="https://mirror.example.org/doc.pdf",
+        normalized_url=normalize_url("https://mirror.example.org/doc.pdf"),
+    )
+    mirror_b = _candidate(
+        connector_id="search:x", raw_hash="hc",
+        title="doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
+        source_url="https://mirror.example.org/doc.pdf",
+        normalized_url=normalize_url("https://mirror.example.org/doc.pdf"),
+    )
+    dedup([mirror_a, mirror_b], existing=[existing_cand])
+    assert existing_cand.alternate_source_urls == ["https://mirror.example.org/doc.pdf"]  # type: ignore[attr-defined]
 
 
 def test_dedup_candidate_without_any_key_is_never_absorbed() -> None:
@@ -185,7 +263,7 @@ def test_dedup_candidate_without_any_key_is_never_absorbed() -> None:
     keyless = _candidate(raw_hash="ha")
     twin = _candidate(connector_id="agora", raw_hash="hb")
 
-    fresh, absorbed = dedup([twin], existing=[keyless])
+    outcome = dedup([twin], existing=[keyless])
 
-    assert fresh == [twin]
-    assert absorbed == 0
+    assert outcome.fresh == [twin]
+    assert outcome.absorbed == 0

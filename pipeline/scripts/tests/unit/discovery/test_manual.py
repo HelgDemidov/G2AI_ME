@@ -123,6 +123,36 @@ def test_inject_normalizes_url_for_dedup(tmp_path: Path) -> None:
     assert is_new2 is False
 
 
+def test_inject_mirror_absorbed_by_strategy_two_reports_real_absorber_and_reason(
+    tmp_path: Path,
+) -> None:
+    """Регресс репро D аудита (spec discovery-acquire-seam-hardening §5, Г4): дубль
+    поглощён стратегией 2 (issuer+title+date), а НЕ по URL-паре — старый код искал
+    поглотителя ТОЛЬКО по ``(normalized_url, supersedes)``, находил ``None`` и
+    возвращал СВЕЖЕГО кандидата; куратор видел «уже есть» без причины отказа, даже
+    не узнавая, что попал в отклонённого. URL зеркала при этом должен осесть в
+    ``alternate_source_urls`` поглотителя (Г4 — не теряться нигде)."""
+    manual.inject(
+        url="https://blocked.gov/law.pdf", title="Registration Law",
+        issuer="Ministry", language="en", date=dt.date(2026, 1, 1), root=tmp_path,
+    )
+    all_cands = store.load(tmp_path)
+    all_cands[0].rejected_reason = "WAF blocks every rung"
+    all_cands[0].rejected_kind = schema.RejectionKind.unacquirable
+    store.save(all_cands, tmp_path)
+
+    mirror_cand, is_new = manual.inject(
+        url="https://mirror.example.org/law.pdf", title="registration law",
+        issuer="Ministry", language="en", date=dt.date(2026, 1, 1), root=tmp_path,
+    )
+
+    assert is_new is False
+    assert mirror_cand.rejected_reason == "WAF blocks every rung"  # реальный поглотитель, не свежий
+    assert mirror_cand.raw_hash == all_cands[0].raw_hash
+    absorber = store.load(tmp_path)[0]
+    assert absorber.alternate_source_urls == ["https://mirror.example.org/law.pdf"]  # type: ignore[attr-defined]
+
+
 # --- pending_candidates / render_worksheet (spec §3) ---
 
 

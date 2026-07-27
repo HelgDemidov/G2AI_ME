@@ -140,6 +140,22 @@ def test_worksheet_omits_section_when_nothing_waits() -> None:
     assert "Недобываемые" not in manual.render_worksheet([], [])
 
 
+def test_worksheet_renders_alternate_urls_column() -> None:
+    """spec discovery-acquire-seam-hardening §5, Г4: накопленные зеркала видны
+    куратору в worksheet — revive + правка URL остаются его руками."""
+    cand = _cand("aa" + "1" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
+    cand.alternate_source_urls = ["https://mirror.example.org/law.pdf"]  # type: ignore[attr-defined]
+    text = manual.render_worksheet([], [cand])
+    assert "alternate_urls" in text
+    assert "https://mirror.example.org/law.pdf" in text
+
+
+def test_worksheet_alternate_urls_column_shows_dash_when_absent() -> None:
+    cand = _cand("bb" + "1" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
+    text = manual.render_worksheet([], [cand])
+    assert "alternate_urls" in text
+
+
 def test_unacquirable_stays_out_of_pending() -> None:
     """Секции не пересекаются: недобываемый отклонён, значит в ждущих его нет."""
     cand = _cand("6" * 64, rejected_reason="WAF", rejected_kind="unacquirable")

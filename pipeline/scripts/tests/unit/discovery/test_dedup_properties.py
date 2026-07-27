@@ -48,10 +48,10 @@ def _oracle_find(
 
 def _oracle_dedup(
     new: list[schema.CandidateRecord], existing: list[schema.CandidateRecord]
-) -> tuple[list[schema.CandidateRecord], int]:
+) -> tuple[list[schema.CandidateRecord], int, list[tuple[schema.CandidateRecord, schema.CandidateRecord]]]:
     pool = list(existing)
     fresh: list[schema.CandidateRecord] = []
-    absorbed = 0
+    absorptions: list[tuple[schema.CandidateRecord, schema.CandidateRecord]] = []
     for cand in new:
         match = _oracle_find(cand, pool)
         if match is not None:
@@ -59,11 +59,11 @@ def _oracle_dedup(
             if cand.connector_id != match.connector_id and cand.connector_id not in merged:
                 merged.append(cand.connector_id)
                 match.merged_connector_ids = merged  # type: ignore[attr-defined]
-            absorbed += 1
+            absorptions.append((cand, match))
             continue
         fresh.append(cand)
         pool.append(cand)
-    return fresh, absorbed
+    return fresh, len(absorptions), absorptions
 
 
 # --- генерация пулов с частыми коллизиями --------------------------------------------
@@ -131,19 +131,24 @@ def test_index_dedup_matches_naive_oracle(
     pools: tuple[list[schema.CandidateRecord], list[schema.CandidateRecord]],
 ) -> None:
     """Полное совпадение наблюдаемого поведения: какие кандидаты свежие, сколько
-    поглощено И КОМУ достался провенанс поглощённого (цель merge — часть семантики)."""
+    поглощено, КОМУ достался провенанс поглощённого (цель merge — часть семантики)
+    И какие именно пары (дубль, поглотитель) несёт ``DedupOutcome.absorptions``
+    (spec discovery-acquire-seam-hardening §5, Г4 — не только счётчик)."""
     existing, new = pools
 
     prod_existing, prod_new = _clone(existing), _clone(new)
     oracle_existing, oracle_new = _clone(existing), _clone(new)
 
-    prod_fresh, prod_absorbed = dedup(prod_new, prod_existing)
-    oracle_fresh, oracle_absorbed = _oracle_dedup(oracle_new, oracle_existing)
+    outcome = dedup(prod_new, prod_existing)
+    oracle_fresh, oracle_absorbed, oracle_absorptions = _oracle_dedup(oracle_new, oracle_existing)
 
-    assert [c.raw_hash for c in prod_fresh] == [c.raw_hash for c in oracle_fresh]
-    assert prod_absorbed == oracle_absorbed
+    assert [c.raw_hash for c in outcome.fresh] == [c.raw_hash for c in oracle_fresh]
+    assert outcome.absorbed == oracle_absorbed
     assert _provenance(prod_existing) == _provenance(oracle_existing)
     assert _provenance(prod_new) == _provenance(oracle_new)
+    assert [(dup.raw_hash, absorber.raw_hash) for dup, absorber in outcome.absorptions] == [
+        (dup.raw_hash, absorber.raw_hash) for dup, absorber in oracle_absorptions
+    ]
 
 
 @given(pools=_pools())
@@ -156,10 +161,10 @@ def test_dedup_invariants_hold(
     existing, new = pools
     prod_existing, prod_new = _clone(existing), _clone(new)
 
-    fresh, absorbed = dedup(prod_new, prod_existing)
+    outcome = dedup(prod_new, prod_existing)
 
-    assert absorbed + len(fresh) == len(prod_new)
-    fresh_hashes = [c.raw_hash for c in fresh]
+    assert outcome.absorbed + len(outcome.fresh) == len(prod_new)
+    fresh_hashes = [c.raw_hash for c in outcome.fresh]
     assert len(fresh_hashes) == len(set(fresh_hashes))
     assert set(fresh_hashes) <= {c.raw_hash for c in prod_new}
     # ни одна existing-запись не потеряла/сменила rejected_reason
@@ -181,11 +186,12 @@ def test_dedup_is_idempotent_against_persisted_pool(
     existing, new = pools
     prod_existing, prod_new = _clone(existing), _clone(new)
 
-    fresh, _ = dedup(prod_new, prod_existing)
+    outcome = dedup(prod_new, prod_existing)
+    fresh = outcome.fresh
     persisted = prod_existing + fresh
 
-    again_fresh, again_absorbed = dedup(_clone(fresh), persisted)
+    again = dedup(_clone(fresh), persisted)
 
     keyless = [c.raw_hash for c in fresh if not _has_dedup_key(c)]
-    assert [c.raw_hash for c in again_fresh] == keyless
-    assert again_absorbed == len(fresh) - len(keyless)
+    assert [c.raw_hash for c in again.fresh] == keyless
+    assert again.absorbed == len(fresh) - len(keyless)
