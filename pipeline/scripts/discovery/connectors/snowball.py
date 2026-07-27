@@ -34,8 +34,7 @@ import pdfplumber
 import yaml
 from lxml import html as lxml_html
 
-from convert.converters import was_ocr_normalized
-from core import fsio, openrouter, schema
+from core import fsio, openrouter, pdfmeta, schema
 from core.env import REPO_ROOT
 from discovery import registry, store
 from discovery.base import ConnectorCursor, DiscoverResult
@@ -328,7 +327,7 @@ def extract_printed_urls(doc_md_path: Path, *, ocr_normalized: bool = False) -> 
     форматы (pdf/html/docx/xlsx) и единственный канал для сканов (аннотаций нет, текст —
     единственный носитель). Контекст — строка doc.md с находкой (её же вызывающая сторона
     урезает до ``CANDIDATE_SUMMARY_MAX`` при маппинге, коммит 4). ``ocr_normalized`` —
-    решение вызывающей стороны (``converters.was_ocr_normalized(raw_path)``, читается
+    решение вызывающей стороны (``pdfmeta.was_ocr_normalized(raw_path)``, читается
     один раз на документ, не здесь) -> помечает КАЖДУЮ находку этого документа
     ``ocr_text_url=True`` (известный класс OCR-искажений цифр/диакритики)."""
     text = doc_md_path.read_text(encoding="utf-8")
@@ -845,7 +844,7 @@ def discover_snowball(
             per_extractor["html_hrefs"] += len(found)
             raw_links.extend((link, "html") for link in found)
         if cfg.emit.printed_urls:
-            ocr_flag = raw_path.suffix == ".pdf" and was_ocr_normalized(raw_path)
+            ocr_flag = raw_path.suffix == ".pdf" and pdfmeta.was_ocr_normalized(raw_path)
             found = extract_printed_urls(md_path, ocr_normalized=ocr_flag)
             per_extractor["printed_urls"] += len(found)
             raw_links.extend((link, "md") for link in found)

@@ -25,7 +25,7 @@ import pdfplumber
 
 from convert import cloud_ocr, html_preprocess, ocr_headings, zipsafe
 from convert.pdf_to_markdown import convert as pdf_convert
-from core import fsio, schema
+from core import fsio, pdfmeta, schema
 from core.env import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -89,25 +89,14 @@ def _detect_scan(raw: Path) -> None:
         )
 
 
-def _was_ocr_normalized(raw: Path) -> bool:
-    """PDF уже прошёл OCR-нормализацию РАНЬШЕ (по метаданным ocrmypdf).
-
-    `_ocr_normalize` мутирует `raw` in-place (один файл, не сайдкар) — после первого
-    успеха текст-слой уже есть, и `_detect_scan` больше НЕ поднимет `NeedsOCR` на
-    повторных конвертациях (`--force`, бамп версии конвертера). Без этой проверки
-    `ocr_headings` перестал бы применяться после первого прогона — метаданные ocrmypdf
-    (`Creator: ocrmypdf ...`) переживают мутацию текст-слоя и остаются надёжным маркером.
-    """
-    with pdfplumber.open(raw) as pdf:
-        creator = (pdf.metadata.get("Creator") or "").lower()
-    return "ocrmypdf" in creator
-
-
-def was_ocr_normalized(raw: Path) -> bool:
-    """Публичный алиас `_was_ocr_normalized` — потребители вне convert-слоя (напр.
-    discovery-snowball §2.3: пометка `ocr-text-url` для URL, извлечённых из OCR-текста,
-    подверженного искажению цифр/диакритики) читают этот факт, не дублируя логику."""
-    return _was_ocr_normalized(raw)
+# Реализация переехала в core/pdfmeta.py (spec discovery-acquire-seam-hardening §1):
+# слои ВЫШЕ convert (acquire/recheck.py, discovery/connectors/snowball.py) читали её
+# инверсией зависимости — core легален для обоих. Оба прежних имени реэкспортируются
+# как алиасы на ту же функцию (тождество, не копия) — внешний контракт convert-слоя
+# не меняется; `_was_ocr_normalized` — только ради единственного внутреннего
+# потребителя ниже (`_convert_pdf`), чтобы диff этого модуля был минимален.
+was_ocr_normalized = pdfmeta.was_ocr_normalized
+_was_ocr_normalized = pdfmeta.was_ocr_normalized
 
 
 # rec.language (schema.py: ISO 639-1, либо 639-3 где нет 639-1, напр. cnr) -> tesseract langcode.

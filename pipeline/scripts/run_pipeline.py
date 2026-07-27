@@ -48,6 +48,7 @@ from convert import cloud_ocr, converters, figures_vlm, lint
 from graph import build_graph
 from index import corpus_index
 from core import fsio
+from core import pdfmeta
 from core import schema
 from core import validate_sources
 from core.env import load_dotenv
@@ -968,9 +969,9 @@ def _report_unembedded(db_path: Path, backend: str) -> None:
 def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tuple[int, int]:
     """``(n_fallback, n_confidential)`` среди ОТСКАНИРОВАННЫХ документов без
     успешного облачного OCR (spec ocr-eval-harness §8.3, S5). Скан определяется
-    метаданными ocrmypdf (``converters.was_ocr_normalized`` — та же проверка,
-    что ветвит ``_convert_pdf``, публичный алиас: эта функция вне convert-слоя, spec
-    acquire-convert-seam-hardening §10, В13), не повторной детекцией ``NeedsOCR``.
+    метаданными ocrmypdf (``pdfmeta.was_ocr_normalized`` — та же проверка,
+    что ветвит ``_convert_pdf``, spec discovery-acquire-seam-hardening §1: единая
+    точка для всех потребителей вне convert-слоя), не повторной детекцией ``NeedsOCR``.
     OCR-путь существует только для PDF (``rec.source_format`` — курируемый источник
     истины, не переоткрытие по расширению файла) — живой прогон на реальном
     корпусе поймал `PdfminerException` на `eu-ai-act-2024` (raw.html) ДО того,
@@ -1005,7 +1006,7 @@ def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tupl
             raw = schema.raw_file(rec, root)
             if raw is None or not raw.exists() or raw.suffix.lower() != ".pdf":
                 continue  # born-digital/ещё не сконвертирован/рассинхрон формата — не скан
-            if not converters.was_ocr_normalized(raw):
+            if not pdfmeta.was_ocr_normalized(raw):
                 continue  # born-digital — не скан
             state = schema.load_state(schema.state_file(rec, root))
             if state.cloud_ocr_model is not None:

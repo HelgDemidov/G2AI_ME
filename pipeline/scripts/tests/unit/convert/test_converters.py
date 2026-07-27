@@ -31,9 +31,7 @@ from convert.converters import (
     _docx_referenced_media_ids,
     _ocr_normalize,
     _tesseract_langs,
-    _was_ocr_normalized,
     resolve_converter,
-    was_ocr_normalized,
 )
 from core import fsio, schema
 from core.schema import SourceRecord
@@ -794,32 +792,10 @@ def test_detect_scan_none_extract_text_treated_as_empty(monkeypatch: Any, tmp_pa
         _detect_scan(tmp_path / "raw.pdf")
 
 
-# --- _was_ocr_normalized: метка ocrmypdf в метаданных переживает мутацию raw ---
-
-
-def test_was_ocr_normalized_true_when_creator_mentions_ocrmypdf(monkeypatch: Any, tmp_path: Path) -> None:
-    _patch_open(monkeypatch, [], metadata={"Creator": "ocrmypdf 15.2.0+dfsg1 / Tesseract OCR-PDF 5.3.4"})
-    assert _was_ocr_normalized(tmp_path / "raw.pdf") is True
-
-
-def test_was_ocr_normalized_false_for_born_digital_pdf(monkeypatch: Any, tmp_path: Path) -> None:
-    _patch_open(monkeypatch, [], metadata={"Creator": "Microsoft® Word 2019"})
-    assert _was_ocr_normalized(tmp_path / "raw.pdf") is False
-
-
-def test_was_ocr_normalized_false_when_no_metadata_at_all(monkeypatch: Any, tmp_path: Path) -> None:
-    _patch_open(monkeypatch, [])  # metadata=None -> {}
-    assert _was_ocr_normalized(tmp_path / "raw.pdf") is False
-
-
-def test_public_was_ocr_normalized_alias_matches_private(monkeypatch: Any, tmp_path: Path) -> None:
-    """Публичный алиас (discovery-snowball §2.3: потребитель вне convert-слоя) должен
-    давать ИДЕНТИЧНЫЙ результат приватной реализации на одном и том же входе — иначе
-    рефактор одной из двух функций разошёлся бы незамеченным."""
-    _patch_open(monkeypatch, [], metadata={"Creator": "ocrmypdf 15.2.0"})
-    raw = tmp_path / "raw.pdf"
-    assert was_ocr_normalized(raw) is True
-    assert was_ocr_normalized(raw) == _was_ocr_normalized(raw)
+# Поведенческие тесты `was_ocr_normalized` переехали в tests/unit/core/test_pdfmeta.py
+# (spec discovery-acquire-seam-hardening §1 — реализация переехала в core/pdfmeta.py);
+# тождество реэкспорта `converters.was_ocr_normalized is pdfmeta.was_ocr_normalized`
+# проверяется там же.
 
 
 def test_convert_pdf_calls_pdf_convert_only_after_scan_check(monkeypatch: Any, tmp_path: Path) -> None:

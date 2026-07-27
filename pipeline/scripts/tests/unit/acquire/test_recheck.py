@@ -215,22 +215,18 @@ def test_deep_baseline_prefers_original_sha256(tmp_path: Path) -> None:
 
 
 def test_deep_baseline_falls_back_to_sha_for_born_digital(tmp_path: Path, monkeypatch: Any) -> None:
-    from convert import converters
-
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 born digital")
-    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr("core.pdfmeta.was_ocr_normalized", lambda raw: False)
     assert recheck.deep_baseline(rec, tmp_path, _state()) == "a" * 64
 
 
 def test_deep_baseline_is_none_for_ocr_normalized_scan(tmp_path: Path, monkeypatch: Any) -> None:
     """sha256 такого raw описывает файл ПОСЛЕ вшивания текст-слоя — сравнивать ответ
     издателя с ним значило бы объявлять drift на каждом прогоне."""
-    from convert import converters
-
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 scanned")
-    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("core.pdfmeta.was_ocr_normalized", lambda raw: True)
     assert recheck.deep_baseline(rec, tmp_path, _state()) is None
 
 
