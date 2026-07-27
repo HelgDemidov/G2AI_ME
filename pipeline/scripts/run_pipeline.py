@@ -406,6 +406,14 @@ def _do_download(
     state.etag_confirms = 0
     if state.sha256 != previous_sha:
         state.snapshot_requested = None  # другие байты = другая редакция -> нужен новый снимок
+        # Фиксити переустанавливается, не наследуется (spec acquire-convert-seam-hardening
+        # §2, В2; PREMIS-практика): original_sha256 существует ТОЛЬКО как хэш издательского
+        # оригинала ДО OCR-мутации (см. converters._capture_original_sha256). Свежескачанный
+        # raw САМ есть новый издательский оригинал — прежнее значение (хэш ПРЕЖНЕЙ редакции)
+        # без сброса навсегда врало бы --recheck-deep вечным ложным drift'ом на наших же
+        # байтах (живой репро аудита). Следующая OCR-нормализация (если нужна) перезахватит
+        # честно — once-if-None в _capture_original_sha256 не мешает: поле уже None.
+        state.original_sha256 = None
     state.acquisition_failed = None      # добыли — backoff снят (§5)
     state.acquisition_failure_reason = None
     # Передобыча — ОДИН из двух человеческих путей разрешения дрейфа (§6): раз новые

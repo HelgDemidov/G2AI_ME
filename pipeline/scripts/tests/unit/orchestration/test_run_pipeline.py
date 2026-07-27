@@ -642,6 +642,83 @@ def test_do_download_snapshot_refires_when_bytes_changed(tmp_path: Path, monkeyp
     assert calls == [rec.source_url, rec.source_url]
 
 
+def test_do_download_resets_original_sha256_when_bytes_change(tmp_path: Path, monkeypatch: Any) -> None:
+    """spec acquire-convert-seam-hardening §2, В2 — живой репро аудита (docs/pipeline/audit/
+    acquire_convert_seam_review_2026-07-27.md, репро B): original_sha256 захватывается
+    ТОЛЬКО once-if-None (converters._capture_original_sha256) и раньше не сбрасывался
+    передобычей вовсе — после --force --only (путь, который сам recheck рекомендует для
+    drift) поле навсегда несло хэш ПРЕЖНЕЙ редакции, --recheck-deep врал бы вечным drift
+    даже на наших же байтах. Свежескачанный raw сам есть новый издательский оригинал —
+    поле обязано сброситься в None (перезахватится честно при следующей OCR-нормализации)."""
+    rec = make()
+    _place(rec, tmp_path, state={"original_sha256": "a" * 64})  # хэш от прежнего скана-редакции
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=b"%PDF-1.4 new edition bytes",
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert schema.load_state(schema.state_file(rec, tmp_path)).original_sha256 is None
+
+
+def test_do_download_preserves_original_sha256_when_bytes_unchanged(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Обратная сторона: --force на ТЕХ ЖЕ байтах (sha256 совпал с previous_sha) не
+    должен сбрасывать original_sha256 — нечего перезахватывать, поле остаётся валидным."""
+    rec = make()
+    body = b"%PDF-1.4 same bytes"
+    _place(rec, tmp_path, state={"original_sha256": "b" * 64, "sha256": hashlib.sha256(body).hexdigest()})
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=body,
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert schema.load_state(schema.state_file(rec, tmp_path)).original_sha256 == "b" * 64
+
+
+def test_do_download_reset_unblocks_deep_baseline_from_stale_edition(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Сквозной регресс репро B: до фикса --recheck-deep после передобычи сравнивал бы
+    ответ издателя со СТАРЫМ original_sha256 (edition1) и получал бы вечный ложный
+    drift даже на наших же байтах (edition2). После сброса в _do_download
+    recheck.deep_baseline честно падает на sha ТЕКУЩЕГО (ещё не OCR-нормализованного)
+    raw — свежую редакцию, а не хвост от предыдущей."""
+    from acquire import recheck
+
+    rec = make()
+    _place(rec, tmp_path, state={"original_sha256": "1" * 64})  # хэш прежней (edition1) редакции
+    new_body = b"%PDF-1.4 edition-2 corrected publisher bytes"
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=new_body,
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    # deep_baseline открывает raw через pdfplumber, только если original_sha256 уже None
+    # (первая ветка функции) — фейковые байты не обязаны быть валидным PDF, born-digital
+    # путь детерминируется явным патчем, тем же приёмом, что test_deep_baseline_falls_back_to_sha_for_born_digital.
+    monkeypatch.setattr("convert.converters._was_ocr_normalized", lambda raw: False)
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    baseline = recheck.deep_baseline(rec, tmp_path, state)
+    assert baseline == hashlib.sha256(new_body).hexdigest()  # НЕ протухший edition1-хэш
+    assert baseline == state.sha256
+
+
 def test_do_download_survives_snapshot_failure(tmp_path: Path, monkeypatch: Any) -> None:
     """Отказ SPN — WARNING, не ошибка документа: страховка не может ронять добычу.
     Дата всё равно пишется (по факту ПОПЫТКИ) — иначе отказавший сервис долбился бы
