@@ -472,9 +472,25 @@ def md_file(rec: SourceRecord, root: Path) -> Path:
     return doc_dir(rec, root) / "doc.md"
 
 
+STATE_SIDECAR_NAME = ".state.yaml"
+"""Имя пер-документного операционного сайдкара — единственное определение (spec
+acquire-convert-seam-hardening §1/В12): до этого спека литерал жил в 3 копиях
+(здесь + ``convert/converters.py`` дважды), и расхождение при смене раскладки не
+падало бы, а тихо читало ПУСТОЕ состояние (``load_state`` несуществующего пути
+честно возвращает ``OperationalState()``) — конвертер решил бы, что кэш невалиден,
+и заново заплатил бы за облачный вызов."""
+
+
 def state_file(rec: SourceRecord, root: Path) -> Path:
     """Операционный sidecar: ``<doc_dir>/.state.yaml``."""
-    return doc_dir(rec, root) / ".state.yaml"
+    return doc_dir(rec, root) / STATE_SIDECAR_NAME
+
+
+def state_file_for_raw(raw: Path) -> Path:
+    """Тот же сайдкар, адресованный от пути ``raw.*`` — для точек convert-слоя,
+    у которых есть только файл raw, без записи/корня (``converters._capture_original_sha256``/
+    ``_cached_or_call_cloud``/``_ocr_normalize``)."""
+    return raw.parent / STATE_SIDECAR_NAME
 
 
 STATE_DIRNAME = ".state"

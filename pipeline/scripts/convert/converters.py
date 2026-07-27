@@ -166,7 +166,7 @@ def _capture_original_sha256(raw: Path) -> None:
     (`--force`/бамп версии конвертера) уже мутированного raw не должна затереть
     РАНЕЕ захваченный оригинальный хэш пересчитанным от файла, который сам уже
     не оригинал."""
-    state_path = raw.parent / ".state.yaml"
+    state_path = schema.state_file_for_raw(raw)
     state = schema.load_state(state_path)
     if state.original_sha256 is not None:
         return
@@ -257,7 +257,7 @@ def _cached_or_call_cloud(raw: Path, language: str | None, *, model: str) -> str
     Иначе (сайдкара нет ИЛИ raw изменился) -> облачный вызов; отказ после
     ретраев -> None + warning (локальный фолбэк, документ не падает)."""
     cache_path = cloud_ocr.cache_path(raw)
-    state_path = raw.parent / ".state.yaml"
+    state_path = schema.state_file_for_raw(raw)
     state = schema.load_state(state_path)
     raw_sha256 = fsio.sha256_file(raw)
 

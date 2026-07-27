@@ -45,6 +45,8 @@ from core.schema import (
     render_frontmatter,
     save_record,
     save_state,
+    state_file,
+    state_file_for_raw,
 )
 
 
@@ -613,6 +615,15 @@ def test_load_real_vocab_nonempty() -> None:
 def test_raw_target_default_ext(tmp_path: Path) -> None:
     rec = SourceRecord.model_validate(valid_record())
     assert raw_target(rec, tmp_path) == doc_dir(rec, tmp_path) / "raw.pdf"
+
+
+def test_state_file_for_raw_matches_state_file(tmp_path: Path) -> None:
+    """spec acquire-convert-seam-hardening §1/В12: единственное определение пути
+    сайдкара, адресуемое и от записи (state_file), и от голого raw (state_file_for_raw) —
+    должны совпасть для одного и того же документа."""
+    rec = SourceRecord.model_validate(valid_record())
+    raw = raw_target(rec, tmp_path)  # <doc_dir>/raw.pdf — путь не обязан существовать
+    assert state_file_for_raw(raw) == state_file(rec, tmp_path)
 
 
 def test_raw_target_custom_ext(tmp_path: Path) -> None:
