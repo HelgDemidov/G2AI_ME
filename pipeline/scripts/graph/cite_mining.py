@@ -210,7 +210,7 @@ _PATTERNS: dict[str, CitePattern] = {
     "eli_uri": CitePattern(
         "eli_uri",
         re.compile(
-            r"(?:data|eur-lex)\.europa\.eu/eli/(?P<kind>reg|dir|dec)/"
+            r"\b(?:data|eur-lex)\.europa\.eu/eli/(?P<kind>reg|dir|dec)/"
             r"(?P<year>\d{4})/(?P<number>\d{1,4})\b",
             re.IGNORECASE,
         ),

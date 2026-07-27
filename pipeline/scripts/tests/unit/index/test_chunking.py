@@ -611,3 +611,15 @@ def test_no_heading_no_merge_regression() -> None:
     """Оверсайз-абзац без предшествующего заголовка режется как раньше."""
     plain = chunk_text(_table(30), wc, 30)
     assert all(c.text.startswith("| A | B |") for c in plain)
+
+
+# --- guard'ы К6 (spec convert-knowledge-seam-hardening §6) ---
+
+
+def test_strip_frontmatter_is_reexport_of_schema() -> None:
+    """Реэкспорт обязан быть ТЕМ ЖЕ объектом, а не копией/обёрткой: две реализации
+    одной грамматики — ровно класс, который §6 сносил (пишущая половина в schema,
+    снимающая была в chunking, и потребители тянули зависимость вверх по конвейеру)."""
+    from core import schema
+
+    assert strip_frontmatter is schema.strip_frontmatter

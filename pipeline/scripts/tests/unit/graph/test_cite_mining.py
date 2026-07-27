@@ -537,3 +537,14 @@ def test_source_url_in_eli_form_resolves_to_record() -> None:
     (штатная форма допусков eurlex-коннектора) не резолвился вовсе."""
     rec = _rec("eu-data-act-2023", url="https://data.europa.eu/eli/reg/2023/2854/oj")
     assert cite_mining.identifiers_from_urls([rec]) == {"CELEX:32023R2854": "eu-data-act-2023"}
+
+
+def test_eli_uri_requires_host_boundary() -> None:
+    """Р2 ревью PR #52: якорь хоста с левой границей — подстрока «data.europa.eu»
+    внутри более длинного имени хоста не матчится (precision-first: ложное ребро
+    дороже пропущенного, даже когда риск умозрителен)."""
+    assert cite_mining.extract_identifiers("https://notdata.europa.eu/eli/reg/2024/1689/oj") == []
+    # а легитимные формы с границей-разделителем — по-прежнему да
+    assert ("CELEX:32024R1689", "eli_uri") in cite_mining.extract_identifiers(
+        "see https://data.europa.eu/eli/reg/2024/1689/oj"
+    )
