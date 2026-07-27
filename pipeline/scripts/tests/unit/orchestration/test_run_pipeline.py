@@ -1329,6 +1329,80 @@ def test_adopt_untracked_raw_does_not_backfill_when_sha_mismatches(tmp_path: Pat
     assert Stage.download in needed_stages(rec, tmp_path)  # расхождение всё равно поймано
 
 
+# --- stat-refresh при совпавшем sha (spec acquire-convert-seam-hardening §9, В10) ---
+
+
+def test_adopt_untracked_raw_refreshes_stat_when_content_unchanged(tmp_path: Path) -> None:
+    """Touched-but-identical raw (бэкап/restore, touch): guard-тройка ПЕРЕУСТАНАВЛИВАЕТСЯ
+    под текущий stat, раз содержимое (sha) не изменилось — без этого needed_stages
+    пересчитывала бы полный sha256 на КАЖДОМ планировании навсегда."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"stable content")
+    _adopt_untracked_raw(rec, tmp_path)  # первое усыновление: guard-тройка зафиксирована
+    before = schema.load_state(schema.state_file(rec, tmp_path))
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.touch()  # тот же контент, новый mtime
+
+    _adopt_untracked_raw(rec, tmp_path)
+
+    after = schema.load_state(schema.state_file(rec, tmp_path))
+    st = raw.stat()
+    assert after.raw_mtime_ns == st.st_mtime_ns
+    assert after.raw_mtime_ns != before.raw_mtime_ns  # действительно переустановлена
+    assert after.sha256 == before.sha256  # контент/хэш не тронуты
+
+
+def test_adopt_untracked_raw_refresh_avoids_sha_recompute_on_next_planning(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Регресс основной находки В10: после переустановки guard-тройки следующее
+    needed_stages НЕ пересчитывает sha256 — ровно расход, от которого stat-guard
+    защищает (двойник test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"stable content", md=_compose_md(rec, ""))
+    _adopt_untracked_raw(rec, tmp_path)
+    _stamp_converter_state(rec, tmp_path)
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.touch()
+    schema.md_file(rec, tmp_path).touch()  # md тоже свежее raw — иначе «stale» сама планирует convert
+    _adopt_untracked_raw(rec, tmp_path)  # переустанавливает guard-тройку под новый stat
+
+    calls = {"n": 0}
+    real_sha256 = _sha256
+
+    def counting_sha256(path: Path) -> str:
+        calls["n"] += 1
+        return real_sha256(path)
+
+    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+
+    assert needed_stages(rec, tmp_path) == []
+    assert calls["n"] == 0  # guard-тройка актуальна — полное чтение не потребовалось
+
+
+def test_adopt_untracked_raw_does_not_refresh_when_sha_mismatches(tmp_path: Path) -> None:
+    """Sha НЕ совпал — НЕ трогаем: это кандидат на передобычу, порча не получает
+    благословения (needed_stages сама поймает расхождение)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"original content")
+    _adopt_untracked_raw(rec, tmp_path)
+    before = schema.load_state(schema.state_file(rec, tmp_path))
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.write_bytes(b"corrupted, DIFFERENT content, different size")  # реальная порча
+
+    _adopt_untracked_raw(rec, tmp_path)
+
+    after = schema.load_state(schema.state_file(rec, tmp_path))
+    assert after.raw_size == before.raw_size  # НЕ переустановлена
+    assert after.raw_mtime_ns == before.raw_mtime_ns
+    assert Stage.download in needed_stages(rec, tmp_path)  # расхождение поймано honestly
+
+
 def test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

@@ -287,7 +287,7 @@ def needed_stages(
 
 def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
     """Обеспечить, что существующий raw отслеживается sha256 + stat-guard'ом
-    (``raw_size``/``raw_mtime_ns``). Покрывает два случая:
+    (``raw_size``/``raw_mtime_ns``). Покрывает три случая:
 
     (а) raw добыт вручную (``--no-download``) — единственный писатель sha был у
     ``_do_download``; без усыновления повреждение такого файла оставалось бы
@@ -297,6 +297,14 @@ def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
     подтверждённо совпадает с уже записанным sha (одноразовая верификация при
     миграции) — иначе рассинхрон/порча тихо получили бы «благословение» без
     проверки, и guard начал бы доверять непроверенному файлу навсегда.
+    (в) stat-refresh (spec acquire-convert-seam-hardening §9, В10): guard-поля ЕСТЬ,
+    но разошлись с текущим ``stat`` (бэкап/restore, touch), а пересчитанный sha256
+    СОВПАЛ с записанным — переустанавливаем guard-тройку под текущий stat. Без
+    этого ``needed_stages`` пересчитывала бы полный sha256 на КАЖДОМ планировании
+    НАВСЕГДА — ровно расход, от которого stat-guard защищает (прецедент —
+    ``git update-index --refresh``: stat «пере-сматчивается» при совпавшем
+    контенте). Sha НЕ совпал -> НЕ трогаем: это кандидат на передобычу
+    (``needed_stages`` сама поймает расхождение), порча не получает благословения.
 
     Идемпотентно. ``acquisition_method``/``fidelity`` не трогает — канал добычи
     неизвестен изначально, человек фиксирует его сам при желании.
@@ -318,6 +326,12 @@ def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
             state.raw_size = st.st_size
             state.raw_mtime_ns = st.st_mtime_ns
             schema.save_state(state_path, state)
+    elif st.st_size != state.raw_size or st.st_mtime_ns != state.raw_mtime_ns:
+        if _sha256(raw) == state.sha256:
+            state.raw_size = st.st_size
+            state.raw_mtime_ns = st.st_mtime_ns
+            schema.save_state(state_path, state)
+            logger.debug("  %s: stat-guard тройка переустановлена (контент не менялся)", rec.id)
 
 
 # Ступени добычи, чей результат — НАША редакция официального URL. Только их и есть
