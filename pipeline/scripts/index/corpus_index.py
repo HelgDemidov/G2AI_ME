@@ -235,7 +235,7 @@ def _reset_derived_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> bool:
     """Аддитивная миграция колонки БЕЗ бампа ``SCHEMA_VERSION`` (тот дропнул бы
     ``vectors``, запрещено). Свежие/мигрированные БД получают колонку прямо из
     ``_SCHEMA``; эта функция бэкфиллит её на уже существующей v3-таблице, где колонки
@@ -250,6 +250,8 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
     cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if cols and column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        return True
+    return False
 
 
 def _ensure_facet_columns(conn: sqlite3.Connection) -> None:
@@ -262,11 +264,43 @@ def _ensure_facet_columns(conn: sqlite3.Connection) -> None:
     """
     _ensure_column(conn, "doc_facets", "sensitivity", "TEXT NOT NULL DEFAULT 'public'")
     _ensure_column(conn, "doc_facets", "superseded", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(conn, "chunks", "reconstruction", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(conn, "chunks", "markup_heavy", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "doc_facets", "fidelity", "TEXT")
     _ensure_column(conn, "doc_facets", "ocr_model", "TEXT")
     _ensure_column(conn, "doc_facets", "quality_flags", "TEXT NOT NULL DEFAULT ''")
+    # ``chunks`` — отдельный случай, см. ``_invalidate_doc_state_after_chunk_migration``:
+    # список не схлопывать в ``any(generator)``, оба ALTER обязаны выполниться.
+    chunk_columns_added = [
+        _ensure_column(conn, "chunks", "reconstruction", "INTEGER NOT NULL DEFAULT 0"),
+        _ensure_column(conn, "chunks", "markup_heavy", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    if any(chunk_columns_added):
+        _invalidate_doc_state_after_chunk_migration(conn)
+
+
+def _invalidate_doc_state_after_chunk_migration(conn: sqlite3.Connection) -> None:
+    """Заставить следующий инкремент пере-чанковать ВЕСЬ корпус после добавления колонок
+    в ``chunks`` (spec convert-knowledge-seam-hardening §2, найдено живой приёмкой).
+
+    Асимметрия с ``doc_facets`` принципиальна и стоила живого дефекта: фасеты
+    ПОЛНОСТЬЮ переписываются каждый прогон, поэтому их новая колонка наполняется сама.
+    Значения колонок ``chunks`` пишутся только при вставке чанка, то есть лишь для
+    документов, чей ``doc.md`` изменился ПОСЛЕ миграции. У остальных остаётся дефолт
+    ``0`` из ``ALTER`` — и читается он как «проверено, чисто», хотя означает «неизвестно»
+    (живой замер: `eu-ai-act-2024`, 396 чанков, показывал ``markup_heavy=0`` при 173
+    фактических — ровно тот класс тихой лжи, против которого написан весь этот спек).
+
+    Сброс ``doc_state`` дороже точечного бэкфилла ровно на одну пере-чанковку корпуса
+    (bge-токенизация, минуты) и честнее его: ``reconstruction`` — свойство абзаца в
+    КОНТЕКСТЕ блока инъекции, из одного текста чанка не восстановимое. ``content_hash``
+    при этом не меняется, поэтому ни один вектор не осиротеет и переэмбеддинга не будет.
+
+    Вместе с ``doc_state`` снимается и ``corpus_fingerprint``: пересборку гейтит именно
+    он (``run_pipeline._needs_index_rebuild``), и без этого на неизменившемся корпусе
+    прогон честно отвечал бы «индекс актуален», а миграция осталась бы половинчатой до
+    первой правки документов — найдено живой приёмкой того же спека, вторым заходом.
+    """
+    conn.execute("DELETE FROM doc_state")
+    conn.execute("DELETE FROM index_meta WHERE key = 'corpus_fingerprint'")
 
 
 def create_db(db_path: Path) -> sqlite3.Connection:

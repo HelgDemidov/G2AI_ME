@@ -1138,3 +1138,66 @@ def test_fts_folds_balkan_diacritics() -> None:
     for query in ('"Član"', '"Clan"', '"Sluzbeni"', '"Službeni"'):
         assert [h.doc_id for h in fts_search(conn, query)] == ["me-law"], query
     conn.close()
+
+
+def test_chunk_column_migration_forces_recompute_on_unchanged_docs(tmp_path: Path) -> None:
+    """Найдено живой приёмкой: ALTER заполняет новые колонки chunks дефолтом, и у
+    документов, чей doc.md больше не менялся, ноль остаётся навсегда — читаясь как
+    «проверено, чисто» вместо «неизвестно» (боевой случай: eu-ai-act-2024, 396 чанков,
+    markup_heavy=0 при 173 фактических). Миграция обязана сбросить doc_state."""
+    root = tmp_path / "src"
+    _doc(root, "doc-table-2026", "ta", "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |")
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert any(v == 1 for v in _flag_rows(conn, "markup_heavy").values())
+
+    # откат к состоянию «БД собрана до §2», документ при этом не менялся
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.execute("ALTER TABLE chunks DROP COLUMN reconstruction")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)  # миграция: колонки вернулись с дефолтом 0
+    assert conn.execute("SELECT COUNT(*) FROM doc_state").fetchone()[0] == 0
+    changed, _ = index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert changed == 1  # документ пере-чанкован, хотя doc.md не трогали
+    assert any(v == 1 for v in _flag_rows(conn, "markup_heavy").values())
+    conn.close()
+
+
+def test_chunk_column_migration_preserves_vectors(tmp_path: Path) -> None:
+    """Пере-чанковка не осиротит эмбеддинги: content_hash от новых колонок не зависит."""
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    hashes_before = {r[0] for r in conn.execute("SELECT content_hash FROM chunks")}
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert {r[0] for r in conn.execute("SELECT content_hash FROM chunks")} == hashes_before
+    conn.close()
+
+
+def test_chunk_column_migration_also_clears_corpus_fingerprint(tmp_path: Path) -> None:
+    """Вторая половина того же дефекта (найдена вторым заходом живой приёмки): сброса
+    doc_state мало — пересборку гейтит corpus_fingerprint, и на неизменившемся корпусе
+    прогон отвечал бы «индекс актуален», оставив миграцию половинчатой."""
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert read_meta(conn, "corpus_fingerprint") is not None
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)
+    assert read_meta(conn, "corpus_fingerprint") is None
+    conn.close()

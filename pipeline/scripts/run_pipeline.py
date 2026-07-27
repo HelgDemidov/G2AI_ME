@@ -533,8 +533,15 @@ def _do_figures(rec: schema.SourceRecord, root: Path) -> None:
     defects = _conversion_defects(
         raw, md.read_text(encoding="utf-8"), conv.name, state, _sha256(raw)
     ) + figure_defects
+    # Логируем только НОВОЕ относительно того, что уже записал этот прогон конвертации:
+    # стадия figures планируется сразу после convert, и повтор тех же строк удваивал бы
+    # каждое предупреждение в логе — ровно alarm fatigue, которую проект лечит везде
+    # ещё (найдено на живой приёмке спека). Самовосстановительный путь (figures без
+    # convert) при этом остаётся информативным: там прежних строк в state нет.
+    already_logged = set(state.lint_defects)
     for defect in defects:
-        logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
+        if defect not in already_logged:
+            logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
     state.lint_defects = defects
     schema.save_state(state_path, state)
 
@@ -943,6 +950,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         logger.info("Индекс: dry-run, не трогаем")
     else:
+        # Миграции схемы индекса применяются ДО гейта «нужна ли пересборка»: миграция
+        # может инвалидировать производные данные (добавление колонки `chunks` сбрасывает
+        # doc_state и отпечаток), и тогда пересборка нужна, даже если корпус не менялся.
+        # Несуществующую БД не создаём — пустой файл ради миграции бессмыслен.
+        if args.db.exists():
+            corpus_index.create_db(args.db).close()
         needs_rebuild, _ = _needs_index_rebuild(args.sources, args.db, force=args.force)
         if needs_rebuild:
             try:
