@@ -302,13 +302,6 @@ class OperationalState(BaseModel):
     acquisition_checked: _dt.date | None = None
     fidelity: Fidelity | None = None
     retrieved_snapshot_date: _dt.date | None = None
-    # Поля ``translation_status`` здесь БОЛЬШЕ НЕТ (spec acquire-convert-seam-hardening
-    # §10, В14): резервировалось под фазу перевода корпуса, отменённую решением
-    # 2026-07-23 (перевод живёт в точке использования — ad-hoc/JIT, не стадия
-    # конвейера) — ноль читателей/писателей поля к этому моменту. ``extra="forbid"``:
-    # удаление требует одноразовой миграции существующих ``.state.yaml`` (ключ
-    # сериализован в каждом — иначе каждый документ падал бы на планировании), не в
-    # git (файлы локальные, машиннописаные).
     converter_name: str | None = None     # какой конвертер породил текущий doc.md
     converter_version: str | None = None  # его версия (реконсиляция реконверсии)
     # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
