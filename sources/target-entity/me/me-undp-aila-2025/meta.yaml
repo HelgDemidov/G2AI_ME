@@ -28,10 +28,8 @@ summary: 'First systematic assessment of Montenegro''s AI landscape (UNDP AILA m
   gaps (data interoperability, skills, infrastructure) and recommends priority AI applications
   for public administration, tourism and environmental management.'
 relations: []
-relevance:
-  target_fit: primary
+admission:
   axis: digital_sovereignty
-  assessed_stage: confirmed
   rationale: 'First systematic assessment of Montenegro''s AI landscape (UNDP AILA methodology):
     government as AI user, government as ecosystem enabler, ethical AI development — direct
     analytical input for the target-entity track (the very strategy-drafting need this corpus
@@ -45,4 +43,3 @@ relevance:
     Business 0.67 — reconstructed verbatim by figures-VLM and verified against the original
     page at 400 DPI). Also served as the figures-VLM acceptance document (convert-cloud-tier
     checkpoint 2): 16 figure/raster markers VLM-interpreted, 0 bare left, lint clean.'
-  assessed_date: '2026-07-19'

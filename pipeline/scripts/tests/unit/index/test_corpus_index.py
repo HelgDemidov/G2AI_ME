@@ -404,11 +404,11 @@ def test_rebuild_facets_populates_both_tables(tmp_path: Path) -> None:
     _rebuild_facets(conn, [rec])
     conn.commit()
     row = conn.execute(
-        "SELECT entity_id, track, doc_type, authority, language, axis, target_fit, assessed_stage "
+        "SELECT entity_id, track, doc_type, authority, language, axis "
         "FROM doc_facets WHERE doc_id = ?",
         (rec.id,),
     ).fetchone()
-    assert row == ("sg", "intl-xperience", "framework", "soft_law", "en", "agentic_g2ai", "primary", "confirmed")
+    assert row == ("sg", "intl-xperience", "framework", "soft_law", "en", "agentic_g2ai")
     topics = {r[0] for r in conn.execute("SELECT topic FROM topics_map WHERE doc_id = ?", (rec.id,))}
     assert topics == {"ai-governance", "agentic-ai"}
 
@@ -425,16 +425,16 @@ def test_rebuild_facets_overwrites_on_repeated_call(tmp_path: Path) -> None:
     ).fetchone()[0] == 2
 
 
-def test_rebuild_facets_null_axis_when_no_relevance(tmp_path: Path) -> None:
+def test_rebuild_facets_null_axis_when_no_admission(tmp_path: Path) -> None:
     rec_dict = valid_record()
-    rec_dict.pop("relevance")
+    rec_dict.pop("admission")
     rec = SourceRecord.model_validate(rec_dict)
     conn = create_db(tmp_path / "c.db")
     _rebuild_facets(conn, [rec])
     row = conn.execute(
-        "SELECT axis, target_fit, assessed_stage FROM doc_facets WHERE doc_id = ?", (rec.id,)
+        "SELECT axis FROM doc_facets WHERE doc_id = ?", (rec.id,)
     ).fetchone()
-    assert row == (None, None, None)
+    assert row == (None,)
 
 
 # --- doc_facets.sensitivity: аддитивная миграция (spec embed-api-first §3.1) ---

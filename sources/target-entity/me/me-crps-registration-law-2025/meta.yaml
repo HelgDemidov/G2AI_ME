@@ -25,10 +25,8 @@ summary: Montenegrin law (2025) establishing the Central Register of Business an
   are authenticated via qualified electronic signature and seal; publication is
   electronic display on the CRPS website.
 relations: []
-relevance:
-  target_fit: context
+admission:
   axis: digital_sovereignty
-  assessed_stage: confirmed
   rationale: Law establishing Montenegro's Central Register of Business and Other
     Entities (CRPS) as a public electronic database — registration decisions authenticated
     by qualified electronic signature/seal (Art. 7), filing exclusively electronic
@@ -48,4 +46,3 @@ relevance:
     restoration), (3) Unicode-aware regional keywords (Član/Clan) + OCR-glued-
     number rejoin + CAPS-length recalibration, unifying heading levels that used
     to disagree between pdf_to_markdown's own size clustering and ocr_headings.
-  assessed_date: '2026-07-17'

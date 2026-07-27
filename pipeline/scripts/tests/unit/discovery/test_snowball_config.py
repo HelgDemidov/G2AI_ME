@@ -4,6 +4,9 @@
 """
 from __future__ import annotations
 
+import dataclasses
+import inspect
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,41 @@ def test_connector_kind_snowball_round_trips_as_string() -> None:
     assert schema.ConnectorKind("snowball") is schema.ConnectorKind.snowball
 
 
+# --- orphan-ключ конфига (spec drop-relevance-tier §7; урок Г10 agora, PR #54) ---
+
+_SNOWBALL_CONFIG_DATACLASSES = (
+    snowball.SourceFilter,
+    snowball.UrlFilter,
+    snowball.EmitConfig,
+    snowball.SnowballConfig,
+)
+
+
+def test_every_snowball_config_field_is_used_outside_load_config() -> None:
+    """Урок orphan-конфига (agora, Г10: удалённый ``non_us_include_all`` не читался ни
+    одной веткой) распространён на ``SnowballConfig`` — здесь вложенный (``source_filter``/
+    ``url_filter``/``emit`` — отдельные dataclass'ы), поэтому скан обходит ВСЕ четыре секции,
+    не копирует агоровский плоский тест буквально. Определения секций и ``load_config`` —
+    единственные легитимные места, где поле упоминается ТОЛЬКО в парсинге/декларации;
+    регрессия (новое поле без реального потребителя) должна ломать тест, а не проходить
+    ревью молча. Честная граница (как у агоровского прецедента): текстовый скан, не AST —
+    совпадение имени поля в прозе/докстроке даёт ложноотрицательный результат теоретически,
+    но ни разу не наблюдалось на реальных полях этого модуля."""
+    module_source = inspect.getsource(snowball)
+    outside = module_source
+    for dc in _SNOWBALL_CONFIG_DATACLASSES:
+        outside = outside.replace(inspect.getsource(dc), "")
+    outside = outside.replace(inspect.getsource(snowball.load_config), "")
+
+    orphaned = [
+        f"{dc.__name__}.{field.name}"
+        for dc in _SNOWBALL_CONFIG_DATACLASSES
+        for field in dataclasses.fields(dc)
+        if not re.search(rf"\b{re.escape(field.name)}\b", outside)
+    ]
+    assert not orphaned, f"поля SnowballConfig не используются вне load_config: {orphaned}"
+
+
 # --- load_config: реальный трекаемый файл ---
 
 
@@ -29,7 +67,6 @@ def test_load_config_reads_real_tracked_config() -> None:
     config = snowball.load_config()
     assert config.enabled is True
     assert config.source_filter.tracks == ()
-    assert config.source_filter.target_fit == ()
     assert config.source_filter.include_doc_ids == ()
     assert config.source_filter.exclude_doc_ids == ()
     assert config.url_filter.exclude_domains == ()
@@ -59,7 +96,6 @@ def test_load_config_custom_path_full(tmp_path: Path) -> None:
             "enabled": False,
             "source_filter": {
                 "tracks": ["target-entity"],
-                "target_fit": ["primary"],
                 "include_doc_ids": ["me-crps-registration-law-2025"],
                 "exclude_doc_ids": ["eu-ai-act-2024"],
             },

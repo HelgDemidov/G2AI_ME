@@ -114,44 +114,36 @@ def test_match_vocab_tags_case_insensitive() -> None:
 # --- apply_source_filter ---
 
 
-def _rec(id_: str, *, track: str = "target-entity", target_fit: str = "primary") -> schema.SourceRecord:
+def _rec(id_: str, *, track: str = "target-entity") -> schema.SourceRecord:
     data = valid_record()
     data["id"] = id_
     data["track"] = track
     data["entity_id"] = "me" if track == "target-entity" else "sg"
-    data["relevance"]["target_fit"] = target_fit
     return schema.SourceRecord.model_validate(data)
 
 
 def test_apply_source_filter_empty_is_permissive() -> None:
     records = [_rec("a-doc-one"), _rec("b-doc-two")]
-    empty = SourceFilter(tracks=(), target_fit=(), include_doc_ids=(), exclude_doc_ids=())
+    empty = SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=())
     assert apply_source_filter(records, empty) == records
 
 
 def test_apply_source_filter_tracks() -> None:
     a = _rec("a-doc-one", track="target-entity")
     b = _rec("b-doc-two", track="intl-xperience")
-    sf = SourceFilter(tracks=("target-entity",), target_fit=(), include_doc_ids=(), exclude_doc_ids=())
-    assert apply_source_filter([a, b], sf) == [a]
-
-
-def test_apply_source_filter_target_fit() -> None:
-    a = _rec("a-doc-one", target_fit="primary")
-    b = _rec("b-doc-two", target_fit="background")
-    sf = SourceFilter(tracks=(), target_fit=("primary",), include_doc_ids=(), exclude_doc_ids=())
+    sf = SourceFilter(tracks=("target-entity",), include_doc_ids=(), exclude_doc_ids=())
     assert apply_source_filter([a, b], sf) == [a]
 
 
 def test_apply_source_filter_include_doc_ids_is_allowlist() -> None:
     a, b = _rec("a-doc-one"), _rec("b-doc-two")
-    sf = SourceFilter(tracks=(), target_fit=(), include_doc_ids=("a-doc-one",), exclude_doc_ids=())
+    sf = SourceFilter(tracks=(), include_doc_ids=("a-doc-one",), exclude_doc_ids=())
     assert apply_source_filter([a, b], sf) == [a]
 
 
 def test_apply_source_filter_exclude_doc_ids() -> None:
     a, b = _rec("a-doc-one"), _rec("b-doc-two")
-    sf = SourceFilter(tracks=(), target_fit=(), include_doc_ids=(), exclude_doc_ids=("b-doc-two",))
+    sf = SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=("b-doc-two",))
     assert apply_source_filter([a, b], sf) == [a]
 
 
@@ -160,7 +152,7 @@ def test_apply_source_filter_include_and_exclude_intersecting() -> None:
     (применяется вторым, после include-allowlist)."""
     a, b = _rec("a-doc-one"), _rec("b-doc-two")
     sf = SourceFilter(
-        tracks=(), target_fit=(), include_doc_ids=("a-doc-one", "b-doc-two"), exclude_doc_ids=("b-doc-two",)
+        tracks=(), include_doc_ids=("a-doc-one", "b-doc-two"), exclude_doc_ids=("b-doc-two",)
     )
     assert apply_source_filter([a, b], sf) == [a]
 

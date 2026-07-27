@@ -32,9 +32,6 @@ summary: >-
   Model framework for governing agentic AI: risk assessment and mitigation at
   input, meaningful human accountability, technical controls and agent testing,
   and end-user responsibility.
-relevance:
-  target_fit: primary
+admission:
   axis: agentic_g2ai
-  assessed_stage: confirmed
   rationale: IMDA Model AI Governance Framework for Agentic AI — reference agentic G2AI document.
-  assessed_date: 2026-07-15

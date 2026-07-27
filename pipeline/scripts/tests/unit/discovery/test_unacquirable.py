@@ -273,12 +273,9 @@ def test_admit_unacquirable_candidate_directly_disappears_from_both_queues(tmp_p
         "geo_scope": "national",
         "doc_type": "national_strategy",
         "authority": "soft_law",
-        "relevance": {
-            "target_fit": "primary",
+        "admission": {
             "axis": "agentic_g2ai",
-            "assessed_stage": "triage",
             "rationale": "matches axis",
-            "assessed_date": "2026-07-27",
         },
     }
     summary = manual.apply_decisions([decision], root=tmp_path)

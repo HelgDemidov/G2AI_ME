@@ -411,12 +411,9 @@ def valid_record() -> dict[str, Any]:
         "topics": ["ai-governance", "agentic-ai"],
         "g2ai_pattern": ["agent-governance-framework"],
         "source_url": "https://example.org/doc.pdf",
-        "relevance": {
-            "target_fit": "primary",
+        "admission": {
             "axis": "agentic_g2ai",
-            "assessed_stage": "confirmed",
             "rationale": "эталонный агентный G2AI-документ",
-            "assessed_date": "2026-07-15",
         },
     }
 

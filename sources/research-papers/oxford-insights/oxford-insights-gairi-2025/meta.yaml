@@ -23,10 +23,7 @@ summary: Eighth annual Government AI Readiness Index by Oxford Insights, ranking
   14 dimensions and 6 pillars. The 2025 edition shifts the research question from
   implementation readiness to real-world public impact.
 relations: []
-relevance:
-  target_fit: context
+admission:
   axis: digital_sovereignty
-  assessed_stage: triage
   rationale: Comparative frame for positioning Montenegro and small states on the
     broad axis; not a primary source of transferable agentic patterns.
-  assessed_date: '2026-07-21'

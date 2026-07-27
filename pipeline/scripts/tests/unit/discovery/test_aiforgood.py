@@ -8,7 +8,6 @@ Fetch/parse РАЗДЕЛЕНЫ (принцип eurlex/agora): эти тесты 
 """
 from __future__ import annotations
 
-import datetime as dt
 import io
 import json
 import time
@@ -473,12 +472,9 @@ def test_candidate_requires_language_override_like_agora() -> None:
         geo_scope=schema.GeoScope.international,
         doc_type="technical_standard",
         authority="voluntary_standard",
-        relevance=schema.Relevance(
-            target_fit=schema.TargetFit.primary,
+        admission=schema.Admission(
             axis="digital_sovereignty",
-            assessed_stage=schema.AssessedStage.triage,
             rationale="test",
-            assessed_date=dt.date(2026, 7, 24),
         ),
         language="en",
     )

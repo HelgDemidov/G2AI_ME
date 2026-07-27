@@ -27,7 +27,6 @@ class RetrievalFilters:
     authority: str | None = None
     topic: str | None = None  # membership в topics_map
     axis: str | None = None
-    target_fit: str | None = None
     # Заменённые редакции по умолчанию НЕ выдаются (spec graph-v2 §2): устаревшая
     # редакция закона в top-k evidence-пака — тихая содержательная ошибка того же
     # класса, что «вектор указывает на чужой текст». История — по явному флагу.
@@ -114,7 +113,6 @@ def _resolve_filters(conn: sqlite3.Connection, filters: RetrievalFilters) -> set
         ("doc_type", filters.doc_type),
         ("authority", filters.authority),
         ("axis", filters.axis),
-        ("target_fit", filters.target_fit),
     ):
         if value is not None:
             conditions.append(f"doc_facets.{column} = ?")
