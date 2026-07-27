@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from core import markers
 from index.chunking import (
     _hard_split,
     _split_by_chars,
@@ -10,6 +11,7 @@ from index.chunking import (
     _table_header,
     chunk_text,
     embed_input,
+    is_markup_heavy,
     strip_frontmatter,
 )
 
@@ -468,3 +470,156 @@ def test_hard_split_single_word_within_budget_stays_whole() -> None:
     """Регресс: слово В БЮДЖЕТЕ не должно уходить в посимвольный фолбэк."""
     chunks = _hard_split("short", char_len, max_tokens=10)
     assert chunks == ["short"]
+
+
+# --- chunk-провенанс: reconstruction/markup_heavy (spec convert-knowledge-seam-hardening §2) ---
+
+_OPEN = markers.injection_open("Figure, p. 6, region abc123def456", "some/model")
+_END = markers.injection_end("region abc123def456")
+
+
+def test_reconstruction_tags_only_injected_block() -> None:
+    """Флаг стоит на абзацах ВНУТРИ блока (включая оба маркера) и не течёт наружу:
+    verbatim-текст издателя после терминатора остаётся непомеченным."""
+    text = f"Verbatim before.\n\n{_OPEN}\n\nVLM prose about the figure.\n\n{_END}\n\nVerbatim after."
+    chunks = chunk_text(text, wc, 4)
+
+    flagged = [c.text for c in chunks if c.reconstruction]
+    clean = [c.text for c in chunks if not c.reconstruction]
+    assert any("VLM prose" in t for t in flagged)
+    assert all("Verbatim before" not in t for t in flagged)
+    assert all("Verbatim after" not in t for t in flagged)
+    assert any("Verbatim after" in t for t in clean)
+
+
+def test_reconstruction_marks_mixed_chunk() -> None:
+    """Смешанный чанк (verbatim + реконструкция под одним бюджетом) считается
+    реконструированным: занизить доверие честнее, чем завысить."""
+    text = f"{_OPEN}\n\nprose\n\n{_END}\n\ntail"
+    chunks = chunk_text(text, wc, 10_000)  # всё влезает в один чанк
+    assert len(chunks) == 1
+    assert chunks[0].reconstruction is True
+
+
+def test_legacy_injection_without_terminator_stops_at_heading() -> None:
+    """Инъекции до этого спека терминатора не несут (живут до первой реконверсии):
+    флаг закрывается ближайшим заголовком, а не течёт до конца документа."""
+    text = f"{_OPEN}\n\nVLM prose.\n\n# Real heading\n\nDocument body."
+    chunks = chunk_text(text, wc, 4)
+
+    assert any(c.reconstruction and "VLM prose" in c.text for c in chunks)
+    assert all(not c.reconstruction for c in chunks if "Document body" in c.text)
+    assert all(not c.reconstruction for c in chunks if c.text.startswith("# Real heading"))
+
+
+def test_reconstruction_flag_does_not_change_chunk_boundaries() -> None:
+    """Инвариант §2: тегирование едет РЯДОМ с текстом и в packing не входит — тексты и
+    границы чанков побитово те же, что и без предшествующего блока инъекции.
+
+    Секция ``# H`` пакуется независимо от того, что было до неё, поэтому сравнение
+    честно изолирует именно влияние флага (полная сверка по всему корпусу — живым
+    прогоном: множества content_hash до и после введения флага совпали побитово)."""
+    section = "# H\n\nalpha beta\n\ngamma delta\n\nepsilon zeta\n\neta theta"
+    plain = [(c.text, c.breadcrumb) for c in chunk_text(section, wc, 4)]
+    wrapped = [
+        (c.text, c.breadcrumb)
+        for c in chunk_text(f"{_OPEN}\n\nvlm prose\n\n{_END}\n\n{section}", wc, 4)
+        if c.breadcrumb == "H"
+    ]
+    assert wrapped == plain
+    assert all(not c.reconstruction for c in chunk_text(f"{_OPEN}\n\nv\n\n{_END}\n\n{section}", wc, 4) if c.breadcrumb == "H")
+
+
+def test_no_reconstruction_flag_on_ordinary_text() -> None:
+    chunks = chunk_text("# Title\n\nOrdinary prose.\n\n> [Figure, p. 1, region abc — structure not reconstructed]", wc, 50)
+    assert all(c.reconstruction is False for c in chunks)
+
+
+def test_is_markup_heavy_detects_tables_fences_markers() -> None:
+    table = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |"
+    fence = "```mermaid\npie title X\n    \"A\" : 1\n```"
+    prose = "Обычный абзац прозы без единой строки разметки, просто текст."
+    assert is_markup_heavy(table) is True
+    assert is_markup_heavy(fence) is True
+    assert is_markup_heavy(prose) is False
+    assert is_markup_heavy("") is False
+
+
+def test_is_markup_heavy_mixed_block_below_threshold() -> None:
+    """Абзац прозы с одной таблицей-строкой — не markup-heavy (порог по доле строк)."""
+    mixed = "Prose line one.\nProse line two.\nProse line three.\n| a | b |"
+    assert is_markup_heavy(mixed) is False
+
+
+# --- заголовок не остаётся чанком-сиротой (spec convert-knowledge-seam-hardening §10) ---
+
+
+def _table(n_rows: int) -> str:
+    rows = "\n".join(f"| cell{i}a | cell{i}b |" for i in range(n_rows))
+    return f"| A | B |\n| --- | --- |\n{rows}"
+
+
+def test_heading_joins_first_piece_of_oversize_table() -> None:
+    """Секция «заголовок + длинная таблица» больше не даёт чанк из одной строки:
+    заголовок едет с первым куском таблицы (Б15)."""
+    text = f"## Section Title\n\n{_table(30)}"
+    chunks = chunk_text(text, wc, 30)
+
+    assert chunks[0].text.startswith("## Section Title\n\n| A | B |")
+    assert all(c.n_tokens <= 30 for c in chunks)
+    assert not any(c.text.strip() == "## Section Title" for c in chunks)
+
+
+def test_heading_join_preserves_all_table_rows() -> None:
+    """Склейка не теряет данных: все строки таблицы присутствуют в сумме кусков."""
+    text = f"### T\n\n{_table(25)}"
+    joined = "\n".join(c.text for c in chunk_text(text, wc, 30))
+    for i in range(25):
+        assert f"| cell{i}a | cell{i}b |" in joined
+
+
+def test_heading_join_keeps_every_piece_a_valid_table() -> None:
+    for c in chunk_text(f"## T\n\n{_table(25)}", wc, 30):
+        body = c.text.removeprefix("## T\n\n")
+        assert body.startswith("| A | B |\n| --- | --- |")
+
+
+def test_heading_only_section_stays_orphan_by_design() -> None:
+    """Секция без собственного контента (следом сразу другой заголовок) — сирота
+    остаётся: убрать её нечем, а склейка через границу секции нарушила бы инвариант
+    «чанк не пересекает границу секции»."""
+    chunks = chunk_text("# A\n\n## A.1\n\nbody text here", wc, 50)
+    assert any(c.text.strip() == "# A" for c in chunks)
+
+
+def test_heading_join_skipped_when_heading_leaves_no_budget() -> None:
+    """Заголовок сам почти в бюджет — склейка невозможна, поведение прежнее."""
+    long_heading = "## " + " ".join(f"w{i}" for i in range(20))
+    chunks = chunk_text(f"{long_heading}\n\n{_table(20)}", wc, 21)
+    assert chunks[0].text == long_heading
+    assert all(c.n_tokens <= 21 or c.text.count("\n") == 0 for c in chunks)
+
+
+def test_heading_join_applies_to_prose_paragraph_too() -> None:
+    sentences = " ".join(f"Sentence number {i} here." for i in range(40))
+    chunks = chunk_text(f"## Prose Section\n\n{sentences}", wc, 40)
+    assert chunks[0].text.startswith("## Prose Section\n\n")
+    assert all(c.n_tokens <= 40 for c in chunks)
+
+
+def test_no_heading_no_merge_regression() -> None:
+    """Оверсайз-абзац без предшествующего заголовка режется как раньше."""
+    plain = chunk_text(_table(30), wc, 30)
+    assert all(c.text.startswith("| A | B |") for c in plain)
+
+
+# --- guard'ы К6 (spec convert-knowledge-seam-hardening §6) ---
+
+
+def test_strip_frontmatter_is_reexport_of_schema() -> None:
+    """Реэкспорт обязан быть ТЕМ ЖЕ объектом, а не копией/обёрткой: две реализации
+    одной грамматики — ровно класс, который §6 сносил (пишущая половина в schema,
+    снимающая была в chunking, и потребители тянули зависимость вверх по конвейеру)."""
+    from core import schema
+
+    assert strip_frontmatter is schema.strip_frontmatter

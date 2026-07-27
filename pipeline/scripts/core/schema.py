@@ -8,6 +8,7 @@ g2ai_pattern) и ссылочной целостности ``relations`` вын�
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -288,9 +289,14 @@ class OperationalState(BaseModel):
     converter_name: str | None = None     # какой конвертер породил текущий doc.md
     converter_version: str | None = None  # его версия (реконсиляция реконверсии)
     # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
-    # список строк-дефектов convert/lint.py (пустой = чисто); машиночитаемость нужна
-    # worksheet'у батч-триажа (spec discovery-manual), флагованные документы видны
-    # при Стадии 2. Старые .state.yaml без поля валидны (Field с default).
+    # список строк-дефектов convert/lint.py (пустой = чисто). Старые .state.yaml без
+    # поля валидны (Field с default).
+    # Потребители (spec convert-knowledge-seam-hardening §3): ИМЕНА дефектов едут в
+    # фасет `doc_facets.quality_flags` и оттуда — пометкой ⚑ в выдаче hsearch; полная
+    # евидентность (числа расхождений и т.п.) остаётся здесь. Прежний докстринг обещал
+    # читателя-worksheet, которого никогда не существовало (аудит шва, Б2): поле
+    # писалось прилежно и не читалось ничем — документ с непогашенным расхождением
+    # чисел был в выдаче неотличим от чистого.
     lint_defects: list[str] = Field(default_factory=list)
     # spec convert-cloud-tier §2.2: валидность кэша .cloudocr.md — по этим двум
     # полям (модель + sha256 raw НА МОМЕНТ облачного вызова, т.е. ПОСЛЕ ocrmypdf).
@@ -742,3 +748,22 @@ def render_frontmatter(rec: SourceRecord) -> str:
     present = {k: v for k, v in fields.items() if v not in (None, [], "")}
     body = yaml.safe_dump(present, allow_unicode=True, sort_keys=False)
     return f"---\n{body}---\n"
+
+
+# Якорь ``^`` без re.MULTILINE — совпадает ТОЛЬКО в начале строки-документа, поэтому
+# горизонтальная линейка ``---`` в теле (markdownify эмитит её для docx ``<hr>``)
+# отдельным фронтматтером не станет.
+_FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
+
+
+def strip_frontmatter(md: str) -> str:
+    """Снять YAML-frontmatter в начале ``.md`` (если он есть) — обратная сторона
+    ``render_frontmatter``.
+
+    Живёт ЗДЕСЬ, а не в ``index.chunking`` (spec convert-knowledge-seam-hardening §6):
+    пишущая и снимающая половины одной грамматики принадлежат одному модулю, иначе
+    потребители «тела документа» из разных слоёв тянут зависимость вверх по конвейеру
+    (``convert.lint`` -> ``index``) — тот же класс, что переезд ``state_dir``
+    (knowledge-hardening §2). ``index.chunking`` реэкспортирует имя для совместимости.
+    """
+    return _FRONTMATTER_RE.sub("", md, count=1)

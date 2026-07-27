@@ -100,7 +100,7 @@ def test_convert_xlsx_full_fixture_produces_stable_output_with_provenance(tmp_pa
     _convert_xlsx(_FIXTURE, out, "en")
     text = out.read_text(encoding="utf-8")
     assert "## Stats" in text
-    assert "> лист Stats, якорь" in text
+    assert "> sheet Stats, anchor" in text
     assert "Institutional Responsibility for GovTech" in text
     assert "GovTech Maturity Index Components" in text
     assert "```mermaid" in text

@@ -473,3 +473,78 @@ def test_cite_mining_does_not_import_discovery() -> None:
     assert not hasattr(cite_mining, "store")
     source = Path(cite_mining.__file__).read_text(encoding="utf-8")
     assert "import discovery" not in source and "from discovery" not in source
+
+
+# --- frontmatter не участвует в экстракции (spec convert-knowledge-seam-hardening §6) ---
+
+
+def test_frontmatter_metadata_does_not_create_edges(tmp_path: Path) -> None:
+    """Курируемые метаданные — не текст издателя: акт, названный только в ``title``
+    frontmatter'а, ребра ``cites`` не даёт (штатная форма заголовка в реестрах ЕС —
+    «Guidance on applying Regulation (EU) …»), а тот же акт в ТЕЛЕ — даёт."""
+    cited = _place(tmp_path, "gdpr-2016", "# GDPR\n")
+    citing = _place(tmp_path, "guidance-doc-2025", "Тело без формальных ссылок.\n")
+    md = schema.md_file(citing, tmp_path)
+    md.write_text(
+        "---\ntitle: Guidance on applying Regulation (EU) 2016/679 to AI\n---\n\n"
+        + md.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    identifiers = {"CELEX:32016R0679": "gdpr-2016"}
+
+    result = cite_mining.mine_corpus([cited, citing], tmp_path, identifiers=identifiers, aliases={})
+    assert result.edges == []
+
+    md.write_text(
+        md.read_text(encoding="utf-8") + "\nсогласно Regulation (EU) 2016/679\n", encoding="utf-8"
+    )
+    result = cite_mining.mine_corpus([cited, citing], tmp_path, identifiers=identifiers, aliases={})
+    assert [(e.source_id, e.target_id) for e in result.edges] == [("guidance-doc-2025", "gdpr-2016")]
+
+
+# --- ELI-URI ЕС (spec convert-knowledge-seam-hardening §9) ---
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://data.europa.eu/eli/reg/2024/1689/oj", "CELEX:32024R1689"),
+        ("https://eur-lex.europa.eu/eli/reg/2024/900/oj/eng", "CELEX:32024R0900"),
+        ("https://data.europa.eu/eli/dir/2000/31/oj", "CELEX:32000L0031"),
+        ("https://data.europa.eu/eli/dec/2008/768/oj", "CELEX:32008D0768"),
+    ],
+)
+def test_eli_uri_resolves_to_celex(url: str, expected: str) -> None:
+    """ELI — официальный URI-шаблон ЕС, отображение на сектор-3 CELEX детерминировано;
+    живой факт аудита: все шесть внешних ссылок EUR-Lex HTML именно в этой форме."""
+    assert (expected, "eli_uri") in cite_mining.extract_identifiers(url)
+
+
+def test_national_eli_portal_is_not_matched() -> None:
+    """Хост — обязательная часть якоря: национальные ELI-порталы используют ту же
+    path-грамматику для НАЦИОНАЛЬНОГО права, и без хоста запись строила бы ложные
+    CELEX (ложное ребро дороже пропущенного)."""
+    assert cite_mining.extract_identifiers("https://eli.gov.pl/eli/DU/2024/1234") == []
+    assert cite_mining.extract_identifiers("https://example.org/eli/reg/2024/1689/oj") == []
+
+
+def test_eli_uri_year_gate_rejects_implausible() -> None:
+    assert cite_mining.extract_identifiers("https://data.europa.eu/eli/reg/9999/1/oj") == []
+
+
+def test_source_url_in_eli_form_resolves_to_record() -> None:
+    """Б9: до этой записи URL-канал знал только якорь CELEX:, и source_url в ELI-форме
+    (штатная форма допусков eurlex-коннектора) не резолвился вовсе."""
+    rec = _rec("eu-data-act-2023", url="https://data.europa.eu/eli/reg/2023/2854/oj")
+    assert cite_mining.identifiers_from_urls([rec]) == {"CELEX:32023R2854": "eu-data-act-2023"}
+
+
+def test_eli_uri_requires_host_boundary() -> None:
+    """Р2 ревью PR #52: якорь хоста с левой границей — подстрока «data.europa.eu»
+    внутри более длинного имени хоста не матчится (precision-first: ложное ребро
+    дороже пропущенного, даже когда риск умозрителен)."""
+    assert cite_mining.extract_identifiers("https://notdata.europa.eu/eli/reg/2024/1689/oj") == []
+    # а легитимные формы с границей-разделителем — по-прежнему да
+    assert ("CELEX:32024R1689", "eli_uri") in cite_mining.extract_identifiers(
+        "see https://data.europa.eu/eli/reg/2024/1689/oj"
+    )

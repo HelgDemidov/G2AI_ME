@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import run_pipeline
 from acquire import acquisition
 from convert import cloud_ocr, converters, figures_vlm
 from index import corpus_index
@@ -20,6 +22,7 @@ from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
 from core import fsio
 from run_pipeline import (
     RETRY_BACKOFF_DAYS,
+    main,
     Stage,
     _adopt_untracked_raw,
     _compose_md,
@@ -1299,9 +1302,9 @@ def test_do_figures_calls_apply_figures_pass_with_active_model(tmp_path: Path, m
     _place(rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, "body"))
     calls: list[dict[str, Any]] = []
 
-    def fake_apply(md: Path, raw: Path, *, model: str) -> bool:
+    def fake_apply(md: Path, raw: Path, *, model: str) -> tuple[bool, list[str]]:
         calls.append({"md": md, "raw": raw, "model": model})
-        return True
+        return True, []
 
     monkeypatch.setattr(figures_vlm, "apply_figures_pass", fake_apply)
     monkeypatch.setattr(cloud_ocr, "ACTIVE_MODEL", "test-active-model")
@@ -1622,3 +1625,74 @@ def test_report_scan_fallback_silent_when_nothing_to_report(tmp_path: Path, capl
     with caplog.at_level("INFO", logger="run_pipeline"):
         _report_scan_fallback([], tmp_path / "sources")
     assert caplog.records == []
+
+
+def test_do_figures_relints_final_text_and_records_witness_defects(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Б13: lint_defects, посчитанные в _do_convert, описывают ДОинъекционный текст —
+    артефакт, который никто не индексирует. _do_figures пересчитывает их на финальном
+    тексте и добавляет witness-дефекты самих инъекций (§7)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, "body without headings"))
+
+    def fake_apply(md: Path, raw: Path, *, model: str) -> tuple[bool, list[str]]:
+        return True, ["figure-witness-recall: abc123 0.10"]
+
+    monkeypatch.setattr(figures_vlm, "apply_figures_pass", fake_apply)
+    _do_figures(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert "figure-witness-recall: abc123 0.10" in state.lint_defects
+    assert "no-headings" in state.lint_defects  # линт финального текста реально выполнен
+
+
+def test_main_applies_index_migration_before_rebuild_gate(tmp_path: Path, monkeypatch: Any) -> None:
+    """Миграция схемы индекса не должна быть за гейтом «нужна ли пересборка»: она сама
+    может сделать пересборку нужной (найдено живой приёмкой convert-knowledge-seam-
+    hardening §2 — на неизменившемся корпусе колонки chunks оставались незаполненными)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, "body"))
+    db = tmp_path / "c.db"
+    conn = corpus_index.create_db(db)
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.commit()
+    conn.close()
+
+    called: list[bool] = []
+
+    def fake_rebuild(*a: Any, **kw: Any) -> str:
+        called.append(True)
+        return "ok"
+
+    monkeypatch.setattr(run_pipeline, "rebuild_index", fake_rebuild)
+    main([str(tmp_path), "--db", str(db), "--no-download"])
+
+    assert called == [True]  # миграция инвалидировала отпечаток -> пересборка запланирована
+    conn = sqlite3.connect(db)
+    assert "markup_heavy" in {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+    conn.close()
+
+
+def test_do_figures_does_not_relog_defects_already_recorded(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """Стадия figures идёт сразу за convert, поэтому повтор тех же строк удваивал бы
+    каждое предупреждение в логе прогона (найдено живой приёмкой). Новое — логируется."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, "body without headings"))
+    state_path = schema.state_file(rec, tmp_path)
+    state = schema.load_state(state_path)
+    state.lint_defects = ["no-headings"]  # как будто уже записал _do_convert
+    schema.save_state(state_path, state)
+
+    monkeypatch.setattr(
+        figures_vlm, "apply_figures_pass",
+        lambda md, raw, *, model: (True, ["figure-witness-recall: abc 0.1"]),
+    )
+    with caplog.at_level("WARNING", logger="run_pipeline"):
+        _do_figures(rec, tmp_path)
+
+    assert caplog.text.count("no-headings") == 0          # уже было — не повторяем
+    assert "figure-witness-recall: abc 0.1" in caplog.text  # новое — сообщаем
+    assert "no-headings" in schema.load_state(state_path).lint_defects  # в state сохранено

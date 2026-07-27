@@ -114,6 +114,36 @@ def _eu_act_slash(m: re.Match[str]) -> list[str]:
     return [f"CELEX:3{year:04d}{letter}{number:04d}"]
 
 
+# Аббревиатуры типа акта в ELI-пути -> те же литеры сектора-3, что у прозаических форм:
+# производные от _EU_ACT_LETTER, а не вторая таблица тех же букв.
+_ELI_TYPE_LETTER = {
+    "reg": _EU_ACT_LETTER["regulation"],
+    "dir": _EU_ACT_LETTER["directive"],
+    "dec": _EU_ACT_LETTER["decision"],
+}
+
+
+def _eli_uri(m: re.Match[str]) -> list[str]:
+    """``data.europa.eu/eli/reg/2024/1689/oj`` -> CELEX (spec
+    convert-knowledge-seam-hardening §9).
+
+    ELI — официальный URI-шаблон идентификации законодательства ЕС (Publications
+    Office), и отображение ``eli/{type}/{year}/{number}`` на сектор-3 CELEX
+    детерминировано. Живой факт аудита: ВСЕ шесть внешних ссылок конвертированного
+    EUR-Lex HTML — именно ELI-форма, а URL-канал резолюции знал только якорь ``CELEX:``,
+    то есть ``source_url`` в ELI-форме не резолвился вовсе.
+
+    Хост — ОБЯЗАТЕЛЬНАЯ часть якоря (см. регекс): национальные ELI-порталы
+    (``eli.gov.pl`` и др.) используют ту же path-грамматику для НАЦИОНАЛЬНОГО права, и
+    без хоста запись строила бы ложные CELEX. Граница та же, что у прозаических
+    регексов: ложное ребро в юридическом графе дороже пропущенного.
+    """
+    year, number = int(m.group("year")), int(m.group("number"))
+    if not _EU_YEAR_MIN <= year <= _EU_YEAR_MAX:
+        return []
+    return [f"CELEX:3{year:04d}{_ELI_TYPE_LETTER[m.group('kind').lower()]}{number:04d}"]
+
+
 def _sluzbeni(m: re.Match[str]) -> list[str]:
     idents: list[str] = []
     for number, year in re.findall(r"(\d+)\s*/\s*(\d{2,4})", m.group("numbers")):
@@ -173,6 +203,18 @@ _PATTERNS: dict[str, CitePattern] = {
             r"(?P<year>\d{2,4})\s*/\s*(?P<number>\d{1,4})\s*/\s*(?:EC|EEC|EU|Euratom)\b"
         ),
         _eu_act_slash,
+    ),
+    # ELI-URI ЕС: официальный машиночитаемый идентификатор, отображается на CELEX
+    # детерминированно. Одна запись покрывает оба канала — прозаический (напечатанный
+    # URL в тексте) и URL-резолюцию (``source_url`` допуска в ELI-форме).
+    "eli_uri": CitePattern(
+        "eli_uri",
+        re.compile(
+            r"\b(?:data|eur-lex)\.europa\.eu/eli/(?P<kind>reg|dir|dec)/"
+            r"(?P<year>\d{4})/(?P<number>\d{1,4})\b",
+            re.IGNORECASE,
+        ),
+        _eli_uri,
     ),
     "iso": CitePattern(
         "iso",
@@ -387,6 +429,14 @@ def mine_corpus(
 
     ``identifiers``/``aliases`` — обе секции курируемого справочника; ``None`` читает их
     с диска, явный словарь (в т.ч. пустой) отключает чтение, чтобы тест был герметичен.
+
+    Экстракция идёт по ТЕЛУ документа: frontmatter снимается (spec
+    convert-knowledge-seam-hardening §6) — он производная ``meta.yaml``, а не текст
+    издателя, и его ``title``/``source_url`` законно несут номер ЧУЖОГО акта («Guidance
+    on applying Regulation (EU) 2016/679…» — штатная форма заголовка в реестрах ЕС).
+    Ребро ``cites`` из курируемых метаданных подменило бы основание L1-слоя
+    («документ цитирует в своём тексте»); заодно определение «тела» становится общим с
+    chunking/lint, а не расходящимся у каждого потребителя ``doc.md``.
     """
     resolved, dangling = _resolution_map(
         records, identifiers if identifiers is not None else load_identifiers()
@@ -407,7 +457,7 @@ def mine_corpus(
             # реконсиляционен — починенный файл даст рёбра следующим прогоном.
             logger.warning("  ⚠ %s: doc.md не читается (%s) — пропущен майнингом", rec.id, exc)
             continue
-        for ident, rule in extract_identifiers(text, alias_map):
+        for ident, rule in extract_identifiers(schema.strip_frontmatter(text), alias_map):
             target = resolved.get(ident)
             if target is None:
                 lead = unresolved.setdefault(

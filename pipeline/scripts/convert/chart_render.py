@@ -14,9 +14,11 @@ bubble/waterfall/treemap/sunburst/boxplot/3D/лог-шкалы) -> mermaid-ко�
 ловят рискованную ФОРМУ, но не гарантируют, что mermaid.js реально примет
 СИНТАКСИС/СЕМАНТИКУ результата — живой пример: кавычки в ``pie title``
 синтаксически валидны, но рендерятся буквально. Финальный гейт —
-``_mermaid_renders``: настоящий рендер через ``mermaidx`` (embedded QuickJS,
+``mermaid_renders``: настоящий рендер через ``mermaidx`` (embedded QuickJS,
 runtime-зависимость с 2026-07-22), любой отказ -> откат к таблице-only, НЕ
-крах конвертации."""
+крах конвертации. Гейт публичен (spec convert-knowledge-seam-hardening §8-bis):
+``figures_vlm`` применяет его к mermaid-фенсам VLM-ответа — тот же класс вывода,
+та же дисциплина (прецедент публикации — ``apply_superseded_gate``)."""
 from __future__ import annotations
 
 import re
@@ -168,7 +170,7 @@ def _mermaid_radar(data: ChartData) -> str | None:
     return "```mermaid\nradar-beta\n" + "\n".join(lines) + "\n```"
 
 
-def _mermaid_renders(code: str) -> bool:
+def mermaid_renders(code: str) -> bool:
     """Настоящая render-проверка через ``mermaidx`` (spec chart-data-extraction,
     решение пользователя 2026-07-22 — сначала dev-тест, затем штатный
     runtime-гейт): структурные эвристики выше (``_series_shape_ok`` и т.п.)
@@ -202,7 +204,7 @@ def _mermaid(data: ChartData) -> str | None:
     if candidate is None:
         return None
     code = candidate.removeprefix("```mermaid\n").removesuffix("\n```")
-    return candidate if _mermaid_renders(code) else None
+    return candidate if mermaid_renders(code) else None
 
 
 def render_chart(data: ChartData) -> str | None:

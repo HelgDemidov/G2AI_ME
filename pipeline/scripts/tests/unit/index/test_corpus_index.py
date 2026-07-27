@@ -30,6 +30,7 @@ from index.corpus_index import (
     sanitize_fts_query,
     write_meta,
 )
+from core import markers, schema
 from core.schema import SourceRecord
 from tests.support import valid_record, write_doc
 
@@ -856,4 +857,347 @@ def test_index_corpus_no_oversize_suffix_when_all_within_budget(tmp_path: Path) 
     conn = create_db(tmp_path / "c.db")
     status = index_corpus(conn, root, _fake_counter, _MAX)
     assert "превышают" not in status
+    conn.close()
+
+
+# --- изоляция битого doc.md (spec convert-knowledge-seam-hardening §4) ---
+
+
+def _break_doc_md(doc_dir: Path) -> None:
+    """Сделать doc.md нечитаемым как UTF-8 — класс «сбой диска/обрыв записи»."""
+    (doc_dir / "doc.md").write_bytes(b"# Heading\n\n\xff\xfe not valid utf-8 \x80\x81")
+
+
+def test_incremental_isolates_unreadable_doc(tmp_path: Path, caplog: Any) -> None:
+    """Один битый doc.md не роняет переиндексацию всего корпуса (зеркало изоляции
+    mine_corpus, knowledge-hardening §1): здоровый документ индексируется, битый —
+    пропускается с предупреждением."""
+    root = tmp_path / "src"
+    dir_broken = _doc(root, "doc-broken-2026", "br", _A_BODY)
+    _doc(root, "doc-healthy-2026", "he", _B_BODY)
+    _break_doc_md(dir_broken)
+    conn = create_db(tmp_path / "c.db")
+
+    with caplog.at_level("WARNING", logger="corpus_index"):
+        changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (1, 0)  # считаются РЕАЛЬНО переиндексированные
+    assert _fts_docs(conn, "monitoring") == {("doc-healthy-2026", 0)}
+    assert "doc-broken-2026" in caplog.text
+    conn.close()
+
+
+def test_incremental_keeps_previous_generation_of_broken_doc(tmp_path: Path) -> None:
+    """Порча УЖЕ проиндексированного документа не стирает его прежние чанки и не
+    двигает его doc_state — последнее хорошее поколение остаётся в выдаче, а починка
+    файла (новый mtime) вернёт документ в changed следующим прогоном."""
+    root = tmp_path / "src"
+    dir_a = _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    before = _chunk_rows(conn)
+    fp_before = dict(conn.execute("SELECT doc_id, fingerprint FROM doc_state").fetchall())
+
+    time.sleep(0.01)
+    _break_doc_md(dir_a)
+    changed, vanished = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    assert (changed, vanished) == (0, 0)
+    assert _chunk_rows(conn) == before  # чанки прежнего поколения на месте
+    assert dict(conn.execute("SELECT doc_id, fingerprint FROM doc_state").fetchall()) == fp_before
+    assert _fts_docs(conn, "governance") == {("doc-alpha-2026", 0)}
+
+    # починка -> следующий прогон подхватывает документ штатно
+    (dir_a / "doc.md").write_text("alpha governance\n\nrepaired body", encoding="utf-8")
+    changed, _ = index_corpus_incremental(conn, root, _fake_counter, _MAX)
+    assert changed == 1
+    assert _fts_docs(conn, "repaired") == {("doc-alpha-2026", 1)}
+    conn.close()
+
+
+def test_chunks_from_corpus_isolates_unreadable_doc(tmp_path: Path, caplog: Any) -> None:
+    """Полная пересборка: битый документ пропускается с предупреждением, чанки
+    остальных собираются (до фикса — UnicodeDecodeError ронял весь вызов)."""
+    root = tmp_path / "src"
+    dir_broken = _doc(root, "doc-broken-2026", "br", _A_BODY)
+    _doc(root, "doc-healthy-2026", "he", _B_BODY)
+    _break_doc_md(dir_broken)
+
+    with caplog.at_level("WARNING", logger="corpus_index"):
+        chunks = corpus_index.chunks_from_corpus(root, _fake_counter, _MAX)
+
+    assert {c.doc_id for c in chunks} == {"doc-healthy-2026"}
+    assert "doc-broken-2026" in caplog.text
+
+
+def test_index_corpus_force_rebuild_survives_unreadable_doc(tmp_path: Path) -> None:
+    """Сквозной путь force-пересборки: отказ одного документа не рвёт стадию индекса."""
+    root = tmp_path / "src"
+    dir_broken = _doc(root, "doc-broken-2026", "br", _A_BODY)
+    _doc(root, "doc-healthy-2026", "he", _B_BODY)
+    _break_doc_md(dir_broken)
+    conn = create_db(tmp_path / "c.db")
+
+    status = index_corpus(conn, root, _fake_counter, _MAX, force=True)
+
+    assert "полная пересборка" in status
+    assert _fts_docs(conn, "monitoring") == {("doc-healthy-2026", 0)}
+    conn.close()
+
+
+# --- chunk-провенанс в индексе (spec convert-knowledge-seam-hardening §2) ---
+
+_RECON_BODY = (
+    f"{markers.injection_open('Figure, p. 1, region abc123def456', 'some/model')}\n\n"
+    "vlm prose about the figure\n\n"
+    f"{markers.injection_end('region abc123def456')}\n\n"
+    "verbatim publisher text"
+)
+
+
+def _flag_rows(conn: sqlite3.Connection, column: str) -> dict[tuple[str, int], int]:
+    return {
+        (str(r[0]), int(r[1])): int(r[2])
+        for r in conn.execute(f"SELECT doc_id, chunk_index, {column} FROM chunks")
+    }
+
+
+def test_reconstruction_column_written_on_full_rebuild(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-recon-2026", "re", _RECON_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, 10_000, force=True)
+
+    flags = _flag_rows(conn, "reconstruction")
+    assert any(v == 1 for v in flags.values())
+    conn.close()
+
+
+def test_reconstruction_column_written_on_incremental(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-recon-2026", "re", _RECON_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+
+    assert any(v == 1 for v in _flag_rows(conn, "reconstruction").values())
+    conn.close()
+
+
+def test_markup_heavy_column_written(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-table-2026", "ta", "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |")
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, 10_000, force=True)
+
+    assert any(v == 1 for v in _flag_rows(conn, "markup_heavy").values())
+    conn.close()
+
+
+def test_provenance_columns_backfilled_on_legacy_v3_db(tmp_path: Path) -> None:
+    """Аддитивная миграция БЕЗ бампа SCHEMA_VERSION: БД, собранная до этого спека,
+    получает колонки, а её векторы переживают (бамп версии дропнул бы vectors)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, sample_chunks())
+    conn.execute("CREATE TABLE IF NOT EXISTS vectors (content_hash TEXT, model TEXT, vec BLOB)")
+    conn.execute("INSERT INTO vectors VALUES ('h1', 'm', X'00')")
+    conn.commit()
+    # откат к форме до §2
+    conn.execute("ALTER TABLE chunks DROP COLUMN reconstruction")
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+    assert {"reconstruction", "markup_heavy"} <= cols
+    assert conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0] == 1
+    conn.close()
+
+
+def test_status_reports_reconstruction_and_markup_counters(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-recon-2026", "re", _RECON_BODY)
+    _doc(root, "doc-table-2026", "ta", "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |")
+    conn = create_db(tmp_path / "c.db")
+
+    status = index_corpus(conn, root, _fake_counter, 10_000, force=True)
+
+    assert "реконструированных" in status
+    assert "markup-heavy" in status
+    conn.close()
+
+
+def test_status_has_no_provenance_suffix_on_plain_corpus(tmp_path: Path) -> None:
+    """Регресс: обычный прозаический корпус не получает суффикса вовсе."""
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    status = index_corpus(conn, root, _fake_counter, 10_000)
+    assert "(" not in status
+    conn.close()
+
+
+# --- provenance-фасеты из .state.yaml (spec convert-knowledge-seam-hardening §3) ---
+
+
+def _write_state(doc_dir: Path, **fields: Any) -> None:
+    state = schema.OperationalState(**fields)
+    schema.save_state(doc_dir / ".state.yaml", state)
+
+
+def test_provenance_facets_read_from_state(tmp_path: Path) -> None:
+    """Сигналы acquire/convert доезжают до фасетов: до §3 ни один потребитель
+    index/analyze/graph не читал .state.yaml вовсе (grep-верификация аудита, Б2)."""
+    root = tmp_path / "src"
+    doc_dir = _doc(root, "doc-scan-2026", "sc", _A_BODY)
+    _write_state(
+        doc_dir,
+        fidelity=schema.Fidelity.archived_snapshot,
+        cloud_ocr_model="google/gemini-3-flash-preview",
+        lint_defects=["cloud-ocr-numeric-divergence: witness_only=[12] cloud_only=[18]"],
+        recheck_finding="drift: etag changed",
+    )
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, _MAX, force=True)
+
+    row = conn.execute(
+        "SELECT fidelity, ocr_model, quality_flags FROM doc_facets WHERE doc_id = ?",
+        ("doc-scan-2026",),
+    ).fetchone()
+    assert row[0] == "archived_snapshot"
+    assert row[1] == "google/gemini-3-flash-preview"
+    # в фасет идут ИМЕНА, не полные строки с евидентностью
+    assert row[2] == "cloud-ocr-numeric-divergence;drift"
+    conn.close()
+
+
+def test_provenance_facets_empty_without_state(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-clean-2026", "cl", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, _MAX, force=True)
+
+    row = conn.execute(
+        "SELECT fidelity, ocr_model, quality_flags FROM doc_facets WHERE doc_id = ?",
+        ("doc-clean-2026",),
+    ).fetchone()
+    assert row == (None, None, "")
+    conn.close()
+
+
+def test_provenance_facets_on_incremental_path(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    doc_dir = _doc(root, "doc-scan-2026", "sc", _A_BODY)
+    _write_state(doc_dir, fidelity=schema.Fidelity.live, lint_defects=["no-headings"])
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    row = conn.execute("SELECT fidelity, quality_flags FROM doc_facets").fetchone()
+    assert row == ("live", "no-headings")
+    conn.close()
+
+
+def test_rebuild_facets_without_root_leaves_provenance_empty(tmp_path: Path) -> None:
+    """Герметичные вызовы (тесты, легаси) не обязаны выдумывать корень корпуса."""
+    conn = create_db(tmp_path / "c.db")
+    rec = SourceRecord.model_validate(valid_record())
+    _rebuild_facets(conn, [rec])
+    assert conn.execute("SELECT fidelity, ocr_model, quality_flags FROM doc_facets").fetchone() == (
+        None, None, "",
+    )
+    conn.close()
+
+
+def test_corpus_fingerprint_is_state_aware(tmp_path: Path) -> None:
+    """Находка recheck/новый lint-дефект обязаны сдвинуть отпечаток — иначе фасет
+    останется протухшим ровно там, где он и нужен (§3)."""
+    doc_dir = _write_corpus_doc(tmp_path)
+    fp_before = corpus_fingerprint(tmp_path)
+    _write_state(doc_dir, recheck_finding="drift: etag changed")
+    assert corpus_fingerprint(tmp_path) != fp_before
+
+
+def test_corpus_fingerprint_stable_without_state_change(tmp_path: Path) -> None:
+    _write_corpus_doc(tmp_path)
+    assert corpus_fingerprint(tmp_path) == corpus_fingerprint(tmp_path)
+
+
+def test_fts_folds_balkan_diacritics() -> None:
+    """Фиксация невидимого инварианта (аудит шва Б14): ``unicode61`` по умолчанию
+    снимает диакритику (``remove_diacritics=1``), поэтому известное ограничение OCR
+    («систематически теряет čćžšđ», convert-ocr §3.1) для лексического канала
+    безвредно — «Član» и «Clan» находят друг друга.
+
+    Комплементарность СЛУЧАЙНА: она держится на дефолте SQLite, который никто не
+    выбирал осознанно. Тест — сторож на случай миграции токенизатора (напр. вторая
+    FTS-таблица ``trigram`` для CJK, §27): свойство надо будет сохранить или снять
+    осознанно, а не потерять молча."""
+    conn = create_db(Path(":memory:"))
+    index_chunks(conn, [Chunk("me-law", 0, "Član 19 Službeni list Crne Gore", 6)])
+    for query in ('"Član"', '"Clan"', '"Sluzbeni"', '"Službeni"'):
+        assert [h.doc_id for h in fts_search(conn, query)] == ["me-law"], query
+    conn.close()
+
+
+def test_chunk_column_migration_forces_recompute_on_unchanged_docs(tmp_path: Path) -> None:
+    """Найдено живой приёмкой: ALTER заполняет новые колонки chunks дефолтом, и у
+    документов, чей doc.md больше не менялся, ноль остаётся навсегда — читаясь как
+    «проверено, чисто» вместо «неизвестно» (боевой случай: eu-ai-act-2024, 396 чанков,
+    markup_heavy=0 при 173 фактических). Миграция обязана сбросить doc_state."""
+    root = tmp_path / "src"
+    _doc(root, "doc-table-2026", "ta", "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |")
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert any(v == 1 for v in _flag_rows(conn, "markup_heavy").values())
+
+    # откат к состоянию «БД собрана до §2», документ при этом не менялся
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.execute("ALTER TABLE chunks DROP COLUMN reconstruction")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)  # миграция: колонки вернулись с дефолтом 0
+    assert conn.execute("SELECT COUNT(*) FROM doc_state").fetchone()[0] == 0
+    changed, _ = index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert changed == 1  # документ пере-чанкован, хотя doc.md не трогали
+    assert any(v == 1 for v in _flag_rows(conn, "markup_heavy").values())
+    conn.close()
+
+
+def test_chunk_column_migration_preserves_vectors(tmp_path: Path) -> None:
+    """Пере-чанковка не осиротит эмбеддинги: content_hash от новых колонок не зависит."""
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    hashes_before = {r[0] for r in conn.execute("SELECT content_hash FROM chunks")}
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert {r[0] for r in conn.execute("SELECT content_hash FROM chunks")} == hashes_before
+    conn.close()
+
+
+def test_chunk_column_migration_also_clears_corpus_fingerprint(tmp_path: Path) -> None:
+    """Вторая половина того же дефекта (найдена вторым заходом живой приёмки): сброса
+    doc_state мало — пересборку гейтит corpus_fingerprint, и на неизменившемся корпусе
+    прогон отвечал бы «индекс актуален», оставив миграцию половинчатой."""
+    root = tmp_path / "src"
+    _doc(root, "doc-alpha-2026", "al", _A_BODY)
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_corpus_incremental(conn, root, _fake_counter, 10_000)
+    assert read_meta(conn, "corpus_fingerprint") is not None
+    conn.execute("ALTER TABLE chunks DROP COLUMN markup_heavy")
+    conn.commit()
+    conn.close()
+
+    conn = create_db(db)
+    assert read_meta(conn, "corpus_fingerprint") is None
     conn.close()

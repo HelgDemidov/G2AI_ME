@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
+from convert import cloud_ocr
 from convert.cloud_ocr import (
     OCR_BATCH_MAX_MB,
     OCR_BATCH_PAGES,
@@ -279,3 +280,54 @@ def test_convert_scan_header_change_discards_partial_checkpoint(monkeypatch: Any
     text = convert_scan(raw, "en", model="new-model")
     assert text == "# Fresh"
     assert len(calls) == 1  # старый чекпоинт (другая модель) не переиспользован
+
+
+# --- ленивый рендер батчей (spec convert-knowledge-seam-hardening §10, Б20) ---
+
+
+def test_convert_scan_renders_lazily_not_whole_document(tmp_path: Path, monkeypatch: Any) -> None:
+    """Раньше рендерились ВСЕ страницы разом и их base64 жили в памяти одновременно.
+    Теперь к моменту первого сетевого вызова отрендерены только страницы первого
+    батча — проверяем это счётчиком рендеров на момент запроса."""
+    rendered: list[int] = []
+    rendered_at_first_request: list[int] = []
+
+    class _Page:
+        def __init__(self, num: int) -> None:
+            self.num = num
+
+    class _Pdf:
+        pages = [_Page(i) for i in range(1, 46)]  # 45 страниц -> 3 батча по 20/20/5
+
+        def __enter__(self) -> "_Pdf":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            return None
+
+    def fake_render(page: Any) -> tuple[str, int]:
+        rendered.append(page.num)
+        return f"data:image/jpeg;base64,p{page.num}", 1000
+
+    def fake_chat(payload: dict[str, Any], *, api_key: str, timeout: float = 1800.0) -> dict[str, Any]:
+        rendered_at_first_request.append(len(rendered))
+        return {"choices": [{"message": {"content": "text"}}]}
+
+    monkeypatch.setattr(cloud_ocr, "_render_page", fake_render)
+    monkeypatch.setattr("convert.cloud_ocr.pdfplumber.open", lambda p: _Pdf())
+    monkeypatch.setattr("convert.cloud_ocr.openrouter.chat_request", fake_chat)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"pdf")
+
+    cloud_ocr.convert_scan(raw, "en", model="m")
+
+    assert rendered_at_first_request[0] == 21  # 20 страниц батча + первая следующего
+    assert len(rendered) == 45  # весь документ в итоге обработан
+
+
+def test_lazy_batching_matches_materialized_plan() -> None:
+    """Границы батчей ленивого пути ИДЕНТИЧНЫ прежним — иначе частичные чекпоинты
+    прошлых прогонов при склейке задублировали бы страницы."""
+    weights = [("uri%d" % i, 400_000) for i in range(1, 51)]
+    assert list(cloud_ocr._iter_batches(weights)) == cloud_ocr._plan_batches(weights)

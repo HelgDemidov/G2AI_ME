@@ -50,6 +50,11 @@ class ScoredChunk:
     rrf_score: float
     fts_rank: int | None  # 1-based ранг в канале; None — канал не нашёл
     vec_rank: int | None
+    # Текст чанка несёт машинную реконструкцию (VLM-описание фигуры), а не verbatim
+    # издателя (spec convert-knowledge-seam-hardening §2). АННОТАЦИЯ, не фильтр:
+    # выдача не меняется ни на бит, потребитель решает сам. Политика доверия —
+    # вопрос analyze-evidence, первого содержательного потребителя.
+    reconstruction: bool = False
 
 
 def _superseded_doc_ids(conn: sqlite3.Connection) -> set[str]:
@@ -133,17 +138,35 @@ def _rank_map(keys: list[tuple[str, int]]) -> dict[tuple[str, int], int]:
 
 def _chunk_lookup(
     conn: sqlite3.Connection, keys: list[tuple[str, int]]
-) -> dict[tuple[str, int], tuple[str, str]]:
-    """breadcrumb+text для итоговых (doc_id, chunk_index) — ОДИН SQL-запрос на весь
-    итоговый список, не по хиту (spec analyze-retrieval §4.5)."""
+) -> dict[tuple[str, int], tuple[str, str, bool]]:
+    """breadcrumb+text+провенанс для итоговых (doc_id, chunk_index) — ОДИН SQL-запрос
+    на весь итоговый список, не по хиту (spec analyze-retrieval §4.5).
+
+    Колонка ``reconstruction`` (spec convert-knowledge-seam-hardening §2) читается
+    мягко: БД, собранная до этого спека (``hsearch`` подключается напрямую, минуя
+    ``create_db`` с его миграцией), отдаёт прежние поля и ``False`` — та же
+    легаси-терпимость, что у ``_superseded_doc_ids``, и по той же причине: отсутствие
+    признака не повод отказывать в поиске.
+    """
     if not keys:
         return {}
     conditions = " OR ".join(["(doc_id = ? AND chunk_index = ?)"] * len(keys))
     params: list[object] = [v for doc_id, idx in keys for v in (doc_id, idx)]
-    rows = conn.execute(
-        f"SELECT doc_id, chunk_index, breadcrumb, text FROM chunks WHERE {conditions}", params
-    ).fetchall()
-    return {(str(r[0]), int(r[1])): (str(r[2]), str(r[3])) for r in rows}
+    try:
+        rows = conn.execute(
+            f"SELECT doc_id, chunk_index, breadcrumb, text, reconstruction "
+            f"FROM chunks WHERE {conditions}",
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = [
+            (*r, 0)
+            for r in conn.execute(
+                f"SELECT doc_id, chunk_index, breadcrumb, text FROM chunks WHERE {conditions}",
+                params,
+            ).fetchall()
+        ]
+    return {(str(r[0]), int(r[1])): (str(r[2]), str(r[3]), bool(r[4])) for r in rows}
 
 
 def retrieve(
@@ -201,6 +224,7 @@ def retrieve(
             rrf_score=score,
             fts_rank=fr,
             vec_rank=vr,
+            reconstruction=lookup[(doc_id, chunk_index)][2],
         )
         for score, doc_id, chunk_index, fr, vr in top
     ]

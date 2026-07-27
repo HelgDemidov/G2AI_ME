@@ -52,6 +52,34 @@ def _warn_if_stale(conn: sqlite3.Connection, sources_root: Path) -> None:
         )
 
 
+def _provenance_notes(conn: sqlite3.Connection, doc_ids: set[str]) -> dict[str, str]:
+    """``doc_id -> короткая пометка происхождения/качества`` из ``doc_facets``
+    (spec convert-knowledge-seam-hardening §3).
+
+    Сигналы acquire/convert (fidelity добычи, находки recheck, lint-дефекты) до этого
+    спека умирали в ``.state.yaml``: документ из Wayback-снимка был в выдаче неотличим
+    от живого оригинала, а скан с непогашенным расхождением чисел — от чистого.
+    Легаси-БД без колонок — пустой словарь (поиск не отказывает)."""
+    if not doc_ids:
+        return {}
+    placeholders = ",".join("?" * len(doc_ids))
+    try:
+        rows = conn.execute(
+            f"SELECT doc_id, fidelity, quality_flags FROM doc_facets WHERE doc_id IN ({placeholders})",
+            sorted(doc_ids),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    notes: dict[str, str] = {}
+    for doc_id, fidelity, quality_flags in rows:
+        parts = [p for p in (str(quality_flags or ""), ) if p]
+        if fidelity == "archived_snapshot":
+            parts.insert(0, "archived_snapshot")
+        if parts:
+            notes[str(doc_id)] = ";".join(parts)
+    return notes
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Гибридный поиск по корпусу G2AI (RRF: FTS5 + вектор)")
     parser.add_argument("query")
@@ -102,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ошибка поиска: {exc}", file=sys.stderr)
         conn.close()
         return 2
+    notes = _provenance_notes(conn, {r.doc_id for r in results})
 
     if embedder is not None:
         missing = unembedded_count(conn, embedder.name)
@@ -119,7 +148,12 @@ def main(argv: list[str] | None = None) -> int:
     for r in results:
         preview = r.text[:120].replace("\n", " ")
         crumb = f" · {r.breadcrumb}" if r.breadcrumb else ""
-        print(f"[{r.rrf_score:.4f}] {r.doc_id} #{r.chunk_index}{crumb}: {preview}…")
+        # Провенанс чанка (spec convert-knowledge-seam-hardening §2): машинная
+        # реконструкция фигуры выглядит как обычная проза документа — до этой пометки
+        # аналитик не мог отличить её в выдаче вообще ничем.
+        provenance = " · ⚠ reconstruction" if r.reconstruction else ""
+        note = f" · ⚑ {notes[r.doc_id]}" if r.doc_id in notes else ""
+        print(f"[{r.rrf_score:.4f}] {r.doc_id} #{r.chunk_index}{crumb}{provenance}{note}: {preview}…")
     return 0
 
 

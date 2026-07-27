@@ -173,3 +173,27 @@ def test_witness_diacritics_preserved_in_tokenization() -> None:
     witness = "vođenje registra Crne Gore"
     cloud = "vođenje registra Crne Gore"
     assert witness_checks(witness, cloud) == []
+
+
+def test_lint_does_not_import_index_layer() -> None:
+    """Guard направления зависимостей (spec convert-knowledge-seam-hardening §6, Б11):
+    convert/lint.py был ЕДИНСТВЕННЫМ импортом convert-слоя, направленным вверх по
+    конвейеру (index.chunking ради strip_frontmatter). После переезда грамматики в
+    core.schema обратная регрессия должна ломать тест, а не проходить ревью молча.
+
+    Проверка по AST, не по строке-грепу: комментарий/докстринг со словом «index»
+    ложного срабатывания не даст."""
+    import ast
+    import inspect
+
+    from convert import lint as lint_module
+
+    tree = ast.parse(inspect.getsource(lint_module))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    offenders = {m for m in imported if m == "index" or m.startswith("index.")}
+    assert not offenders, f"convert.lint импортирует index-слой: {offenders}"

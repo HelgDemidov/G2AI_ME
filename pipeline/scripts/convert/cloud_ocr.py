@@ -19,6 +19,7 @@ import base64
 import io
 import logging
 import os
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -102,11 +103,18 @@ def _render_page(page: Any) -> tuple[str, int]:
     return f"data:image/jpeg;base64,{b64}", len(b64)
 
 
-def _plan_batches(rendered: list[tuple[str, int]]) -> list[tuple[int, int, list[str]]]:
-    """Нарезка 1-based списка отрендеренных страниц на батчи по двум потолкам
-    §2.1 (страницы И байты — что раньше). Чистая функция над уже готовыми
-    (data_uri, byte_len) — тестируется синтетическими весами без PDF."""
-    batches: list[tuple[int, int, list[str]]] = []
+def _iter_batches(rendered: Iterable[tuple[str, int]]) -> Iterator[tuple[int, int, list[str]]]:
+    """Нарезка ПОТОКА отрендеренных страниц на батчи по двум потолкам §2.1 (страницы И
+    байты — что раньше), 1-based нумерация.
+
+    Ленивая по построению (spec convert-knowledge-seam-hardening §10, Б20): раньше
+    ``convert_scan`` рендерил ВСЕ страницы документа и держал их base64 в памяти
+    одновременно (замер аудита: ~82 МБ на 200-страничный скан — в пределах, но без
+    нужды). Теперь в памяти живёт максимум один собираемый батч (потолок 8 МБ) плюс
+    батч, который прямо сейчас уходит в сеть. Границы батчей ТЕ ЖЕ — та же логика над
+    той же последовательностью, поэтому частичные чекпоинты прошлых прогонов остаются
+    валидными (их совместимость сторожит ``_header``, где потолки уже учтены).
+    """
     current: list[str] = []
     current_bytes = 0
     start = 1
@@ -115,14 +123,21 @@ def _plan_batches(rendered: list[tuple[str, int]]) -> list[tuple[int, int, list[
         would_exceed_pages = len(current) >= OCR_BATCH_PAGES
         would_exceed_bytes = bool(current) and (current_bytes + byte_len) > max_bytes
         if current and (would_exceed_pages or would_exceed_bytes):
-            batches.append((start, start + len(current) - 1, current))
+            yield (start, start + len(current) - 1, current)
             current, current_bytes = [], 0
             start = page_num
         current.append(data_uri)
         current_bytes += byte_len
     if current:
-        batches.append((start, start + len(current) - 1, current))
-    return batches
+        yield (start, start + len(current) - 1, current)
+
+
+def _plan_batches(rendered: list[tuple[str, int]]) -> list[tuple[int, int, list[str]]]:
+    """Материализованная нарезка — тонкая обёртка над ``_iter_batches`` для тестов
+    (синтетические веса без PDF). Одна реализация правила границ на оба пути: копия
+    предиката разошлась бы с потолками ``_header`` и тихо задублировала бы страницы
+    при склейке чекпоинта."""
+    return list(_iter_batches(rendered))
 
 
 def _ordered_texts(parts: dict[str, str]) -> list[str]:
@@ -197,22 +212,24 @@ def convert_scan(raw: Path, language: str | None, *, model: str) -> str:
     parts = _load_parts(raw, model=model, raw_sha256=raw_sha256)
     prompt_base = OCR_PROMPT.format(lang_name=_lang_name(language))
 
+    # Рендер ленив (spec convert-knowledge-seam-hardening §10): страницы кодируются по
+    # мере сборки батча, а не все разом — pdfplumber остаётся открыт на всё время цикла,
+    # включая сетевые вызовы.
     with pdfplumber.open(raw) as pdf:
-        rendered = [_render_page(p) for p in pdf.pages]
-    batches = _plan_batches(rendered)
-
-    for start, end, data_uris in batches:
-        key = f"{start}-{end}"
-        if key in parts:
-            continue  # уже добыт предыдущим (прерванным) прогоном — сеть не трогаем
-        prompt = prompt_base
-        if start > 1:
-            outline = [ln for text in _ordered_texts(parts) for ln in text.splitlines() if ln.startswith("#")]
-            if outline:
-                prompt += _OUTLINE_PREAMBLE + "\n".join(outline)
-        response = openrouter.chat_request(_build_payload(model, prompt, data_uris), api_key=api_key)
-        parts[key] = response["choices"][0]["message"]["content"]
-        _save_parts(raw, model=model, raw_sha256=raw_sha256, parts=parts)  # чекпоинт СРАЗУ после батча
+        for start, end, data_uris in _iter_batches(_render_page(p) for p in pdf.pages):
+            key = f"{start}-{end}"
+            if key in parts:
+                continue  # уже добыт предыдущим (прерванным) прогоном — сеть не трогаем
+            prompt = prompt_base
+            if start > 1:
+                outline = [
+                    ln for text in _ordered_texts(parts) for ln in text.splitlines() if ln.startswith("#")
+                ]
+                if outline:
+                    prompt += _OUTLINE_PREAMBLE + "\n".join(outline)
+            response = openrouter.chat_request(_build_payload(model, prompt, data_uris), api_key=api_key)
+            parts[key] = response["choices"][0]["message"]["content"]
+            _save_parts(raw, model=model, raw_sha256=raw_sha256, parts=parts)  # чекпоинт СРАЗУ
 
     full_text = "\n\n".join(_ordered_texts(parts))
     _finalize_parts(raw)

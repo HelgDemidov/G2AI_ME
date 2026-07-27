@@ -138,7 +138,7 @@ def test_inject_group_markers_empty_captions_says_no_text() -> None:
 
     group = DocxGroup(id12="abc123def456", media_ids=frozenset(), captions=())
     result = inject_group_markers(f"{SENTINEL_PREFIX}abc123def456", [group])
-    assert "> captions: (нет текста)" in result
+    assert "> captions: (no captions)" in result
 
 
 def test_inject_group_markers_no_groups_is_noop() -> None:

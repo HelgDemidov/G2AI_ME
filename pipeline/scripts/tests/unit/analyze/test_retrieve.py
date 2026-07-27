@@ -176,3 +176,48 @@ def test_filters_empty_match_returns_empty_list(tmp_path: Path) -> None:
     index_chunks(conn, [Chunk(rec.id, 0, "governance text", 3)])
     results = retrieve(conn, "governance", None, k=10, filters=RetrievalFilters(entity_id="nowhere"))
     assert results == []
+
+
+# --- провенанс в выдаче (spec convert-knowledge-seam-hardening §2) ---
+
+
+def test_scored_chunk_carries_reconstruction_flag(tmp_path: Path) -> None:
+    conn = create_db(tmp_path / "c.db")
+    index_chunks(conn, [
+        Chunk("doc-a", 0, "figure shows governance layers", 4, "", True),
+        Chunk("doc-b", 0, "governance framework verbatim", 4, "", False),
+    ])
+    results = {r.doc_id: r.reconstruction for r in retrieve(conn, "governance", None, k=10)}
+    assert results == {"doc-a": True, "doc-b": False}
+    conn.close()
+
+
+def test_reconstruction_flag_does_not_filter_results(tmp_path: Path) -> None:
+    """Провенанс — АННОТАЦИЯ, не фильтр: выдача не меняется ни на бит (политика
+    доверия — вопрос analyze-evidence, первого содержательного потребителя)."""
+    conn = create_db(tmp_path / "c.db")
+    plain = [Chunk("doc-a", 0, "governance layers", 4), Chunk("doc-b", 0, "governance framework", 4)]
+    index_chunks(conn, plain)
+    before = [(r.doc_id, r.chunk_index, r.rrf_score) for r in retrieve(conn, "governance", None, k=10)]
+
+    flagged = [Chunk(c.doc_id, c.index, c.text, c.n_tokens, c.breadcrumb, True) for c in plain]
+    index_chunks(conn, flagged)
+    after = [(r.doc_id, r.chunk_index, r.rrf_score) for r in retrieve(conn, "governance", None, k=10)]
+
+    assert after == before
+    conn.close()
+
+
+def test_retrieve_degrades_on_db_without_provenance_column(tmp_path: Path) -> None:
+    """Легаси-БД (собрана до §2, hsearch подключается к ней напрямую) — поиск работает,
+    провенанс честно False; та же терпимость, что у superseded-фасета."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "governance framework", 4)])
+    conn.execute("ALTER TABLE chunks DROP COLUMN reconstruction")
+    conn.commit()
+
+    results = retrieve(conn, "governance", None, k=10)
+    assert [r.doc_id for r in results] == ["doc-a"]
+    assert results[0].reconstruction is False
+    conn.close()

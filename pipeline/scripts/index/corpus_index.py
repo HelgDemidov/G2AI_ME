@@ -1,10 +1,14 @@
 """Единый SQLite-индекс корпуса: канонические чанки + полнотекстовый поиск FTS5.
 
 Схема (одна БД, векторный слой в vector_store.py):
-  chunks(chunk_id, doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb)
+  chunks(chunk_id, doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb,
+         reconstruction, markup_heavy)
     content_hash = sha256(breadcrumb + text) — стабильный «адрес» СОДЕРЖИМОГО чанка: к
     нему привязан вектор (vector_store), поэтому пере-чанковка не осиротит эмбеддинги
     неизменившихся чанков, а старый вектор физически не может указать на чужой текст.
+    reconstruction/markup_heavy — провенанс и форма чанка (spec
+    convert-knowledge-seam-hardening §2): в content_hash НЕ входят, поэтому их
+    появление не осиротило ни одного вектора.
   chunks_fts — внешне-контентная FTS5 над chunks.text + chunks.breadcrumb, tokenize=unicode61.
   doc_facets(doc_id, ...) / topics_map(doc_id, topic) — фасеты метаданных для retrieval-
     фильтров (spec analyze-retrieval §2.3); полная перезапись при каждой индексации.
@@ -20,16 +24,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from index.bge_tokenizer import EMBED_MAX_TOKENS, token_counter
-from index.chunking import Chunk, TokenCounter, chunk_text, strip_frontmatter
+from index.chunking import Chunk, TokenCounter, chunk_text, is_markup_heavy, strip_frontmatter
 from core.env import REPO_ROOT
-from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, md_file
+from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, load_state, md_file, state_file
 from core.schema import superseded_ids as schema_superseded_ids
+
+logger = logging.getLogger("corpus_index")
 
 DEFAULT_DB = REPO_ROOT / "pipeline" / "index" / "corpus.db"
 
@@ -46,13 +53,15 @@ _DERIVED_TABLES = ("chunks_fts", "chunks", "doc_state", "vectors", "doc_facets",
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id     INTEGER PRIMARY KEY,
-    doc_id       TEXT    NOT NULL,
-    chunk_index  INTEGER NOT NULL,
-    text         TEXT    NOT NULL,
-    n_tokens     INTEGER NOT NULL,
-    content_hash TEXT    NOT NULL,
-    breadcrumb   TEXT    NOT NULL DEFAULT ''
+    chunk_id       INTEGER PRIMARY KEY,
+    doc_id         TEXT    NOT NULL,
+    chunk_index    INTEGER NOT NULL,
+    text           TEXT    NOT NULL,
+    n_tokens       INTEGER NOT NULL,
+    content_hash   TEXT    NOT NULL,
+    breadcrumb     TEXT    NOT NULL DEFAULT '',
+    reconstruction INTEGER NOT NULL DEFAULT 0,
+    markup_heavy   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc  ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(content_hash);
@@ -82,7 +91,10 @@ CREATE TABLE IF NOT EXISTS doc_facets (
     target_fit     TEXT,
     assessed_stage TEXT,
     sensitivity    TEXT NOT NULL DEFAULT 'public',
-    superseded     INTEGER NOT NULL DEFAULT 0
+    superseded     INTEGER NOT NULL DEFAULT 0,
+    fidelity       TEXT,
+    ocr_model      TEXT,
+    quality_flags  TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS topics_map (
     doc_id TEXT NOT NULL,
@@ -134,6 +146,15 @@ def _doc_fingerprint(path: Path) -> str:
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
+def _optional_fingerprint(path: Path) -> str:
+    """``_doc_fingerprint`` для файла, которого может не быть (``.state.yaml`` свежего,
+    ещё не добывавшегося документа) — ``"-"`` вместо отказа."""
+    try:
+        return _doc_fingerprint(path)
+    except OSError:
+        return "-"
+
+
 def _fingerprint_from_parts(parts: list[str]) -> str:
     """sha256 отсортированных строк — общий хэш для ``corpus_fingerprint`` и его
     инкрементального пересчёта (``index_corpus_incremental``): формат обязан
@@ -154,10 +175,18 @@ def corpus_fingerprint(sources_root: Path) -> str:
     meta НЕ должна пере-чанковывать/пере-эмбеддить документ, только обновить фасеты
     (см. ``index_corpus``/``index_corpus_incremental``). Документы без ``doc.md`` не
     входят — их появление (после конвертации) меняет отпечаток и триггерит
-    пересборку. На ~200 документах — ~400 ``stat()``, миллисекунды.
+    пересборку. На ~200 документах — ~600 ``stat()``, миллисекунды.
+
+    State-aware (spec convert-knowledge-seam-hardening §3): в отпечаток входит и
+    ``.state.yaml``, потому что из него теперь собираются provenance-фасеты. Без этого
+    находка recheck (``drift``) или новый lint-дефект не сдвигали бы отпечаток, и
+    ``run_pipeline`` счёл бы индекс актуальным — фасет остался бы протухшим ровно там,
+    где он и нужен. Пере-чанковки это не вызывает: ``doc_state`` по-прежнему считается
+    только по ``doc.md``, поэтому дорогая часть (токенизация, эмбеддинг) не трогается.
     """
     parts = [
         f"{rec.id}:{_doc_fingerprint(md)}:{_doc_fingerprint(md.parent / 'meta.yaml')}"
+        f":{_optional_fingerprint(state_file(rec, sources_root))}"
         for rec in load_records(sources_root)
         if (md := md_file(rec, sources_root)).exists()
     ]
@@ -206,26 +235,72 @@ def _reset_derived_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_facet_column(conn: sqlite3.Connection, column: str, ddl: str) -> None:
-    """Аддитивная миграция колонки ``doc_facets`` БЕЗ бампа ``SCHEMA_VERSION`` (тот
-    дропнул бы ``vectors``, запрещено). Свежие/мигрированные БД получают колонку прямо
-    из ``_SCHEMA``; эта функция бэкфиллит её на уже существующей v3 ``doc_facets``, где
-    колонки ещё нет. Идемпотентна; отсутствие таблицы (легаси до v3, ещё будет создана
-    ниже) — no-op.
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> bool:
+    """Аддитивная миграция колонки БЕЗ бампа ``SCHEMA_VERSION`` (тот дропнул бы
+    ``vectors``, запрещено). Свежие/мигрированные БД получают колонку прямо из
+    ``_SCHEMA``; эта функция бэкфиллит её на уже существующей v3-таблице, где колонки
+    ещё нет. Идемпотентна; отсутствие таблицы (легаси до v3, ещё будет создана ниже) —
+    no-op.
 
-    Обобщена на втором применении (``sensitivity`` — spec embed-api-first §3.1,
-    ``superseded`` — spec graph-v2 §2): третья аддитивная колонка добавляется строкой
-    в ``_ensure_facet_columns``, а не копией функции.
+    Обобщена по таблицам на ЧЕТВЁРТОМ применении (spec convert-knowledge-seam-hardening
+    §2 добавляет колонки в ``chunks``, а не только в ``doc_facets``): раньше имя таблицы
+    было зашито в функцию, и второй адресат потребовал бы её копии — тот самый класс,
+    который проект закрывает реестрами.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(doc_facets)").fetchall()}
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if cols and column not in cols:
-        conn.execute(f"ALTER TABLE doc_facets ADD COLUMN {column} {ddl}")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        return True
+    return False
 
 
 def _ensure_facet_columns(conn: sqlite3.Connection) -> None:
-    """Все аддитивные колонки ``doc_facets``, добавленные после введения схемы v3."""
-    _ensure_facet_column(conn, "sensitivity", "TEXT NOT NULL DEFAULT 'public'")
-    _ensure_facet_column(conn, "superseded", "INTEGER NOT NULL DEFAULT 0")
+    """Все аддитивные колонки, добавленные после введения схемы v3.
+
+    ``doc_facets``: ``sensitivity`` (spec embed-api-first §3.1), ``superseded``
+    (graph-v2 §2). ``chunks``: ``reconstruction``/``markup_heavy``
+    (convert-knowledge-seam-hardening §2) — провенанс и форма чанка; ``content_hash``
+    от них НЕ зависит, поэтому уже посчитанные векторы переживают миграцию.
+    """
+    _ensure_column(conn, "doc_facets", "sensitivity", "TEXT NOT NULL DEFAULT 'public'")
+    _ensure_column(conn, "doc_facets", "superseded", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "doc_facets", "fidelity", "TEXT")
+    _ensure_column(conn, "doc_facets", "ocr_model", "TEXT")
+    _ensure_column(conn, "doc_facets", "quality_flags", "TEXT NOT NULL DEFAULT ''")
+    # ``chunks`` — отдельный случай, см. ``_invalidate_doc_state_after_chunk_migration``:
+    # список не схлопывать в ``any(generator)``, оба ALTER обязаны выполниться.
+    chunk_columns_added = [
+        _ensure_column(conn, "chunks", "reconstruction", "INTEGER NOT NULL DEFAULT 0"),
+        _ensure_column(conn, "chunks", "markup_heavy", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    if any(chunk_columns_added):
+        _invalidate_doc_state_after_chunk_migration(conn)
+
+
+def _invalidate_doc_state_after_chunk_migration(conn: sqlite3.Connection) -> None:
+    """Заставить следующий инкремент пере-чанковать ВЕСЬ корпус после добавления колонок
+    в ``chunks`` (spec convert-knowledge-seam-hardening §2, найдено живой приёмкой).
+
+    Асимметрия с ``doc_facets`` принципиальна и стоила живого дефекта: фасеты
+    ПОЛНОСТЬЮ переписываются каждый прогон, поэтому их новая колонка наполняется сама.
+    Значения колонок ``chunks`` пишутся только при вставке чанка, то есть лишь для
+    документов, чей ``doc.md`` изменился ПОСЛЕ миграции. У остальных остаётся дефолт
+    ``0`` из ``ALTER`` — и читается он как «проверено, чисто», хотя означает «неизвестно»
+    (живой замер: `eu-ai-act-2024`, 396 чанков, показывал ``markup_heavy=0`` при 173
+    фактических — ровно тот класс тихой лжи, против которого написан весь этот спек).
+
+    Сброс ``doc_state`` дороже точечного бэкфилла ровно на одну пере-чанковку корпуса
+    (bge-токенизация, минуты) и честнее его: ``reconstruction`` — свойство абзаца в
+    КОНТЕКСТЕ блока инъекции, из одного текста чанка не восстановимое. ``content_hash``
+    при этом не меняется, поэтому ни один вектор не осиротеет и переэмбеддинга не будет.
+
+    Вместе с ``doc_state`` снимается и ``corpus_fingerprint``: пересборку гейтит именно
+    он (``run_pipeline._needs_index_rebuild``), и без этого на неизменившемся корпусе
+    прогон честно отвечал бы «индекс актуален», а миграция осталась бы половинчатой до
+    первой правки документов — найдено живой приёмкой того же спека, вторым заходом.
+    """
+    conn.execute("DELETE FROM doc_state")
+    conn.execute("DELETE FROM index_meta WHERE key = 'corpus_fingerprint'")
 
 
 def create_db(db_path: Path) -> sqlite3.Connection:
@@ -242,7 +317,38 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> None:
+def _flag_name(entry: str) -> str:
+    """Имя дефекта/находки без евидентности: ``"cloud-ocr-numeric-divergence: -12/+18"``
+    -> ``"cloud-ocr-numeric-divergence"``. В фасет идёт ИМЯ, не полная строка: фасет —
+    короткий сигнал «посмотри в .state.yaml», а не его дубликат (полные строки несут
+    списки чисел)."""
+    return entry.split(":", 1)[0].strip()
+
+
+def _provenance_facets(rec: SourceRecord, sources_root: Path) -> tuple[str | None, str | None, str]:
+    """``(fidelity, ocr_model, quality_flags)`` документа из его ``.state.yaml``
+    (spec convert-knowledge-seam-hardening §3).
+
+    До этого спека НИ ОДИН читатель операционного состояния не жил в index/analyze/graph
+    (grep-верификация аудита): acquire и convert прилежно писали fidelity, находки
+    recheck и lint-дефекты, а выдача о них молчала — документ из Wayback-снимка был
+    неотличим от живого оригинала, а скан с непогашенным расхождением чисел — от
+    чистого. Отсутствующий сайдкар (документ ещё не добывался) — пустые значения, не
+    ошибка."""
+    state = load_state(state_file(rec, sources_root))
+    flags = [_flag_name(d) for d in state.lint_defects]
+    if state.recheck_finding:
+        flags.append(_flag_name(state.recheck_finding))
+    return (
+        state.fidelity.value if state.fidelity else None,
+        state.cloud_ocr_model,
+        ";".join(dict.fromkeys(f for f in flags if f)),  # дедуп с сохранением порядка
+    )
+
+
+def _rebuild_facets(
+    conn: sqlite3.Connection, records: list[SourceRecord], sources_root: Path | None = None
+) -> None:
     """Перезаписать ``doc_facets``/``topics_map`` из курируемых записей (полная
     перезапись — O(сотен строк), дешевле любой инкрементальности diff'а). ``axis``/
     ``target_fit``/``assessed_stage`` — ``None``, если у записи ещё нет ``relevance``
@@ -251,15 +357,24 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
     ``superseded`` (spec graph-v2 §2) — кросс-документный фасет: считается общим
     ``schema.superseded_ids`` (тем же, которым recheck-контур исключает записи из
     ротации — одно определение на двух потребителей) на УЖЕ загруженном списке записей,
-    ноль новых чтений с диска."""
+    ноль новых чтений с диска.
+
+    ``sources_root`` (spec convert-knowledge-seam-hardening §3) включает provenance-
+    фасеты из ``.state.yaml`` (~1 мелкое чтение на документ, та же частота, что сам
+    rebuild). ``None`` — фасеты пустые: герметичные тесты и легаси-вызовы, у которых
+    корня нет, не должны требовать выдуманного пути."""
     superseded = schema_superseded_ids(records)
+    provenance = {
+        rec.id: (_provenance_facets(rec, sources_root) if sources_root is not None else (None, None, ""))
+        for rec in records
+    }
     conn.execute("DELETE FROM doc_facets")
     conn.execute("DELETE FROM topics_map")
     conn.executemany(
         "INSERT INTO doc_facets "
         "(doc_id, entity_id, track, doc_type, authority, language, axis, target_fit, "
-        "assessed_stage, sensitivity, superseded) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assessed_stage, sensitivity, superseded, fidelity, ocr_model, quality_flags) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 rec.id,
@@ -273,6 +388,7 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
                 rec.relevance.assessed_stage.value if rec.relevance else None,
                 rec.sensitivity.value,
                 int(rec.id in superseded),
+                *provenance[rec.id],
             )
             for rec in records
         ],
@@ -290,6 +406,7 @@ def index_chunks(
     corpus_fingerprint: str | None = None,
     chunk_max_tokens: int | None = None,
     records: list[SourceRecord] | None = None,
+    sources_root: Path | None = None,
 ) -> None:
     """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно).
 
@@ -315,16 +432,20 @@ def index_chunks(
     conn.execute(_META_SCHEMA)  # defensive — index_meta может не существовать без create_db
     conn.execute("DELETE FROM chunks")
     conn.executemany(
-        "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chunks "
+        "(doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb, reconstruction, markup_heavy) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb), c.breadcrumb)
+            (
+                c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb),
+                c.breadcrumb, int(c.reconstruction), int(is_markup_heavy(c.text)),
+            )
             for c in chunks
         ],
     )
     conn.execute("INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild')")
     if records is not None:
-        _rebuild_facets(conn, records)
+        _rebuild_facets(conn, records, sources_root)
     if corpus_fingerprint is not None:
         write_meta(conn, "corpus_fingerprint", corpus_fingerprint)
     if chunk_max_tokens is not None:
@@ -362,9 +483,13 @@ def _insert_doc_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
     ТЕ ЖЕ text/breadcrumb (инвариант для последующего ``_delete_doc_chunks``)."""
     for c in chunks:
         cur = conn.execute(
-            "INSERT INTO chunks (doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb), c.breadcrumb),
+            "INSERT INTO chunks "
+            "(doc_id, chunk_index, text, n_tokens, content_hash, breadcrumb, reconstruction, markup_heavy) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                c.doc_id, c.index, c.text, c.n_tokens, content_hash(c.text, c.breadcrumb),
+                c.breadcrumb, int(c.reconstruction), int(is_markup_heavy(c.text)),
+            ),
         )
         conn.execute(
             "INSERT INTO chunks_fts (rowid, text, breadcrumb) VALUES (?, ?, ?)",
@@ -407,6 +532,14 @@ def index_corpus_incremental(
     и порвал бы атомарность. ``corpus_fingerprint`` — ЕДИНАЯ meta-aware функция
     (та же, что глобальный гейт ``run_pipeline``), не локальная пересборка из
     per-doc частей — иначе форматы разошлись бы (spec analyze-retrieval §2.3).
+
+    Чтение ``doc.md`` вынесено ДО транзакции (spec convert-knowledge-seam-hardening §4):
+    битый файл (не-UTF-8 после сбоя диска) исключается из поколения, а не роняет
+    переиндексацию ВСЕГО корпуса — тот же паттерн «отказ документа не рвёт батч», что в
+    ``run_pipeline``/``discovery``/``mine_corpus``. Прежние чанки такого документа при
+    этом НЕ удаляются и ``doc_state`` НЕ обновляется: последнее хорошее поколение
+    остаётся в выдаче, а починка файла сдвинет mtime и вернёт документ в ``changed``
+    следующим прогоном. Возвращаемое «изменено» считает РЕАЛЬНО переиндексированные.
     """
     all_records = list(load_records(sources_root))
     current: dict[str, tuple[str, Path]] = {}
@@ -421,14 +554,25 @@ def index_corpus_incremental(
 
     changed = [doc_id for doc_id, (fp, _) in current.items() if stored.get(doc_id) != fp]
     vanished = [doc_id for doc_id in stored if doc_id not in current]
+
+    pending: list[tuple[str, str, str]] = []  # (doc_id, fingerprint, тело без frontmatter)
+    for doc_id in changed:
+        fp, md = current[doc_id]
+        try:
+            text = md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "  ⚠ %s: doc.md не читается (%s) — документ пропущен переиндексацией", doc_id, exc
+            )
+            continue
+        pending.append((doc_id, fp, strip_frontmatter(text)))
+
     corpus_fp = corpus_fingerprint(sources_root)
 
     with conn:  # атомарно: либо всё новое поколение, либо ничего
-        for doc_id in (*changed, *vanished):
+        for doc_id in (*(p[0] for p in pending), *vanished):
             _delete_doc_chunks(conn, doc_id)
-        for doc_id in changed:
-            fp, md = current[doc_id]
-            text = strip_frontmatter(md.read_text(encoding="utf-8"))
+        for doc_id, fp, text in pending:
             _insert_doc_chunks(conn, chunk_text(text, count_tokens, max_tokens, doc_id=doc_id))
             conn.execute(
                 "INSERT INTO doc_state (doc_id, fingerprint) VALUES (?, ?) "
@@ -437,10 +581,10 @@ def index_corpus_incremental(
             )
         for doc_id in vanished:
             conn.execute("DELETE FROM doc_state WHERE doc_id = ?", (doc_id,))
-        _rebuild_facets(conn, all_records)
+        _rebuild_facets(conn, all_records, sources_root)
         write_meta(conn, "corpus_fingerprint", corpus_fp)
         write_meta(conn, "chunk_max_tokens", str(max_tokens))
-    return len(changed), len(vanished)
+    return len(pending), len(vanished)
 
 
 def _count_oversize_chunks(conn: sqlite3.Connection, max_tokens: int) -> int:
@@ -454,11 +598,30 @@ def _count_oversize_chunks(conn: sqlite3.Connection, max_tokens: int) -> int:
     return int(row[0]) if row else 0
 
 
+def _count_flagged_chunks(conn: sqlite3.Connection, column: str) -> int:
+    row = conn.execute(f"SELECT COUNT(*) FROM chunks WHERE {column} = 1").fetchone()
+    return int(row[0]) if row else 0
+
+
 def _oversize_suffix(conn: sqlite3.Connection, max_tokens: int) -> str:
+    """Хвост статус-строки индексации: что в собранном поколении стоит увидеть глазами.
+
+    Оверсайзы (knowledge-hardening §8) + провенанс/форма чанков (spec
+    convert-knowledge-seam-hardening §2): доля машинной реконструкции в выдаче и доля
+    чанков-разметки — величины, которые аудит пришлось мерить ad-hoc скриптом; счётчик
+    делает их штатно наблюдаемыми.
+    """
+    parts: list[str] = []
     oversize = _count_oversize_chunks(conn, max_tokens)
-    if not oversize:
-        return ""
-    return f" (⚠ {oversize} превышают {max_tokens} ткн — эмбеддер усечёт)"
+    if oversize:
+        parts.append(f"⚠ {oversize} превышают {max_tokens} ткн — эмбеддер усечёт")
+    reconstruction = _count_flagged_chunks(conn, "reconstruction")
+    if reconstruction:
+        parts.append(f"{reconstruction} реконструированных")
+    markup_heavy = _count_flagged_chunks(conn, "markup_heavy")
+    if markup_heavy:
+        parts.append(f"{markup_heavy} markup-heavy")
+    return f" ({'; '.join(parts)})" if parts else ""
 
 
 def index_corpus(
@@ -483,6 +646,7 @@ def index_corpus(
             corpus_fingerprint=corpus_fingerprint(sources_root),
             chunk_max_tokens=max_tokens,
             records=list(load_records(sources_root)),
+            sources_root=sources_root,
         )
         _rebuild_doc_state(conn, sources_root)
         return f"полная пересборка: {len(chunks)} чанков" + _oversize_suffix(conn, max_tokens)
@@ -549,15 +713,29 @@ def chunks_from_corpus(
     count_tokens: TokenCounter,
     max_tokens: int = EMBED_MAX_TOKENS,
 ) -> list[Chunk]:
-    """Собрать канонические чанки всех doc.md корпуса (пути выводятся из папки-документа)."""
+    """Собрать канонические чанки всех doc.md корпуса (пути выводятся из папки-документа).
+
+    Нечитаемый ``doc.md`` пропускается с предупреждением, а не роняет сборку всего
+    корпуса (spec convert-knowledge-seam-hardening §4). ⚠ В отличие от инкрементального
+    пути, здесь пропуск означает ОТСУТСТВИЕ документа в новом поколении индекса — это
+    полная пересборка, прежних чанков она не сохраняет ни для кого."""
     chunks: list[Chunk] = []
     for rec in load_records(sources_root):
         md = md_file(rec, sources_root)
         if not md.exists():
             print(f"  пропуск {rec.id}: нет файла {md}", file=sys.stderr)
             continue
-        text = strip_frontmatter(md.read_text(encoding="utf-8"))
-        chunks.extend(chunk_text(text, count_tokens, max_tokens, doc_id=rec.id))
+        try:
+            raw_text = md.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "  ⚠ %s: doc.md не читается (%s) — документ не войдёт в пересобранный индекс",
+                rec.id, exc,
+            )
+            continue
+        chunks.extend(
+            chunk_text(strip_frontmatter(raw_text), count_tokens, max_tokens, doc_id=rec.id)
+        )
     return chunks
 
 
