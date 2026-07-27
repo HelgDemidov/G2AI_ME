@@ -33,9 +33,11 @@ from run_pipeline import (
     _do_frontmatter,
     _needs_index_rebuild,
     _read_index_fingerprint,
+    _record_convert_failure,
     _report,
     _run_lock_path,
     _sha256,
+    convert_deferred,
     needed_stages,
     process_docs,
     rebuild_index,
@@ -903,6 +905,211 @@ def test_backoff_does_not_defer_document_that_already_has_raw(tmp_path: Path) ->
     _place(rec, tmp_path, raw=b"%PDF-1.4 existing", state=_failed_state(1))
     stages = needed_stages(rec, tmp_path)
     assert Stage.download not in stages and Stage.convert in stages
+
+
+# --- backoff отказов конвертации (spec acquire-convert-seam-hardening §8, В11) ---
+
+
+def _pdf_converter_key() -> str:
+    conv = converters._CONVERTERS["pdf"]
+    return f"{conv.name}@{conv.version}"
+
+
+def _state_with(**kw: Any) -> schema.OperationalState:
+    return schema.OperationalState.model_validate({"sha256": "a" * 64, **kw})
+
+
+def test_convert_deferred_fresh_failure_same_converter_same_raw() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", True) is True
+
+
+def test_convert_deferred_pierced_by_force() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", True, force=True) is False
+
+
+def test_convert_deferred_pierced_by_ignore_backoff() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", True, ignore_backoff=True) is False
+
+
+def test_convert_deferred_pierced_by_converter_version_bump() -> None:
+    """Детерминированный отказ старой версии не предсказывает исход новой —
+    бамп версии конвертера пробивает backoff немедленно."""
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@7", True) is False
+
+
+def test_convert_deferred_pierced_by_raw_change() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", False) is False
+
+
+def test_convert_deferred_expired_window_pierces() -> None:
+    state = _state_with(
+        convert_failed=dt.date.today() - dt.timedelta(days=RETRY_BACKOFF_DAYS),
+        convert_failed_converter="pdf@6",
+    )
+    assert convert_deferred(state, "pdf@6", True) is False
+
+
+def test_convert_deferred_no_prior_failure_pierces() -> None:
+    assert convert_deferred(_state_with(), "pdf@6", True) is False
+
+
+def test_record_convert_failure_writes_date_reason_and_converter(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _record_convert_failure(rec, tmp_path, RuntimeError("ocrmypdf timeout"))
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed == dt.date.today()
+    assert state.convert_failure_reason == "ocrmypdf timeout"
+    assert state.convert_failed_converter == _pdf_converter_key()
+
+
+def test_record_convert_failure_truncates_long_reason(tmp_path: Path) -> None:
+    from run_pipeline import _FAILURE_REASON_MAX
+
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+    _record_convert_failure(rec, tmp_path, RuntimeError("x" * (_FAILURE_REASON_MAX + 100)))
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failure_reason is not None
+    assert len(state.convert_failure_reason) == _FAILURE_REASON_MAX
+
+
+def test_record_convert_failure_without_raw_leaves_converter_key_none(tmp_path: Path) -> None:
+    rec = make()  # ни raw, ни папки документа вовсе нет
+    _record_convert_failure(rec, tmp_path, RuntimeError("нет raw-файла для конвертации"))
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed == dt.date.today()
+    assert state.convert_failed_converter is None
+
+
+def _convert_failed_state(days_ago: int, *, converter_key: str | None = None) -> dict[str, Any]:
+    failed = dt.date.today() - dt.timedelta(days=days_ago)
+    return {
+        "convert_failed": failed.isoformat(),
+        "convert_failure_reason": "ocrmypdf timeout",
+        "convert_failed_converter": converter_key or _pdf_converter_key(),
+    }
+
+
+def test_needed_stages_defers_convert_after_fresh_failure(tmp_path: Path) -> None:
+    """Живой сценарий В11: первая попытка конвертации патологического скана
+    провалилась сегодня — raw присутствует и стабилен (нет download), doc.md так и
+    не появился (`not md.exists()` иначе бы требовал Stage.convert). Следующее
+    планирование НЕ повторяет заведомо дорогую попытку в тот же день."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _adopt_untracked_raw(rec, tmp_path)  # заполняет guard-тройку под raw_stat_matches
+    state_path = schema.state_file(rec, tmp_path)
+    state = schema.load_state(state_path)
+    state.convert_failed = dt.date.today()
+    state.convert_failed_converter = _pdf_converter_key()
+    schema.save_state(state_path, state)
+
+    assert needed_stages(rec, tmp_path) == []
+
+
+def test_needed_stages_convert_backoff_pierced_by_raw_stat_mismatch(tmp_path: Path) -> None:
+    """Изолирует raw_stat_matches=False-ветку convert_deferred от download-путя:
+    touch БЕЗ смены содержимого меняет mtime (guard-тройка не совпадёт), но sha256
+    остаётся прежним -> Stage.download сам по себе НЕ требуется (в отличие от замены
+    байт, которая пробила бы backoff через download-need, не через convert_deferred).
+    Детерминированный отказ на другом (по стату) входе мог бы не повториться —
+    backoff пробивается немедленно."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _adopt_untracked_raw(rec, tmp_path)
+    state_path = schema.state_file(rec, tmp_path)
+    state = schema.load_state(state_path)
+    state.convert_failed = dt.date.today()
+    state.convert_failed_converter = _pdf_converter_key()
+    schema.save_state(state_path, state)
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.touch()  # тот же контент, новый mtime -> guard-тройка не совпадёт
+
+    stages = needed_stages(rec, tmp_path)
+    assert Stage.download not in stages  # sha всё ещё совпадает — download НЕ нужен
+    assert Stage.convert in stages       # но stat разошёлся -> backoff пробит
+
+
+def test_needed_stages_convert_backoff_pierced_by_force(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _adopt_untracked_raw(rec, tmp_path)
+    state_path = schema.state_file(rec, tmp_path)
+    state = schema.load_state(state_path)
+    state.convert_failed = dt.date.today()
+    state.convert_failed_converter = _pdf_converter_key()
+    schema.save_state(state_path, state)
+
+    assert Stage.convert in needed_stages(rec, tmp_path, force=True)
+
+
+def test_process_docs_records_convert_failure_and_defers_on_next_planning(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Сквозной регресс §8: process_docs фиксирует провал стадии convert, а
+    СЛЕДУЮЩЕЕ планирование того же документа честно откладывает конвертацию —
+    класс waiting_convert, не error, сводка несёт отдельную строку ⏳."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+
+    def boom(raw: Path, out: Path, language: str | None) -> None:
+        raise RuntimeError("ocrmypdf timeout after 7200s")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(boom))
+
+    first = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+    assert first[0].error is not None and first[0].error.startswith("convert:")
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed == dt.date.today()
+    assert state.convert_failed_converter == "pdf@test"
+
+    second = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+    assert second[0].waiting_convert is not None
+    assert second[0].error is None and second[0].up_to_date is False
+
+    rc = _report(second)
+    assert rc == 0  # ждущая конвертация — НЕ ошибка прогона
+
+
+def test_process_docs_report_shows_convert_waiting_class(tmp_path: Path, caplog: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 scan", state=_convert_failed_state(1))
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        results = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+        _report(results)
+
+    assert results[0].waiting_convert is not None
+    assert "конвертация отложена: 1" in caplog.text
+
+
+def test_do_convert_success_clears_prior_failure_trio(tmp_path: Path, monkeypatch: Any) -> None:
+    """Успешная конвертация — один из двух путей разрешения backoff'а (второй —
+    свежая добыча, spec §2/В2 — _do_download сбрасывает трио аналогично)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", state=_convert_failed_state(1))
+
+    def fake_convert(raw: Path, out: Path, language: str | None) -> None:
+        out.write_text("body", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    _do_convert(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed is None
+    assert state.convert_failure_reason is None
+    assert state.convert_failed_converter is None
 
 
 def test_process_docs_reports_waiting_class_not_error(tmp_path: Path, caplog: Any) -> None:

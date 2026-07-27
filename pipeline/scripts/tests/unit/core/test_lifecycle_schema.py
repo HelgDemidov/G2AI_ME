@@ -76,6 +76,29 @@ def test_lifecycle_fields_roundtrip_through_state_file(tmp_path: Path) -> None:
     assert "etag_confirms" in yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+# --- OperationalState: backoff отказов конвертации (spec acquire-convert-seam-hardening §8, В11) ---
+
+
+def test_legacy_state_without_convert_backoff_fields_stays_valid() -> None:
+    """Обратная совместимость: та же дисциплина, что и у контура времени (§7) —
+    новое поле без дефолта уронило бы КАЖДЫЙ существующий .state.yaml корпуса."""
+    state = OperationalState.model_validate({"sha256": "a" * 64})
+    assert state.convert_failed is None
+    assert state.convert_failure_reason is None
+    assert state.convert_failed_converter is None
+
+
+def test_convert_backoff_fields_roundtrip_through_state_file(tmp_path: Path) -> None:
+    path = tmp_path / ".state.yaml"
+    state = OperationalState(
+        convert_failed=dt.date(2026, 7, 27),
+        convert_failure_reason="ocrmypdf завершился с кодом 1: timeout",
+        convert_failed_converter="pdf@6",
+    )
+    save_state(path, state)
+    assert load_state(path) == state
+
+
 def test_state_rejects_unknown_field() -> None:
     """``extra="forbid"`` в силе и после расширения — опечатка в имени нового поля
     падает громко, а не оседает write-only мусором в сайдкаре."""

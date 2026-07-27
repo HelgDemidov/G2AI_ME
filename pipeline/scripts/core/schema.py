@@ -352,6 +352,18 @@ class OperationalState(BaseModel):
     # добыча очищает оба поля.
     acquisition_failed: _dt.date | None = None
     acquisition_failure_reason: str | None = None
+    # Backoff отказов КОНВЕРТАЦИИ (spec acquire-convert-seam-hardening §8, В11) —
+    # зеркало пары полей выше, но для стадии convert, у которой backoff не было
+    # вовсе: патологический документ (напр. 2-часовой OCR_TIMEOUT) повторял бы
+    # полную стоимость КАЖДЫЙ прогон, след оставался только в логе. Успешная
+    # конвертация ИЛИ свежая добыча (новые байты = новый вход) очищают все три поля.
+    convert_failed: _dt.date | None = None
+    convert_failure_reason: str | None = None
+    # Конвертер, на котором провалилась ПОСЛЕДНЯЯ попытка — "имя@версия" одним
+    # значением (компактный контекст инвалидации: бамп версии конвертера пробивает
+    # backoff немедленно, детерминированный отказ старой версии не предсказывает
+    # исход новой).
+    convert_failed_converter: str | None = None
 
 
 class SourceRecord(BaseModel):

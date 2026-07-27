@@ -90,6 +90,12 @@ class DocResult:
     # вышло, и в окне backoff мы сознательно не пробуем. Это НЕ ошибка прогона (exit-код
     # не портится) и НЕ «актуально» — иначе недобытые молча растворились бы в сводке.
     waiting_acquisition: str | None = None
+    # «Конвертация отложена» — зеркальный четвёртый класс (spec acquire-convert-seam-
+    # hardening §8, В11): документ с raw, чья последняя попытка конвертации провалилась
+    # недавно (окно RETRY_BACKOFF_DAYS, тот же вход/конвертер) — штатный батч сознательно
+    # не повторяет заведомо дорогую и, скорее всего, снова провальную попытку. Прежнее
+    # хорошее поколение doc.md (если есть) продолжает служить.
+    waiting_convert: str | None = None
 
 
 # Окно, в течение которого провалившаяся добыча не пере-пробуется штатным батчем
@@ -133,6 +139,36 @@ def download_deferred(
     if force or ignore_backoff or state.acquisition_failed is None:
         return False
     return ((today or _dt.date.today()) - state.acquisition_failed).days < RETRY_BACKOFF_DAYS
+
+
+def convert_deferred(
+    state: schema.OperationalState,
+    converter_key: str,
+    raw_stat_matches: bool,
+    *,
+    force: bool = False,
+    ignore_backoff: bool = False,
+    today: _dt.date | None = None,
+) -> bool:
+    """Отложена ли конвертация backoff'ом провалившихся попыток (spec
+    acquire-convert-seam-hardening §8, В11) — зеркало ``download_deferred``, но
+    для стадии convert, у которой backoff не было вовсе: патологический документ
+    (напр. ``OCR_TIMEOUT``) повторял бы полную стоимость КАЖДЫЙ прогон.
+
+    Чистая функция. Отказ свежее окна И ``converter_key`` совпадает с записанным
+    (``state.convert_failed_converter``) И raw не менялся (``raw_stat_matches`` —
+    та же stat-guard тройка, что уже сторожит целостность raw для download) —
+    ТОЛЬКО тогда отложена. Любое из: смена версии/имени конвертера, смена raw —
+    пробивает НЕМЕДЛЕННО (детерминированный отказ мог бы не повториться на другом
+    входе; окно ограничивает только повтор ИДЕНТИЧНОЙ попытки, не отказ вообще).
+    ``--force``/``ignore_backoff`` (``--only <id>``) — те же два явных сигнала
+    намерения, что у ``download_deferred``.
+    """
+    if force or ignore_backoff or state.convert_failed is None:
+        return False
+    if state.convert_failed_converter != converter_key or not raw_stat_matches:
+        return False
+    return ((today or _dt.date.today()) - state.convert_failed).days < RETRY_BACKOFF_DAYS
 
 
 def needed_stages(
@@ -188,9 +224,14 @@ def needed_stages(
     stale = False
     if raw is not None and raw.exists() and md.exists():
         stale = raw.stat().st_mtime > md.stat().st_mtime
+    # UnsupportedFormat невозможен здесь: инвариант формата выше (raw.suffix ==
+    # rec.source_format.value) уже гарантирует зарегистрированное расширение — все
+    # 4 члена SourceFormat зарегистрированы в _CONVERTERS. Вычисляется безусловно
+    # (не только при md.exists()) — нужен и backoff-проверке ниже (В11).
+    conv = converters.resolve_converter(raw) if raw is not None else None
     converter_changed = False
     if raw is not None and md.exists():
-        conv = converters.resolve_converter(raw)   # UnsupportedFormat => planning-отказ (изолирован)
+        assert conv is not None
         converter_changed = (state.converter_name, state.converter_version) != (conv.name, conv.version)
     # ФС-реконсиляция §6.4 спека convert-cloud-tier: удаление .cloudocr.md — ЕДИНСТВЕННЫЙ
     # способ инвалидации (отдельного флага/CLI нет) — сайдкар пропал, а state всё ещё
@@ -200,7 +241,22 @@ def needed_stages(
         raw is not None and raw.exists() and state.cloud_ocr_model is not None
         and not cloud_ocr.cache_path(raw).exists()
     )
-    if force or Stage.download in stages or not md.exists() or stale or converter_changed or cloudocr_cache_missing:
+    convert_needed = (
+        force or Stage.download in stages or not md.exists() or stale or converter_changed or cloudocr_cache_missing
+    )
+    if convert_needed and Stage.download not in stages:
+        # Backoff отказов конвертации (§8, В11): проверяется ТОЛЬКО когда download
+        # НЕ запланирован — свежая добыча заменит raw и сама очистит трио отказа
+        # (_do_download, §2), дефёррал на паре download->convert дал бы холостой цикл.
+        assert raw is not None and conv is not None  # Stage.download отсутствует ⟹ raw уже существовал
+        st = raw.stat()
+        raw_stat_matches = st.st_size == state.raw_size and st.st_mtime_ns == state.raw_mtime_ns
+        if convert_deferred(
+            state, f"{conv.name}@{conv.version}", raw_stat_matches,
+            force=force, ignore_backoff=ignore_backoff,
+        ):
+            convert_needed = False
+    if convert_needed:
         stages.append(Stage.convert)
 
     # Порядок стадий: convert -> figures -> frontmatter (spec §5). Свежая конвертация
@@ -301,6 +357,35 @@ def _record_acquisition_failure(rec: schema.SourceRecord, root: Path, exc: BaseE
         logger.debug("не удалось записать состояние отказа добычи для %s", rec.id, exc_info=True)
 
 
+def _record_convert_failure(rec: schema.SourceRecord, root: Path, exc: BaseException) -> None:
+    """Зафиксировать провал КОНВЕРТАЦИИ в ``.state.yaml`` (spec acquire-convert-seam-
+    hardening §8, В11) — зеркало ``_record_acquisition_failure`` для стадии convert,
+    у которой backoff не было вовсе: патологический документ (напр. ``OCR_TIMEOUT``)
+    повторял бы полную стоимость КАЖДЫЙ прогон, след оставался только в логе.
+
+    Конвертер, на котором провалилась попытка, захватывается ЗДЕСЬ (не протаскивается
+    параметром) — тот же принцип self-containment, что у ``_record_acquisition_failure``.
+    Сбой самого ``resolve_converter`` (в теории невозможен после инварианта формата §4 —
+    см. ``needed_stages`` — но диагностика провала диагностики не должна маскировать
+    исходную ошибку) оставляет ``convert_failed_converter`` пустым, не роняет запись.
+    """
+    try:
+        state_path = schema.state_file(rec, root)
+        state = schema.load_state(state_path)
+        state.convert_failed = _dt.date.today()
+        state.convert_failure_reason = str(exc)[:_FAILURE_REASON_MAX]
+        raw = schema.raw_file(rec, root)
+        if raw is not None:
+            try:
+                conv = converters.resolve_converter(raw)
+                state.convert_failed_converter = f"{conv.name}@{conv.version}"
+            except converters.UnsupportedFormat:
+                pass
+        schema.save_state(state_path, state)
+    except OSError:
+        logger.debug("не удалось записать состояние отказа конвертации для %s", rec.id, exc_info=True)
+
+
 def _acquisition_wait_note(rec: schema.SourceRecord, root: Path) -> str | None:
     """Почему документу нечего делать: он ждёт добычи, а не «актуален» (§5).
 
@@ -315,6 +400,24 @@ def _acquisition_wait_note(rec: schema.SourceRecord, root: Path) -> str | None:
         return None
     reason = state.acquisition_failure_reason or "добыча провалилась"
     return f"с {state.acquisition_failed.isoformat()}: {reason}"
+
+
+def _convert_wait_note(rec: schema.SourceRecord, root: Path) -> str | None:
+    """Почему документу нечего делать: конвертация отложена backoff'ом, а не
+    «актуальна» (spec acquire-convert-seam-hardening §8, В11 — зеркало
+    ``_acquisition_wait_note``).
+
+    Только для записей С raw и непогашенным ``convert_failed`` — по построению
+    взаимоисключимо с ``_acquisition_wait_note`` (та требует ОТСУТСТВИЕ raw), поэтому
+    оба можно проверить безусловно и использовать тот, что не None.
+    """
+    if schema.raw_file(rec, root) is None:
+        return None
+    state = schema.load_state(schema.state_file(rec, root))
+    if state.convert_failed is None:
+        return None
+    reason = state.convert_failure_reason or "конвертация провалилась"
+    return f"с {state.convert_failed.isoformat()}: {reason}"
 
 
 def _maybe_request_snapshot(rec: schema.SourceRecord, state: schema.OperationalState) -> None:
@@ -542,6 +645,12 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     state.sha256 = raw_sha256
     state.raw_size = st.st_size
     state.raw_mtime_ns = st.st_mtime_ns
+    # Успешная конвертация — один из двух путей разрешения backoff'а В11 (второй —
+    # свежая добыча, _do_download §2): раз конвертация ПРОШЛА, отказ прошлой попытки
+    # больше не описывает текущее состояние документа.
+    state.convert_failed = None
+    state.convert_failure_reason = None
+    state.convert_failed_converter = None
     schema.save_state(state_path, state)
 
 
@@ -637,6 +746,9 @@ def process_docs(
                 _adopt_untracked_raw(rec, root)  # ручной/старого формата raw — под контролем целостности
             stages = needed_stages(rec, root, force=force, ignore_backoff=ignore_backoff)
             wait_note = _acquisition_wait_note(rec, root) if not stages else None
+            # Взаимоисключимо с wait_note by construction (§8, В11): _acquisition_wait_note
+            # требует ОТСУТСТВИЕ raw, _convert_wait_note — его ПРИСУТСТВИЕ.
+            convert_wait_note = _convert_wait_note(rec, root) if not stages else None
         except Exception as exc:  # noqa: BLE001 — изоляция отказа документа (планирование)
             res.error = f"planning: {exc}"
             logger.error("  ✗ %s: %s", rec.id, res.error)
@@ -646,6 +758,9 @@ def process_docs(
             if wait_note is not None:
                 res.waiting_acquisition = wait_note
                 logger.info("• %s: ждёт добычи — %s", rec.id, wait_note)
+            elif convert_wait_note is not None:
+                res.waiting_convert = convert_wait_note
+                logger.info("• %s: конвертация отложена — %s", rec.id, convert_wait_note)
             else:
                 res.up_to_date = True
                 logger.info("• %s: актуально", rec.id)
@@ -686,6 +801,8 @@ def process_docs(
             except Exception as exc:  # noqa: BLE001 — изоляция отказа документа
                 res.error = f"{stage.value}: {exc}"
                 logger.error("  ✗ %s: %s", rec.id, res.error)
+                if stage is Stage.convert:
+                    _record_convert_failure(rec, root, exc)  # backoff §8, В11
                 break  # остальные стадии этого документа пропускаем
         results.append(res)
     return results
@@ -898,10 +1015,12 @@ def _report(results: list[DocResult]) -> int:
     up = sum(r.up_to_date for r in results)
     failed = [r for r in results if r.error]
     waiting = [r for r in results if r.waiting_acquisition is not None]
+    waiting_convert = [r for r in results if r.waiting_convert is not None]
     processed = [r for r in results if r.done and not r.error]
     logger.info(
-        "Итог: %d документ(ов) | актуально: %d | обработано: %d | ждут добычи: %d | ошибок: %d",
-        len(results), up, len(processed), len(waiting), len(failed),
+        "Итог: %d документ(ов) | актуально: %d | обработано: %d | ждут добычи: %d | "
+        "конвертация отложена: %d | ошибок: %d",
+        len(results), up, len(processed), len(waiting), len(waiting_convert), len(failed),
     )
     for res in failed:
         logger.info("  ✗ %s — %s", res.doc_id, res.error)
@@ -909,6 +1028,10 @@ def _report(results: list[DocResult]) -> int:
     # Пере-пробовать конкретный документ прямо сейчас — --only <id> (пробивает backoff).
     for res in waiting:
         logger.info("  ⏳ %s — %s", res.doc_id, res.waiting_acquisition)
+    # Зеркальный класс (§8, В11): дорогая повторно-проваливающаяся конвертация не
+    # долбится каждый прогон — тот же принцип, что у «ждут добычи».
+    for res in waiting_convert:
+        logger.info("  ⏳ %s — конвертация: %s", res.doc_id, res.waiting_convert)
     return 1 if failed else 0
 
 
