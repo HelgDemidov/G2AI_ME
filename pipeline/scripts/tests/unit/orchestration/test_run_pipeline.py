@@ -34,6 +34,7 @@ from run_pipeline import (
     _needs_index_rebuild,
     _read_index_fingerprint,
     _report,
+    _run_lock_path,
     _sha256,
     needed_stages,
     process_docs,
@@ -1566,6 +1567,46 @@ def test_main_dry_run_logs_index_not_touched(tmp_path: Path, caplog: Any) -> Non
     with caplog.at_level("INFO", logger="run_pipeline"):
         assert main([str(sources), "--dry-run"]) == 0
     assert any("dry-run" in r.message for r in caplog.records)
+
+
+# --- эксклюзивный лок mutating-прогонов (spec acquire-convert-seam-hardening §3, В3) ---
+
+
+def test_main_dry_run_never_touches_lock_file(tmp_path: Path) -> None:
+    """--dry-run обязан быть no-op и не мешать живому прогону: файл лока не создаётся
+    вовсе (contextlib.nullcontext, не fsio.exclusive_flock)."""
+    sources = tmp_path / "sources"
+    assert main([str(sources), "--dry-run"]) == 0
+    assert not _run_lock_path(sources).exists()
+
+
+def test_main_returns_one_when_another_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
+    sources = tmp_path / "sources"
+    lock_path = _run_lock_path(sources)
+    with fsio.exclusive_flock(lock_path):
+        with caplog.at_level("ERROR", logger="run_pipeline"):
+            rc = main([str(sources), "--db", str(tmp_path / "c.db")])
+    assert rc == 1
+    assert any("уже занято" in r.message for r in caplog.records)
+
+
+def test_main_recheck_returns_one_when_batch_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
+    """--recheck и штатный прогон стадий — писатели ОДНОГО и того же .state.yaml,
+    поэтому делят один лок-файл."""
+    sources = tmp_path / "sources"
+    with fsio.exclusive_flock(_run_lock_path(sources)):
+        with caplog.at_level("ERROR", logger="run_pipeline"):
+            rc = main([str(sources), "--recheck"])
+    assert rc == 1
+    assert any("уже занято" in r.message for r in caplog.records)
+
+
+def test_main_normal_run_releases_lock_for_the_next_one(tmp_path: Path) -> None:
+    """Лок не остаётся протухшим: два последовательных (не параллельных) прогона
+    оба успевают отработать."""
+    sources = tmp_path / "sources"
+    assert main([str(sources), "--db", str(tmp_path / "c.db")]) == 0
+    assert main([str(sources), "--db", str(tmp_path / "c.db")]) == 0
 
 
 # --- _embed_namespace / _report_unembedded: напоминание об отставании векторного слоя ---

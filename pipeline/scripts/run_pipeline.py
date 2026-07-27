@@ -31,6 +31,7 @@ post-acquisition-lifecycle): проверка живости источнико�
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import hashlib
 import logging
@@ -832,6 +833,16 @@ def _report_scan_fallback(records: list[schema.SourceRecord], root: Path) -> Non
         )
 
 
+def _run_lock_path(sources_root: Path) -> Path:
+    """Путь эксклюзивного лока прогона (spec acquire-convert-seam-hardening §3, В3):
+    пер-корпусный (``args.sources``), в ``sources/.state/`` — та же конвенция, что и
+    прочие операционные артефакты КОРПУСА (``schema.state_dir``). Скоуп — РОВНО
+    писатели ``.state.yaml``: штатный прогон стадий и ``--recheck``. ``discover.py``/
+    ``vector_store.py`` этот лок не берут — они не пишут ``.state.yaml`` (кандидаты —
+    свой слой со своей save-семантикой; индекс — SQLite с собственным локингом)."""
+    return schema.state_dir(sources_root) / "run_pipeline.lock"
+
+
 def _report(results: list[DocResult]) -> int:
     up = sum(r.up_to_date for r in results)
     failed = [r for r in results if r.error]
@@ -921,76 +932,101 @@ def main(argv: list[str] | None = None) -> int:
     # скачивает, не конвертирует и не трогает индекс, а только спрашивает издателей
     # «изменилось ли». Возврат здесь и есть эта взаимоисключимость.
     if args.recheck:
-        # Слой кандидатов (популяция (c)) грузится/сохраняется ЗДЕСЬ: оркестратор
-        # сшивает слои по определению своей роли, а сам ACQUIRE о раскладке store
-        # слоя DISCOVERY не знает (и не должен).
-        candidates = store.load(args.sources)
-        summary = recheck.run_recheck(
-            records, args.sources,
-            user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
-            candidates=candidates,
-        )
-        if summary.candidates_changed:
-            store.save(candidates, args.sources)
-        return recheck.report(summary)
-
-    # Синхронный manual watch-folder путь — только осмыслен для одно-документного
-    # прогона (--only): пользователь реально сидит и ждёт клика (§6 спека, решение №2).
-    results = process_docs(
-        records, args.sources,
-        force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
-        interactive=bool(args.only), watch_dir=args.watch_dir,
-        # --only <id> — явное намерение куратора попробовать ИМЕННО этот документ
-        # сейчас; молчаливый скип по backoff сбил бы его (особенно на watch-folder пути)
-        ignore_backoff=bool(args.only),
-    )
-
-    # Сводка фолбэк-OCR-пути (S5, spec ocr-eval-harness §8.3) — читает ТОЛЬКО
-    # .state.yaml с диска, не зависит от индекса/сети; безусловно (в т.ч. dry-run,
-    # в отличие от _report_unembedded ниже, завязанной на corpus.db).
-    _report_scan_fallback(records, args.sources)
-
-    # корпусный индекс: реконсилируется по fingerprint (не по in-run флагу —
-    # краш/прерывание между конвертацией и пересборкой не должны оставлять индекс
-    # устаревшим навсегда). fp считается ПОСЛЕ process_docs — конвертация меняет
-    # mtime doc.md.
-    index_error: str | None = None
-    if args.dry_run:
-        logger.info("Индекс: dry-run, не трогаем")
-    else:
-        # Миграции схемы индекса применяются ДО гейта «нужна ли пересборка»: миграция
-        # может инвалидировать производные данные (добавление колонки `chunks` сбрасывает
-        # doc_state и отпечаток), и тогда пересборка нужна, даже если корпус не менялся.
-        # Несуществующую БД не создаём — пустой файл ради миграции бессмыслен.
-        if args.db.exists():
-            corpus_index.create_db(args.db).close()
-        needs_rebuild, _ = _needs_index_rebuild(args.sources, args.db, force=args.force)
-        if needs_rebuild:
-            try:
-                logger.info(
-                    "Индекс: %s",
-                    rebuild_index(
-                        args.sources, args.db,
-                        embed=args.embed, force=args.force, embed_backend=args.embed_backend,
-                    ),
+        # Эксклюзивный лок (spec acquire-convert-seam-hardening §3, В3): recheck и
+        # штатный прогон стадий — оба писатели .state.yaml (recheck пишет findings,
+        # держит state загруженным на время сетевого условного GET); без лока
+        # интерливание load->save двух одновременных прогонов теряет поля полной
+        # перезаписью модели (живой репро аудита — единственное невосстановимое
+        # поле original_sha256).
+        try:
+            with fsio.exclusive_flock(_run_lock_path(args.sources)):
+                # Слой кандидатов (популяция (c)) грузится/сохраняется ЗДЕСЬ: оркестратор
+                # сшивает слои по определению своей роли, а сам ACQUIRE о раскладке store
+                # слоя DISCOVERY не знает (и не должен).
+                candidates = store.load(args.sources)
+                summary = recheck.run_recheck(
+                    records, args.sources,
+                    user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
+                    candidates=candidates,
                 )
-            except Exception as exc:  # noqa: BLE001 — изоляция отказа стадии индекса:
-                # FTS-часть закоммичена ДО векторной (порядок в rebuild_index), отказ
-                # облака после ретраев её не рвёт; репорт + ненулевой exit, как у
-                # прочих стадий (spec embed-api-first §4)
-                index_error = str(exc)
-                logger.error("  ✗ индекс: %s", index_error)
-        else:
-            logger.info("Индекс: актуален (fingerprint совпадает)")
-        _report_unembedded(args.db, args.embed_backend)
+                if summary.candidates_changed:
+                    store.save(candidates, args.sources)
+                return recheck.report(summary)
+        except fsio.AlreadyLocked as exc:
+            logger.error(str(exc))
+            return 1
 
-    if args.graphml is not None and not args.dry_run:
-        # build_corpus_graph, а не голый build_graph: экспорт из оркестратора обязан
-        # нести тот же L1-слой цитат, что и CLI графа — иначе два «одинаковых» графа
-        # расходились бы содержанием.
-        graph, mining = build_graph.build_corpus_graph(records, args.sources)
-        build_graph.export_graphml(graph, args.graphml)
-        logger.info("GraphML: %s (L1-цитат: %d)", args.graphml, len(mining.edges))
+    # Эксклюзивный лок (spec acquire-convert-seam-hardening §3, В3) — тот же файл,
+    # что и --recheck-ветка выше: батч-прогон стадий пишет .state.yaml документов
+    # (download/convert/figures/frontmatter), одновременный --recheck держит своё
+    # состояние загруженным на время сетевого запроса — без лока запись теряется.
+    # --dry-run НЕ берёт лок вовсе (nullcontext) — обязан быть no-op и не мешать
+    # живому прогону; process_docs(dry_run=True) и так не пишет .state.yaml.
+    lock_ctx = (
+        contextlib.nullcontext() if args.dry_run else fsio.exclusive_flock(_run_lock_path(args.sources))
+    )
+    try:
+        with lock_ctx:
+            # Синхронный manual watch-folder путь — только осмыслен для одно-документного
+            # прогона (--only): пользователь реально сидит и ждёт клика (§6 спека, решение №2).
+            results = process_docs(
+                records, args.sources,
+                force=args.force, dry_run=args.dry_run, no_download=args.no_download, pause=args.pause,
+                interactive=bool(args.only), watch_dir=args.watch_dir,
+                # --only <id> — явное намерение куратора попробовать ИМЕННО этот документ
+                # сейчас; молчаливый скип по backoff сбил бы его (особенно на watch-folder пути)
+                ignore_backoff=bool(args.only),
+            )
+
+            # Сводка фолбэк-OCR-пути (S5, spec ocr-eval-harness §8.3) — читает ТОЛЬКО
+            # .state.yaml с диска, не зависит от индекса/сети; безусловно (в т.ч. dry-run,
+            # в отличие от _report_unembedded ниже, завязанной на corpus.db).
+            _report_scan_fallback(records, args.sources)
+
+            # корпусный индекс: реконсилируется по fingerprint (не по in-run флагу —
+            # краш/прерывание между конвертацией и пересборкой не должны оставлять индекс
+            # устаревшим навсегда). fp считается ПОСЛЕ process_docs — конвертация меняет
+            # mtime doc.md.
+            index_error: str | None = None
+            if args.dry_run:
+                logger.info("Индекс: dry-run, не трогаем")
+            else:
+                # Миграции схемы индекса применяются ДО гейта «нужна ли пересборка»: миграция
+                # может инвалидировать производные данные (добавление колонки `chunks` сбрасывает
+                # doc_state и отпечаток), и тогда пересборка нужна, даже если корпус не менялся.
+                # Несуществующую БД не создаём — пустой файл ради миграции бессмыслен.
+                if args.db.exists():
+                    corpus_index.create_db(args.db).close()
+                needs_rebuild, _ = _needs_index_rebuild(args.sources, args.db, force=args.force)
+                if needs_rebuild:
+                    try:
+                        logger.info(
+                            "Индекс: %s",
+                            rebuild_index(
+                                args.sources, args.db,
+                                embed=args.embed, force=args.force, embed_backend=args.embed_backend,
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — изоляция отказа стадии индекса:
+                        # FTS-часть закоммичена ДО векторной (порядок в rebuild_index), отказ
+                        # облака после ретраев её не рвёт; репорт + ненулевой exit, как у
+                        # прочих стадий (spec embed-api-first §4)
+                        index_error = str(exc)
+                        logger.error("  ✗ индекс: %s", index_error)
+                else:
+                    logger.info("Индекс: актуален (fingerprint совпадает)")
+                _report_unembedded(args.db, args.embed_backend)
+
+            if args.graphml is not None and not args.dry_run:
+                # build_corpus_graph, а не голый build_graph: экспорт из оркестратора обязан
+                # нести тот же L1-слой цитат, что и CLI графа — иначе два «одинаковых» графа
+                # расходились бы содержанием.
+                graph, mining = build_graph.build_corpus_graph(records, args.sources)
+                build_graph.export_graphml(graph, args.graphml)
+                logger.info("GraphML: %s (L1-цитат: %d)", args.graphml, len(mining.edges))
+    except fsio.AlreadyLocked as exc:
+        logger.error(str(exc))
+        return 1
 
     rc = _report(results)
     return 1 if index_error else rc
