@@ -204,28 +204,49 @@ def test_due_candidates_only_unacquirable_with_url() -> None:
     assert recheck.due_candidates([ok, irrelevant, no_url], limit=10) == [ok]
 
 
-def test_due_candidates_registered_none_preserves_old_behavior() -> None:
-    """``registered=None`` (легаси-вызовы/тесты) — прежнее поведение без реконсиляции."""
-    ok = _cand("7d" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
-    assert recheck.due_candidates([ok], limit=10, registered=None) == [ok]
-
-
-def test_due_candidates_registered_excludes_pair() -> None:
-    """spec discovery-acquire-seam-hardening §4, Г3: пара уже допущенного документа
-    реестра гасит вечный probe URL, который уже добыт."""
-    registered = _cand(
+def test_due_candidates_reconciliation_is_the_callers_job() -> None:
+    """Ревью PR #54: реконсиляция с реестром живёт в ЕДИНСТВЕННОЙ реализации
+    (``manual.unacquirable_candidates``), а не второй копией внутри ``due_candidates`` —
+    там она сравнивала ``c.normalized_url`` напрямую и на легаси-форме расходилась с
+    worksheet-очередью. Сама ``due_candidates`` знает только то, что выражается в
+    терминах ACQUIRE: непробиваемый (без URL) выбывает, остальное — сортировка и лимит."""
+    registered_cand = _cand(
         "8e" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
         source_url="https://gov.example.org/registered.pdf",
         normalized_url="https://gov.example.org/registered.pdf",
     )
-    still_waiting = _cand("9f" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
-
-    due = recheck.due_candidates(
-        [registered, still_waiting], limit=10,
-        registered={("https://gov.example.org/registered.pdf", None)},
+    still_waiting = _cand(
+        "9f" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
+        source_url="https://gov.example.org/waiting.pdf",
+        normalized_url="https://gov.example.org/waiting.pdf",
     )
+    rec_data = valid_record() | {"source_url": "https://gov.example.org/registered.pdf"}
+    rec = schema.SourceRecord.model_validate(rec_data)
 
-    assert due == [still_waiting]
+    pool = [registered_cand, still_waiting]
+    assert recheck.due_candidates(pool, limit=10) == pool  # сама по себе — не реконсилирует
+    reconciled = manual.unacquirable_candidates(pool, [rec])
+    assert recheck.due_candidates(reconciled, limit=10) == [still_waiting]
+
+
+def test_legacy_candidate_without_normalized_url_leaves_both_queues() -> None:
+    """Регресс ревью PR #54: кандидат с ``source_url``, но БЕЗ ``normalized_url`` —
+    живая легаси-форма (4 из 6 записей ``manual.yaml`` боевого store). Прежняя вторая
+    реализация реконсиляции внутри ``due_candidates`` строила ключ ``(None, supersedes)``,
+    который в множестве пар реестра не встречается никогда: worksheet-секция кандидата
+    отпускала, а ротация recheck держала его вечно — ровно тот зомби-класс, ради
+    которого §4 писался, только в одной из двух очередей."""
+    legacy = _cand(
+        "7d" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
+        source_url="https://gov.example.org/legacy.pdf",
+        normalized_url=None,  # <-- поле не заполнено (inject до конвенции пары)
+    )
+    rec_data = valid_record() | {"source_url": "https://gov.example.org/legacy.pdf"}
+    rec = schema.SourceRecord.model_validate(rec_data)
+
+    reconciled = manual.unacquirable_candidates([legacy], [rec])
+    assert reconciled == []
+    assert recheck.due_candidates(reconciled, limit=10) == []
 
 
 def test_admit_unacquirable_candidate_directly_disappears_from_both_queues(tmp_path: Path) -> None:
@@ -267,9 +288,9 @@ def test_admit_unacquirable_candidate_directly_disappears_from_both_queues(tmp_p
     reloaded_records = schema.load_records(tmp_path)
     assert len(reloaded_records) == 1  # admit не мутирует rejected_* кандидата — только реконсиляция
 
-    assert manual.unacquirable_candidates(reloaded_candidates, reloaded_records) == []
-    registered = manual.registered_pairs(reloaded_records)
-    assert recheck.due_candidates(reloaded_candidates, limit=10, registered=registered) == []
+    reconciled = manual.unacquirable_candidates(reloaded_candidates, reloaded_records)
+    assert reconciled == []  # worksheet-секция недобываемых
+    assert recheck.due_candidates(reconciled, limit=10) == []  # и ротация recheck — тем же путём
 
 
 def test_probe_marks_candidate_acquirable(monkeypatch: Any) -> None:

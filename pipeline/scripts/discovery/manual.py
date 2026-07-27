@@ -136,8 +136,14 @@ def inject(
 
 def registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
     """Пары ``(нормализованный source_url, заменяемый doc-id | None)``, уже представленные
-    в реестре — правая часть реконсиляции ``pending_candidates``/``unacquirable_candidates``
-    (discovery) и ``recheck.due_candidates`` (acquire, spec discovery-acquire-seam-hardening §4).
+    в реестре — правая часть реконсиляции ``pending_candidates``/``unacquirable_candidates``,
+    двух очередей слоя кандидатов (spec discovery-acquire-seam-hardening §4).
+
+    Публично, хотя оба вызывающих — соседи по модулю: это словарь предметной области
+    слоя (реконсиляция «что уже в реестре»), а не деталь одной функции. Кросс-слойного
+    потребителя у него нет и быть не должно — ротацию recheck кормит уже реконсилированным
+    списком оркестратор (ревью PR #54, см. ``acquire.recheck.due_candidates``): здесь
+    нормализуются URL, а ``normalize_url`` — знание слоя DISCOVERY.
 
     Каждая запись регистрирует ``(url, None)`` — URL как таковой корпусом покрыт — И
     ``(url, target)`` для каждого своего ребра ``supersedes``: последнее означает «редакция,

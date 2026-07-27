@@ -1149,11 +1149,8 @@ def main(argv: list[str] | None = None) -> int:
             # лимитом (20 сетевых GET неожиданно для --only).
             due_c: list[schema.CandidateRecord] = []
             if not args.only:
-                plan_candidates = store.load(args.sources)
-                plan_registered = manual.registered_pairs(records)
-                due_c = recheck.due_candidates(
-                    plan_candidates, limit=args.recheck_limit, registered=plan_registered
-                )
+                plan_candidates = manual.unacquirable_candidates(store.load(args.sources), records)
+                due_c = recheck.due_candidates(plan_candidates, limit=args.recheck_limit)
             with_raw, without_raw = recheck.due_records(records, args.sources, limit=args.recheck_limit)
             mode = "deep" if args.recheck_deep else "conditional"
             logger.info("Recheck (dry-run, %s) — кого проверил бы этот прогон:", mode)
@@ -1184,17 +1181,22 @@ def main(argv: list[str] | None = None) -> int:
                 # сшивает слои по определению своей роли, а сам ACQUIRE о раскладке store
                 # слоя DISCOVERY не знает (и не должен). Симметрично, реконсиляция
                 # популяции (c) с реестром (spec discovery-acquire-seam-hardening §4,
-                # Г3) — тоже забота оркестратора: пары считает manual.registered_pairs
-                # (discovery), acquire остаётся discovery-агностичным (plain-data параметр).
-                # Г11: --only — явное намерение куратора проверить ОДИН документ, populяция
+                # Г3) — тоже забота оркестратора, и делает её ЕДИНСТВЕННАЯ реализация,
+                # общая с worksheet-секцией недобываемых (manual.unacquirable_candidates;
+                # ревью PR #54 — вторая реализация внутри due_candidates расходилась с
+                # ней на легаси-записях без normalized_url). В store.save уходит ПОЛНЫЙ
+                # список: отфильтрованный несёт те же объекты, probe мутирует их на месте.
+                # Г11: --only — явное намерение куратора проверить ОДИН документ, популяция
                 # (c) с ним не связана — не грузим/не трогаем её вовсе (20 сетевых GET от
                 # «одно-документной» команды удивили бы куратора).
                 candidates = None if args.only else store.load(args.sources)
-                registered = None if args.only else manual.registered_pairs(records)
+                due_pool = None if candidates is None else manual.unacquirable_candidates(
+                    candidates, records
+                )
                 summary = recheck.run_recheck(
                     records, args.sources,
                     user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
-                    candidates=candidates, registered=registered,
+                    candidates=due_pool,
                 )
                 if summary.candidates_changed:
                     assert candidates is not None

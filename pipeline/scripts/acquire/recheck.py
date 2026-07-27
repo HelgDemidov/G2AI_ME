@@ -359,10 +359,7 @@ def due_records(
 
 
 def due_candidates(
-    candidates: list[schema.CandidateRecord],
-    *,
-    limit: int,
-    registered: set[tuple[str, str | None]] | None = None,
+    candidates: list[schema.CandidateRecord], *, limit: int
 ) -> list[schema.CandidateRecord]:
     """Популяция (c): кандидаты, отклонённые как ``unacquirable`` (§5).
 
@@ -371,24 +368,31 @@ def due_candidates(
     зеркало). Без этого различения второй закрывался бы навсегда по ошибке, потому что
     заметить смену обстоятельств некому.
 
-    ``registered`` (spec discovery-acquire-seam-hardening §4, Г3) — пары
-    ``(нормализованный source_url, supersedes)``, уже представленные в реестре
-    (``discovery.manual.registered_pairs(records)``) — реконсиляция, симметричная
-    ``discovery.manual.pending_candidates``/``unacquirable_candidates``: admit
-    недобываемого кандидата напрямую (revive→admit требует двух батчей, срезать
-    угол естественно при ``probe_finding: acquirable``) не должен оставлять его
-    НАВСЕГДА в этой ротации — документ уже в корпусе. Plain-data множество, а не
-    список записей: acquire остаётся discovery-агностичным, пары считает
-    оркестратор (``run_pipeline``) и передаёт через ``run_recheck``. ``None``
-    (легаси-вызовы/тесты) — прежнее поведение без реконсиляции.
+    **Реконсиляция с реестром — НЕ здесь, а у вызывающей стороны** (ревью PR #54):
+    отсеять уже допущенные документы (admit недобываемого напрямую оставлял бы
+    кандидата в ротации навсегда) можно только по нормализованному URL, а
+    ``normalize_url`` живёт в ``discovery.dedup`` — слой ACQUIRE его не видит и видеть
+    не должен. Первая попытка (spec discovery-acquire-seam-hardening §4, Г3) передавала
+    сюда plain-data множество пар и сравнивала с ним ``c.normalized_url`` НАПРЯМУЮ, без
+    фолбэка на ``normalize_url(c.source_url)`` — а легаси-записи без заполненного
+    ``normalized_url`` в живом store есть (4 из 6 в ``manual.yaml``): для них очередь
+    recheck расходилась с worksheet-секцией недобываемых, то есть ровно тот зомби-класс,
+    ради которого §4 писался, оставался открытым для одной из двух очередей.
+
+    Поэтому реконсиляция теперь в ЕДИНСТВЕННОЙ реализации —
+    ``discovery.manual.unacquirable_candidates(candidates, records)``, — а оркестратор
+    (``run_pipeline``, чья роль и есть сшивание слоёв) отдаёт сюда уже отфильтрованный
+    список. Порядок ротации у обеих функций один и тот же и без дополнительной
+    договорённости: ``(probe_checked is not None, probe_checked or date.min, raw_hash)``.
+    Здесь остаётся ровно то, что выражается в терминах самого ACQUIRE: кандидат без
+    ``source_url`` непробиваем (в worksheet он остаётся видимым — там безопасный дефолт
+    другой), сортировка и лимит.
     """
     due = [
         c
         for c in candidates
         if c.rejected_kind is schema.RejectionKind.unacquirable and c.source_url
     ]
-    if registered is not None:
-        due = [c for c in due if (c.normalized_url, c.supersedes) not in registered]
     due.sort(key=lambda c: _checked_sort_key(c.probe_checked, c.raw_hash))
     return due[:limit]
 
@@ -536,19 +540,17 @@ def run_recheck(
     deep: bool = False,
     today: _dt.date | None = None,
     candidates: list[schema.CandidateRecord] | None = None,
-    registered: set[tuple[str, str | None]] | None = None,
 ) -> RecheckSummary:
     """Прогон контура по трём популяциям. Отказ одного документа не рвёт прогон
     (изоляция как в ``process_docs``): упавший остаётся с прежним курсором и будет
     взят следующим прогоном первым же.
 
-    ``candidates`` (популяция (c)) мутируется НА МЕСТЕ; загрузку и сохранение store
-    делает вызывающая сторона — слой ACQUIRE не знает о раскладке слоя DISCOVERY.
+    ``candidates`` (популяция (c)) — УЖЕ реконсилированный с реестром список
+    (``discovery.manual.unacquirable_candidates``, см. ``due_candidates``); мутируется
+    НА МЕСТЕ, поэтому вызывающая сторона сохраняет свой ПОЛНЫЙ список store — записи
+    те же объекты. Загрузку/фильтрацию/сохранение делает оркестратор: слой ACQUIRE не
+    знает ни о раскладке слоя DISCOVERY, ни о нормализации его URL.
     ``RecheckSummary.candidates_changed`` говорит, есть ли что сохранять.
-
-    ``registered`` (spec discovery-acquire-seam-hardening §4, Г3) — форвардится в
-    ``due_candidates`` как есть (plain-data пары ``(нормализованный URL,
-    supersedes)`` уже допущенных документов реестра); ``None`` — прежнее поведение.
     """
     today = today or _dt.date.today()
     with_raw, without_raw = due_records(records, root, limit=limit)
@@ -569,7 +571,7 @@ def run_recheck(
             items.append(RecheckItem(rec.id, "", error=str(exc)))
 
     changed = False
-    for cand in due_candidates(candidates or [], limit=limit, registered=registered):
+    for cand in due_candidates(candidates or [], limit=limit):
         try:
             items.append(_probe_unacquirable(cand, user_agent=user_agent, today=today))
             changed = True

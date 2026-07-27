@@ -206,8 +206,8 @@ def test_pending_candidates_without_url_stays_pending() -> None:
 
 def test_registered_pairs_public_and_includes_supersedes_edge() -> None:
     """spec discovery-acquire-seam-hardening §4: ``registered_pairs`` — публичное имя
-    (было ``_registered_pairs``), общий примитив реконсиляции для discovery
-    (``unacquirable_candidates``) И acquire (``recheck.due_candidates``)."""
+    (было ``_registered_pairs``), общий примитив реконсиляции обеих очередей слоя
+    кандидатов (``pending_candidates`` и ``unacquirable_candidates``)."""
     rec_data = valid_record()
     rec_data["source_url"] = "https://gov.example.org/a.pdf"
     rec_data["relations"] = [{"type": "supersedes", "target": "me-old-law-2024"}]
