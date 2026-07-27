@@ -168,6 +168,20 @@ def classify_response(
     return result
 
 
+def _format_mismatch_note(headers: dict[str, str], expected: schema.SourceFormat) -> str:
+    """Диагноз частого промаха лестницы (spec discovery-acquire-seam-hardening §8,
+    Г7): сервер вернул HTML, когда ожидался другой формат — типичный признак
+    рассинхрона курируемого ``source_format`` с реальным содержимым (документ на
+    самом деле HTML-страница), а не WAF-блока (тот уже отловлен маркерами тела/
+    заголовков раньше по коду). Зеркало уже существующего диагноза
+    ``_classify_html`` для обратного случая («сервер отдал PDF при
+    source_format=html»). Пустая строка — не наш случай, ничего не добавляем;
+    только СТРОКА-ПРИЧИНА меняется, исход классификации (``blocked``) — тот же."""
+    if "text/html" not in headers.get("content-type", ""):
+        return ""
+    return f" — сервер отдал HTML при ожидании {expected.value} (проверьте source_format: ошибка формата?)"
+
+
 def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
     if body.startswith(b"%PDF"):
         return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid PDF")
@@ -176,9 +190,16 @@ def _classify_pdf(body: bytes, headers: dict[str, str], status: int | None) -> C
         return ClassifiedResponse(AcquisitionOutcome.blocked, status, "WAF challenge signature detected")
 
     if len(body) < MIN_EXPECTED_PDF_SIZE:
-        return ClassifiedResponse(AcquisitionOutcome.blocked, status, "response too small to be the expected document")
+        return ClassifiedResponse(
+            AcquisitionOutcome.blocked, status,
+            "response too small to be the expected document"
+            + _format_mismatch_note(headers, schema.SourceFormat.pdf),
+        )
 
-    return ClassifiedResponse(AcquisitionOutcome.blocked, status, "unexpected content (not a valid PDF)")
+    return ClassifiedResponse(
+        AcquisitionOutcome.blocked, status,
+        "unexpected content (not a valid PDF)" + _format_mismatch_note(headers, schema.SourceFormat.pdf),
+    )
 
 
 def _classify_docx(body: bytes, headers: dict[str, str], status: int | None) -> ClassifiedResponse:
@@ -193,7 +214,9 @@ def _classify_docx(body: bytes, headers: dict[str, str], status: int | None) -> 
         return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid DOCX (zip magic)")
 
     return ClassifiedResponse(
-        AcquisitionOutcome.blocked, status, "unexpected content (not the expected DOCX document)"
+        AcquisitionOutcome.blocked, status,
+        "unexpected content (not the expected DOCX document)"
+        + _format_mismatch_note(headers, schema.SourceFormat.docx),
     )
 
 
@@ -209,7 +232,9 @@ def _classify_xlsx(body: bytes, headers: dict[str, str], status: int | None) -> 
         return ClassifiedResponse(AcquisitionOutcome.ok, status, "valid XLSX (zip magic)")
 
     return ClassifiedResponse(
-        AcquisitionOutcome.blocked, status, "unexpected content (not the expected XLSX document)"
+        AcquisitionOutcome.blocked, status,
+        "unexpected content (not the expected XLSX document)"
+        + _format_mismatch_note(headers, schema.SourceFormat.xlsx),
     )
 
 

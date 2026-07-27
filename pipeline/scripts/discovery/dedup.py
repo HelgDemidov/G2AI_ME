@@ -27,7 +27,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
-from core.schema import CandidateRecord
+from core.schema import CandidateRecord, SourceFormat
 
 _NON_WORD_RE = re.compile(r"[\W_]+", re.UNICODE)
 
@@ -51,6 +51,29 @@ def normalized_title(title: str) -> str:
     дают один ключ. Диакритика (č/š/đ) сохраняется как буква, не отбрасывается.
     """
     return _NON_WORD_RE.sub("", title.lower())
+
+
+_EXT_TO_FORMAT = {
+    "pdf": SourceFormat.pdf,
+    "docx": SourceFormat.docx,
+    "xlsx": SourceFormat.xlsx,
+    "html": SourceFormat.html,
+    "htm": SourceFormat.html,
+}
+
+
+def format_hint_from_url(url: str) -> SourceFormat | None:
+    """Генерическая эвристика подсказки формата по URL (spec discovery-acquire-
+    seam-hardening §8, Г7): расширение хвоста ``path`` -> ``SourceFormat``, иначе
+    ``None``. Query/фрагмент НЕ смотрим (``?format=pdf`` у лендинга и т.п.) —
+    точность важнее покрытия, лгущая подсказка (с эхом «по дефолту: …» в сводке
+    apply) опаснее отсутствующей: она выглядит авторитетно. URL-утилиты слоя
+    живут рядом с ``normalize_url``."""
+    segment = urlsplit(url).path.rsplit("/", 1)[-1]
+    if "." not in segment:
+        return None
+    ext = segment.rsplit(".", 1)[-1].lower()
+    return _EXT_TO_FORMAT.get(ext)
 
 
 def _match_key(cand: CandidateRecord) -> tuple[str, str, str, str | None] | None:

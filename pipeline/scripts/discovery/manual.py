@@ -115,6 +115,7 @@ def inject(
         matched_query=query,
         normalized_url=normalized,
         supersedes=supersedes,
+        native_format_hint=dedup.format_hint_from_url(url),
     )
 
     existing = store.load(root)
@@ -238,8 +239,9 @@ _WORKSHEET_HEADER = """\
   think_tank/academia→research-papers, иначе intl-xperience.
 - `relations` — если связь с другим документом реестра видна уже сейчас (`implements`/`cites`/…),
   указать сразу: второго прохода по документу не будет (pre-wave требование graph-v2).
-- `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf` (дефолт); сверить с квотой
-  форматов волны.
+- `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf`; опущенный ключ резолвится
+  подсказкой кандидата (колонка `format_hint` в таблице ждущих), а без неё — дефолтом `pdf`
+  (сводка эхнёт «по дефолту: …», когда сработала подсказка); сверить с квотой форматов волны.
 - Непустой `supersedes` в строке = НОВАЯ РЕДАКЦИЯ документа, уже лежащего в корпусе (тот же
   URL — нормальное состояние для законов), а НЕ дубль: `reject` здесь потерял бы редакцию.
   Ребро `supersedes` в meta.yaml проставит `apply` сам — вписывать его в `relations` руками
@@ -312,13 +314,13 @@ def render_worksheet(
     lines = [_WORKSHEET_HEADER, ""]
     lines.append(
         "| raw_hash | title | issuer | jurisdiction | doc_date | supersedes | connector_id "
-        "| native_tags/matched_query | source_url |"
+        "| native_tags/matched_query | source_url | format_hint |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for cand in pending:
         tags = ", ".join(cand.native_tags) if cand.native_tags else (cand.matched_query or "")
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 cand.raw_hash[:12],
                 cand.title or "",
                 cand.issuer or "",
@@ -329,6 +331,7 @@ def render_worksheet(
                 cand.connector_id,
                 tags,
                 cand.source_url or "",
+                cand.native_format_hint.value if cand.native_format_hint else "",
             )
         )
     if unacquirable:
@@ -485,6 +488,19 @@ def _build_admit_record(
         track = _default_track(cand.jurisdiction, issuer_type)
         defaulted.append(f"track={track.value}")
 
+    # Резолюция формата (spec discovery-acquire-seam-hardening §8, Г7): явный ключ
+    # решения > подсказка кандидата (by construction у eurlex/URL-эвристика) >
+    # молчаливый дефолт "pdf". Выведенное из подсказки значение эхается в defaulted
+    # той же механикой, что authority/track — куратор видит, во что развернулась
+    # подсказка, не только счёт документов.
+    if "source_format" in decision:
+        source_format = schema.SourceFormat(decision["source_format"])
+    elif cand.native_format_hint is not None:
+        source_format = cand.native_format_hint
+        defaulted.append(f"source_format={source_format.value} (подсказка кандидата)")
+    else:
+        source_format = schema.SourceFormat.pdf
+
     relations_raw = decision.get("relations")
     rec = schema.promote_candidate(
         cand,
@@ -496,7 +512,7 @@ def _build_admit_record(
         doc_type=decision["doc_type"],
         authority=authority,
         relevance=schema.Relevance.model_validate(decision["relevance"]),
-        source_format=schema.SourceFormat(decision.get("source_format", "pdf")),
+        source_format=source_format,
         topics=decision.get("topics"),
         g2ai_pattern=decision.get("g2ai_pattern"),
         summary=decision.get("summary"),

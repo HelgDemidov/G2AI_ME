@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 
 from core import schema
-from discovery.dedup import dedup, normalize_url, normalized_title
+from discovery.dedup import dedup, format_hint_from_url, normalize_url, normalized_title
 
 
 def _candidate(**overrides: object) -> schema.CandidateRecord:
@@ -65,6 +65,47 @@ def test_normalized_title_diacritics_preserved_as_letters() -> None:
     """Балканская диакритика (č/š/đ) не отбрасывается — иначе Član/Odjeljak слились бы с шумом."""
     assert normalized_title("Član 1") != normalized_title("Clan 1")
     assert normalized_title("Član 1") == normalized_title("ČLAN, 1")
+
+
+# --- format_hint_from_url (spec discovery-acquire-seam-hardening §8, Г7) ----------
+
+
+def test_format_hint_from_url_pdf() -> None:
+    assert format_hint_from_url("https://gov.example.org/law.pdf") == schema.SourceFormat.pdf
+
+
+def test_format_hint_from_url_docx() -> None:
+    assert format_hint_from_url("https://gov.example.org/law.docx") == schema.SourceFormat.docx
+
+
+def test_format_hint_from_url_xlsx() -> None:
+    assert format_hint_from_url("https://gov.example.org/data.xlsx") == schema.SourceFormat.xlsx
+
+
+def test_format_hint_from_url_html() -> None:
+    assert format_hint_from_url("https://gov.example.org/law.html") == schema.SourceFormat.html
+
+
+def test_format_hint_from_url_htm() -> None:
+    assert format_hint_from_url("https://gov.example.org/law.htm") == schema.SourceFormat.html
+
+
+def test_format_hint_from_url_case_insensitive_extension() -> None:
+    assert format_hint_from_url("https://gov.example.org/LAW.PDF") == schema.SourceFormat.pdf
+
+
+def test_format_hint_from_url_query_string_not_sniffed() -> None:
+    """Точность важнее покрытия: лгущая подсказка (``?format=pdf`` у лендинга)
+    опаснее отсутствующей — query/фрагмент НЕ смотрим."""
+    assert format_hint_from_url("https://gov.example.org/view?format=pdf") is None
+
+
+def test_format_hint_from_url_no_extension_is_none() -> None:
+    assert format_hint_from_url("https://gov.example.org/document/view/8842") is None
+
+
+def test_format_hint_from_url_unknown_extension_is_none() -> None:
+    assert format_hint_from_url("https://gov.example.org/page.aspx") is None
 
 
 # --- dedup ------------------------------------------------------------------------

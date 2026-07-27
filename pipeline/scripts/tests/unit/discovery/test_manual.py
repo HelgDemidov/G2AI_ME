@@ -463,6 +463,44 @@ def test_apply_admit_track_defaults_me_jurisdiction_to_target_entity(tmp_path: P
     assert schema.load_records(tmp_path)[0].track == schema.Track.target_entity
 
 
+# --- source_format резолюция (spec discovery-acquire-seam-hardening §8, Г7) ------
+
+
+def test_apply_admit_source_format_defaults_to_pdf_without_hint(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path)
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].source_format == schema.SourceFormat.pdf
+
+
+def test_apply_admit_source_format_defaults_from_candidate_hint(tmp_path: Path) -> None:
+    """Подсказка кандидата замещает молчаливый дефолт "pdf", когда решение не
+    указывает формат явно — эхо в сводке, той же механикой, что authority/track."""
+    cand = _candidate(raw_hash="b" * 64, native_format_hint="html")
+    store.save([cand], tmp_path)
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].source_format == schema.SourceFormat.html
+    assert any("source_format=html" in o.detail for o in summary.outcomes)
+
+
+def test_apply_admit_explicit_source_format_wins_over_hint(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, native_format_hint="html")
+    store.save([cand], tmp_path)
+    decision = _admit_decision("b" * 64, source_format="docx")
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].source_format == schema.SourceFormat.docx
+
+
+def test_render_worksheet_includes_format_hint_column() -> None:
+    cand = _candidate(native_format_hint="html")
+    text = manual.render_worksheet([cand])
+    assert "format_hint" in text
+    assert "| html |" in text
+
+
 def test_load_target_entity_jurisdictions_reads_real_tracked_config() -> None:
     """pipeline/config/target_entities.yaml — настоящий трекаемый файл, не фикстура."""
     assert manual.load_target_entity_jurisdictions() == ("me",)

@@ -146,6 +146,46 @@ def test_classify_small_unexpected_body_is_blocked() -> None:
     assert result.outcome == AcquisitionOutcome.blocked
 
 
+# --- диагноз промаха формата в лестнице (spec discovery-acquire-seam-hardening
+# §8, Г7): не-challenge промах с content-type: text/html дополняет reason ---
+
+
+def test_classify_pdf_too_small_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(b"<html>redirect</html>", OK_HTML_HEADERS, schema.SourceFormat.pdf)
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
+
+
+def test_classify_pdf_unexpected_content_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(
+        b"<html>real page</html>" + b"x" * 4000, OK_HTML_HEADERS, schema.SourceFormat.pdf
+    )
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
+
+
+def test_classify_pdf_unexpected_content_without_html_content_type_no_mismatch_note() -> None:
+    result = classify_response(b"garbage" + b"x" * 4000, OK_HEADERS, schema.SourceFormat.pdf)
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" not in result.reason
+
+
+def test_classify_docx_not_zip_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(
+        b"<html>not a docx</html>" + b"x" * 4000, OK_HTML_HEADERS, schema.SourceFormat.docx
+    )
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
+
+
+def test_classify_xlsx_not_zip_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(
+        b"<html>not an xlsx</html>" + b"x" * 4000, OK_HTML_HEADERS, schema.SourceFormat.xlsx
+    )
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
+
+
 def test_classify_redirect_keeps_only_final_hop_status_and_headers() -> None:
     # Финальный статус (403) должен победить промежуточный 301; cf-ray виден только
     # в финальном блоке заголовков -> детектор не должен потеряться в редиректе.

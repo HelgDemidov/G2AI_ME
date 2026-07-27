@@ -459,6 +459,12 @@ class CandidateRecord(BaseModel):
     # дешёвый pre-signal (НЕ вердикт — target_fit присваивает только триаж)
     matched_query: str | None = None
     matched_vocab_tags: list[str] | None = None
+    # Подсказка формата (spec discovery-acquire-seam-hardening §8, Г7) — НЕ вердикт:
+    # формат ОБЪЯВЛЯЕТ куратор при триаже, подсказка лишь замещает молчаливый дефолт
+    # "pdf" в admit-двери, когда коннектор знает формат by construction (eurlex строит
+    # `/TXT/HTML/`-URL) либо по расширению хвоста URL (`dedup.format_hint_from_url`).
+    # Ошибочная подсказка опаснее отсутствующей — см. design rationale спека.
+    native_format_hint: SourceFormat | None = None
     # провенанс добычи (обязательно)
     connector_id: str = Field(min_length=1)
     retrieved_at: _dt.date

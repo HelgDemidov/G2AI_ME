@@ -38,7 +38,7 @@ from core import fsio, openrouter, pdfmeta, schema
 from core.env import REPO_ROOT
 from discovery import registry, store
 from discovery.base import ConnectorCursor, DiscoverResult
-from discovery.dedup import normalize_url
+from discovery.dedup import format_hint_from_url, normalize_url
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_snowball.yaml"
 CONNECTOR_ID = "snowball"
@@ -448,6 +448,7 @@ def map_link(
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash,
         normalized_url=normalized,
+        native_format_hint=format_hint_from_url(link.url),
     )
 
 
