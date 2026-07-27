@@ -549,3 +549,65 @@ def test_is_markup_heavy_mixed_block_below_threshold() -> None:
     """Абзац прозы с одной таблицей-строкой — не markup-heavy (порог по доле строк)."""
     mixed = "Prose line one.\nProse line two.\nProse line three.\n| a | b |"
     assert is_markup_heavy(mixed) is False
+
+
+# --- заголовок не остаётся чанком-сиротой (spec convert-knowledge-seam-hardening §10) ---
+
+
+def _table(n_rows: int) -> str:
+    rows = "\n".join(f"| cell{i}a | cell{i}b |" for i in range(n_rows))
+    return f"| A | B |\n| --- | --- |\n{rows}"
+
+
+def test_heading_joins_first_piece_of_oversize_table() -> None:
+    """Секция «заголовок + длинная таблица» больше не даёт чанк из одной строки:
+    заголовок едет с первым куском таблицы (Б15)."""
+    text = f"## Section Title\n\n{_table(30)}"
+    chunks = chunk_text(text, wc, 30)
+
+    assert chunks[0].text.startswith("## Section Title\n\n| A | B |")
+    assert all(c.n_tokens <= 30 for c in chunks)
+    assert not any(c.text.strip() == "## Section Title" for c in chunks)
+
+
+def test_heading_join_preserves_all_table_rows() -> None:
+    """Склейка не теряет данных: все строки таблицы присутствуют в сумме кусков."""
+    text = f"### T\n\n{_table(25)}"
+    joined = "\n".join(c.text for c in chunk_text(text, wc, 30))
+    for i in range(25):
+        assert f"| cell{i}a | cell{i}b |" in joined
+
+
+def test_heading_join_keeps_every_piece_a_valid_table() -> None:
+    for c in chunk_text(f"## T\n\n{_table(25)}", wc, 30):
+        body = c.text.removeprefix("## T\n\n")
+        assert body.startswith("| A | B |\n| --- | --- |")
+
+
+def test_heading_only_section_stays_orphan_by_design() -> None:
+    """Секция без собственного контента (следом сразу другой заголовок) — сирота
+    остаётся: убрать её нечем, а склейка через границу секции нарушила бы инвариант
+    «чанк не пересекает границу секции»."""
+    chunks = chunk_text("# A\n\n## A.1\n\nbody text here", wc, 50)
+    assert any(c.text.strip() == "# A" for c in chunks)
+
+
+def test_heading_join_skipped_when_heading_leaves_no_budget() -> None:
+    """Заголовок сам почти в бюджет — склейка невозможна, поведение прежнее."""
+    long_heading = "## " + " ".join(f"w{i}" for i in range(20))
+    chunks = chunk_text(f"{long_heading}\n\n{_table(20)}", wc, 21)
+    assert chunks[0].text == long_heading
+    assert all(c.n_tokens <= 21 or c.text.count("\n") == 0 for c in chunks)
+
+
+def test_heading_join_applies_to_prose_paragraph_too() -> None:
+    sentences = " ".join(f"Sentence number {i} here." for i in range(40))
+    chunks = chunk_text(f"## Prose Section\n\n{sentences}", wc, 40)
+    assert chunks[0].text.startswith("## Prose Section\n\n")
+    assert all(c.n_tokens <= 40 for c in chunks)
+
+
+def test_no_heading_no_merge_regression() -> None:
+    """Оверсайз-абзац без предшествующего заголовка режется как раньше."""
+    plain = chunk_text(_table(30), wc, 30)
+    assert all(c.text.startswith("| A | B |") for c in plain)

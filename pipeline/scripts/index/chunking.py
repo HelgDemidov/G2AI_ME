@@ -285,7 +285,12 @@ def _table_header(para: str) -> tuple[str, str, list[str]] | None:
 
 
 def _split_table_paragraph(
-    header: str, sep: str, rows: list[str], count_tokens: TokenCounter, max_tokens: int
+    header: str,
+    sep: str,
+    rows: list[str],
+    count_tokens: TokenCounter,
+    max_tokens: int,
+    first_budget: int | None = None,
 ) -> list[str]:
     """GFM-таблица больше лимита -> резать ПО СТРОКАМ, повторяя заголовок+
     разделитель в каждом куске (row+header — практика RAG для табличных данных:
@@ -301,11 +306,13 @@ def _split_table_paragraph(
     out: list[str] = []
     current: list[str] = []
     current_tokens = prefix_tokens
+    budget = first_budget if first_budget is not None else max_tokens
     for row in rows:
         n = count_tokens(row)
-        if current and current_tokens + n > max_tokens:
+        if current and current_tokens + n > budget:
             out.append("\n".join([prefix, *current]))
             current, current_tokens = [], prefix_tokens
+            budget = max_tokens  # уменьшённый бюджет — только у ПЕРВОГО куска
         current.append(row)
         current_tokens += n
     if current:
@@ -313,16 +320,23 @@ def _split_table_paragraph(
     return out or [prefix]  # таблица без строк данных (вырожденный случай) — как есть
 
 
-def _split_long_paragraph(para: str, count_tokens: TokenCounter, max_tokens: int) -> list[str]:
+def _split_long_paragraph(
+    para: str, count_tokens: TokenCounter, max_tokens: int, first_budget: int | None = None
+) -> list[str]:
     """Абзац больше лимита -> нарезать по предложениям (с fallback на слова);
     GFM-таблица — по строкам с повторением заголовка (см. ``_split_table_paragraph``
-    выше)."""
+    выше).
+
+    ``first_budget`` (spec convert-knowledge-seam-hardening §10) — уменьшённый бюджет
+    ПЕРВОГО куска: он поедет в один чанк со строкой-заголовком секции, чтобы та не
+    осталась чанком-сиротой. Остальные куски получают полный ``max_tokens``."""
     table = _table_header(para)
     if table is not None:
-        return _split_table_paragraph(*table, count_tokens, max_tokens)
+        return _split_table_paragraph(*table, count_tokens, max_tokens, first_budget)
     out: list[str] = []
     current: list[str] = []
     current_tokens = 0
+    budget = first_budget if first_budget is not None else max_tokens
     for sent in _sentences(para):
         n = count_tokens(sent)
         if n > max_tokens:
@@ -330,15 +344,57 @@ def _split_long_paragraph(para: str, count_tokens: TokenCounter, max_tokens: int
                 out.append(" ".join(current))
                 current, current_tokens = [], 0
             out.extend(_hard_split(sent, count_tokens, max_tokens))
+            budget = max_tokens
             continue
-        if current and current_tokens + n > max_tokens:
+        if current and current_tokens + n > budget:
             out.append(" ".join(current))
             current, current_tokens = [], 0
+            budget = max_tokens
         current.append(sent)
         current_tokens += n
     if current:
         out.append(" ".join(current))
     return out
+
+
+def _merge_heading_with_first_piece(
+    current: list[tuple[str, bool]],
+    current_tokens: int,
+    para: str,
+    reconstructed: bool,
+    count_tokens: TokenCounter,
+    max_tokens: int,
+) -> tuple[tuple[str, bool], list[str]] | None:
+    """Приклеить строку-заголовок секции к первому куску следующего (оверсайз) абзаца —
+    иначе она осталась бы чанком-сиротой (spec convert-knowledge-seam-hardening §10,
+    Б15: секция «заголовок + длинная таблица» давала отдельный чанк из одной строки,
+    полноправного кандидата выдачи и отдельный вектор без содержания).
+
+    ``None`` — приклеивать нечего или невыгодно: накопленный чанк не является ровно
+    строкой-заголовком, запаса бюджета нет, либо склейка всё равно не влезла в
+    ``max_tokens`` (post-check — гарантия инварианта независимо от внутренностей
+    сплиттера). Во всех этих случаях вызывающая сторона идёт прежним путём.
+
+    ⚠ НЕ трогает секцию, состоящую ТОЛЬКО из заголовка (следом сразу другой заголовок):
+    там сироту убрать нечем — контента у секции нет вовсе, а склейка через границу
+    секции нарушила бы инвариант «чанк не пересекает границу секции». Живой замер
+    корпуса: этот подслучай и есть основная масса коротких чанков (см. спек §10).
+    """
+    if len(current) != 1:
+        return None
+    head_text, head_flag = current[0]
+    if not _HEADING_RE.match(head_text.splitlines()[0]):
+        return None
+    first_budget = max_tokens - current_tokens
+    if first_budget <= 0:
+        return None
+    pieces = _split_long_paragraph(para, count_tokens, max_tokens, first_budget)
+    if not pieces:
+        return None
+    merged_text = f"{head_text}\n\n{pieces[0]}"
+    if count_tokens(merged_text) > max_tokens:
+        return None
+    return (merged_text, head_flag or reconstructed), pieces[1:]
 
 
 def _pack_paragraphs(
@@ -366,6 +422,15 @@ def _pack_paragraphs(
     for para, reconstructed in paras:
         n = count_tokens(para)
         if n > max_tokens:
+            merged = _merge_heading_with_first_piece(
+                current, current_tokens, para, reconstructed, count_tokens, max_tokens
+            )
+            if merged is not None:
+                head_chunk, pieces = merged
+                raw.append(head_chunk)
+                current, current_tokens = [], 0
+                raw.extend((piece, reconstructed) for piece in pieces)
+                continue
             flush()
             raw.extend(
                 (piece, reconstructed)
