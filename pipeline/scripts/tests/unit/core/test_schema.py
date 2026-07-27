@@ -636,6 +636,109 @@ def test_promote_candidate_language_on_candidate_wins_without_override() -> None
     assert rec.language == "cnr"
 
 
+def test_promote_candidate_title_override_success() -> None:
+    """spec triage-intake-hardening §1: title override той же формы, что language (spec
+    discovery-agora §7) — snowball массово не даёт настоящий заголовок (title_provenance
+    §3), решение подаёт его через override."""
+    data = valid_candidate()
+    data.update(issuer="Gov", language="en", source_url="https://ex.org/d.pdf")  # без title
+    cand = CandidateRecord.model_validate(data)
+    assert cand.title is None
+    rec = promote_candidate(
+        cand,
+        id="us-cabinet-agentic-2026",
+        entity_id="us",
+        track=Track.intl_xperience,
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="framework",
+        authority="soft_law",
+        admission=_admission(),
+        title="Overridden Title",
+    )
+    assert rec.title == "Overridden Title"
+
+
+def test_promote_candidate_title_override_none_and_candidate_none_raises() -> None:
+    data = valid_candidate()
+    data.update(issuer="Gov", language="en", source_url="https://ex.org/d.pdf")  # без title
+    cand = CandidateRecord.model_validate(data)
+    with pytest.raises(ValueError, match="title"):
+        promote_candidate(
+            cand,
+            id="x-y-2026",
+            entity_id="xx",
+            track=Track.intl_xperience,
+            issuer_type=IssuerType.government,
+            geo_scope=GeoScope.national,
+            doc_type="framework",
+            authority="soft_law",
+            admission=_admission(),
+        )
+
+
+def test_promote_candidate_issuer_override_success() -> None:
+    """spec triage-intake-hardening §1: issuer override — 22% очереди (oecd/snowball) его
+    не дают вовсе, дверь для override отсутствовала (в отличие от language) до этого спека."""
+    data = valid_candidate()
+    data.update(title="Doc", language="en", source_url="https://ex.org/d.pdf")  # без issuer
+    cand = CandidateRecord.model_validate(data)
+    assert cand.issuer is None
+    rec = promote_candidate(
+        cand,
+        id="us-cabinet-agentic-2026",
+        entity_id="us",
+        track=Track.intl_xperience,
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="framework",
+        authority="soft_law",
+        admission=_admission(),
+        issuer="Overridden Gov",
+    )
+    assert rec.issuer == "Overridden Gov"
+
+
+def test_promote_candidate_issuer_override_none_and_candidate_none_raises() -> None:
+    data = valid_candidate()
+    data.update(title="Doc", language="en", source_url="https://ex.org/d.pdf")  # без issuer
+    cand = CandidateRecord.model_validate(data)
+    with pytest.raises(ValueError, match="issuer"):
+        promote_candidate(
+            cand,
+            id="x-y-2026",
+            entity_id="xx",
+            track=Track.intl_xperience,
+            issuer_type=IssuerType.government,
+            geo_scope=GeoScope.national,
+            doc_type="framework",
+            authority="soft_law",
+            admission=_admission(),
+        )
+
+
+def test_promote_candidate_source_url_override_success() -> None:
+    """spec triage-intake-hardening §1/§6: source_url override — OECD-значение может быть
+    недостоверным (§6, url_provenance: suspect), куратор подаёт верный адрес через решение."""
+    data = valid_candidate()
+    data.update(title="Doc", issuer="Gov", language="en")  # без source_url
+    cand = CandidateRecord.model_validate(data)
+    assert cand.source_url is None
+    rec = promote_candidate(
+        cand,
+        id="us-cabinet-agentic-2026",
+        entity_id="us",
+        track=Track.intl_xperience,
+        issuer_type=IssuerType.government,
+        geo_scope=GeoScope.national,
+        doc_type="framework",
+        authority="soft_law",
+        admission=_admission(),
+        source_url="https://ex.org/override.pdf",
+    )
+    assert rec.source_url == "https://ex.org/override.pdf"
+
+
 def test_operational_state_default() -> None:
     st = OperationalState()
     assert st.sha256 is None

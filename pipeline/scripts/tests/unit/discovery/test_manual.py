@@ -412,6 +412,44 @@ def test_apply_admit_without_language_override_and_candidate_without_language_er
     assert "language" in summary.errors[0].detail
 
 
+@pytest.mark.parametrize(
+    "field_name,override_value",
+    [
+        ("title", "Overridden Title"),
+        ("issuer", "Overridden Gov"),
+        ("source_url", "https://ex.org/override.pdf"),
+    ],
+)
+def test_apply_admit_field_override_reaches_meta_yaml(
+    tmp_path: Path, field_name: str, override_value: str
+) -> None:
+    """spec triage-intake-hardening §1: title/issuer/source_url override той же формы, что
+    language выше — кандидат без поля промоутится, если decision несёт override."""
+    cand = _candidate(raw_hash="b" * 64, **{field_name: None})
+    store.save([cand], tmp_path)
+
+    decision = _admit_decision("b" * 64, **{field_name: override_value})
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    rec = schema.load_records(tmp_path)[0]
+    assert getattr(rec, field_name) == override_value
+
+
+@pytest.mark.parametrize("field_name", ["title", "issuer", "source_url"])
+def test_apply_admit_without_field_override_and_candidate_without_field_errors(
+    tmp_path: Path, field_name: str
+) -> None:
+    """Явная ошибка решения называет ИМЕННО недостающее поле и ключ, который его чинит —
+    не общий ValueError из глубины promote_candidate."""
+    cand = _candidate(raw_hash="b" * 64, **{field_name: None})
+    store.save([cand], tmp_path)
+
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert len(summary.errors) == 1
+    assert f"`{field_name}`" in summary.errors[0].detail
+    assert f"`{field_name}:`" in summary.errors[0].detail
+
+
 def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Path) -> None:
     good = _candidate(raw_hash="b" * 64)
     bad = _candidate(raw_hash="c" * 64)

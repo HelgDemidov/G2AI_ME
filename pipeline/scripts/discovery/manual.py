@@ -494,6 +494,22 @@ def _build_admit_record(
     if missing:
         raise ValueError(f"admit: отсутствуют обязательные поля: {', '.join(missing)}")
 
+    # Условно-обязательные (spec triage-intake-hardening §1): у кандидата может не быть
+    # title/issuer/language/source_url (agora/aiforgood/oecd/snowball массово их не дают,
+    # либо OECD-значение недостоверно — §6); в этом случае решение обязано задать ключ явно.
+    # Ошибка называет ИМЕННО недостающее поле и ключ, который его чинит — а не долетает
+    # до ValueError из глубины promote_candidate, где контекста решения уже нет.
+    for field_name, cand_value in (
+        ("title", cand.title),
+        ("issuer", cand.issuer),
+        ("language", cand.language),
+        ("source_url", cand.source_url),
+    ):
+        if decision.get(field_name) is None and cand_value is None:
+            raise ValueError(
+                f"admit: у кандидата нет `{field_name}`, задайте его ключом `{field_name}:` в решении"
+            )
+
     defaulted: list[str] = []
     issuer_type = schema.IssuerType(decision["issuer_type"])
 
@@ -551,6 +567,9 @@ def _build_admit_record(
         summary=decision.get("summary"),
         relations=[schema.Relation.model_validate(r) for r in relations_raw] if relations_raw else None,
         language=decision.get("language"),
+        title=decision.get("title"),
+        issuer=decision.get("issuer"),
+        source_url=decision.get("source_url"),
     )
     return rec, defaulted
 

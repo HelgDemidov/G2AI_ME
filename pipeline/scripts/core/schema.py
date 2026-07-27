@@ -699,6 +699,9 @@ def promote_candidate(
     relations: list[Relation] | None = None,
     language: str | None = None,
     official_alt_url: str | None = None,
+    title: str | None = None,
+    issuer: str | None = None,
+    source_url: str | None = None,
 ) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
@@ -718,11 +721,17 @@ def promote_candidate(
     Словарную принадлежность ``topics``/``g2ai_pattern`` эта функция не проверяет — как и раньше,
     это ``validate_sources.py`` (schema словарей не грузит).
 
-    ``language`` (v3, spec discovery-agora §7) — опциональный override триажа: registry-каналы
+    ``language`` (v3, спек discovery-agora §7) — опциональный override триажа: registry-каналы
     (AGORA и т.п.) структурно не дают язык в метаданных реестра, а ``promote_candidate`` требует
     его non-None — резолюция ``language if language is not None else cand.language`` (override
     побеждает, ``None`` -> прежнее поведение). manual/directed_search-кандидаты с языком на
     ``inject`` продолжают работать без override (обратная совместимость).
+
+    ``title``/``issuer``/``source_url`` (v6, спек triage-intake-hardening §1/§6) — override'ы
+    ТОЙ ЖЕ формы, что ``language``: у части каналов этих полей нет вовсе (``issuer`` — 22%
+    очереди на момент спека) либо значение недостоверно (OECD: делённый между записями
+    ``website`` — §6). Резолюция та же (override побеждает, ``None`` -> кандидат, оба ``None``
+    -> прежний ``ValueError``) — четвёртое симметричное применение одного механизма.
 
     ``cand.supersedes`` (v4, spec discovery-candidates-sharding §5) — ЕДИНСТВЕННАЯ точка, где
     временнáя цепочка редакций материализуется в курируемое ядро: непустое значение
@@ -737,15 +746,17 @@ def promote_candidate(
     вносит САМ в admit-решение. ``None`` -> прежнее поведение (поле ``SourceRecord``
     уже существовало, просто не имело двери промоушена).
     """
-    title, issuer, source_url = cand.title, cand.issuer, cand.source_url
+    resolved_title = title if title is not None else cand.title
+    resolved_issuer = issuer if issuer is not None else cand.issuer
     resolved_language = language if language is not None else cand.language
+    resolved_source_url = source_url if source_url is not None else cand.source_url
     missing = [
         name
         for name, val in (
-            ("title", title),
-            ("issuer", issuer),
+            ("title", resolved_title),
+            ("issuer", resolved_issuer),
             ("language", resolved_language),
-            ("source_url", source_url),
+            ("source_url", resolved_source_url),
         )
         if val is None
     ]
@@ -755,8 +766,8 @@ def promote_candidate(
             f"кандидат ({cand.connector_id}: {ident}): "
             f"нельзя промоутить без полей: {', '.join(missing)}"
         )
-    assert title is not None and issuer is not None
-    assert resolved_language is not None and source_url is not None
+    assert resolved_title is not None and resolved_issuer is not None
+    assert resolved_language is not None and resolved_source_url is not None
 
     resolved_relations = list(relations or [])
     if cand.supersedes is not None:
@@ -768,15 +779,15 @@ def promote_candidate(
         id=id,
         entity_id=entity_id,
         track=track,
-        title=title,
-        issuer=issuer,
+        title=resolved_title,
+        issuer=resolved_issuer,
         issuer_type=issuer_type,
         geo_scope=geo_scope,
         language=resolved_language,
         dates=Dates(published=cand.doc_date),
         doc_type=doc_type,
         authority=authority,
-        source_url=source_url,
+        source_url=resolved_source_url,
         official_alt_url=official_alt_url,
         source_format=source_format,
         rights=cand.rights or Rights.unknown,
