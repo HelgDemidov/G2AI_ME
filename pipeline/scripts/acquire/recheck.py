@@ -317,6 +317,11 @@ def due_records(
     ``sensitivity: confidential`` из (a) НЕ исключается: условный запрос идёт к тому
     же официальному источнику, что и добыча, третьих сторон в нём нет (в отличие от
     SavePageNow, который гейтится).
+
+    Ротация (b) сортирует по ``acquisition_probe_checked or acquisition_failed``
+    (spec discovery-acquire-seam-hardening §3, Г2): курсор ротации отделён от якоря
+    backoff, легаси-записи без нового поля (проверялись до этого спека) фолбэчат на
+    прежний курсор — первый же probe их бэкфиллит.
     """
     superseded = schema.superseded_ids(records)
     with_raw: list[tuple[tuple[bool, _dt.date, str], schema.SourceRecord]] = []
@@ -333,7 +338,8 @@ def due_records(
         if raw is not None:
             with_raw.append((_checked_sort_key(state.acquisition_checked, rec.id), rec))
         elif state.acquisition_failed is not None:
-            without_raw.append((_checked_sort_key(state.acquisition_failed, rec.id), rec))
+            rotation_cursor = state.acquisition_probe_checked or state.acquisition_failed
+            without_raw.append((_checked_sort_key(rotation_cursor, rec.id), rec))
     with_raw.sort(key=lambda pair: pair[0])
     without_raw.sort(key=lambda pair: pair[0])
     return [r for _, r in with_raw[:limit]], [r for _, r in without_raw[:limit]]
@@ -436,7 +442,15 @@ def _reprobe_unacquired(
     """Популяция (b): допущен триажем, добыть не удалось — «а не открылось ли?».
 
     Успех НЕ скачивает документ здесь: контур только снимает backoff, а добирает его
-    ближайший штатный прогон ``run_pipeline`` — одна дверь к добыче, а не две."""
+    ближайший штатный прогон ``run_pipeline`` — одна дверь к добыче, а не две.
+
+    ``acquisition_probe_checked`` бампается на ЛЮБОМ исходе (курсор ротации — иначе
+    голодание хвоста популяции); ``acquisition_failed`` (якорь backoff полной
+    лестницы, spec §3, Г2) probe трогает ТОЛЬКО на успехе (снимает backoff — лестница
+    добудет сама на ближайшем прогоне). Неуспех probe НЕ переустанавливает якорь —
+    он заведомо слабее полной лестницы (один GET по ``source_url``, без official_alt/
+    browser/archive) и не имеет права продлевать её окно; ``acquisition_failure_reason``
+    всё же обновляется свежей причиной — полезно сводке, реестра backoff не касается."""
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     probe = probe_url(
@@ -444,12 +458,12 @@ def _reprobe_unacquired(
     )
     classified = probe.classified
     assert classified is not None  # conditional=False => 304 невозможен
+    state.acquisition_probe_checked = today
     if classified.outcome is acquisition.AcquisitionOutcome.ok:
         state.acquisition_failed = None
         state.acquisition_failure_reason = None
         note = "стало добываемо — ближайший прогон run_pipeline доберёт"
     else:
-        state.acquisition_failed = today
         state.acquisition_failure_reason = classified.reason
         note = f"по-прежнему недобываем: {classified.reason}"
     schema.save_state(state_path, state)

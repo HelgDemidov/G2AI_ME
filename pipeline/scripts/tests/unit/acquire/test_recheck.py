@@ -401,6 +401,20 @@ def test_due_records_splits_unacquired_population(tmp_path: Path) -> None:
     assert [r.id for r in without_raw] == ["bb-missing-2026"]
 
 
+def test_due_records_rotation_prefers_probe_checked_over_acquisition_failed(tmp_path: Path) -> None:
+    """spec discovery-acquire-seam-hardening §3, Г2: ротация (b) сортирует по
+    ``acquisition_probe_checked or acquisition_failed`` — легаси-запись без нового
+    поля фолбэчит на прежний курсор."""
+    _doc(tmp_path, "aa-legacy-2026", raw=None, state={"acquisition_failed": "2026-07-01"})
+    _doc(
+        tmp_path, "bb-recent-probe-2026", raw=None,
+        state={"acquisition_failed": "2026-06-01", "acquisition_probe_checked": "2026-07-20"},
+    )
+    records = schema.load_records(tmp_path)
+    _, without_raw = recheck.due_records(records, tmp_path, limit=10)
+    assert [r.id for r in without_raw] == ["aa-legacy-2026", "bb-recent-probe-2026"]
+
+
 def test_due_records_keeps_confidential_in_rotation(tmp_path: Path) -> None:
     """Условный запрос идёт к тому же официальному источнику, что и добыча: третьих
     сторон в нём нет (в отличие от SavePageNow, который гейтится)."""
@@ -568,7 +582,7 @@ def test_confidential_drift_does_not_snapshot(tmp_path: Path, monkeypatch: Any) 
 
 def test_unacquired_population_clears_backoff_when_source_opens(tmp_path: Path, monkeypatch: Any) -> None:
     """Контур только СНИМАЕТ backoff; добирает документ ближайший штатный прогон —
-    одна дверь к добыче, а не две."""
+    одна дверь к добыче, а не две. Успех бампает и курсор ротации `acquisition_probe_checked`."""
     _doc(tmp_path, "aa-blocked-2026", raw=None, state={"acquisition_failed": "2026-07-01",
                                                        "acquisition_failure_reason": "direct blocked"})
     monkeypatch.setattr(recheck, "probe_url", lambda *a, **kw: _probe())
@@ -578,10 +592,21 @@ def test_unacquired_population_clears_backoff_when_source_opens(tmp_path: Path, 
     rec = schema.load_records(tmp_path)[0]
     st = schema.load_state(schema.state_file(rec, tmp_path))
     assert st.acquisition_failed is None and st.acquisition_failure_reason is None
+    assert st.acquisition_probe_checked == TODAY
 
 
-def test_unacquired_population_extends_backoff_when_still_blocked(tmp_path: Path, monkeypatch: Any) -> None:
-    _doc(tmp_path, "aa-blocked-2026", raw=None, state={"acquisition_failed": "2026-07-01"})
+def test_unacquired_population_does_not_extend_backoff_when_still_blocked(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Регресс репро B аудита (spec discovery-acquire-seam-hardening §3, Г2): probe
+    заведомо слабее полной лестницы (один GET по source_url, без official_alt/
+    browser/archive) и не имеет права переустанавливать якорь backoff — иначе окно
+    не истекает никогда при регулярном --recheck. Курсор ротации сдвигается,
+    якорь — нет; причина всё же обновляется свежей (полезна сводке)."""
+    _doc(
+        tmp_path, "aa-blocked-2026", raw=None,
+        state={"acquisition_failed": "2026-07-01", "acquisition_failure_reason": "old reason"},
+    )
     monkeypatch.setattr(
         recheck, "probe_url",
         lambda *a, **kw: _probe(outcome=acquisition.AcquisitionOutcome.blocked, reason="WAF challenge"),
@@ -591,5 +616,6 @@ def test_unacquired_population_extends_backoff_when_still_blocked(tmp_path: Path
 
     rec = schema.load_records(tmp_path)[0]
     st = schema.load_state(schema.state_file(rec, tmp_path))
-    assert st.acquisition_failed == TODAY
-    assert st.acquisition_failure_reason == "WAF challenge"
+    assert st.acquisition_failed == dt.date(2026, 7, 1)  # якорь backoff НЕ переустановлен
+    assert st.acquisition_failure_reason == "WAF challenge"  # причина всё же свежая
+    assert st.acquisition_probe_checked == TODAY  # курсор ротации сдвинут

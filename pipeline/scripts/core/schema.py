@@ -340,9 +340,24 @@ class OperationalState(BaseModel):
     snapshot_requested: _dt.date | None = None
     # Backoff недобытых (§5): когда лестница провалилась и почему. Пока свежее
     # RETRY_BACKOFF_DAYS — download не планируется (кроме --force/--only); успешная
-    # добыча очищает оба поля.
+    # добыча очищает оба поля. ⚠ ЯКОРЬ backoff'а, НЕ курсор ротации (b) — см.
+    # acquisition_probe_checked ниже (spec discovery-acquire-seam-hardening §3, Г2):
+    # только полноценная попытка ВСЕЙ лестницы вправе переустановить это поле.
     acquisition_failed: _dt.date | None = None
     acquisition_failure_reason: str | None = None
+    # Курсор ротации популяции (b) recheck-контура (spec discovery-acquire-seam-
+    # hardening §3, Г2) — дата ПОСЛЕДНЕГО probe, отдельно от `acquisition_failed`.
+    # Прежде probe при неуспехе бампал сам `acquisition_failed` (единственное
+    # доступное ему поле) — тем самым ЗАНОВО закрывал окно backoff при каждом
+    # регулярном `--recheck`, хотя probe заведомо СЛАБЕЕ полной лестницы (один GET
+    # по `source_url`: official_alt/browser/archive ему недостижимы). Три класса
+    # документов, которые лестница добыла бы, оставались «недобываемы» навсегда —
+    # и тем надёжнее, чем прилежнее куратор гоняет контур времени (живой репро
+    # аудита). Разведение ролей: probe бампает ТОЛЬКО это поле (+ reason), полная
+    # попытка лестницы (`_record_acquisition_failure`) — только `acquisition_failed`.
+    # Optional/дефолт None — легаси `.state.yaml` без поля валидны, ротация (b)
+    # фолбэчит на `acquisition_failed` (см. `recheck.due_records`).
+    acquisition_probe_checked: _dt.date | None = None
     # Backoff отказов КОНВЕРТАЦИИ (spec acquire-convert-seam-hardening §8, В11) —
     # зеркало пары полей выше, но для стадии convert, у которой backoff не было
     # вовсе: патологический документ (напр. 2-часовой OCR_TIMEOUT) повторял бы
