@@ -146,11 +146,28 @@ def needed_stages(
     нечего». Честная оговорка: guard доверяет mtime — подмена файла с подделкой
     mtime+size его обойдёт, но это уже модель угроз, не защита от случайной порчи;
     ``--force`` всегда пересчитывает.
+
+    Инвариант формата (spec acquire-convert-seam-hardening §4, В4): расширение
+    существующего ``raw.*`` обязано совпадать с курируемым ``rec.source_format`` —
+    иначе конвертация молча пойдёт «по файлу» (``resolve_converter`` диспетчеризует
+    по расширению), а формат-специфичные потребители курируемого поля (напр.
+    ``scan_fallback_counts``) откроют не тот файл не тем инструментом. Живой репро
+    аудита: ручная замена raw при прерванном флоу смены формата дала
+    неперехваченный ``PdfminerException`` в диагностике ПОСЛЕ этой функции. Громкий
+    per-doc отказ здесь (изоляция — забота ``process_docs``) — единственный честный
+    исход: молчаливая правка ЛЮБОЙ из двух истин угадывала бы намерение куратора.
     """
     stages: list[Stage] = []
     raw = schema.raw_file(rec, root)          # существующий raw.* или None
     md = schema.md_file(rec, root)            # doc.md (путь; может не существовать)
     state = schema.load_state(schema.state_file(rec, root))
+
+    if raw is not None and raw.suffix.lstrip(".").lower() != rec.source_format.value:
+        raise RuntimeError(
+            f"{rec.id}: raw имеет расширение '{raw.suffix}', а source_format='{rec.source_format.value}' — "
+            f"формат сменён сознательно? приведите raw/meta в соответствие; передобыча: "
+            f"run_pipeline.py --force --only {rec.id}"
+        )
 
     download_needed = False
     if force or raw is None:
@@ -629,6 +646,17 @@ def process_docs(
             try:
                 if stage is Stage.download:
                     if no_download:
+                        # raw уже есть, но download всё равно запланирован -> sha разошёлся
+                        # (сознательная замена файла куратором) — подсказка иначе гласила бы
+                        # «скачайте вручную» о файле, который уже лежит на месте (spec
+                        # acquire-convert-seam-hardening §4, В4).
+                        existing_raw = schema.raw_file(rec, root)
+                        if existing_raw is not None:
+                            raise RuntimeError(
+                                "нужен download, но задан --no-download: raw присутствует, но не "
+                                "совпадает с записанным sha256 — сознательная замена: удалите "
+                                f".state.yaml (или поле sha256); порча: --force --only {rec.id}"
+                            )
                         raise RuntimeError("нужен download, но задан --no-download (скачайте raw вручную)")
                     if not dry_run:
                         _do_download(
@@ -796,21 +824,34 @@ def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tupl
     куратора текущего прогона, а отсутствие ключа уже даёт собственный warning
     внутри ``cloud_allowed`` (один раз за прогон) — дублировать нечего.
 
+    Двойная броня против рассинхрона формата (spec acquire-convert-seam-hardening
+    §4, В4): гейт по ``raw.suffix`` РЯДОМ с гейтом по ``rec.source_format`` (первый
+    ловит записи, где именно raw НЕ .pdf при заявленном ``source_format=pdf`` —
+    живой репро аудита, `needed_stages` ловит такое на планировании, но эта функция
+    вызывается по ВСЕМ записям корпуса независимо от исхода планирования) + per-
+    record ``try/except``: диагностический проход не имеет права ронять сводку
+    прогона (тот же принцип, что ``_raw_text``).
+
     Чистая функция: без сети, состояние читается с диска (``.state.yaml``)."""
     fallback = confidential = 0
     for rec in records:
-        if rec.source_format is not schema.SourceFormat.pdf:
-            continue  # OCR-путь существует только для PDF; _was_ocr_normalized падает на html/docx/xlsx
-        raw = schema.raw_file(rec, root)
-        if raw is None or not raw.exists() or not converters._was_ocr_normalized(raw):
-            continue  # born-digital либо ещё не сконвертирован — не скан
-        state = schema.load_state(schema.state_file(rec, root))
-        if state.cloud_ocr_model is not None:
-            continue  # облако отработало
-        if converters.cloud_allowed(rec):
-            fallback += 1
-        elif rec.sensitivity is schema.Sensitivity.confidential:
-            confidential += 1
+        try:
+            if rec.source_format is not schema.SourceFormat.pdf:
+                continue  # OCR-путь существует только для PDF; _was_ocr_normalized падает на html/docx/xlsx
+            raw = schema.raw_file(rec, root)
+            if raw is None or not raw.exists() or raw.suffix.lower() != ".pdf":
+                continue  # born-digital/ещё не сконвертирован/рассинхрон формата — не скан
+            if not converters._was_ocr_normalized(raw):
+                continue  # born-digital — не скан
+            state = schema.load_state(schema.state_file(rec, root))
+            if state.cloud_ocr_model is not None:
+                continue  # облако отработало
+            if converters.cloud_allowed(rec):
+                fallback += 1
+            elif rec.sensitivity is schema.Sensitivity.confidential:
+                confidential += 1
+        except Exception:  # noqa: BLE001 — диагностический проход не должен ронять сводку прогона
+            logger.warning("  ⚠ %s: не удалось оценить OCR-фолбэк для сводки", rec.id, exc_info=True)
     return fallback, confidential
 
 

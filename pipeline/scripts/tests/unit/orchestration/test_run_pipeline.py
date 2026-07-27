@@ -1174,6 +1174,86 @@ def test_corrupted_raw_after_adoption_triggers_download(tmp_path: Path) -> None:
     assert Stage.download in needed_stages(rec, tmp_path)
 
 
+# --- инвариант формата: расширение raw.* == rec.source_format
+# (spec acquire-convert-seam-hardening §4, В4) ---
+
+
+def test_needed_stages_raises_on_format_mismatch(tmp_path: Path) -> None:
+    """Живой репро аудита (докс/pipeline/audit/acquire_convert_seam_review_2026-07-27.md,
+    репро C): rec.source_format=pdf (дефолт), но на диске raw.html — рассинхрон,
+    возможный после ручной замены файла/прерванного флоу смены формата. Громкий
+    отказ ЭТОГО документа (изоляция — забота process_docs), а не молчаливая
+    конвертация «по файлу»."""
+    rec = make()  # source_format дефолтит pdf
+    d = schema.doc_dir(rec, tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "raw.html").write_bytes(b"<html><body>not a pdf</body></html>")
+    with pytest.raises(RuntimeError, match="raw имеет расширение '.html'"):
+        needed_stages(rec, tmp_path)
+
+
+def test_needed_stages_format_mismatch_is_isolated_per_document(tmp_path: Path) -> None:
+    """Регресс: рассинхрон формата ОДНОГО документа не должен рвать весь батч —
+    process_docs уже изолирует планирование (test_planning_failure_isolated_from_batch),
+    needed_stages лишь обязана поднять исключение, а не упасть иначе (AttributeError и
+    т.п.) на самой проверке."""
+    broken = make(id="broken-fmt-2026", entity_id="bb")
+    d = schema.doc_dir(broken, tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "raw.html").write_bytes(b"<html></html>")
+
+    ok = make(id="ok-doc-2026", entity_id="oo")
+    _place(ok, tmp_path, raw=b"pdf", md=_compose_md(ok, ""), state=_current_converter_state())
+
+    results = process_docs([broken, ok], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+
+    r_broken = next(r for r in results if r.doc_id == "broken-fmt-2026")
+    r_ok = next(r for r in results if r.doc_id == "ok-doc-2026")
+    assert r_broken.error is not None and r_broken.error.startswith("planning:")
+    assert r_ok.up_to_date is True
+
+
+def test_needed_stages_format_match_is_unaffected(tmp_path: Path) -> None:
+    """Консистентная запись (расширение == source_format) продолжает работать как
+    раньше — регресс-guard на отсутствие ложных срабатываний нового инварианта."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+    assert needed_stages(rec, tmp_path) == [Stage.convert, Stage.frontmatter]
+
+
+def test_needed_stages_format_invariant_skipped_when_raw_absent(tmp_path: Path) -> None:
+    """Документ без raw вовсе (ещё не скачан) — новый инвариант неприменим, обычная
+    реконсиляция (Stage.download) отрабатывает как раньше."""
+    rec = make()
+    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
+
+
+def test_no_download_hint_mentions_sha_mismatch_when_raw_present(tmp_path: Path) -> None:
+    """spec §4, В4: подсказка --no-download отличается, когда raw физически ЕСТЬ
+    (сознательная замена/порча — не «скачайте вручную» о файле, который уже на месте)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", state={"sha256": "0" * 64})  # sha заведомо не совпадёт
+
+    results = process_docs(
+        [rec], tmp_path, force=False, dry_run=False, no_download=True, pause=0
+    )
+
+    assert results[0].error is not None
+    assert "не совпадает с записанным sha256" in results[0].error
+    assert "--force --only" in results[0].error
+
+
+def test_no_download_hint_unchanged_when_raw_absent(tmp_path: Path) -> None:
+    rec = make()  # раw вовсе нет
+
+    results = process_docs(
+        [rec], tmp_path, force=False, dry_run=False, no_download=True, pause=0
+    )
+
+    assert results[0].error is not None
+    assert "скачайте raw вручную" in results[0].error
+
+
 # --- дефолты API-first: --embed-backend / изоляция отказа индексной стадии
 # (spec embed-api-first §4) ---
 
@@ -1768,6 +1848,51 @@ def test_scan_fallback_counts_skips_non_pdf_source_format(tmp_path: Path) -> Non
     rec = SourceRecord.model_validate(rec_data)
 
     assert scan_fallback_counts([rec], sources) == (0, 0)  # не падает, тихо пропускает
+
+
+def test_scan_fallback_counts_survives_record_source_format_desync_with_actual_file(
+    tmp_path: Path,
+) -> None:
+    """spec acquire-convert-seam-hardening §4, В4 — герметичный репро репро C аудита:
+    ЗАПИСЬ заявляет source_format=pdf (дефолт), но ФАЙЛ на диске — raw.html (рассинхрон,
+    возможный после ручной замены). Существующий гейт по rec.source_format (см. тест
+    выше) НЕ ловит этот случай — он смотрит на курируемое поле, не на файл; новый
+    гейт по raw.suffix закрывает именно эту дыру."""
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-desync-2026"}  # source_format=pdf по дефолту
+    doc_dir = write_doc(sources, rec_data)
+    (doc_dir / "raw.html").write_bytes(b"<html><body>not actually a pdf</body></html>")
+    rec = SourceRecord.model_validate(rec_data)
+
+    assert scan_fallback_counts([rec], sources) == (0, 0)  # не падает (репро C: было PdfminerException)
+
+
+def test_scan_fallback_counts_isolates_ambiguous_raw_per_record(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Броня per-record try/except (§4): папка с двумя raw.* роняет schema.raw_file
+    (ValueError) на ОДНОМ документе — сводка по ОСТАЛЬНЫМ записям обязана честно
+    досчитаться (не просто «не упасть», а реально учесть вклад здорового документа —
+    иначе broken-запись могла бы молча проглотить и чужой вклад тоже)."""
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    broken_data = {**valid_record(), "id": "sg-broken-2026"}
+    broken_dir = write_doc(sources, broken_data, raw=b"%PDF fake", raw_ext="pdf")
+    (broken_dir / "raw.html").write_bytes(b"<html></html>")  # второй raw.* -> raw_file ValueError
+    broken_rec = SourceRecord.model_validate(broken_data)
+
+    ok_data = {**valid_record(), "id": "sg-ok-2026"}
+    write_doc(sources, ok_data, raw=b"%PDF fake scan", state={})
+    ok_rec = SourceRecord.model_validate(ok_data)
+
+    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    assert scan_fallback_counts([broken_rec, ok_rec], sources) == (1, 0)  # только ok_rec посчитан
 
 
 def test_report_scan_fallback_logs_warning_for_fallback_and_info_for_confidential(
