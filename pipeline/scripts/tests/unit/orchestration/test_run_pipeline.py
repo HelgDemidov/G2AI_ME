@@ -587,13 +587,18 @@ def test_do_download_skips_snapshot_for_confidential(tmp_path: Path, monkeypatch
         (schema.AcquisitionMethod.official_alt, schema.Fidelity.rehost),
         (schema.AcquisitionMethod.manual, schema.Fidelity.manual),
         (schema.AcquisitionMethod.archive, schema.Fidelity.archived_snapshot),
+        (schema.AcquisitionMethod.browser, schema.Fidelity.rendered),
     ],
 )
 def test_do_download_skips_snapshot_for_non_own_edition(
     tmp_path: Path, monkeypatch: Any, method: schema.AcquisitionMethod, fidelity: schema.Fidelity
 ) -> None:
     """Снимать нечего: rehost — чужой хост, manual — файл из папки загрузок,
-    archived_snapshot — снимок уже существует (им мы и добыли документ)."""
+    archived_snapshot — снимок уже существует (им мы и добыли документ), rendered —
+    ступень достигается ТОЛЬКО когда WAF отбил curl (spec acquire-convert-seam-
+    hardening §7, В8): датацентровый краулер Wayback почти наверняка получит тот же
+    челлендж — страховка объявляется неприменимой, а не имитируется ложной пометкой
+    snapshot_requested."""
     rec = make()
     calls = _spy_snapshot(monkeypatch)
     monkeypatch.setattr(
@@ -604,6 +609,7 @@ def test_do_download_skips_snapshot_for_non_own_edition(
     _do_download(rec, tmp_path, pause=0)
 
     assert calls == []
+    assert schema.load_state(schema.state_file(rec, tmp_path)).snapshot_requested is None
 
 
 def test_do_download_snapshot_is_idempotent_for_unchanged_bytes(tmp_path: Path, monkeypatch: Any) -> None:

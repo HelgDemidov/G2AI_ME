@@ -267,7 +267,17 @@ def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
 # Ступени добычи, чей результат — НАША редакция официального URL. Только их и есть
 # смысл просить заархивировать: rehost — чужой хост, manual — файл из папки загрузок
 # (URL издателя мог и не отдать его), archived_snapshot — снимок уже существует.
-_SNAPSHOT_FIDELITIES = frozenset({schema.Fidelity.live, schema.Fidelity.rendered})
+#
+# ``rendered`` (браузерная ступень) сознательно ИСКЛЮЧЕНА (spec acquire-convert-
+# seam-hardening §7, В8): она достигается ТОЛЬКО когда WAF отбил curl с жилого IP —
+# страховка объявляется НЕприменимой для этого класса, а не имитируется. Датацентровый
+# краулер Wayback почти наверняка получит тот же челлендж; снимок был бы challenge-
+# страницей, которую archive-ступень потом сама же отфильтрует классификатором
+# (`classify_response`) — страховки не существует в обе стороны, и помечать попытку
+# выполненной (`snapshot_requested`) значило бы навсегда закрыть честную повторную
+# попытку в будущем (authenticated SPN2 и т.п.), при этом ничего не застраховав.
+# Rendered-документ страхуется локальным raw (+ будущий R2-бэкап), как и manual-класс.
+_SNAPSHOT_FIDELITIES = frozenset({schema.Fidelity.live})
 
 
 def _record_acquisition_failure(rec: schema.SourceRecord, root: Path, exc: BaseException) -> None:

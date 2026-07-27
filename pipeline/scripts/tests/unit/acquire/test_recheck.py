@@ -537,6 +537,28 @@ def test_drift_triggers_snapshot_once(tmp_path: Path, monkeypatch: Any) -> None:
     assert len(calls) == 1
 
 
+def test_drift_snapshot_targets_official_alt_when_acquired_via_it(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """spec acquire-convert-seam-hardening §7, В9-код: если добыча шла через
+    official_alt (валидаторы сняты с НЕГО — probe_url_for это отражает), дрейф
+    наблюдён на official_alt_url — SPN обязан снять ТУ же редакцию, не голый
+    rec.source_url, о котором мы вообще ничего не знаем в этом сценарии."""
+    data = valid_record() | {
+        "id": "aa-alt-2026", "official_alt_url": "https://mirror.example.org/doc.pdf",
+    }
+    write_doc(
+        tmp_path, data, raw=b"%PDF",
+        state={"etag": '"v1"', "etag_confirms": 3, "acquisition_method": "official_alt"},
+    )
+    monkeypatch.setattr(recheck, "probe_url", lambda *a, **kw: _probe(etag='"v2"'))
+    calls = _spy_snapshot(monkeypatch)
+
+    recheck.run_recheck(schema.load_records(tmp_path), tmp_path, user_agent="ua", today=TODAY)
+
+    assert calls == ["https://mirror.example.org/doc.pdf"]
+
+
 def test_confidential_drift_does_not_snapshot(tmp_path: Path, monkeypatch: Any) -> None:
     data = valid_record() | {"id": "me-secret-2026", "sensitivity": "confidential"}
     write_doc(tmp_path, data, raw=b"%PDF", state={"etag": '"v1"', "etag_confirms": 3, "fidelity": "live"})

@@ -780,13 +780,19 @@ def request_snapshot(url: str, *, timeout: int = SPN_TIMEOUT_SECONDS) -> bool:
     Анонимного доступа достаточно на нашем темпе (единицы запросов за прогон);
     аутентифицированный SPN с более высокими лимитами — эскалация на случай, если
     анонимный начнёт отказывать.
+
+    ``url`` квотится (spec acquire-convert-seam-hardening §7, В9-код) — та же
+    дисциплина, что уже применена в ``find_wayback_snapshot`` для CDX-запроса:
+    пробелы/иные не-URL-символы в query-строке ``url`` иначе ломали бы итоговый
+    SPN-запрос (отказ, не инъекция — argv-элемент, не shell). ``safe`` сохраняет
+    структурные символы САМОГО ``url`` (он и без внешнего квотинга уже валидный URL).
     """
     try:
         proc = subprocess.run(
             [
                 "curl", "-sS", "-o", os.devnull,
                 "--connect-timeout", str(timeout), "--max-time", str(timeout),
-                f"{WAYBACK_SAVE_URL}{url}",
+                f"{WAYBACK_SAVE_URL}{quote(url, safe=':/?&=#%')}",
             ],
             check=False,
         )
