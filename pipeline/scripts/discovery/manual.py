@@ -305,6 +305,15 @@ def unacquirable_candidates(
     return due
 
 
+def _md_cell(value: str) -> str:
+    """Экранировать ``|`` в значении ячейки markdown-таблицы (spec discovery-
+    acquire-seam-hardening §12): title/anchor из недоверенных источников (реестры,
+    анкоры снежного кома) могут естественно нести ``|`` — без экранирования
+    строка таблицы рвётся по колонкам. Применяется на ВСЕ интерполируемые ячейки
+    обеих таблиц ``render_worksheet``, не только очевидно небезопасные."""
+    return value.replace("|", "\\|")
+
+
 def render_worksheet(
     pending: list[schema.CandidateRecord],
     unacquirable: list[schema.CandidateRecord] | None = None,
@@ -325,17 +334,17 @@ def render_worksheet(
         tags = ", ".join(cand.native_tags) if cand.native_tags else (cand.matched_query or "")
         lines.append(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
-                cand.raw_hash[:12],
-                cand.title or "",
-                cand.issuer or "",
-                cand.jurisdiction or "",
-                cand.doc_date.isoformat() if cand.doc_date else "",
+                _md_cell(cand.raw_hash[:12]),
+                _md_cell(cand.title or ""),
+                _md_cell(cand.issuer or ""),
+                _md_cell(cand.jurisdiction or ""),
+                _md_cell(cand.doc_date.isoformat() if cand.doc_date else ""),
                 # непустое значение = редакция существующей записи корпуса, не дубль
-                cand.supersedes or "",
-                cand.connector_id,
-                tags,
-                cand.source_url or "",
-                cand.native_format_hint.value if cand.native_format_hint else "",
+                _md_cell(cand.supersedes or ""),
+                _md_cell(cand.connector_id),
+                _md_cell(tags),
+                _md_cell(cand.source_url or ""),
+                _md_cell(cand.native_format_hint.value if cand.native_format_hint else ""),
             )
         )
     if unacquirable:
@@ -348,13 +357,13 @@ def render_worksheet(
             alternates = ", ".join(getattr(cand, "alternate_source_urls", None) or [])
             lines.append(
                 "| {} | {} | {} | {} | {} | {} | {} |".format(
-                    cand.raw_hash[:12],
-                    cand.title or "",
-                    cand.issuer or "",
+                    _md_cell(cand.raw_hash[:12]),
+                    _md_cell(cand.title or ""),
+                    _md_cell(cand.issuer or ""),
                     cand.probe_checked.isoformat() if cand.probe_checked else "—",
-                    cand.probe_finding or "—",
-                    cand.source_url or "",
-                    alternates or "—",
+                    _md_cell(cand.probe_finding or "—"),
+                    _md_cell(cand.source_url or ""),
+                    _md_cell(alternates or "—"),
                 )
             )
     return "\n".join(lines) + "\n"

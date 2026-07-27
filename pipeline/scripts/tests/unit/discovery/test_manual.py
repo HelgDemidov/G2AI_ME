@@ -243,6 +243,48 @@ def test_render_worksheet_empty_pending_still_has_header() -> None:
     assert "raw_hash" in text
 
 
+# --- экранирование `|` в ячейках worksheet (spec discovery-acquire-seam-hardening §12) ---
+
+
+def test_render_worksheet_escapes_pipe_in_pending_row() -> None:
+    """Недоверенный title/issuer (реестры, анкоры снежного кома) может нести `|`
+    естественно — без экранирования строка таблицы рвётся по колонкам."""
+    cand = _candidate(title="AI Act | Draft", issuer="Ministry | Agency")
+    text = manual.render_worksheet([cand])
+    lines = [
+        line for line in text.splitlines()
+        if line.startswith("|") and cand.raw_hash[:12] in line
+    ]
+    assert len(lines) == 1
+    # число колонок сохранено: экранированный `|` не создаёт лишних разделителей
+    assert lines[0].count(" | ") == 9  # 10 колонок таблицы pending
+
+
+def test_render_worksheet_escapes_pipe_in_unacquirable_row() -> None:
+    cand = _candidate(
+        title="AI Act | Draft",
+        rejected_reason="WAF", rejected_kind="unacquirable",
+        probe_finding="acquirable: HTTP 200 | ok",
+    )
+    text = manual.render_worksheet([], [cand])
+    lines = [
+        line for line in text.splitlines()
+        if line.startswith("|") and cand.raw_hash[:12] in line
+    ]
+    assert len(lines) == 1
+    assert lines[0].count(" | ") == 6  # 7 колонок таблицы unacquirable
+
+
+# --- authority-map ⊆ vocab_doc_types (spec discovery-acquire-seam-hardening §12) ---
+
+
+def test_authority_by_doc_type_is_subset_of_doc_type_vocab() -> None:
+    """Дрейф при переименовании термина словаря ловится тестом, а не молчаливым
+    «нет дефолта» — полного покрытия словаря НЕ требует (честная деградация
+    «задайте authority явно» остаётся штатной для новых терминов)."""
+    assert set(manual._AUTHORITY_BY_DOC_TYPE) <= schema.load_vocab("doc_types")
+
+
 # --- apply_decisions (spec §4) ---
 
 
