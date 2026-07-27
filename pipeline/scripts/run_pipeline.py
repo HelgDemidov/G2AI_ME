@@ -1134,6 +1134,34 @@ def main(argv: list[str] | None = None) -> int:
     # скачивает, не конвертирует и не трогает индекс, а только спрашивает издателей
     # «изменилось ли». Возврат здесь и есть эта взаимоисключимость.
     if args.recheck:
+        if args.dry_run:
+            # Честный --recheck --dry-run (spec discovery-acquire-seam-hardening §6,
+            # Г5): прежде флаг молча игнорировался — комбинация брала лок, ходила в
+            # сеть, писала probe-поля/findings, стреляла в SavePageNow. Идиома
+            # dry-run проекта — план, не отказ (иначе единственное место, где флаг
+            # означал бы «нельзя», а не «покажи»): план строится из тех же чистых
+            # функций отбора, что и боевой прогон (due_records/due_candidates), лок
+            # не берётся, сеть/.state.yaml/store не трогаются.
+            candidates = store.load(args.sources)
+            registered = manual.registered_pairs(records)
+            with_raw, without_raw = recheck.due_records(records, args.sources, limit=args.recheck_limit)
+            due_c = recheck.due_candidates(candidates, limit=args.recheck_limit, registered=registered)
+            mode = "deep" if args.recheck_deep else "conditional"
+            logger.info("Recheck (dry-run, %s) — кого проверил бы этот прогон:", mode)
+            for rec in with_raw:
+                state = schema.load_state(schema.state_file(rec, args.sources))
+                logger.info("  (a) %s — курсор: %s", rec.id, state.acquisition_checked or "никогда")
+            for rec in without_raw:
+                state = schema.load_state(schema.state_file(rec, args.sources))
+                cursor = state.acquisition_probe_checked or state.acquisition_failed
+                logger.info("  (b) %s — курсор: %s", rec.id, cursor or "никогда")
+            for cand in due_c:
+                logger.info("  (c) %s — курсор: %s", cand.raw_hash[:12], cand.probe_checked or "никогда")
+            logger.info(
+                "Итого (dry-run, ничего не записано): (a) %d | (b) %d | (c) %d",
+                len(with_raw), len(without_raw), len(due_c),
+            )
+            return 0
         # Эксклюзивный корпусный лок (spec discovery-acquire-seam-hardening §2, Г1) —
         # тот же файл, что берут mutating-подкоманды discover.py: recheck пишет и
         # .state.yaml (findings), и слой кандидатов (популяция (c) — probe-поля/

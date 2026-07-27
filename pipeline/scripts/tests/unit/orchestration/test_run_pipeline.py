@@ -15,8 +15,9 @@ from typing import Any
 import pytest
 
 import run_pipeline
-from acquire import acquisition
+from acquire import acquisition, recheck
 from convert import cloud_ocr, converters, figures_vlm
+from discovery import store
 from index import corpus_index
 from core import schema
 from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
@@ -2036,6 +2037,70 @@ def test_main_recheck_returns_one_when_batch_run_holds_the_lock(tmp_path: Path, 
             rc = main([str(sources), "--recheck"])
     assert rc == 1
     assert any("уже занято" in r.message for r in caplog.records)
+
+
+# --- honest --recheck --dry-run (spec discovery-acquire-seam-hardening §6, Г5) ---
+
+
+def _seed_three_populations(sources: Path) -> None:
+    """(a) документ с raw и курсором; (b) допущен, добыча провалена; (c) кандидат
+    отклонён как unacquirable."""
+    with_raw = valid_record() | {"id": "aa-recheck-a-2026"}
+    write_doc(sources, with_raw, raw=b"%PDF", state={"acquisition_checked": "2026-07-01"})
+    without_raw = valid_record() | {"id": "bb-recheck-b-2026"}
+    write_doc(sources, without_raw, raw=None, state={"acquisition_failed": "2026-07-01"})
+    cand = schema.CandidateRecord.model_validate(
+        {
+            "connector_id": "manual", "retrieved_at": "2026-07-01", "raw_hash": "c" * 64,
+            "title": "Doc", "issuer": "Ministry", "source_url": "https://gov.example.org/doc.pdf",
+            "rejected_reason": "WAF", "rejected_kind": "unacquirable",
+        }
+    )
+    store.save([cand], sources)
+
+
+def test_main_recheck_dry_run_is_noop(tmp_path: Path, monkeypatch: Any) -> None:
+    """Регресс репро E аудита: прежде флаг молча игнорировался — брал лок, ходил в
+    сеть, писал probe-поля/findings. Сеть замонкипатчена на assert-fail — падение
+    теста доказывало бы, что dry-run всё же дозвонился до probe_url."""
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+    records_before = schema.load_records(sources)
+    candidates_before = store.load(sources)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("--recheck --dry-run не должен ходить в сеть")
+
+    monkeypatch.setattr(recheck, "probe_url", boom)
+
+    assert main([str(sources), "--recheck", "--dry-run"]) == 0
+
+    assert not schema.corpus_lock_path(sources).exists()  # лок не берётся
+    assert schema.load_records(sources) == records_before
+    assert store.load(sources) == candidates_before
+
+
+def test_main_recheck_dry_run_prints_all_three_populations(tmp_path: Path, caplog: Any) -> None:
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        rc = main([str(sources), "--recheck", "--dry-run"])
+
+    assert rc == 0
+    text = caplog.text
+    assert "(a) aa-recheck-a-2026" in text
+    assert "(b) bb-recheck-b-2026" in text
+    assert "(c) " + "c" * 12 in text
+
+
+def test_main_recheck_dry_run_not_blocked_while_lock_held(tmp_path: Path) -> None:
+    """dry-run обязан быть no-op и не мешать живому прогону — удержанный лок ему не
+    помеха (симметрично штатному --dry-run)."""
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+    with fsio.exclusive_flock(schema.corpus_lock_path(sources)):
+        assert main([str(sources), "--recheck", "--dry-run"]) == 0
 
 
 def test_main_normal_run_releases_lock_for_the_next_one(tmp_path: Path) -> None:
