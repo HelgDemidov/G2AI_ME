@@ -35,7 +35,7 @@ from typing import Any
 import pdfplumber
 import yaml
 
-from convert import chart_render, docx_groups, pdf_graphics, pdf_to_markdown
+from convert import chart_render, docx_groups, lint, pdf_graphics, pdf_to_markdown
 from core import fsio, markers, openrouter
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Скан-грамматика: ТОЧНОЕ зеркало pdf_graphics._render_opaque/render_raster_marker.
 _FIGURE_MARKER_RE = re.compile(
     r"^> \[Figure, p\. (?P<page>\d+), region (?P<id>[0-9a-f]{12}) — structure not reconstructed\]\n"
-    r"> Labels \(reading order not guaranteed\): .*$",
+    r"> Labels \(reading order not guaranteed\): (?P<witness>.*)$",
     re.MULTILINE,
 )
 _IMAGE_MARKER_RE = re.compile(
@@ -67,7 +67,7 @@ _DOCX_IMAGE_MARKER_RE = re.compile(
 # см. Design rationale спека), а не эскалируется в soffice+VLM.
 _DOCX_GROUP_MARKER_RE = re.compile(
     r"^> \[Figure, docx group (?P<id>[0-9a-f]{12}) — composite content not analyzed\]\n"
-    r"> captions: .*$",
+    r"> captions: (?P<witness>.*)$",
     re.MULTILINE,
 )
 # xlsx-чарты БОЛЬШЕ НЕ идут через VLM (spec chart-data-extraction §4.3):
@@ -463,6 +463,42 @@ def sanitize_vlm_markdown(md: str) -> str:
     return _gate_mermaid_fences(_demote_headings(md))
 
 
+FIGURE_WITNESS_MIN_RECALL = lint.WITNESS_MIN_TOKEN_RECALL
+"""Порог словарного recall для сверки VLM-описания фигуры с её собственными подписями.
+Стартово общий с witness-гейтом OCR — калибровать по живым флагам, как все пороги
+проекта."""
+
+
+def witness_defects(witness: str, markdown: str, obj_id: str) -> list[str]:
+    """Сверка VLM-описания фигуры с НЕЗАВИСИМЫМ свидетелем — подписями региона, которые
+    детерминированно извлёк сам конвертер (spec convert-knowledge-seam-hardening §7).
+
+    Аудит шва (Б3): scan-OCR путь имел образцовый witness-гейт, а путь фигур — никакого,
+    хотя свидетель существовал по построению и лежал прямо в замещаемом маркере
+    (``Labels``/``captions``). При этом на пути фигур модель ЧИТАЕТ график, а не
+    переписывает текст, то есть оснований доверять меньше, а не больше.
+
+    **Сигнал, не отказ** (та же дисциплина, что ``lint.witness_checks``): расхождение
+    маркирует «посмотреть глазами» на Стадии 2, финальный арбитр — человек. Числовая
+    проверка ОДНОСТОРОННЯЯ: числа свидетеля, пропавшие в описании, подозрительны, а
+    обратное легально — VLM читает значения с самого графика, которых в подписях нет.
+    Пустой свидетель (растровые маркеры его не несут вовсе) -> гейт неприменим."""
+    if not witness.strip():
+        return []
+    defects: list[str] = []
+    recall = lint.token_recall(witness, markdown)
+    if recall < FIGURE_WITNESS_MIN_RECALL:
+        defects.append(f"figure-witness-recall: {obj_id} {recall:.2f}")
+    witness_nums = lint.numeric_counter(witness)
+    figure_nums = lint.numeric_counter(markdown)
+    if witness_nums - figure_nums:
+        defects.append(
+            f"figure-witness-numeric: {obj_id} "
+            f"witness_only=[{lint.format_missing_side(witness_nums, figure_nums)}]"
+        )
+    return defects
+
+
 def _render_injected(head: str, address: str, model: str, markdown: str) -> str:
     """Ограниченный блок инъекции: открывающий маркер, санитизированное тело,
     терминатор. ``head`` — адрес для человека («Figure, p. 6, region abc…»),
@@ -496,18 +532,22 @@ def _render_injected_docx_group(id12: str, model: str, markdown: str) -> str:
     return _render_injected(f"Figure, docx group {id12}", f"docx group {id12}", model, markdown)
 
 
-def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
+def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> tuple[bool, list[str]]:
     """Сканирует ``md_path`` на голые маркеры pdf_graphics, инъецирует VLM-
-    интерпретацию (кэш-хит — офлайн; кэш-мисс — рендер+вызов+кэш). Возвращает
-    True, если файл переписан (вызывающая сторона решает о реиндексе), False —
-    маркеров нет ИЛИ все уже инъецированы (истинный no-op, файл не тронут)."""
+    интерпретацию (кэш-хит — офлайн; кэш-мисс — рендер+вызов+кэш).
+
+    Возвращает ``(файл переписан, witness-дефекты)``. Первое — True, если текст
+    изменился (вызывающая сторона решает о реиндексе), False — маркеров нет ИЛИ все уже
+    инъецированы (истинный no-op, файл не тронут). Второе — сверка каждой инъекции с её
+    собственными подписями (``witness_defects``, spec convert-knowledge-seam-hardening
+    §7); считается и на кэш-хите, поэтому переживает офлайн-реинъекцию."""
     text = md_path.read_text(encoding="utf-8")
     figure_matches = list(_FIGURE_MARKER_RE.finditer(text))
     image_matches = list(_IMAGE_MARKER_RE.finditer(text))
     docx_image_matches = list(_DOCX_IMAGE_MARKER_RE.finditer(text))
     docx_group_matches = list(_DOCX_GROUP_MARKER_RE.finditer(text))
     if not any((figure_matches, image_matches, docx_image_matches, docx_group_matches)):
-        return False
+        return False, []
 
     # Ключ требуется ЛЕНИВО — только когда реально нужен облачный вызов (cache-miss,
     # см. _require_key ниже): реинъекция с тёплым кэшем полностью офлайн и работает
@@ -522,6 +562,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
 
     cache = _load_cache(raw)
     cache_dirty = False
+    defects: list[str] = []
     doc: pdf_to_markdown.DocGraphics | None = None
     pdf_doc: Any = None  # ленивый pdfplumber.open — только на cache-miss (реальный рендер)
     replacements: list[tuple[int, int, str]] = []
@@ -549,6 +590,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 entry = {"model": model, "markdown": markdown, "requested": _dt.date.today().isoformat()}
                 cache[rid] = entry
                 cache_dirty = True
+            defects.extend(witness_defects(m.group("witness"), entry["markdown"], rid))
             replacements.append(
                 (m.start(), m.end(), _render_injected_figure(page_num, rid, entry["model"], entry["markdown"]))
             )
@@ -610,6 +652,7 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
                 entry = {"model": model, "markdown": markdown, "requested": _dt.date.today().isoformat()}
                 cache[gid] = entry
                 cache_dirty = True
+            defects.extend(witness_defects(m.group("witness"), entry["markdown"], gid))
             replacements.append(
                 (m.start(), m.end(), _render_injected_docx_group(gid, entry["model"], entry["markdown"]))
             )
@@ -620,10 +663,10 @@ def apply_figures_pass(md_path: Path, raw: Path, *, model: str) -> bool:
     if cache_dirty:
         _save_cache(raw, cache)
     if not replacements:
-        return False
+        return False, defects
 
     new_text = text
     for start, end, replacement in sorted(replacements, key=lambda t: t[0], reverse=True):
         new_text = new_text[:start] + replacement + new_text[end:]
     fsio.atomic_write_text(md_path, new_text)
-    return True
+    return True, defects

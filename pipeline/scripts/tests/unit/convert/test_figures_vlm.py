@@ -111,7 +111,7 @@ IMAGE_MD = (
 def test_noop_when_no_markers(tmp_path: Path, monkeypatch: Any) -> None:
     md, raw = _write_doc(tmp_path, "# Title\n\nJust prose, no markers.\n")
     _patch_key(monkeypatch)
-    assert apply_figures_pass(md, raw, model="m") is False
+    assert apply_figures_pass(md, raw, model="m")[0] is False
     assert md.read_text(encoding="utf-8") == "# Title\n\nJust prose, no markers.\n"
 
 
@@ -139,7 +139,7 @@ def test_cache_hit_skips_vlm_call_and_injects(tmp_path: Path, monkeypatch: Any) 
         lambda raw_: (_ for _ in ()).throw(AssertionError("пере-детекция не нужна на кэш-хите")),
     )
 
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     text = md.read_text(encoding="utf-8")
     assert "> [Figure, p. 6, region 6eb947f5358b — VLM interpretation (cached-model); " \
@@ -163,7 +163,7 @@ def test_cache_miss_calls_vlm_once_and_persists(tmp_path: Path, monkeypatch: Any
 
     monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
 
-    changed = apply_figures_pass(md, raw, model="fresh-model")
+    changed, _ = apply_figures_pass(md, raw, model="fresh-model")
     assert changed is True
     assert len(calls) == 1
     assert calls[0]["model"] == "fresh-model"
@@ -189,7 +189,7 @@ def test_image_marker_matched_and_injected(tmp_path: Path, monkeypatch: Any) -> 
         lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "A raster chart."}}]},
     )
 
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     text = md.read_text(encoding="utf-8")
     assert "image bbde82b91e13 — VLM interpretation (m); reconstruction, verify against original" in text
@@ -212,7 +212,7 @@ def test_region_not_found_on_redetection_warns_and_skips(tmp_path: Path, monkeyp
     import logging
 
     with caplog.at_level(logging.WARNING):
-        changed = apply_figures_pass(md, raw, model="m")
+        changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is False
     assert md.read_text(encoding="utf-8") == FIGURE_MD  # маркер не тронут
     assert "не найден при пере-детекции" in caplog.text
@@ -232,7 +232,7 @@ def test_vlm_failure_leaves_marker_unchanged(tmp_path: Path, monkeypatch: Any) -
 
     monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", failing_chat)
 
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is False
     assert md.read_text(encoding="utf-8") == FIGURE_MD
     assert not (raw.parent / ".figures.yaml").exists()
@@ -251,7 +251,7 @@ def test_idempotent_second_run_is_byte_identical_noop(tmp_path: Path, monkeypatc
         lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Prose."}}]},
     )
 
-    assert apply_figures_pass(md, raw, model="m") is True
+    assert apply_figures_pass(md, raw, model="m")[0] is True
     once = md.read_text(encoding="utf-8")
 
     monkeypatch.setattr(
@@ -262,7 +262,7 @@ def test_idempotent_second_run_is_byte_identical_noop(tmp_path: Path, monkeypatc
         "convert.figures_vlm.pdf_to_markdown.compute_page_graphics",
         lambda raw_: (_ for _ in ()).throw(AssertionError("двойной прогон не должен пере-детектировать")),
     )
-    changed_again = apply_figures_pass(md, raw, model="m")
+    changed_again, _ = apply_figures_pass(md, raw, model="m")
     assert changed_again is False
     assert md.read_text(encoding="utf-8") == once  # байт-в-байт
 
@@ -284,7 +284,7 @@ def test_multiple_markers_processed_independently(tmp_path: Path, monkeypatch: A
         lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Prose."}}]},
     )
 
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     out = md.read_text(encoding="utf-8")
     assert "region 6eb947f5358b — VLM interpretation" in out
@@ -371,7 +371,7 @@ def test_render_crop_clamps_bbox_to_page_bounds(tmp_path: Path, monkeypatch: Any
         lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Cover art."}}]},
     )
 
-    assert apply_figures_pass(md, raw, model="m") is True
+    assert apply_figures_pass(md, raw, model="m")[0] is True
     assert fake_pdf.pages[19].cropped_bboxes == [(0.0, 0.0, 611.74, 792.0)]
 
 
@@ -388,7 +388,7 @@ def test_warm_cache_injection_works_offline_without_key(tmp_path: Path, monkeypa
         "convert.figures_vlm.openrouter.chat_request",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("сеть недопустима")),
     )
-    assert apply_figures_pass(md, raw, model="m") is True
+    assert apply_figures_pass(md, raw, model="m")[0] is True
     assert "Cached." in md.read_text(encoding="utf-8")
 
 
@@ -473,7 +473,7 @@ def test_apply_figures_pass_docx_cache_miss_calls_vlm_with_media_bytes(tmp_path:
         return {"choices": [{"message": {"content": "Docx chart description."}}]}
 
     monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     assert len(calls) == 1
     img_parts = [p for p in calls[0]["messages"][0]["content"] if p["type"] == "image_url"]
@@ -501,7 +501,7 @@ def test_apply_figures_pass_docx_cache_hit_skips_network(tmp_path: Path, monkeyp
         "convert.figures_vlm.openrouter.chat_request",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("сеть не должна была вызываться")),
     )
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     assert "Cached docx figure." in md.read_text(encoding="utf-8")
 
@@ -520,7 +520,7 @@ def test_apply_figures_pass_docx_media_not_found_warns_and_skips(
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("VLM не должен был вызываться")),
     )
     with caplog.at_level(logging.WARNING):
-        changed = apply_figures_pass(md, raw, model="m")
+        changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is False
     assert md.read_text(encoding="utf-8") == text
     assert "не найдено" in caplog.text
@@ -535,14 +535,14 @@ def test_apply_figures_pass_docx_idempotent_second_run(tmp_path: Path, monkeypat
         "convert.figures_vlm.openrouter.chat_request",
         lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Prose."}}]},
     )
-    assert apply_figures_pass(md, raw, model="m") is True
+    assert apply_figures_pass(md, raw, model="m")[0] is True
     once = md.read_text(encoding="utf-8")
 
     monkeypatch.setattr(
         "convert.figures_vlm.openrouter.chat_request",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("двойной прогон не должен звать сеть")),
     )
-    assert apply_figures_pass(md, raw, model="m") is False
+    assert apply_figures_pass(md, raw, model="m")[0] is False
     assert md.read_text(encoding="utf-8") == once
 
 
@@ -562,7 +562,7 @@ def test_apply_figures_pass_docx_duplicate_id_single_vlm_call(tmp_path: Path, mo
         return {"choices": [{"message": {"content": "Shared figure."}}]}
 
     monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     assert len(calls) == 1
     assert md.read_text(encoding="utf-8").count("Shared figure.") == 2
@@ -773,7 +773,7 @@ def test_apply_figures_pass_docx_group_cache_miss_calls_render_and_vlm(tmp_path:
         return {"choices": [{"message": {"content": "Group description."}}]}
 
     monkeypatch.setattr("convert.figures_vlm.openrouter.chat_request", fake_chat)
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     assert len(calls) == 1
     text = md.read_text(encoding="utf-8")
@@ -818,7 +818,7 @@ def test_apply_figures_pass_docx_chart_marker_left_untouched(tmp_path: Path, mon
         "convert.figures_vlm.openrouter.chat_request",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("chart-kind маркер не должен звать сеть")),
     )
-    assert apply_figures_pass(md, raw, model="m") is False
+    assert apply_figures_pass(md, raw, model="m")[0] is False
     assert md.read_text(encoding="utf-8") == text
 
 
@@ -835,7 +835,7 @@ def test_apply_figures_pass_docx_group_cache_hit_skips_render(tmp_path: Path, mo
         "convert.figures_vlm._render_docx_group",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("рендер не должен был вызываться")),
     )
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is True
     assert "Cached group." in md.read_text(encoding="utf-8")
 
@@ -853,7 +853,7 @@ def test_apply_figures_pass_docx_group_render_failure_leaves_marker_unchanged(
         "convert.figures_vlm.openrouter.chat_request",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("VLM не должен был вызываться")),
     )
-    changed = apply_figures_pass(md, raw, model="m")
+    changed, _ = apply_figures_pass(md, raw, model="m")
     assert changed is False
     assert md.read_text(encoding="utf-8") == text
 
@@ -870,14 +870,14 @@ def test_apply_figures_pass_docx_group_idempotent_second_run(tmp_path: Path, mon
         "convert.figures_vlm.openrouter.chat_request",
         lambda payload, *, api_key, timeout=1800.0: {"choices": [{"message": {"content": "Prose."}}]},
     )
-    assert apply_figures_pass(md, raw, model="m") is True
+    assert apply_figures_pass(md, raw, model="m")[0] is True
     once = md.read_text(encoding="utf-8")
 
     monkeypatch.setattr(
         "convert.figures_vlm.openrouter.chat_request",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("двойной прогон не должен звать сеть")),
     )
-    assert apply_figures_pass(md, raw, model="m") is False
+    assert apply_figures_pass(md, raw, model="m")[0] is False
     assert md.read_text(encoding="utf-8") == once
 
 
@@ -902,7 +902,7 @@ def test_injection_is_bounded_by_terminator(tmp_path: Path, monkeypatch: Any) ->
         encoding="utf-8",
     )
 
-    assert apply_figures_pass(md, raw, model="m") is True
+    assert apply_figures_pass(md, raw, model="m")[0] is True
 
     text = md.read_text(encoding="utf-8")
     assert "> [/VLM interpretation region 6eb947f5358b]" in text
@@ -941,7 +941,7 @@ def test_injected_block_is_not_a_bare_marker(tmp_path: Path, monkeypatch: Any) -
     injected = md.read_text(encoding="utf-8")
 
     assert has_bare_markers(injected) is False
-    assert apply_figures_pass(md, raw, model="m") is False
+    assert apply_figures_pass(md, raw, model="m")[0] is False
     assert md.read_text(encoding="utf-8") == injected
 
 
@@ -1009,3 +1009,71 @@ def test_cached_raw_answer_is_sanitized_on_reinjection(tmp_path: Path, monkeypat
     # кэш остался СЫРЫМ — санитизация не переписывает запись о том, что сказала модель
     cached = yaml.safe_load((raw.parent / ".figures.yaml").read_text(encoding="utf-8"))
     assert cached["6eb947f5358b"]["markdown"].startswith("# Cached Heading")
+
+
+# --- witness-гейт фигур (spec convert-knowledge-seam-hardening §7) ---
+
+
+def test_witness_defects_flag_low_recall_and_lost_numbers() -> None:
+    """Свидетель — подписи, извлечённые самим конвертером; описание, потерявшее их
+    слова и числа, помечается (аудит шва Б3: путь фигур был единственным облачным
+    каналом БЕЗ сверки, хотя модель там читает график, а не переписывает текст)."""
+    from convert.figures_vlm import witness_defects
+
+    defects = witness_defects("Alpha; Beta; Gamma; 42; 17", "A completely unrelated sentence.", "abc123")
+    assert any(d.startswith("figure-witness-recall: abc123") for d in defects)
+    assert any("figure-witness-numeric: abc123" in d and "42" in d and "17" in d for d in defects)
+
+
+def test_witness_defects_silent_when_description_covers_witness() -> None:
+    from convert.figures_vlm import witness_defects
+
+    assert witness_defects("Alpha; Beta; 42", "The figure shows Alpha and Beta with value 42.", "abc") == []
+
+
+def test_witness_defects_allow_numbers_absent_from_labels() -> None:
+    """Односторонность: VLM читает значения с самого графика, которых в подписях нет —
+    это норма, а не расхождение."""
+    from convert.figures_vlm import witness_defects
+
+    assert witness_defects("Alpha; Beta", "Alpha is 12 and Beta is 34.", "abc") == []
+
+
+def test_witness_defects_inapplicable_without_witness() -> None:
+    """Растровые маркеры свидетеля не несут вовсе — гейт честно неприменим."""
+    from convert.figures_vlm import witness_defects
+
+    assert witness_defects("", "any description", "abc") == []
+
+
+def test_apply_figures_pass_returns_witness_defects(tmp_path: Path, monkeypatch: Any) -> None:
+    md, raw = _write_doc(tmp_path, FIGURE_MD)  # Labels: MCP; Protocols; Agent
+    _patch_key(monkeypatch)
+    _mermaid_always(monkeypatch, True)
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({"6eb947f5358b": {"model": "m", "markdown": "Totally different words.", "requested": "x"}}),
+        encoding="utf-8",
+    )
+
+    changed, defects = apply_figures_pass(md, raw, model="m")
+    assert changed is True
+    assert any("figure-witness-recall: 6eb947f5358b" in d for d in defects)
+
+
+def test_apply_figures_pass_witness_computed_on_cache_hit(tmp_path: Path, monkeypatch: Any) -> None:
+    """Гейт считается и на офлайн-реинъекции: он не должен зависеть от того, был ли в
+    этом прогоне сетевой вызов."""
+    md, raw = _write_doc(tmp_path, FIGURE_MD)
+    _patch_key(monkeypatch)
+    _mermaid_always(monkeypatch, True)
+    (raw.parent / ".figures.yaml").write_text(
+        yaml.safe_dump({"6eb947f5358b": {"model": "m", "markdown": "MCP Protocols Agent all present.", "requested": "x"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "convert.figures_vlm.openrouter.chat_request",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("сеть не нужна")),
+    )
+
+    _changed, defects = apply_figures_pass(md, raw, model="m")
+    assert defects == []

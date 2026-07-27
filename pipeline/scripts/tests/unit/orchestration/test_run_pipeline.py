@@ -1299,9 +1299,9 @@ def test_do_figures_calls_apply_figures_pass_with_active_model(tmp_path: Path, m
     _place(rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, "body"))
     calls: list[dict[str, Any]] = []
 
-    def fake_apply(md: Path, raw: Path, *, model: str) -> bool:
+    def fake_apply(md: Path, raw: Path, *, model: str) -> tuple[bool, list[str]]:
         calls.append({"md": md, "raw": raw, "model": model})
-        return True
+        return True, []
 
     monkeypatch.setattr(figures_vlm, "apply_figures_pass", fake_apply)
     monkeypatch.setattr(cloud_ocr, "ACTIVE_MODEL", "test-active-model")
@@ -1622,3 +1622,23 @@ def test_report_scan_fallback_silent_when_nothing_to_report(tmp_path: Path, capl
     with caplog.at_level("INFO", logger="run_pipeline"):
         _report_scan_fallback([], tmp_path / "sources")
     assert caplog.records == []
+
+
+def test_do_figures_relints_final_text_and_records_witness_defects(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Б13: lint_defects, посчитанные в _do_convert, описывают ДОинъекционный текст —
+    артефакт, который никто не индексирует. _do_figures пересчитывает их на финальном
+    тексте и добавляет witness-дефекты самих инъекций (§7)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"raw bytes", md=_compose_md(rec, "body without headings"))
+
+    def fake_apply(md: Path, raw: Path, *, model: str) -> tuple[bool, list[str]]:
+        return True, ["figure-witness-recall: abc123 0.10"]
+
+    monkeypatch.setattr(figures_vlm, "apply_figures_pass", fake_apply)
+    _do_figures(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert "figure-witness-recall: abc123 0.10" in state.lint_defects
+    assert "no-headings" in state.lint_defects  # линт финального текста реально выполнен

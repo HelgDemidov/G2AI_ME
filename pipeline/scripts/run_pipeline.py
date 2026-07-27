@@ -443,6 +443,29 @@ def _raw_text(raw: Path, fmt: str) -> str | None:
         return None
 
 
+def _conversion_defects(
+    raw: Path, md_text: str, conv_name: str, state: schema.OperationalState, raw_sha256: str
+) -> list[str]:
+    """C1-линт документа (spec convert-hardening) + witness-сверка облачного OCR
+    (convert-cloud-tier §3), если ЭТОТ ``doc.md`` подтверждённо облачного происхождения.
+
+    Выделена из ``_do_convert``, потому что у неё появился второй вызывающий:
+    ``_do_figures`` пересчитывает линт на ФИНАЛЬНОМ тексте (spec
+    convert-knowledge-seam-hardening §7, Б13). До этого ``lint_defects`` описывали
+    промежуточный артефакт — текст ДО инъекции описаний фигур, который никто никогда не
+    индексирует.
+    """
+    raw_text = _raw_text(raw, conv_name)
+    defects = lint.lint_conversion(
+        md_text,
+        raw_text_chars=len(raw_text) if raw_text is not None else None,
+        fmt=conv_name,
+    )
+    if raw_text is not None and state.cloud_ocr_model is not None and state.cloud_ocr_raw_sha256 == raw_sha256:
+        defects.extend(lint.witness_checks(raw_text, strip_frontmatter(md_text)))
+    return defects
+
+
 def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     raw = schema.raw_file(rec, root)
     md = schema.md_file(rec, root)
@@ -459,12 +482,6 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
     # никогда не роняет конвертацию, только сигналит (лог + машиночитаемый state).
     md_text = md.read_text(encoding="utf-8")
-    raw_text = _raw_text(raw, conv.name)
-    defects = lint.lint_conversion(
-        md_text,
-        raw_text_chars=len(raw_text) if raw_text is not None else None,
-        fmt=conv.name,
-    )
 
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
@@ -473,10 +490,7 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     # вызов при конвертации; устаревшая пара sha/model — это фолбэк-путь ЭТОГО
     # прогона, а не облачный vintage, witness тут неприменим).
     raw_sha256 = _sha256(raw)
-    if raw_text is not None and state.cloud_ocr_model is not None and state.cloud_ocr_raw_sha256 == raw_sha256:
-        # doc.md ЭТОГО прогона — подтверждённо облачный вывод (spec §3): raw_text —
-        # тот же tesseract-слой, что служит witness. Никакой сети/токенов.
-        defects.extend(lint.witness_checks(raw_text, strip_frontmatter(md_text)))
+    defects = _conversion_defects(raw, md_text, conv.name, state, raw_sha256)
 
     for defect in defects:
         logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
@@ -498,14 +512,31 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
 def _do_figures(rec: schema.SourceRecord, root: Path) -> None:
     """VLM-пасс фигур (spec convert-cloud-tier §5) — идемпотентен по построению
     (figures_vlm.apply_figures_pass), гейт (cloud_allowed) уже применён в
-    needed_stages при планировании этой стадии."""
+    needed_stages при планировании этой стадии.
+
+    Линт пересчитывается на ФИНАЛЬНОМ тексте (spec convert-knowledge-seam-hardening §7):
+    ``lint_defects``, посчитанные в ``_do_convert``, описывают ДОинъекционный артефакт,
+    который никто не индексирует. К ним добавляются witness-дефекты самих инъекций
+    (сверка описания фигуры с её подписями) — они и есть новая половина гейта.
+    """
     raw = schema.raw_file(rec, root)
     md = schema.md_file(rec, root)
     if raw is None or not raw.exists():
         raise RuntimeError("нет raw-файла для фигурного пасса")
     if not md.exists():
         raise RuntimeError("нет doc.md для фигурного пасса")
-    figures_vlm.apply_figures_pass(md, raw, model=cloud_ocr.ACTIVE_MODEL)
+    _rewritten, figure_defects = figures_vlm.apply_figures_pass(md, raw, model=cloud_ocr.ACTIVE_MODEL)
+
+    state_path = schema.state_file(rec, root)
+    state = schema.load_state(state_path)
+    conv = converters.resolve_converter(raw)
+    defects = _conversion_defects(
+        raw, md.read_text(encoding="utf-8"), conv.name, state, _sha256(raw)
+    ) + figure_defects
+    for defect in defects:
+        logger.warning("  ⚠ %s: convert-lint — %s", rec.id, defect)
+    state.lint_defects = defects
+    schema.save_state(state_path, state)
 
 
 def _do_frontmatter(rec: schema.SourceRecord, root: Path) -> bool:

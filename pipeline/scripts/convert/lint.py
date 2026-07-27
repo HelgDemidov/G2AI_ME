@@ -128,7 +128,7 @@ def numeric_delta(reference: str, candidate: str) -> tuple[int, int]:
 _NUMERIC_DIVERGENCE_TOKEN_CAP = 10  # токенов на сторону в строке дефекта — .state.yaml не резиновый
 
 
-def _format_missing_side(nums: Counter[str], other: Counter[str]) -> str:
+def format_missing_side(nums: Counter[str], other: Counter[str]) -> str:
     """Сами числа стороны ``nums``, отсутствующие в ``other`` — множество (не
     мультимножество: повтор значения неинформативен в списке «что разошлось»),
     отсортировано численно для детерминизма отчёта, капается на ``_NUMERIC_DIVERGENCE_TOKEN_CAP``."""
@@ -170,8 +170,8 @@ def witness_checks(witness_text: str, cloud_text: str) -> list[str]:
     if witness_nums != cloud_nums:
         defects.append(
             "cloud-ocr-numeric-divergence: "
-            f"witness_only=[{_format_missing_side(witness_nums, cloud_nums)}] "
-            f"cloud_only=[{_format_missing_side(cloud_nums, witness_nums)}]"
+            f"witness_only=[{format_missing_side(witness_nums, cloud_nums)}] "
+            f"cloud_only=[{format_missing_side(cloud_nums, witness_nums)}]"
         )
 
     return defects
