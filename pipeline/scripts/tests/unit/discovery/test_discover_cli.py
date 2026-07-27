@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from core import schema
+from core import fsio, schema
 from discover import main
 from discovery import registry, store
 from discovery.base import ConnectorCursor, DiscoverResult
@@ -586,3 +586,83 @@ def test_snowball_subcommand_doc_filter_excludes_other_documents(tmp_path: Path)
 
     loaded = store.load(tmp_path)
     assert [c.source_url for c in loaded] == ["https://example.org/only-a"]
+
+
+# --- corpus_mutation.lock (spec discovery-acquire-seam-hardening §2, Г1) ---
+#
+# Живая проба PR #53 (fsio.exclusive_flock): два независимых open+flock конфликтуют
+# и ВНУТРИ одного процесса (per-open-file-description locking) — держим лок в тесте
+# через `with fsio.exclusive_flock(...)`, вызов `main()` внутри блока симулирует
+# конкурентный прогон (recheck/run_pipeline) без второго процесса.
+
+
+def test_inject_subcommand_blocked_while_lock_held(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Регресс репро A аудита: inject в окне, где другой мутатор (recheck/discover)
+    держит корпусный лок, обязан быть отвергнут, а не потерян тихой перезаписью store."""
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(
+            [
+                "inject", "--root", str(tmp_path),
+                "--url", "https://example.org/doc", "--title", "Doc",
+                "--issuer", "Issuer", "--language", "en",
+            ]
+        )
+    assert code == 1
+    assert "другой прогон" in capsys.readouterr().out
+    assert store.load(tmp_path) == []  # не просочилось мимо лока
+
+
+def test_apply_subcommand_blocked_while_lock_held(tmp_path: Path) -> None:
+    decisions = tmp_path / "decisions.yaml"
+    decisions.write_text("[]", encoding="utf-8")
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(["apply", str(decisions), "--root", str(tmp_path)])
+    assert code == 1
+
+
+def test_apply_subcommand_dry_run_not_blocked_while_lock_held(tmp_path: Path) -> None:
+    """dry-run обязан быть no-op и не мешать живому прогону — лок его не касается."""
+    decisions = tmp_path / "decisions.yaml"
+    decisions.write_text("[]", encoding="utf-8")
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(["apply", str(decisions), "--root", str(tmp_path), "--dry-run"])
+    assert code == 0
+
+
+def test_discover_subcommand_blocked_while_lock_held(tmp_path: Path) -> None:
+    registry.register(_StaticConnector("a"))
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(["discover", "--root", str(tmp_path)])
+    assert code == 1
+    assert store.load(tmp_path) == []
+
+
+def test_discover_subcommand_dry_run_not_blocked_while_lock_held(tmp_path: Path) -> None:
+    registry.register(_StaticConnector("a"))
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(["discover", "--root", str(tmp_path), "--dry-run"])
+    assert code == 0
+
+
+def test_worksheet_subcommand_not_blocked_while_lock_held(tmp_path: Path) -> None:
+    """worksheet — read-only, лок никогда не берёт, удержанный лок ему не мешает."""
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(["worksheet", "--root", str(tmp_path)])
+    assert code == 0
+
+
+def test_snowball_subcommand_blocked_while_lock_held(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(["snowball", "--root", str(tmp_path)])
+    assert code == 1
+    assert "другой прогон" in capsys.readouterr().out
+
+
+def test_snowball_subcommand_dry_run_not_blocked_while_lock_held(tmp_path: Path) -> None:
+    with fsio.exclusive_flock(schema.corpus_lock_path(tmp_path)):
+        code = main(["snowball", "--root", str(tmp_path), "--dry-run"])
+    assert code == 0

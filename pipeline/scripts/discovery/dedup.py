@@ -24,9 +24,10 @@ fresh) в порядке url -> key -> hash, остановка на перво�
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
-from core.schema import CandidateRecord
+from core.schema import CandidateRecord, SourceFormat
 
 _NON_WORD_RE = re.compile(r"[\W_]+", re.UNICODE)
 
@@ -50,6 +51,29 @@ def normalized_title(title: str) -> str:
     дают один ключ. Диакритика (č/š/đ) сохраняется как буква, не отбрасывается.
     """
     return _NON_WORD_RE.sub("", title.lower())
+
+
+_EXT_TO_FORMAT = {
+    "pdf": SourceFormat.pdf,
+    "docx": SourceFormat.docx,
+    "xlsx": SourceFormat.xlsx,
+    "html": SourceFormat.html,
+    "htm": SourceFormat.html,
+}
+
+
+def format_hint_from_url(url: str) -> SourceFormat | None:
+    """Генерическая эвристика подсказки формата по URL (spec discovery-acquire-
+    seam-hardening §8, Г7): расширение хвоста ``path`` -> ``SourceFormat``, иначе
+    ``None``. Query/фрагмент НЕ смотрим (``?format=pdf`` у лендинга и т.п.) —
+    точность важнее покрытия, лгущая подсказка (с эхом «по дефолту: …» в сводке
+    apply) опаснее отсутствующей: она выглядит авторитетно. URL-утилиты слоя
+    живут рядом с ``normalize_url``."""
+    segment = urlsplit(url).path.rsplit("/", 1)[-1]
+    if "." not in segment:
+        return None
+    ext = segment.rsplit(".", 1)[-1].lower()
+    return _EXT_TO_FORMAT.get(ext)
 
 
 def _match_key(cand: CandidateRecord) -> tuple[str, str, str, str | None] | None:
@@ -108,17 +132,51 @@ class _PoolIndex:
 
 
 def _merge_provenance(existing: CandidateRecord, dup: CandidateRecord) -> None:
-    """Дописать provenance поглощённого дубля в existing — НИКОГДА не перезаписывая его поля."""
+    """Дописать provenance поглощённого дубля в existing — НИКОГДА не перезаписывая его поля.
+
+    ``alternate_source_urls`` (spec discovery-acquire-seam-hardening §5, Г4): если
+    URL дубля расходится (после нормализации) с URL поглотителя, он копится в
+    extra-поле-списке поглотителя (``extra="allow"`` уже позволяет; дедуп внутри
+    списка). Стратегии 2/3 (issuer+title+date / content_hash) МОГУТ поглотить
+    кандидата с другим URL — живой сценарий: зеркало WAF-заблокированного
+    первоисточника (тот же документ, официальный alt-хост/национальный портал). До
+    этого спека такой URL терялся НИГДЕ — тупик ровно на популяции (c), ради
+    которой ``rejected_kind: unacquirable`` существует."""
     merged: list[str] = list(getattr(existing, "merged_connector_ids", None) or [])
     if dup.connector_id != existing.connector_id and dup.connector_id not in merged:
         merged.append(dup.connector_id)
         existing.merged_connector_ids = merged  # type: ignore[attr-defined]  # extra="allow"
 
+    if dup.source_url:
+        dup_normalized = dup.normalized_url or normalize_url(dup.source_url)
+        existing_normalized = existing.normalized_url or (
+            normalize_url(existing.source_url) if existing.source_url else None
+        )
+        if dup_normalized != existing_normalized:
+            alternates: list[str] = list(getattr(existing, "alternate_source_urls", None) or [])
+            if dup.source_url not in alternates:
+                alternates.append(dup.source_url)
+                existing.alternate_source_urls = alternates  # type: ignore[attr-defined]  # extra="allow"
 
-def dedup(
-    new: list[CandidateRecord], existing: list[CandidateRecord]
-) -> tuple[list[CandidateRecord], int]:
-    """Разложить ``new`` на (свежие-после-dedup, счётчик поглощённых).
+
+@dataclass(frozen=True)
+class DedupOutcome:
+    """Итог ``dedup()`` (spec discovery-acquire-seam-hardening §5, Г4).
+
+    ``fresh``/``absorbed`` — прежняя форма (обратная совместимость счётчика);
+    ``absorptions`` — пары ``(дубль, поглотитель)`` по ВСЕМ трём стратегиям —
+    честный ответ вызывающей стороне (``inject``: «уже отклонён ранее, вот
+    причина», не голое «уже есть»), а не только счётчик поглощённых. Семантика
+    сопоставления не меняется ни на бит — меняется только форма возврата.
+    """
+
+    fresh: list[CandidateRecord]
+    absorbed: int
+    absorptions: list[tuple[CandidateRecord, CandidateRecord]]
+
+
+def dedup(new: list[CandidateRecord], existing: list[CandidateRecord]) -> DedupOutcome:
+    """Разложить ``new`` на (свежие-после-dedup, поглощённые) — см. ``DedupOutcome``.
 
     Дубль внутри ``new`` -> первый выигрывает, второй сливается в него. Дубль против
     ``existing`` (включая отклонённых триажем — они персистят с ``rejected_reason`` и
@@ -132,15 +190,15 @@ def dedup(
         index.add(cand)
 
     fresh: list[CandidateRecord] = []
-    absorbed = 0
+    absorptions: list[tuple[CandidateRecord, CandidateRecord]] = []
 
     for cand in new:
         match = index.find(cand)
         if match is not None:
             _merge_provenance(match, cand)
-            absorbed += 1
+            absorptions.append((cand, match))
             continue
         fresh.append(cand)
         index.add(cand)  # принятый fresh участвует в сверке следующих (прежний _find_match(cand, fresh))
 
-    return fresh, absorbed
+    return DedupOutcome(fresh=fresh, absorbed=len(absorptions), absorptions=absorptions)

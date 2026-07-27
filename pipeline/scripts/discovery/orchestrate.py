@@ -82,15 +82,15 @@ def discover(
             summaries.append(ConnectorRunSummary(connector_id=connector.id, error=str(exc)))
             continue
 
-        fresh, merged = dedup(result.candidates, existing + fresh_this_run)
-        fresh_this_run.extend(fresh)
+        outcome = dedup(result.candidates, existing + fresh_this_run)
+        fresh_this_run.extend(outcome.fresh)
         cursors[connector.id] = result.cursor
         summaries.append(
             ConnectorRunSummary(
                 connector_id=connector.id,
                 found=len(result.candidates),
-                fresh=len(fresh),
-                merged=merged,
+                fresh=len(outcome.fresh),
+                merged=outcome.absorbed,
                 diagnostics=result.diagnostics,
             )
         )

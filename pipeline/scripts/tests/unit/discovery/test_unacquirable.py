@@ -13,6 +13,7 @@ from typing import Any
 from acquire import acquisition, recheck
 from core import schema
 from discovery import manual, store
+from tests.support import valid_record
 
 TODAY = dt.date(2026, 7, 25)
 
@@ -119,7 +120,7 @@ def test_unacquirable_candidates_selected_and_ordered() -> None:
     fresh = _cand("2" * 64, rejected_reason="WAF", rejected_kind="unacquirable", probe_checked="2026-07-24")
     never = _cand("3" * 64, rejected_reason="WAF", rejected_kind="unacquirable")
     plain = _cand("4" * 64, rejected_reason="off-axis")
-    due = manual.unacquirable_candidates([fresh, never, plain])
+    due = manual.unacquirable_candidates([fresh, never, plain], [])
     assert [c.raw_hash for c in due] == [never.raw_hash, fresh.raw_hash]  # непробованные первыми
 
 
@@ -139,10 +140,58 @@ def test_worksheet_omits_section_when_nothing_waits() -> None:
     assert "Недобываемые" not in manual.render_worksheet([], [])
 
 
+def test_worksheet_renders_alternate_urls_column() -> None:
+    """spec discovery-acquire-seam-hardening §5, Г4: накопленные зеркала видны
+    куратору в worksheet — revive + правка URL остаются его руками."""
+    cand = _cand("aa" + "1" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
+    cand.alternate_source_urls = ["https://mirror.example.org/law.pdf"]  # type: ignore[attr-defined]
+    text = manual.render_worksheet([], [cand])
+    assert "alternate_urls" in text
+    assert "https://mirror.example.org/law.pdf" in text
+
+
+def test_worksheet_alternate_urls_column_shows_dash_when_absent() -> None:
+    cand = _cand("bb" + "1" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
+    text = manual.render_worksheet([], [cand])
+    assert "alternate_urls" in text
+
+
 def test_unacquirable_stays_out_of_pending() -> None:
     """Секции не пересекаются: недобываемый отклонён, значит в ждущих его нет."""
     cand = _cand("6" * 64, rejected_reason="WAF", rejected_kind="unacquirable")
     assert manual.pending_candidates([cand], []) == []
+
+
+# --- реконсиляция с реестром (spec discovery-acquire-seam-hardening §4, Г3) ---
+
+
+def test_unacquirable_candidates_excludes_registered_pair() -> None:
+    """До этого спека — единственная очередь слоя, НЕ выводимая реконсиляцией:
+    admit недобываемого кандидата напрямую (revive→admit требует двух батчей)
+    оставлял его НАВСЕГДА видимым здесь, хотя документ уже в корпусе."""
+    registered_cand = _cand(
+        "1a" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
+        source_url="https://gov.example.org/registered.pdf",
+        normalized_url="https://gov.example.org/registered.pdf",
+    )
+    still_waiting = _cand("2b" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
+    rec_data = valid_record() | {"source_url": "https://gov.example.org/registered.pdf"}
+    rec = schema.SourceRecord.model_validate(rec_data)
+
+    due = manual.unacquirable_candidates([registered_cand, still_waiting], [rec])
+
+    assert [c.raw_hash for c in due] == [still_waiting.raw_hash]
+
+
+def test_unacquirable_candidates_without_url_stays_visible_even_with_records() -> None:
+    """Безопасный дефолт, симметричный ``pending_candidates``: кандидат без URL
+    реконсиляцией не поддаётся — не прячем от куратора то, чего не можем сопоставить."""
+    cand = _cand(
+        "3c" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
+        source_url=None, normalized_url=None,
+    )
+    rec = schema.SourceRecord.model_validate(valid_record())
+    assert manual.unacquirable_candidates([cand], [rec]) == [cand]
 
 
 # --- популяция (c) recheck ---
@@ -153,6 +202,74 @@ def test_due_candidates_only_unacquirable_with_url() -> None:
     irrelevant = _cand("8" * 64, rejected_reason="off-axis")
     no_url = _cand("9" * 64, rejected_reason="WAF", rejected_kind="unacquirable", source_url=None)
     assert recheck.due_candidates([ok, irrelevant, no_url], limit=10) == [ok]
+
+
+def test_due_candidates_registered_none_preserves_old_behavior() -> None:
+    """``registered=None`` (легаси-вызовы/тесты) — прежнее поведение без реконсиляции."""
+    ok = _cand("7d" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
+    assert recheck.due_candidates([ok], limit=10, registered=None) == [ok]
+
+
+def test_due_candidates_registered_excludes_pair() -> None:
+    """spec discovery-acquire-seam-hardening §4, Г3: пара уже допущенного документа
+    реестра гасит вечный probe URL, который уже добыт."""
+    registered = _cand(
+        "8e" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
+        source_url="https://gov.example.org/registered.pdf",
+        normalized_url="https://gov.example.org/registered.pdf",
+    )
+    still_waiting = _cand("9f" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
+
+    due = recheck.due_candidates(
+        [registered, still_waiting], limit=10,
+        registered={("https://gov.example.org/registered.pdf", None)},
+    )
+
+    assert due == [still_waiting]
+
+
+def test_admit_unacquirable_candidate_directly_disappears_from_both_queues(tmp_path: Path) -> None:
+    """Регресс репро C аудита (spec discovery-acquire-seam-hardening §4, Г3): admit
+    недобываемого кандидата НАПРЯМУЮ (код разрешает молча; штатный revive→admit
+    требует двух батчей, и срезать угол естественно при ``probe_finding: acquirable``)
+    не должен оставлять его НАВСЕГДА зомби в обеих очередях — реконсиляция чинит и
+    исторические случаи, не только будущие admit."""
+    cand = _cand(
+        "aa" + "1" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
+        source_url="https://gov.example.org/zombie.pdf",
+        normalized_url="https://gov.example.org/zombie.pdf",
+        language="en",
+    )
+    store.save([cand], tmp_path)
+
+    decision = {
+        "raw_hash": cand.raw_hash,
+        "action": "admit",
+        "id": "me-zombie-law-2026",
+        "entity_id": "me",
+        "track": "target-entity",
+        "issuer_type": "government",
+        "geo_scope": "national",
+        "doc_type": "national_strategy",
+        "authority": "soft_law",
+        "relevance": {
+            "target_fit": "primary",
+            "axis": "agentic_g2ai",
+            "assessed_stage": "triage",
+            "rationale": "matches axis",
+            "assessed_date": "2026-07-27",
+        },
+    }
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+
+    reloaded_candidates = store.load(tmp_path)
+    reloaded_records = schema.load_records(tmp_path)
+    assert len(reloaded_records) == 1  # admit не мутирует rejected_* кандидата — только реконсиляция
+
+    assert manual.unacquirable_candidates(reloaded_candidates, reloaded_records) == []
+    registered = manual.registered_pairs(reloaded_records)
+    assert recheck.due_candidates(reloaded_candidates, limit=10, registered=registered) == []
 
 
 def test_probe_marks_candidate_acquirable(monkeypatch: Any) -> None:
@@ -224,4 +341,16 @@ def test_classify_probe_404_is_dead() -> None:
 
 def test_classify_probe_empty_200_is_blocked() -> None:
     result = acquisition.classify_probe(b"", "HTTP/1.1 200 OK\r\n")
+    assert result.outcome is acquisition.AcquisitionOutcome.blocked
+
+
+def test_classify_probe_206_partial_content_is_acquirable() -> None:
+    """spec discovery-acquire-seam-hardening §11, Г12: 206 — штатный ответ на
+    Range-запрос (byte_cap probe), не аномалия."""
+    result = acquisition.classify_probe(b"<html>real content</html>", "HTTP/1.1 206 Partial Content\r\n")
+    assert result.outcome is acquisition.AcquisitionOutcome.ok
+
+
+def test_classify_probe_206_empty_body_is_blocked() -> None:
+    result = acquisition.classify_probe(b"", "HTTP/1.1 206 Partial Content\r\n")
     assert result.outcome is acquisition.AcquisitionOutcome.blocked

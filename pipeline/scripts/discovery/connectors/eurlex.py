@@ -348,6 +348,10 @@ def _map_group(
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash,
         normalized_url=dedup.normalize_url(source_url),
+        # by construction: _build_source_url всегда строит /TXT/HTML/ — коннектор
+        # ЗНАЕТ формат (spec discovery-acquire-seam-hardening §8, Г7), в отличие от
+        # молчаливого дефолта "pdf" на admit-двери.
+        native_format_hint=schema.SourceFormat.html,
     )
 
 

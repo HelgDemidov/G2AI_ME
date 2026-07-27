@@ -41,7 +41,6 @@ class AgoraConfig:
 
     enabled: bool
     zenodo_doi: str
-    non_us_include_all: bool
     us_probe_limit: int
     us_probe_min_year: int | None
     us_probe_match_terms: tuple[str, ...]
@@ -54,7 +53,6 @@ def load_config(path: Path = CONFIG_PATH) -> AgoraConfig:
     return AgoraConfig(
         enabled=bool(raw["enabled"]),
         zenodo_doi=str(raw["zenodo_doi"]),
-        non_us_include_all=bool(raw["non_us"]["include_all"]),
         us_probe_limit=int(probe["limit"]),
         us_probe_min_year=probe.get("min_year"),
         us_probe_match_terms=tuple(probe["match_terms"]),
@@ -294,6 +292,7 @@ def _map_row(row: dict[str, Any], *, match_terms: tuple[str, ...]) -> schema.Can
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash,
         normalized_url=dedup.normalize_url(source_url),
+        native_format_hint=dedup.format_hint_from_url(source_url),
     )
 
 

@@ -51,7 +51,7 @@ def test_load_config_reads_real_tracked_config() -> None:
 
 def test_load_config_custom_path(tmp_path: Path) -> None:
     """Анти-orphan: КАЖДОЕ поле конфига доходит до ``OecdConfig``, ни одно не потеряно
-    (урок orphan-бага ``non_us_include_all`` agora, PR #36 — спек §4)."""
+    (урок orphan-конфига agora, PR #36 — спек §4)."""
     path = tmp_path / "discovery_oecd.yaml"
     path.write_text(
         yaml.safe_dump(

@@ -215,22 +215,18 @@ def test_deep_baseline_prefers_original_sha256(tmp_path: Path) -> None:
 
 
 def test_deep_baseline_falls_back_to_sha_for_born_digital(tmp_path: Path, monkeypatch: Any) -> None:
-    from convert import converters
-
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 born digital")
-    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr("core.pdfmeta.was_ocr_normalized", lambda raw: False)
     assert recheck.deep_baseline(rec, tmp_path, _state()) == "a" * 64
 
 
 def test_deep_baseline_is_none_for_ocr_normalized_scan(tmp_path: Path, monkeypatch: Any) -> None:
     """sha256 такого raw описывает файл ПОСЛЕ вшивания текст-слоя — сравнивать ответ
     издателя с ним значило бы объявлять drift на каждом прогоне."""
-    from convert import converters
-
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 scanned")
-    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("core.pdfmeta.was_ocr_normalized", lambda raw: True)
     assert recheck.deep_baseline(rec, tmp_path, _state()) is None
 
 
@@ -329,6 +325,40 @@ def test_probe_url_uses_format_agnostic_classifier_when_expected_none(monkeypatc
     assert probe.classified.outcome is acquisition.AcquisitionOutcome.ok
 
 
+def _fake_fetch_raw_capturing_byte_cap(
+    monkeypatch: Any, response: acquisition.RawResponse
+) -> list[int | None]:
+    """Перехватить ``byte_cap``, с которым ушёл запрос."""
+    captured: list[int | None] = []
+
+    def fake(url: str, dest: Path, **kw: Any) -> acquisition.RawResponse:
+        captured.append(kw.get("byte_cap"))
+        return response
+
+    monkeypatch.setattr(acquisition, "fetch_raw", fake)
+    return captured
+
+
+def test_probe_url_passes_byte_cap_for_format_agnostic_population_c(monkeypatch: Any) -> None:
+    """spec discovery-acquire-seam-hardening §11, Г12: только формат-агностичный
+    probe (популяция (c), ``expected=None``) получает потолок байтов."""
+    captured = _fake_fetch_raw_capturing_byte_cap(
+        monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", b"<html>page</html>")
+    )
+    recheck.probe_url("https://e.gov/page", user_agent="ua", expected=None)
+    assert captured == [recheck.PROBE_BYTE_CAP]
+
+
+def test_probe_url_omits_byte_cap_for_formatted_populations(monkeypatch: Any) -> None:
+    """Популяции (a)/(b) — форматные ok-ветки статус-чувствительны (``status ==
+    200``, которого 206 сломал бы), капа не получают."""
+    captured = _fake_fetch_raw_capturing_byte_cap(
+        monkeypatch, acquisition.RawResponse(200, "HTTP/1.1 200 OK\r\n", b"%PDF body")
+    )
+    recheck.probe_url("https://e.gov/d.pdf", user_agent="ua", expected=schema.SourceFormat.pdf)
+    assert captured == [None]
+
+
 # --- §2: выбор URL проверки ---
 
 
@@ -403,6 +433,20 @@ def test_due_records_splits_unacquired_population(tmp_path: Path) -> None:
     with_raw, without_raw = recheck.due_records(records, tmp_path, limit=10)
     assert [r.id for r in with_raw] == ["aa-have-2026"]
     assert [r.id for r in without_raw] == ["bb-missing-2026"]
+
+
+def test_due_records_rotation_prefers_probe_checked_over_acquisition_failed(tmp_path: Path) -> None:
+    """spec discovery-acquire-seam-hardening §3, Г2: ротация (b) сортирует по
+    ``acquisition_probe_checked or acquisition_failed`` — легаси-запись без нового
+    поля фолбэчит на прежний курсор."""
+    _doc(tmp_path, "aa-legacy-2026", raw=None, state={"acquisition_failed": "2026-07-01"})
+    _doc(
+        tmp_path, "bb-recent-probe-2026", raw=None,
+        state={"acquisition_failed": "2026-06-01", "acquisition_probe_checked": "2026-07-20"},
+    )
+    records = schema.load_records(tmp_path)
+    _, without_raw = recheck.due_records(records, tmp_path, limit=10)
+    assert [r.id for r in without_raw] == ["aa-legacy-2026", "bb-recent-probe-2026"]
 
 
 def test_due_records_keeps_confidential_in_rotation(tmp_path: Path) -> None:
@@ -572,7 +616,7 @@ def test_confidential_drift_does_not_snapshot(tmp_path: Path, monkeypatch: Any) 
 
 def test_unacquired_population_clears_backoff_when_source_opens(tmp_path: Path, monkeypatch: Any) -> None:
     """Контур только СНИМАЕТ backoff; добирает документ ближайший штатный прогон —
-    одна дверь к добыче, а не две."""
+    одна дверь к добыче, а не две. Успех бампает и курсор ротации `acquisition_probe_checked`."""
     _doc(tmp_path, "aa-blocked-2026", raw=None, state={"acquisition_failed": "2026-07-01",
                                                        "acquisition_failure_reason": "direct blocked"})
     monkeypatch.setattr(recheck, "probe_url", lambda *a, **kw: _probe())
@@ -582,10 +626,21 @@ def test_unacquired_population_clears_backoff_when_source_opens(tmp_path: Path, 
     rec = schema.load_records(tmp_path)[0]
     st = schema.load_state(schema.state_file(rec, tmp_path))
     assert st.acquisition_failed is None and st.acquisition_failure_reason is None
+    assert st.acquisition_probe_checked == TODAY
 
 
-def test_unacquired_population_extends_backoff_when_still_blocked(tmp_path: Path, monkeypatch: Any) -> None:
-    _doc(tmp_path, "aa-blocked-2026", raw=None, state={"acquisition_failed": "2026-07-01"})
+def test_unacquired_population_does_not_extend_backoff_when_still_blocked(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Регресс репро B аудита (spec discovery-acquire-seam-hardening §3, Г2): probe
+    заведомо слабее полной лестницы (один GET по source_url, без official_alt/
+    browser/archive) и не имеет права переустанавливать якорь backoff — иначе окно
+    не истекает никогда при регулярном --recheck. Курсор ротации сдвигается,
+    якорь — нет; причина всё же обновляется свежей (полезна сводке)."""
+    _doc(
+        tmp_path, "aa-blocked-2026", raw=None,
+        state={"acquisition_failed": "2026-07-01", "acquisition_failure_reason": "old reason"},
+    )
     monkeypatch.setattr(
         recheck, "probe_url",
         lambda *a, **kw: _probe(outcome=acquisition.AcquisitionOutcome.blocked, reason="WAF challenge"),
@@ -595,5 +650,6 @@ def test_unacquired_population_extends_backoff_when_still_blocked(tmp_path: Path
 
     rec = schema.load_records(tmp_path)[0]
     st = schema.load_state(schema.state_file(rec, tmp_path))
-    assert st.acquisition_failed == TODAY
-    assert st.acquisition_failure_reason == "WAF challenge"
+    assert st.acquisition_failed == dt.date(2026, 7, 1)  # якорь backoff НЕ переустановлен
+    assert st.acquisition_failure_reason == "WAF challenge"  # причина всё же свежая
+    assert st.acquisition_probe_checked == TODAY  # курсор ротации сдвинут

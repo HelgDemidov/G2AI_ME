@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -115,24 +116,28 @@ def inject(
         matched_query=query,
         normalized_url=normalized,
         supersedes=supersedes,
+        native_format_hint=dedup.format_hint_from_url(url),
     )
 
     existing = store.load(root)
-    fresh, absorbed = dedup.dedup([cand], existing)
-    store.save(existing + fresh, root)
+    outcome = dedup.dedup([cand], existing)
+    store.save(existing + outcome.fresh, root)
 
-    if fresh:
+    if outcome.fresh:
         return cand, True
-    matched = next(
-        (c for c in existing if (c.normalized_url, c.supersedes) == (normalized, supersedes)), None
-    )
-    assert absorbed  # dedup гарантирует: не fresh -> поглощён кем-то из existing
-    return matched or cand, False
+    # spec discovery-acquire-seam-hardening §5, Г4: поглотитель берётся из
+    # absorptions (реальный, любой из трёх стратегий) — не поиском по URL-паре,
+    # который находил бы None и при поглощении стратегией 2/3 давал куратору
+    # ложное «уже есть» без причины отказа.
+    assert outcome.absorptions  # dedup гарантирует: не fresh -> поглощён кем-то из existing
+    _, absorber = outcome.absorptions[0]
+    return absorber, False
 
 
-def _registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
+def registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
     """Пары ``(нормализованный source_url, заменяемый doc-id | None)``, уже представленные
-    в реестре — правая часть реконсиляции ``pending_candidates``.
+    в реестре — правая часть реконсиляции ``pending_candidates``/``unacquirable_candidates``
+    (discovery) и ``recheck.due_candidates`` (acquire, spec discovery-acquire-seam-hardening §4).
 
     Каждая запись регистрирует ``(url, None)`` — URL как таковой корпусом покрыт — И
     ``(url, target)`` для каждого своего ребра ``supersedes``: последнее означает «редакция,
@@ -156,7 +161,7 @@ def pending_candidates(
     """«Ждущие» кандидаты — вычисляется реконсиляцией, не хранимым статусом (spec §3).
 
     Кандидат «ждущий», если у него нет ``rejected_reason`` И его пара
-    ``(URL, supersedes)`` не представлена в реестре (см. ``_registered_pairs``). Кандидат
+    ``(URL, supersedes)`` не представлена в реестре (см. ``registered_pairs``). Кандидат
     без URL вовсе (совпадение только по ``content_hash``/тайтлу) реконсиляцией по URL
     отфильтровать нельзя — остаётся ждущим (безопасный дефолт: не прячем от куратора то,
     чего не можем уверенно сопоставить).
@@ -170,7 +175,7 @@ def pending_candidates(
     Куратор, переписавший авто-ребро при триаже, вернёт кандидата в worksheet — видимый
     сбой, не тихий.
     """
-    registered = _registered_pairs(records)
+    registered = registered_pairs(records)
     pending: list[schema.CandidateRecord] = []
     for cand in candidates:
         if cand.rejected_reason is not None:
@@ -235,8 +240,12 @@ _WORKSHEET_HEADER = """\
   think_tank/academia→research-papers, иначе intl-xperience.
 - `relations` — если связь с другим документом реестра видна уже сейчас (`implements`/`cites`/…),
   указать сразу: второго прохода по документу не будет (pre-wave требование graph-v2).
-- `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf` (дефолт); сверить с квотой
-  форматов волны.
+- `source_format` — поддерживает `html`/`docx`/`xlsx` помимо `pdf`; опущенный ключ резолвится
+  подсказкой кандидата (колонка `format_hint` в таблице ждущих), а без неё — дефолтом `pdf`
+  (сводка эхнёт «по дефолту: …», когда сработала подсказка); сверить с квотой форматов волны.
+- `official_alt_url` (опционально) — вторая ступень лестницы добычи (`https?://`); суждение об
+  официальности зеркала вносит куратор сам, коннекторы этого знания не несут (накопленные
+  зеркала недобываемых видны в секции ниже — `alternate_urls`, но перенос в это поле не автомат).
 - Непустой `supersedes` в строке = НОВАЯ РЕДАКЦИЯ документа, уже лежащего в корпусе (тот же
   URL — нормальное состояние для законов), а НЕ дубль: `reject` здесь потерял бы редакцию.
   Ребро `supersedes` в meta.yaml проставит `apply` сам — вписывать его в `relations` руками
@@ -264,17 +273,45 @@ _UNACQUIRABLE_SECTION_HEADER = """\
 
 
 def unacquirable_candidates(
-    candidates: list[schema.CandidateRecord],
+    candidates: list[schema.CandidateRecord], records: list[schema.SourceRecord]
 ) -> list[schema.CandidateRecord]:
     """Кандидаты, отклонённые как «нужен, но недобываем» (spec post-acquisition-lifecycle §5).
 
-    Вычисляется реконсиляцией по ``rejected_kind``, как и всё остальное в этом модуле —
-    отдельного хранимого «статуса очереди» нет. Самые давно не пробованные первыми:
-    тот же порядок, в котором их берёт recheck, — куратор видит список в его логике.
+    Вычисляется реконсиляцией по ``rejected_kind`` — как и всё остальное в этом
+    модуле — отдельного хранимого «статуса очереди» нет. Самые давно не пробованные
+    первыми: тот же порядок, в котором их берёт recheck, — куратор видит список в
+    его логике.
+
+    ``records`` (spec discovery-acquire-seam-hardening §4, Г3) — реконсиляция с
+    реестром, симметрично ``pending_candidates``: кандидат, чья пара ``(URL,
+    supersedes)`` уже представлена в реестре (``registered_pairs``), из секции
+    выбывает. До этого спека эта очередь была ЕДИНСТВЕННОЙ в слое кандидатов, не
+    выводимой реконсиляцией — admit недобываемого кандидата напрямую (код
+    разрешает молча; штатный revive→admit требует двух батчей, и срезать угол
+    естественно при ``probe_finding: acquirable``) оставлял его НАВСЕГДА видимым
+    здесь, хотя документ уже в корпусе. Кандидат без URL реконсиляции не поддаётся —
+    остаётся видимым (тот же безопасный дефолт, что у ``pending_candidates``).
     """
-    due = [c for c in candidates if c.rejected_kind is schema.RejectionKind.unacquirable]
+    registered = registered_pairs(records)
+    due: list[schema.CandidateRecord] = []
+    for cand in candidates:
+        if cand.rejected_kind is not schema.RejectionKind.unacquirable:
+            continue
+        url = cand.normalized_url or (dedup.normalize_url(cand.source_url) if cand.source_url else None)
+        if url is not None and (url, cand.supersedes) in registered:
+            continue
+        due.append(cand)
     due.sort(key=lambda c: (c.probe_checked is not None, c.probe_checked or dt.date.min, c.raw_hash))
     return due
+
+
+def _md_cell(value: str) -> str:
+    """Экранировать ``|`` в значении ячейки markdown-таблицы (spec discovery-
+    acquire-seam-hardening §12): title/anchor из недоверенных источников (реестры,
+    анкоры снежного кома) могут естественно нести ``|`` — без экранирования
+    строка таблицы рвётся по колонкам. Применяется на ВСЕ интерполируемые ячейки
+    обеих таблиц ``render_worksheet``, не только очевидно небезопасные."""
+    return value.replace("|", "\\|")
 
 
 def render_worksheet(
@@ -290,38 +327,43 @@ def render_worksheet(
     lines = [_WORKSHEET_HEADER, ""]
     lines.append(
         "| raw_hash | title | issuer | jurisdiction | doc_date | supersedes | connector_id "
-        "| native_tags/matched_query | source_url |"
+        "| native_tags/matched_query | source_url | format_hint |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for cand in pending:
         tags = ", ".join(cand.native_tags) if cand.native_tags else (cand.matched_query or "")
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
-                cand.raw_hash[:12],
-                cand.title or "",
-                cand.issuer or "",
-                cand.jurisdiction or "",
-                cand.doc_date.isoformat() if cand.doc_date else "",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                _md_cell(cand.raw_hash[:12]),
+                _md_cell(cand.title or ""),
+                _md_cell(cand.issuer or ""),
+                _md_cell(cand.jurisdiction or ""),
+                _md_cell(cand.doc_date.isoformat() if cand.doc_date else ""),
                 # непустое значение = редакция существующей записи корпуса, не дубль
-                cand.supersedes or "",
-                cand.connector_id,
-                tags,
-                cand.source_url or "",
+                _md_cell(cand.supersedes or ""),
+                _md_cell(cand.connector_id),
+                _md_cell(tags),
+                _md_cell(cand.source_url or ""),
+                _md_cell(cand.native_format_hint.value if cand.native_format_hint else ""),
             )
         )
     if unacquirable:
         lines.append(_UNACQUIRABLE_SECTION_HEADER)
-        lines.append("| raw_hash | title | issuer | probe_checked | probe_finding | source_url |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append(
+            "| raw_hash | title | issuer | probe_checked | probe_finding | source_url | alternate_urls |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
         for cand in unacquirable:
+            alternates = ", ".join(getattr(cand, "alternate_source_urls", None) or [])
             lines.append(
-                "| {} | {} | {} | {} | {} | {} |".format(
-                    cand.raw_hash[:12],
-                    cand.title or "",
-                    cand.issuer or "",
+                "| {} | {} | {} | {} | {} | {} | {} |".format(
+                    _md_cell(cand.raw_hash[:12]),
+                    _md_cell(cand.title or ""),
+                    _md_cell(cand.issuer or ""),
                     cand.probe_checked.isoformat() if cand.probe_checked else "—",
-                    cand.probe_finding or "—",
-                    cand.source_url or "",
+                    _md_cell(cand.probe_finding or "—"),
+                    _md_cell(cand.source_url or ""),
+                    _md_cell(alternates or "—"),
                 )
             )
     return "\n".join(lines) + "\n"
@@ -459,6 +501,26 @@ def _build_admit_record(
         track = _default_track(cand.jurisdiction, issuer_type)
         defaulted.append(f"track={track.value}")
 
+    # Резолюция формата (spec discovery-acquire-seam-hardening §8, Г7): явный ключ
+    # решения > подсказка кандидата (by construction у eurlex/URL-эвристика) >
+    # молчаливый дефолт "pdf". Выведенное из подсказки значение эхается в defaulted
+    # той же механикой, что authority/track — куратор видит, во что развернулась
+    # подсказка, не только счёт документов.
+    if "source_format" in decision:
+        source_format = schema.SourceFormat(decision["source_format"])
+    elif cand.native_format_hint is not None:
+        source_format = cand.native_format_hint
+        defaulted.append(f"source_format={source_format.value} (подсказка кандидата)")
+    else:
+        source_format = schema.SourceFormat.pdf
+
+    # official_alt_url (spec discovery-acquire-seam-hardening §9, Г13): вторая
+    # ступень лестницы через дверь промоушена — суждение об официальности зеркала
+    # куратор вносит явно, ни один коннектор этого знания не несёт (rationale спека).
+    official_alt_url = decision.get("official_alt_url")
+    if official_alt_url is not None and not re.match(r"^https?://", official_alt_url):
+        raise ValueError(f"admit: official_alt_url не похож на URL: {official_alt_url!r}")
+
     relations_raw = decision.get("relations")
     rec = schema.promote_candidate(
         cand,
@@ -470,7 +532,8 @@ def _build_admit_record(
         doc_type=decision["doc_type"],
         authority=authority,
         relevance=schema.Relevance.model_validate(decision["relevance"]),
-        source_format=schema.SourceFormat(decision.get("source_format", "pdf")),
+        source_format=source_format,
+        official_alt_url=official_alt_url,
         topics=decision.get("topics"),
         g2ai_pattern=decision.get("g2ai_pattern"),
         summary=decision.get("summary"),

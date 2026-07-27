@@ -501,6 +501,9 @@ def test_map_group_field_mapping() -> None:
     assert any(t.startswith("EuroVoc:") for t in cand.native_tags or [])
     assert cand.normalized_url is not None
     assert len(cand.raw_hash) == 64
+    # spec discovery-acquire-seam-hardening §8, Г7: eurlex ЗНАЕТ формат by
+    # construction — _build_source_url всегда строит /TXT/HTML/.
+    assert cand.native_format_hint == schema.SourceFormat.html
 
 
 def test_map_group_missing_date_gives_none() -> None:

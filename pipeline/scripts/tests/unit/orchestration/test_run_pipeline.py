@@ -15,8 +15,9 @@ from typing import Any
 import pytest
 
 import run_pipeline
-from acquire import acquisition
+from acquire import acquisition, recheck
 from convert import cloud_ocr, converters, figures_vlm
+from discovery import store
 from index import corpus_index
 from core import schema
 from acquire.acquisition import AcquisitionOutcome, ClassifiedResponse
@@ -35,7 +36,6 @@ from run_pipeline import (
     _read_index_fingerprint,
     _record_convert_failure,
     _report,
-    _run_lock_path,
     convert_deferred,
     needed_stages,
     process_docs,
@@ -720,7 +720,7 @@ def test_do_download_reset_unblocks_deep_baseline_from_stale_edition(
     # deep_baseline открывает raw через pdfplumber, только если original_sha256 уже None
     # (первая ветка функции) — фейковые байты не обязаны быть валидным PDF, born-digital
     # путь детерминируется явным патчем, тем же приёмом, что test_deep_baseline_falls_back_to_sha_for_born_digital.
-    monkeypatch.setattr("convert.converters.was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr("core.pdfmeta.was_ocr_normalized", lambda raw: False)
     state = schema.load_state(schema.state_file(rec, tmp_path))
     baseline = recheck.deep_baseline(rec, tmp_path, state)
     assert baseline == hashlib.sha256(new_body).hexdigest()  # НЕ протухший edition1-хэш
@@ -2007,7 +2007,7 @@ def test_main_dry_run_logs_index_not_touched(tmp_path: Path, caplog: Any) -> Non
     assert any("dry-run" in r.message for r in caplog.records)
 
 
-# --- эксклюзивный лок mutating-прогонов (spec acquire-convert-seam-hardening §3, В3) ---
+# --- эксклюзивный корпусный лок mutating-прогонов (spec discovery-acquire-seam-hardening §2, Г1) ---
 
 
 def test_main_dry_run_never_touches_lock_file(tmp_path: Path) -> None:
@@ -2015,12 +2015,12 @@ def test_main_dry_run_never_touches_lock_file(tmp_path: Path) -> None:
     вовсе (contextlib.nullcontext, не fsio.exclusive_flock)."""
     sources = tmp_path / "sources"
     assert main([str(sources), "--dry-run"]) == 0
-    assert not _run_lock_path(sources).exists()
+    assert not schema.corpus_lock_path(sources).exists()
 
 
 def test_main_returns_one_when_another_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
     sources = tmp_path / "sources"
-    lock_path = _run_lock_path(sources)
+    lock_path = schema.corpus_lock_path(sources)
     with fsio.exclusive_flock(lock_path):
         with caplog.at_level("ERROR", logger="run_pipeline"):
             rc = main([str(sources), "--db", str(tmp_path / "c.db")])
@@ -2029,14 +2029,122 @@ def test_main_returns_one_when_another_run_holds_the_lock(tmp_path: Path, caplog
 
 
 def test_main_recheck_returns_one_when_batch_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
-    """--recheck и штатный прогон стадий — писатели ОДНОГО и того же .state.yaml,
-    поэтому делят один лок-файл."""
+    """--recheck и штатный прогон стадий — писатели ОДНОГО и того же корпусного
+    лока (делят его также с mutating-подкомандами discover.py)."""
     sources = tmp_path / "sources"
-    with fsio.exclusive_flock(_run_lock_path(sources)):
+    with fsio.exclusive_flock(schema.corpus_lock_path(sources)):
         with caplog.at_level("ERROR", logger="run_pipeline"):
             rc = main([str(sources), "--recheck"])
     assert rc == 1
     assert any("уже занято" in r.message for r in caplog.records)
+
+
+# --- honest --recheck --dry-run (spec discovery-acquire-seam-hardening §6, Г5) ---
+
+
+def _seed_three_populations(sources: Path) -> None:
+    """(a) документ с raw и курсором; (b) допущен, добыча провалена; (c) кандидат
+    отклонён как unacquirable."""
+    with_raw = valid_record() | {"id": "aa-recheck-a-2026"}
+    write_doc(sources, with_raw, raw=b"%PDF", state={"acquisition_checked": "2026-07-01"})
+    without_raw = valid_record() | {"id": "bb-recheck-b-2026"}
+    write_doc(sources, without_raw, raw=None, state={"acquisition_failed": "2026-07-01"})
+    cand = schema.CandidateRecord.model_validate(
+        {
+            "connector_id": "manual", "retrieved_at": "2026-07-01", "raw_hash": "c" * 64,
+            "title": "Doc", "issuer": "Ministry", "source_url": "https://gov.example.org/doc.pdf",
+            "rejected_reason": "WAF", "rejected_kind": "unacquirable",
+        }
+    )
+    store.save([cand], sources)
+
+
+def test_main_recheck_dry_run_is_noop(tmp_path: Path, monkeypatch: Any) -> None:
+    """Регресс репро E аудита: прежде флаг молча игнорировался — брал лок, ходил в
+    сеть, писал probe-поля/findings. Сеть замонкипатчена на assert-fail — падение
+    теста доказывало бы, что dry-run всё же дозвонился до probe_url."""
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+    records_before = schema.load_records(sources)
+    candidates_before = store.load(sources)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("--recheck --dry-run не должен ходить в сеть")
+
+    monkeypatch.setattr(recheck, "probe_url", boom)
+
+    assert main([str(sources), "--recheck", "--dry-run"]) == 0
+
+    assert not schema.corpus_lock_path(sources).exists()  # лок не берётся
+    assert schema.load_records(sources) == records_before
+    assert store.load(sources) == candidates_before
+
+
+def test_main_recheck_dry_run_prints_all_three_populations(tmp_path: Path, caplog: Any) -> None:
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        rc = main([str(sources), "--recheck", "--dry-run"])
+
+    assert rc == 0
+    text = caplog.text
+    assert "(a) aa-recheck-a-2026" in text
+    assert "(b) bb-recheck-b-2026" in text
+    assert "(c) " + "c" * 12 in text
+
+
+# --- --only сужает популяцию (c) (spec discovery-acquire-seam-hardening §11, Г11) ---
+
+
+def test_main_recheck_dry_run_only_omits_population_c_from_plan(tmp_path: Path, caplog: Any) -> None:
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        rc = main([str(sources), "--recheck", "--dry-run", "--only", "aa-recheck-a-2026"])
+
+    assert rc == 0
+    assert "(a) aa-recheck-a-2026" in caplog.text
+    assert "  (c) " not in caplog.text  # ни одной per-item строки популяции (c)
+    assert "Итого (dry-run, ничего не записано): (a) 1 | (b) 0 | (c) 0" in caplog.text
+
+
+def test_main_recheck_dry_run_only_skips_loading_candidates_store(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("--recheck --dry-run --only не должен грузить слой кандидатов")
+
+    monkeypatch.setattr(store, "load", boom)
+
+    assert main([str(sources), "--recheck", "--dry-run", "--only", "aa-recheck-a-2026"]) == 0
+
+
+def test_main_recheck_only_skips_loading_candidates_store(tmp_path: Path, monkeypatch: Any) -> None:
+    """«Одно-документная» команда не должна давать неожиданный сетевой трафик по
+    недобываемым кандидатам (популяция (c) с --only никак не связана)."""
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("--recheck --only не должен грузить слой кандидатов (популяция c)")
+
+    monkeypatch.setattr(store, "load", boom)
+
+    assert main([str(sources), "--recheck", "--only", "aa-recheck-a-2026"]) == 0
+
+
+def test_main_recheck_dry_run_not_blocked_while_lock_held(tmp_path: Path) -> None:
+    """dry-run обязан быть no-op и не мешать живому прогону — удержанный лок ему не
+    помеха (симметрично штатному --dry-run)."""
+    sources = tmp_path / "sources"
+    _seed_three_populations(sources)
+    with fsio.exclusive_flock(schema.corpus_lock_path(sources)):
+        assert main([str(sources), "--recheck", "--dry-run"]) == 0
 
 
 def test_main_normal_run_releases_lock_for_the_next_one(tmp_path: Path) -> None:
@@ -2127,7 +2235,7 @@ def test_scan_fallback_counts_counts_cloud_allowed_scan_without_model_as_fallbac
     write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.pdfmeta.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
@@ -2142,7 +2250,7 @@ def test_scan_fallback_counts_counts_confidential_scan_separately(tmp_path: Path
     write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.pdfmeta.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
 
     assert scan_fallback_counts([rec], sources) == (0, 1)
@@ -2159,7 +2267,7 @@ def test_scan_fallback_counts_ignores_scan_with_successful_cloud_ocr(tmp_path: P
     )
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.pdfmeta.was_ocr_normalized", lambda raw: True)
 
     assert scan_fallback_counts([rec], sources) == (0, 0)
 
@@ -2174,7 +2282,7 @@ def test_scan_fallback_counts_ignores_born_digital(tmp_path: Path, monkeypatch: 
     write_doc(sources, rec_data, raw=b"%PDF fake digital", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr("run_pipeline.pdfmeta.was_ocr_normalized", lambda raw: False)
 
     assert scan_fallback_counts([rec], sources) == (0, 0)
 
@@ -2246,7 +2354,7 @@ def test_scan_fallback_counts_isolates_ambiguous_raw_per_record(
     write_doc(sources, ok_data, raw=b"%PDF fake scan", state={})
     ok_rec = SourceRecord.model_validate(ok_data)
 
-    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.pdfmeta.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
@@ -2265,7 +2373,7 @@ def test_report_scan_fallback_logs_warning_for_fallback_and_info_for_confidentia
     write_doc(sources, conf_data, raw=b"%PDF fake", state={})
     records = [SourceRecord.model_validate(fb_data), SourceRecord.model_validate(conf_data)]
 
-    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.pdfmeta.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 

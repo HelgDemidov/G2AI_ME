@@ -48,10 +48,11 @@ from convert import cloud_ocr, converters, figures_vlm, lint
 from graph import build_graph
 from index import corpus_index
 from core import fsio
+from core import pdfmeta
 from core import schema
 from core import validate_sources
 from core.env import load_dotenv
-from discovery import store
+from discovery import manual, store
 from index import vector_store
 from index.chunking import strip_frontmatter
 from index.embed import (
@@ -968,9 +969,9 @@ def _report_unembedded(db_path: Path, backend: str) -> None:
 def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tuple[int, int]:
     """``(n_fallback, n_confidential)`` среди ОТСКАНИРОВАННЫХ документов без
     успешного облачного OCR (spec ocr-eval-harness §8.3, S5). Скан определяется
-    метаданными ocrmypdf (``converters.was_ocr_normalized`` — та же проверка,
-    что ветвит ``_convert_pdf``, публичный алиас: эта функция вне convert-слоя, spec
-    acquire-convert-seam-hardening §10, В13), не повторной детекцией ``NeedsOCR``.
+    метаданными ocrmypdf (``pdfmeta.was_ocr_normalized`` — та же проверка,
+    что ветвит ``_convert_pdf``, spec discovery-acquire-seam-hardening §1: единая
+    точка для всех потребителей вне convert-слоя), не повторной детекцией ``NeedsOCR``.
     OCR-путь существует только для PDF (``rec.source_format`` — курируемый источник
     истины, не переоткрытие по расширению файла) — живой прогон на реальном
     корпусе поймал `PdfminerException` на `eu-ai-act-2024` (raw.html) ДО того,
@@ -1005,7 +1006,7 @@ def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tupl
             raw = schema.raw_file(rec, root)
             if raw is None or not raw.exists() or raw.suffix.lower() != ".pdf":
                 continue  # born-digital/ещё не сконвертирован/рассинхрон формата — не скан
-            if not converters.was_ocr_normalized(raw):
+            if not pdfmeta.was_ocr_normalized(raw):
                 continue  # born-digital — не скан
             state = schema.load_state(schema.state_file(rec, root))
             if state.cloud_ocr_model is not None:
@@ -1036,24 +1037,6 @@ def _report_scan_fallback(records: list[schema.SourceRecord], root: Path) -> Non
             "OCR: %d confidential-скан(ов) намеренно на локальном пути (sensitivity-гейт)",
             confidential,
         )
-
-
-def _run_lock_path(sources_root: Path) -> Path:
-    """Путь эксклюзивного лока прогона (spec acquire-convert-seam-hardening §3, В3):
-    пер-корпусный (``args.sources``), в ``sources/.state/`` — та же конвенция, что и
-    прочие операционные артефакты КОРПУСА (``schema.state_dir``). Скоуп — РОВНО
-    писатели ``.state.yaml``: штатный прогон стадий и ``--recheck``. ``discover.py``/
-    ``vector_store.py`` этот лок не берут — они не пишут ``.state.yaml`` (кандидаты —
-    свой слой со своей save-семантикой; индекс — SQLite с собственным локингом).
-
-    Честная граница скоупа (ревью PR #53): ``--recheck`` пишет и слой КАНДИДАТОВ
-    (популяция (c) — probe-поля/revive), который делит с ``discover.py``; эта пара
-    писателей локом сознательно НЕ покрыта — save шардов кандидатов есть полная
-    перезапись файла, одновременные ``--recheck`` и ``discover`` могут потерять
-    запись друг друга (last-writer-wins). Принятый остаточный риск: обе — ручные
-    команды куратора, одновременный запуск маловероятен; расширение скоупа лока на
-    ``discover.py`` — при первом живом инциденте, не превентивно."""
-    return schema.state_dir(sources_root) / "run_pipeline.lock"
 
 
 def _report(results: list[DocResult]) -> int:
@@ -1109,7 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--recheck-limit", type=int, default=recheck.RECHECK_DEFAULT_LIMIT, metavar="N",
-        help="сколько документов проверить за прогон — НА ПОПУЛЯЦИЮ (записи с raw / недобытые)",
+        help="сколько документов проверить за прогон — НА ПОПУЛЯЦИЮ (записи с raw / недобытые); "
+             "с --only популяция недобываемых кандидатов не затрагивается вовсе",
     )
     parser.add_argument(
         "--recheck-deep", action="store_true",
@@ -1151,38 +1135,86 @@ def main(argv: list[str] | None = None) -> int:
     # скачивает, не конвертирует и не трогает индекс, а только спрашивает издателей
     # «изменилось ли». Возврат здесь и есть эта взаимоисключимость.
     if args.recheck:
-        # Эксклюзивный лок (spec acquire-convert-seam-hardening §3, В3): recheck и
-        # штатный прогон стадий — оба писатели .state.yaml (recheck пишет findings,
-        # держит state загруженным на время сетевого условного GET); без лока
+        if args.dry_run:
+            # Честный --recheck --dry-run (spec discovery-acquire-seam-hardening §6,
+            # Г5): прежде флаг молча игнорировался — комбинация брала лок, ходила в
+            # сеть, писала probe-поля/findings, стреляла в SavePageNow. Идиома
+            # dry-run проекта — план, не отказ (иначе единственное место, где флаг
+            # означал бы «нельзя», а не «покажи»): план строится из тех же чистых
+            # функций отбора, что и боевой прогон (due_records/due_candidates), лок
+            # не берётся, сеть/.state.yaml/store не трогаются.
+            # Г11: --only сужает популяции (a)/(b) до одного документа (records уже
+            # отфильтрован выше) — популяция (c) не связана ни с одним документом,
+            # поэтому "одно-документная" команда не должна пробивать её полным
+            # лимитом (20 сетевых GET неожиданно для --only).
+            due_c: list[schema.CandidateRecord] = []
+            if not args.only:
+                plan_candidates = store.load(args.sources)
+                plan_registered = manual.registered_pairs(records)
+                due_c = recheck.due_candidates(
+                    plan_candidates, limit=args.recheck_limit, registered=plan_registered
+                )
+            with_raw, without_raw = recheck.due_records(records, args.sources, limit=args.recheck_limit)
+            mode = "deep" if args.recheck_deep else "conditional"
+            logger.info("Recheck (dry-run, %s) — кого проверил бы этот прогон:", mode)
+            for rec in with_raw:
+                state = schema.load_state(schema.state_file(rec, args.sources))
+                logger.info("  (a) %s — курсор: %s", rec.id, state.acquisition_checked or "никогда")
+            for rec in without_raw:
+                state = schema.load_state(schema.state_file(rec, args.sources))
+                cursor = state.acquisition_probe_checked or state.acquisition_failed
+                logger.info("  (b) %s — курсор: %s", rec.id, cursor or "никогда")
+            for cand in due_c:
+                logger.info("  (c) %s — курсор: %s", cand.raw_hash[:12], cand.probe_checked or "никогда")
+            logger.info(
+                "Итого (dry-run, ничего не записано): (a) %d | (b) %d | (c) %d",
+                len(with_raw), len(without_raw), len(due_c),
+            )
+            return 0
+        # Эксклюзивный корпусный лок (spec discovery-acquire-seam-hardening §2, Г1) —
+        # тот же файл, что берут mutating-подкоманды discover.py: recheck пишет и
+        # .state.yaml (findings), и слой кандидатов (популяция (c) — probe-поля/
+        # revive), который делят inject/apply/discover/snowball. Без лока
         # интерливание load->save двух одновременных прогонов теряет поля полной
-        # перезаписью модели (живой репро аудита — единственное невосстановимое
-        # поле original_sha256).
+        # перезаписью модели (живой репро аудита — вплоть до физического удаления
+        # шарда кандидатов, не только «потеря записи друг друга»).
         try:
-            with fsio.exclusive_flock(_run_lock_path(args.sources)):
+            with fsio.exclusive_flock(schema.corpus_lock_path(args.sources)):
                 # Слой кандидатов (популяция (c)) грузится/сохраняется ЗДЕСЬ: оркестратор
                 # сшивает слои по определению своей роли, а сам ACQUIRE о раскладке store
-                # слоя DISCOVERY не знает (и не должен).
-                candidates = store.load(args.sources)
+                # слоя DISCOVERY не знает (и не должен). Симметрично, реконсиляция
+                # популяции (c) с реестром (spec discovery-acquire-seam-hardening §4,
+                # Г3) — тоже забота оркестратора: пары считает manual.registered_pairs
+                # (discovery), acquire остаётся discovery-агностичным (plain-data параметр).
+                # Г11: --only — явное намерение куратора проверить ОДИН документ, populяция
+                # (c) с ним не связана — не грузим/не трогаем её вовсе (20 сетевых GET от
+                # «одно-документной» команды удивили бы куратора).
+                candidates = None if args.only else store.load(args.sources)
+                registered = None if args.only else manual.registered_pairs(records)
                 summary = recheck.run_recheck(
                     records, args.sources,
                     user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
-                    candidates=candidates,
+                    candidates=candidates, registered=registered,
                 )
                 if summary.candidates_changed:
+                    assert candidates is not None
                     store.save(candidates, args.sources)
                 return recheck.report(summary)
         except fsio.AlreadyLocked as exc:
             logger.error(str(exc))
             return 1
 
-    # Эксклюзивный лок (spec acquire-convert-seam-hardening §3, В3) — тот же файл,
-    # что и --recheck-ветка выше: батч-прогон стадий пишет .state.yaml документов
-    # (download/convert/figures/frontmatter), одновременный --recheck держит своё
-    # состояние загруженным на время сетевого запроса — без лока запись теряется.
+    # Эксклюзивный корпусный лок (spec discovery-acquire-seam-hardening §2, Г1) — тот
+    # же файл, что и --recheck-ветка выше и mutating-подкоманды discover.py: батч-
+    # прогон стадий пишет .state.yaml документов (download/convert/figures/
+    # frontmatter), одновременный --recheck/discover держит своё состояние
+    # загруженным на время сетевого запроса — без лока запись теряется.
     # --dry-run НЕ берёт лок вовсе (nullcontext) — обязан быть no-op и не мешать
     # живому прогону; process_docs(dry_run=True) и так не пишет .state.yaml.
     lock_ctx = (
-        contextlib.nullcontext() if args.dry_run else fsio.exclusive_flock(_run_lock_path(args.sources))
+        contextlib.nullcontext()
+        if args.dry_run
+        else fsio.exclusive_flock(schema.corpus_lock_path(args.sources))
     )
     try:
         with lock_ctx:

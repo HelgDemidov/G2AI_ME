@@ -340,9 +340,24 @@ class OperationalState(BaseModel):
     snapshot_requested: _dt.date | None = None
     # Backoff недобытых (§5): когда лестница провалилась и почему. Пока свежее
     # RETRY_BACKOFF_DAYS — download не планируется (кроме --force/--only); успешная
-    # добыча очищает оба поля.
+    # добыча очищает оба поля. ⚠ ЯКОРЬ backoff'а, НЕ курсор ротации (b) — см.
+    # acquisition_probe_checked ниже (spec discovery-acquire-seam-hardening §3, Г2):
+    # только полноценная попытка ВСЕЙ лестницы вправе переустановить это поле.
     acquisition_failed: _dt.date | None = None
     acquisition_failure_reason: str | None = None
+    # Курсор ротации популяции (b) recheck-контура (spec discovery-acquire-seam-
+    # hardening §3, Г2) — дата ПОСЛЕДНЕГО probe, отдельно от `acquisition_failed`.
+    # Прежде probe при неуспехе бампал сам `acquisition_failed` (единственное
+    # доступное ему поле) — тем самым ЗАНОВО закрывал окно backoff при каждом
+    # регулярном `--recheck`, хотя probe заведомо СЛАБЕЕ полной лестницы (один GET
+    # по `source_url`: official_alt/browser/archive ему недостижимы). Три класса
+    # документов, которые лестница добыла бы, оставались «недобываемы» навсегда —
+    # и тем надёжнее, чем прилежнее куратор гоняет контур времени (живой репро
+    # аудита). Разведение ролей: probe бампает ТОЛЬКО это поле (+ reason), полная
+    # попытка лестницы (`_record_acquisition_failure`) — только `acquisition_failed`.
+    # Optional/дефолт None — легаси `.state.yaml` без поля валидны, ротация (b)
+    # фолбэчит на `acquisition_failed` (см. `recheck.due_records`).
+    acquisition_probe_checked: _dt.date | None = None
     # Backoff отказов КОНВЕРТАЦИИ (spec acquire-convert-seam-hardening §8, В11) —
     # зеркало пары полей выше, но для стадии convert, у которой backoff не было
     # вовсе: патологический документ (напр. 2-часовой OCR_TIMEOUT) повторял бы
@@ -444,6 +459,12 @@ class CandidateRecord(BaseModel):
     # дешёвый pre-signal (НЕ вердикт — target_fit присваивает только триаж)
     matched_query: str | None = None
     matched_vocab_tags: list[str] | None = None
+    # Подсказка формата (spec discovery-acquire-seam-hardening §8, Г7) — НЕ вердикт:
+    # формат ОБЪЯВЛЯЕТ куратор при триаже, подсказка лишь замещает молчаливый дефолт
+    # "pdf" в admit-двери, когда коннектор знает формат by construction (eurlex строит
+    # `/TXT/HTML/`-URL) либо по расширению хвоста URL (`dedup.format_hint_from_url`).
+    # Ошибочная подсказка опаснее отсутствующей — см. design rationale спека.
+    native_format_hint: SourceFormat | None = None
     # провенанс добычи (обязательно)
     connector_id: str = Field(min_length=1)
     retrieved_at: _dt.date
@@ -539,6 +560,26 @@ def state_dir(root: Path = DEFAULT_SOURCES) -> Path:
     дублируют знание о раскладке.
     """
     return root / STATE_DIRNAME
+
+
+def corpus_lock_path(root: Path = DEFAULT_SOURCES) -> Path:
+    """Эксклюзивный лок мутаторов КОРПУСА (spec discovery-acquire-seam-hardening §2, Г1):
+    ``<root>/.state/corpus_mutation.lock`` — рядом с ``state_dir``, тот же владелец раскладки.
+
+    Держатели: ``run_pipeline.py`` (штатный прогон стадий и ``--recheck`` — оба
+    писатели ``.state.yaml``) и mutating-подкоманды ``discover.py`` (``inject``/
+    ``apply``/``discover``/``snowball``, все без ``--dry-run`` — писатели слоя
+    кандидатов, ``sources/candidates/``). Прежняя конвенция «имя файла — писатель»
+    (см. ``state_dir`` выше) для ОБЩЕГО лока не работает по построению: у лока
+    ВСЕГДА больше одного держателя, имя фиксирует НАЗНАЧЕНИЕ (взаимоисключение
+    мутаторов корпуса), а не единственного писателя. До этого спека лок
+    (``run_pipeline._run_lock_path``) взаимоисключал только штатный прогон и
+    ``--recheck`` — пара ``--recheck`` ↔ ``discover.py`` оставалась «принятым
+    остаточным риском», который живой репро аудита показал недооценённым (окно —
+    минуты-часы сетевой работы, а не секунды; исход — физическое удаление шарда
+    кандидатов или откат целого apply-батча, не «потеря записи друг друга»).
+    """
+    return state_dir(root) / "corpus_mutation.lock"
 
 
 def check_layout(meta_path: Path, rec: SourceRecord, seen_ids: set[str]) -> list[str]:
@@ -675,6 +716,7 @@ def promote_candidate(
     summary: str | None = None,
     relations: list[Relation] | None = None,
     language: str | None = None,
+    official_alt_url: str | None = None,
 ) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
@@ -705,6 +747,12 @@ def promote_candidate(
     ``relations`` — без дублей по ключу ``(type, target)``: куратор, вписавший то же ребро
     руками в decisions.yaml, не получает двойного. Потребитель ребра — вывод валидности
     (спек graph-v2): именно из него следует, что предшественник больше не действует.
+
+    ``official_alt_url`` (v5, spec discovery-acquire-seam-hardening §9, Г13) — вторая
+    ступень лестницы добычи; НЕ приходит от кандидата (ни один существующий коннектор
+    не знает про альтернативный хост) — суждение об официальности зеркала куратор
+    вносит САМ в admit-решение. ``None`` -> прежнее поведение (поле ``SourceRecord``
+    уже существовало, просто не имело двери промоушена).
     """
     title, issuer, source_url = cand.title, cand.issuer, cand.source_url
     resolved_language = language if language is not None else cand.language
@@ -746,6 +794,7 @@ def promote_candidate(
         doc_type=doc_type,
         authority=authority,
         source_url=source_url,
+        official_alt_url=official_alt_url,
         source_format=source_format,
         rights=cand.rights or Rights.unknown,
         sensitivity=cand.sensitivity or Sensitivity.normal,

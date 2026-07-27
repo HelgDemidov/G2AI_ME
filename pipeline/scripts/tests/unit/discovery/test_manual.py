@@ -123,6 +123,36 @@ def test_inject_normalizes_url_for_dedup(tmp_path: Path) -> None:
     assert is_new2 is False
 
 
+def test_inject_mirror_absorbed_by_strategy_two_reports_real_absorber_and_reason(
+    tmp_path: Path,
+) -> None:
+    """Регресс репро D аудита (spec discovery-acquire-seam-hardening §5, Г4): дубль
+    поглощён стратегией 2 (issuer+title+date), а НЕ по URL-паре — старый код искал
+    поглотителя ТОЛЬКО по ``(normalized_url, supersedes)``, находил ``None`` и
+    возвращал СВЕЖЕГО кандидата; куратор видел «уже есть» без причины отказа, даже
+    не узнавая, что попал в отклонённого. URL зеркала при этом должен осесть в
+    ``alternate_source_urls`` поглотителя (Г4 — не теряться нигде)."""
+    manual.inject(
+        url="https://blocked.gov/law.pdf", title="Registration Law",
+        issuer="Ministry", language="en", date=dt.date(2026, 1, 1), root=tmp_path,
+    )
+    all_cands = store.load(tmp_path)
+    all_cands[0].rejected_reason = "WAF blocks every rung"
+    all_cands[0].rejected_kind = schema.RejectionKind.unacquirable
+    store.save(all_cands, tmp_path)
+
+    mirror_cand, is_new = manual.inject(
+        url="https://mirror.example.org/law.pdf", title="registration law",
+        issuer="Ministry", language="en", date=dt.date(2026, 1, 1), root=tmp_path,
+    )
+
+    assert is_new is False
+    assert mirror_cand.rejected_reason == "WAF blocks every rung"  # реальный поглотитель, не свежий
+    assert mirror_cand.raw_hash == all_cands[0].raw_hash
+    absorber = store.load(tmp_path)[0]
+    assert absorber.alternate_source_urls == ["https://mirror.example.org/law.pdf"]  # type: ignore[attr-defined]
+
+
 # --- pending_candidates / render_worksheet (spec §3) ---
 
 
@@ -174,6 +204,19 @@ def test_pending_candidates_without_url_stays_pending() -> None:
     assert manual.pending_candidates([cand], []) == [cand]
 
 
+def test_registered_pairs_public_and_includes_supersedes_edge() -> None:
+    """spec discovery-acquire-seam-hardening §4: ``registered_pairs`` — публичное имя
+    (было ``_registered_pairs``), общий примитив реконсиляции для discovery
+    (``unacquirable_candidates``) И acquire (``recheck.due_candidates``)."""
+    rec_data = valid_record()
+    rec_data["source_url"] = "https://gov.example.org/a.pdf"
+    rec_data["relations"] = [{"type": "supersedes", "target": "me-old-law-2024"}]
+    rec = schema.SourceRecord.model_validate(rec_data)
+    pairs = manual.registered_pairs([rec])
+    assert ("https://gov.example.org/a.pdf", None) in pairs
+    assert ("https://gov.example.org/a.pdf", "me-old-law-2024") in pairs
+
+
 def test_render_worksheet_includes_header_and_row() -> None:
     cand = _candidate(jurisdiction="me", doc_date="2026-03-01", native_tags=["ai-governance"])
     text = manual.render_worksheet([cand])
@@ -198,6 +241,48 @@ def test_render_worksheet_empty_pending_still_has_header() -> None:
     text = manual.render_worksheet([])
     assert "Триаж-worksheet" in text
     assert "raw_hash" in text
+
+
+# --- экранирование `|` в ячейках worksheet (spec discovery-acquire-seam-hardening §12) ---
+
+
+def test_render_worksheet_escapes_pipe_in_pending_row() -> None:
+    """Недоверенный title/issuer (реестры, анкоры снежного кома) может нести `|`
+    естественно — без экранирования строка таблицы рвётся по колонкам."""
+    cand = _candidate(title="AI Act | Draft", issuer="Ministry | Agency")
+    text = manual.render_worksheet([cand])
+    lines = [
+        line for line in text.splitlines()
+        if line.startswith("|") and cand.raw_hash[:12] in line
+    ]
+    assert len(lines) == 1
+    # число колонок сохранено: экранированный `|` не создаёт лишних разделителей
+    assert lines[0].count(" | ") == 9  # 10 колонок таблицы pending
+
+
+def test_render_worksheet_escapes_pipe_in_unacquirable_row() -> None:
+    cand = _candidate(
+        title="AI Act | Draft",
+        rejected_reason="WAF", rejected_kind="unacquirable",
+        probe_finding="acquirable: HTTP 200 | ok",
+    )
+    text = manual.render_worksheet([], [cand])
+    lines = [
+        line for line in text.splitlines()
+        if line.startswith("|") and cand.raw_hash[:12] in line
+    ]
+    assert len(lines) == 1
+    assert lines[0].count(" | ") == 6  # 7 колонок таблицы unacquirable
+
+
+# --- authority-map ⊆ vocab_doc_types (spec discovery-acquire-seam-hardening §12) ---
+
+
+def test_authority_by_doc_type_is_subset_of_doc_type_vocab() -> None:
+    """Дрейф при переименовании термина словаря ловится тестом, а не молчаливым
+    «нет дефолта» — полного покрытия словаря НЕ требует (честная деградация
+    «задайте authority явно» остаётся штатной для новых терминов)."""
+    assert set(manual._AUTHORITY_BY_DOC_TYPE) <= schema.load_vocab("doc_types")
 
 
 # --- apply_decisions (spec §4) ---
@@ -418,6 +503,82 @@ def test_apply_admit_track_defaults_me_jurisdiction_to_target_entity(tmp_path: P
 
     manual.apply_decisions([_admit_no_defaults("b" * 64)], root=tmp_path)
     assert schema.load_records(tmp_path)[0].track == schema.Track.target_entity
+
+
+# --- source_format резолюция (spec discovery-acquire-seam-hardening §8, Г7) ------
+
+
+def test_apply_admit_source_format_defaults_to_pdf_without_hint(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path)
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].source_format == schema.SourceFormat.pdf
+
+
+def test_apply_admit_source_format_defaults_from_candidate_hint(tmp_path: Path) -> None:
+    """Подсказка кандидата замещает молчаливый дефолт "pdf", когда решение не
+    указывает формат явно — эхо в сводке, той же механикой, что authority/track."""
+    cand = _candidate(raw_hash="b" * 64, native_format_hint="html")
+    store.save([cand], tmp_path)
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].source_format == schema.SourceFormat.html
+    assert any("source_format=html" in o.detail for o in summary.outcomes)
+
+
+def test_apply_admit_explicit_source_format_wins_over_hint(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, native_format_hint="html")
+    store.save([cand], tmp_path)
+    decision = _admit_decision("b" * 64, source_format="docx")
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].source_format == schema.SourceFormat.docx
+
+
+# --- official_alt_url через admit-решение (spec discovery-acquire-seam-hardening §9, Г13) ---
+
+
+def test_apply_admit_official_alt_url_reaches_meta_yaml(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path)
+
+    decision = _admit_decision("b" * 64, official_alt_url="https://mirror.example.org/doc.pdf")
+    summary = manual.apply_decisions([decision], root=tmp_path)
+
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].official_alt_url == "https://mirror.example.org/doc.pdf"
+
+
+def test_apply_admit_invalid_official_alt_url_fails_without_aborting_batch(tmp_path: Path) -> None:
+    bad_cand = _candidate(raw_hash="b" * 64)
+    ok_cand = _candidate(raw_hash="c" * 64)
+    store.save([bad_cand, ok_cand], tmp_path)
+
+    bad_decision = _admit_decision("b" * 64, official_alt_url="not-a-url")
+    ok_decision = _admit_decision(
+        "c" * 64, id="me-example-strategy-2027", official_alt_url="https://mirror.example.org/doc.pdf"
+    )
+    summary = manual.apply_decisions([bad_decision, ok_decision], root=tmp_path)
+
+    assert len(summary.errors) == 1
+    records = {r.id: r for r in schema.load_records(tmp_path)}
+    assert "me-example-strategy-2026" not in records  # плохое решение не применилось
+    assert records["me-example-strategy-2027"].official_alt_url == "https://mirror.example.org/doc.pdf"
+
+
+def test_apply_admit_without_official_alt_url_is_prior_behavior(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64)
+    store.save([cand], tmp_path)
+    manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert schema.load_records(tmp_path)[0].official_alt_url is None
+
+
+def test_render_worksheet_includes_format_hint_column() -> None:
+    cand = _candidate(native_format_hint="html")
+    text = manual.render_worksheet([cand])
+    assert "format_hint" in text
+    assert "| html |" in text
 
 
 def test_load_target_entity_jurisdictions_reads_real_tracked_config() -> None:

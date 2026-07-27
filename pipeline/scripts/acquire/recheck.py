@@ -26,7 +26,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from acquire import acquisition
-from core import schema
+from core import pdfmeta, schema
 
 logger = logging.getLogger("recheck")
 
@@ -41,6 +41,14 @@ RECHECK_DEFAULT_LIMIT = 20
 # ложных drift'ов по всему html-слою корпуса. Эвристика без измерительной базы —
 # калибровать по доле ложных drift на первых живых прогонах, не заранее.
 HTML_STABLE_CONFIRMS = 2
+
+# Потолок байтов probe-тела популяции (c) (spec discovery-acquire-seam-hardening §11,
+# Г12): челлендж-маркеры и признаки живого/мёртвого канала — в начале тела; без капа
+# 100-МБ PDF на LTE-канале — полторы минуты трафика на выброс ради классификации,
+# которой хватает первых десятков КБ. ТОЛЬКО для формат-агностичного probe
+# (``expected=None``) — форматные ok-ветки (a)/(b) статус-чувствительны (``status ==
+# 200``, которого 206 сломал бы), а --recheck-deep нужен полный дайджест.
+PROBE_BYTE_CAP = 65536
 
 
 @dataclass(frozen=True)
@@ -88,6 +96,8 @@ def probe_url(
 
     ``expected=None`` — формат-агностичная классификация (``acquisition.classify_probe``)
     для популяции (c): у кандидата слоя discovery ``source_format`` ещё не объявлен.
+    Она же гейтит потолок байтов (``PROBE_BYTE_CAP``, spec §11, Г12) — только формат-
+    агностичный probe его получает, форматные (a)/(b) качают тело полностью.
 
     Тело пишется во временный каталог ВНЕ папки документа — не в ``raw.*``: контур не
     мутирует оригинал ни при каком исходе.
@@ -101,7 +111,10 @@ def probe_url(
 
     with tempfile.TemporaryDirectory(prefix="recheck-") as workdir:
         dest = Path(workdir) / "probe.bin"
-        raw = acquisition.fetch_raw(url, dest, user_agent=user_agent, extra_headers=headers)
+        byte_cap = PROBE_BYTE_CAP if expected is None else None
+        raw = acquisition.fetch_raw(
+            url, dest, user_agent=user_agent, extra_headers=headers, byte_cap=byte_cap
+        )
         if raw.unreachable_reason is not None:
             return ProbeOutcome(
                 not_modified=False,
@@ -288,10 +301,8 @@ def deep_baseline(rec: schema.SourceRecord, root: Path, state: schema.Operationa
     raw = schema.raw_file(rec, root)
     if raw is None or not raw.exists():
         return state.sha256
-    from convert import converters  # ленивый импорт: acquire не зависит от convert по слоям
-
     try:
-        return None if converters.was_ocr_normalized(raw) else state.sha256
+        return None if pdfmeta.was_ocr_normalized(raw) else state.sha256
     except Exception:  # noqa: BLE001 — диагностический проход не должен ронять проверку
         logger.debug("не удалось определить OCR-происхождение %s", raw, exc_info=True)
         return None
@@ -319,6 +330,11 @@ def due_records(
     ``sensitivity: confidential`` из (a) НЕ исключается: условный запрос идёт к тому
     же официальному источнику, что и добыча, третьих сторон в нём нет (в отличие от
     SavePageNow, который гейтится).
+
+    Ротация (b) сортирует по ``acquisition_probe_checked or acquisition_failed``
+    (spec discovery-acquire-seam-hardening §3, Г2): курсор ротации отделён от якоря
+    backoff, легаси-записи без нового поля (проверялись до этого спека) фолбэчат на
+    прежний курсор — первый же probe их бэкфиллит.
     """
     superseded = schema.superseded_ids(records)
     with_raw: list[tuple[tuple[bool, _dt.date, str], schema.SourceRecord]] = []
@@ -335,14 +351,18 @@ def due_records(
         if raw is not None:
             with_raw.append((_checked_sort_key(state.acquisition_checked, rec.id), rec))
         elif state.acquisition_failed is not None:
-            without_raw.append((_checked_sort_key(state.acquisition_failed, rec.id), rec))
+            rotation_cursor = state.acquisition_probe_checked or state.acquisition_failed
+            without_raw.append((_checked_sort_key(rotation_cursor, rec.id), rec))
     with_raw.sort(key=lambda pair: pair[0])
     without_raw.sort(key=lambda pair: pair[0])
     return [r for _, r in with_raw[:limit]], [r for _, r in without_raw[:limit]]
 
 
 def due_candidates(
-    candidates: list[schema.CandidateRecord], *, limit: int
+    candidates: list[schema.CandidateRecord],
+    *,
+    limit: int,
+    registered: set[tuple[str, str | None]] | None = None,
 ) -> list[schema.CandidateRecord]:
     """Популяция (c): кандидаты, отклонённые как ``unacquirable`` (§5).
 
@@ -350,12 +370,25 @@ def due_candidates(
     терминально, второе живёт очередью ожидания обстоятельств (WAF снимут, появится
     зеркало). Без этого различения второй закрывался бы навсегда по ошибке, потому что
     заметить смену обстоятельств некому.
+
+    ``registered`` (spec discovery-acquire-seam-hardening §4, Г3) — пары
+    ``(нормализованный source_url, supersedes)``, уже представленные в реестре
+    (``discovery.manual.registered_pairs(records)``) — реконсиляция, симметричная
+    ``discovery.manual.pending_candidates``/``unacquirable_candidates``: admit
+    недобываемого кандидата напрямую (revive→admit требует двух батчей, срезать
+    угол естественно при ``probe_finding: acquirable``) не должен оставлять его
+    НАВСЕГДА в этой ротации — документ уже в корпусе. Plain-data множество, а не
+    список записей: acquire остаётся discovery-агностичным, пары считает
+    оркестратор (``run_pipeline``) и передаёт через ``run_recheck``. ``None``
+    (легаси-вызовы/тесты) — прежнее поведение без реконсиляции.
     """
     due = [
         c
         for c in candidates
         if c.rejected_kind is schema.RejectionKind.unacquirable and c.source_url
     ]
+    if registered is not None:
+        due = [c for c in due if (c.normalized_url, c.supersedes) not in registered]
     due.sort(key=lambda c: _checked_sort_key(c.probe_checked, c.raw_hash))
     return due[:limit]
 
@@ -438,7 +471,15 @@ def _reprobe_unacquired(
     """Популяция (b): допущен триажем, добыть не удалось — «а не открылось ли?».
 
     Успех НЕ скачивает документ здесь: контур только снимает backoff, а добирает его
-    ближайший штатный прогон ``run_pipeline`` — одна дверь к добыче, а не две."""
+    ближайший штатный прогон ``run_pipeline`` — одна дверь к добыче, а не две.
+
+    ``acquisition_probe_checked`` бампается на ЛЮБОМ исходе (курсор ротации — иначе
+    голодание хвоста популяции); ``acquisition_failed`` (якорь backoff полной
+    лестницы, spec §3, Г2) probe трогает ТОЛЬКО на успехе (снимает backoff — лестница
+    добудет сама на ближайшем прогоне). Неуспех probe НЕ переустанавливает якорь —
+    он заведомо слабее полной лестницы (один GET по ``source_url``, без official_alt/
+    browser/archive) и не имеет права продлевать её окно; ``acquisition_failure_reason``
+    всё же обновляется свежей причиной — полезно сводке, реестра backoff не касается."""
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     probe = probe_url(
@@ -446,12 +487,12 @@ def _reprobe_unacquired(
     )
     classified = probe.classified
     assert classified is not None  # conditional=False => 304 невозможен
+    state.acquisition_probe_checked = today
     if classified.outcome is acquisition.AcquisitionOutcome.ok:
         state.acquisition_failed = None
         state.acquisition_failure_reason = None
         note = "стало добываемо — ближайший прогон run_pipeline доберёт"
     else:
-        state.acquisition_failed = today
         state.acquisition_failure_reason = classified.reason
         note = f"по-прежнему недобываем: {classified.reason}"
     schema.save_state(state_path, state)
@@ -495,6 +536,7 @@ def run_recheck(
     deep: bool = False,
     today: _dt.date | None = None,
     candidates: list[schema.CandidateRecord] | None = None,
+    registered: set[tuple[str, str | None]] | None = None,
 ) -> RecheckSummary:
     """Прогон контура по трём популяциям. Отказ одного документа не рвёт прогон
     (изоляция как в ``process_docs``): упавший остаётся с прежним курсором и будет
@@ -503,6 +545,10 @@ def run_recheck(
     ``candidates`` (популяция (c)) мутируется НА МЕСТЕ; загрузку и сохранение store
     делает вызывающая сторона — слой ACQUIRE не знает о раскладке слоя DISCOVERY.
     ``RecheckSummary.candidates_changed`` говорит, есть ли что сохранять.
+
+    ``registered`` (spec discovery-acquire-seam-hardening §4, Г3) — форвардится в
+    ``due_candidates`` как есть (plain-data пары ``(нормализованный URL,
+    supersedes)`` уже допущенных документов реестра); ``None`` — прежнее поведение.
     """
     today = today or _dt.date.today()
     with_raw, without_raw = due_records(records, root, limit=limit)
@@ -523,7 +569,7 @@ def run_recheck(
             items.append(RecheckItem(rec.id, "", error=str(exc)))
 
     changed = False
-    for cand in due_candidates(candidates or [], limit=limit):
+    for cand in due_candidates(candidates or [], limit=limit, registered=registered):
         try:
             items.append(_probe_unacquirable(cand, user_agent=user_agent, today=today))
             changed = True

@@ -23,6 +23,7 @@ from acquire.acquisition import (
     classify_response,
     fetch_and_classify,
     fetch_from_archive,
+    fetch_raw,
     find_wayback_snapshot,
     next_rung,
     run_ladder,
@@ -144,6 +145,46 @@ def test_classify_small_unexpected_body_is_blocked() -> None:
     # 200, не PDF, без явных challenge-маркеров, но подозрительно маленький -> блок, не "ok".
     result = classify_response(b"tiny", OK_HEADERS)
     assert result.outcome == AcquisitionOutcome.blocked
+
+
+# --- диагноз промаха формата в лестнице (spec discovery-acquire-seam-hardening
+# §8, Г7): не-challenge промах с content-type: text/html дополняет reason ---
+
+
+def test_classify_pdf_too_small_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(b"<html>redirect</html>", OK_HTML_HEADERS, schema.SourceFormat.pdf)
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
+
+
+def test_classify_pdf_unexpected_content_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(
+        b"<html>real page</html>" + b"x" * 4000, OK_HTML_HEADERS, schema.SourceFormat.pdf
+    )
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
+
+
+def test_classify_pdf_unexpected_content_without_html_content_type_no_mismatch_note() -> None:
+    result = classify_response(b"garbage" + b"x" * 4000, OK_HEADERS, schema.SourceFormat.pdf)
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" not in result.reason
+
+
+def test_classify_docx_not_zip_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(
+        b"<html>not a docx</html>" + b"x" * 4000, OK_HTML_HEADERS, schema.SourceFormat.docx
+    )
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
+
+
+def test_classify_xlsx_not_zip_with_html_content_type_notes_format_mismatch() -> None:
+    result = classify_response(
+        b"<html>not an xlsx</html>" + b"x" * 4000, OK_HTML_HEADERS, schema.SourceFormat.xlsx
+    )
+    assert result.outcome == AcquisitionOutcome.blocked
+    assert "проверьте source_format" in result.reason
 
 
 def test_classify_redirect_keeps_only_final_hop_status_and_headers() -> None:
@@ -443,6 +484,41 @@ def test_fetch_and_classify_includes_max_time(tmp_path: Path, monkeypatch: Any) 
     )
     assert "--max-time" in captured_cmd
     assert captured_cmd[captured_cmd.index("--max-time") + 1] == "123"
+
+
+# --- fetch_raw(byte_cap=...): potолок probe-тела (spec discovery-acquire-seam-
+# hardening §11, Г12) ---
+
+
+def test_fetch_raw_with_byte_cap_adds_range_flag(tmp_path: Path, monkeypatch: Any) -> None:
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool) -> _FakeProc:  # noqa: FBT001
+        captured_cmd.extend(cmd)
+        Path(cmd[cmd.index("-D") + 1]).write_text("HTTP/1.1 206 Partial Content\r\n", encoding="utf-8")
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"partial body")
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
+    fetch_raw("https://example.gov/doc", tmp_path / "dest.bin", user_agent="ua", byte_cap=65536)
+
+    assert "-r" in captured_cmd
+    assert captured_cmd[captured_cmd.index("-r") + 1] == "0-65535"
+
+
+def test_fetch_raw_without_byte_cap_omits_range_flag(tmp_path: Path, monkeypatch: Any) -> None:
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd: list[str], check: bool) -> _FakeProc:  # noqa: FBT001
+        captured_cmd.extend(cmd)
+        Path(cmd[cmd.index("-D") + 1]).write_text(OK_HEADERS, encoding="utf-8")
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(REAL_PDF_BODY)
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr("acquire.acquisition.subprocess.run", fake_run)
+    fetch_raw("https://example.org/doc.pdf", tmp_path / "dest.bin", user_agent="ua")
+
+    assert "-r" not in captured_cmd
 
 
 @pytest.mark.parametrize("code", [6, 7])

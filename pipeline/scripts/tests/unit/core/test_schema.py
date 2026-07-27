@@ -484,6 +484,45 @@ def test_promote_candidate_source_format_passthrough() -> None:
     assert rec.source_format == SourceFormat.html
 
 
+def test_promote_candidate_official_alt_url_passthrough() -> None:
+    """spec discovery-acquire-seam-hardening §9, Г13: вторая ступень лестницы через
+    дверь промоушена — суждение об официальности зеркала куратор вносит явно."""
+    data = valid_candidate()
+    data.update(title="Doc", issuer="EU", language="en", source_url="https://ex.org/d.pdf")
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="eu-doc-2024",
+        entity_id="eu",
+        track=Track.intl_xperience,
+        issuer_type=IssuerType.igo,
+        geo_scope=GeoScope.regional,
+        doc_type="legislation",
+        authority="binding_law",
+        relevance=_relevance(),
+        official_alt_url="https://mirror.example.org/d.pdf",
+    )
+    assert rec.official_alt_url == "https://mirror.example.org/d.pdf"
+
+
+def test_promote_candidate_official_alt_url_none_is_prior_behavior() -> None:
+    data = valid_candidate()
+    data.update(title="Doc", issuer="EU", language="en", source_url="https://ex.org/d.pdf")
+    cand = CandidateRecord.model_validate(data)
+    rec = promote_candidate(
+        cand,
+        id="eu-doc-2024",
+        entity_id="eu",
+        track=Track.intl_xperience,
+        issuer_type=IssuerType.igo,
+        geo_scope=GeoScope.regional,
+        doc_type="legislation",
+        authority="binding_law",
+        relevance=_relevance(),
+    )
+    assert rec.official_alt_url is None
+
+
 def test_promote_candidate_v2_analytics_fields_populated() -> None:
     data = valid_candidate()
     data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
