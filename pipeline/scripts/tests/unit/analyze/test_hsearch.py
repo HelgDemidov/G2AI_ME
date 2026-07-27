@@ -167,3 +167,39 @@ def test_hsearch_annotates_reconstruction(tmp_path: Path, capsys: Any) -> None:
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
     assert any("doc-a" in ln and "⚠ reconstruction" in ln for ln in lines)
     assert any("doc-b" in ln and "⚠ reconstruction" not in ln for ln in lines)
+
+
+def test_hsearch_annotates_quality_flags_and_archived_fidelity(tmp_path: Path, capsys: Any) -> None:
+    """Пометка ⚑ доносит до аналитика то, что раньше умирало в .state.yaml: документ
+    из Wayback-снимка и документ с непогашенным дефектом OCR (аудит шва Б2)."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [
+        Chunk("doc-a", 0, "governance framework alpha", 4),
+        Chunk("doc-b", 0, "governance framework beta", 4),
+    ])
+    conn.executemany(
+        "INSERT INTO doc_facets (doc_id, entity_id, track, doc_type, authority, language, "
+        "fidelity, quality_flags) VALUES (?, 'e', 'intl-xperience', 'strategy', 'official', 'en', ?, ?)",
+        [("doc-a", "archived_snapshot", "cloud-ocr-numeric-divergence"), ("doc-b", "live", "")],
+    )
+    conn.commit()
+    conn.close()
+
+    assert main(["governance", "--db", str(db), "--backend", "none"]) == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert any("doc-a" in ln and "archived_snapshot" in ln and "cloud-ocr-numeric-divergence" in ln for ln in lines)
+    assert any("doc-b" in ln and "⚑" not in ln for ln in lines)
+
+
+def test_hsearch_provenance_notes_tolerate_legacy_db(tmp_path: Path, capsys: Any) -> None:
+    """БД без provenance-колонок (собрана до §3) — поиск работает, пометок просто нет."""
+    db = tmp_path / "c.db"
+    conn = create_db(db)
+    index_chunks(conn, [Chunk("doc-a", 0, "governance framework", 4)])
+    conn.execute("ALTER TABLE doc_facets DROP COLUMN quality_flags")
+    conn.commit()
+    conn.close()
+
+    assert main(["governance", "--db", str(db), "--backend", "none"]) == 0
+    assert "doc-a" in capsys.readouterr().out

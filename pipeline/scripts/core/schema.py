@@ -289,9 +289,14 @@ class OperationalState(BaseModel):
     converter_name: str | None = None     # какой конвертер породил текущий doc.md
     converter_version: str | None = None  # его версия (реконсиляция реконверсии)
     # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
-    # список строк-дефектов convert/lint.py (пустой = чисто); машиночитаемость нужна
-    # worksheet'у батч-триажа (spec discovery-manual), флагованные документы видны
-    # при Стадии 2. Старые .state.yaml без поля валидны (Field с default).
+    # список строк-дефектов convert/lint.py (пустой = чисто). Старые .state.yaml без
+    # поля валидны (Field с default).
+    # Потребители (spec convert-knowledge-seam-hardening §3): ИМЕНА дефектов едут в
+    # фасет `doc_facets.quality_flags` и оттуда — пометкой ⚑ в выдаче hsearch; полная
+    # евидентность (числа расхождений и т.п.) остаётся здесь. Прежний докстринг обещал
+    # читателя-worksheet, которого никогда не существовало (аудит шва, Б2): поле
+    # писалось прилежно и не читалось ничем — документ с непогашенным расхождением
+    # чисел был в выдаче неотличим от чистого.
     lint_defects: list[str] = Field(default_factory=list)
     # spec convert-cloud-tier §2.2: валидность кэша .cloudocr.md — по этим двум
     # полям (модель + sha256 raw НА МОМЕНТ облачного вызова, т.е. ПОСЛЕ ocrmypdf).

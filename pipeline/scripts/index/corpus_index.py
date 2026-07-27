@@ -33,7 +33,7 @@ from pathlib import Path
 from index.bge_tokenizer import EMBED_MAX_TOKENS, token_counter
 from index.chunking import Chunk, TokenCounter, chunk_text, is_markup_heavy, strip_frontmatter
 from core.env import REPO_ROOT
-from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, md_file
+from core.schema import DEFAULT_SOURCES, SourceRecord, load_records, load_state, md_file, state_file
 from core.schema import superseded_ids as schema_superseded_ids
 
 logger = logging.getLogger("corpus_index")
@@ -91,7 +91,10 @@ CREATE TABLE IF NOT EXISTS doc_facets (
     target_fit     TEXT,
     assessed_stage TEXT,
     sensitivity    TEXT NOT NULL DEFAULT 'public',
-    superseded     INTEGER NOT NULL DEFAULT 0
+    superseded     INTEGER NOT NULL DEFAULT 0,
+    fidelity       TEXT,
+    ocr_model      TEXT,
+    quality_flags  TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS topics_map (
     doc_id TEXT NOT NULL,
@@ -143,6 +146,15 @@ def _doc_fingerprint(path: Path) -> str:
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
+def _optional_fingerprint(path: Path) -> str:
+    """``_doc_fingerprint`` для файла, которого может не быть (``.state.yaml`` свежего,
+    ещё не добывавшегося документа) — ``"-"`` вместо отказа."""
+    try:
+        return _doc_fingerprint(path)
+    except OSError:
+        return "-"
+
+
 def _fingerprint_from_parts(parts: list[str]) -> str:
     """sha256 отсортированных строк — общий хэш для ``corpus_fingerprint`` и его
     инкрементального пересчёта (``index_corpus_incremental``): формат обязан
@@ -163,10 +175,18 @@ def corpus_fingerprint(sources_root: Path) -> str:
     meta НЕ должна пере-чанковывать/пере-эмбеддить документ, только обновить фасеты
     (см. ``index_corpus``/``index_corpus_incremental``). Документы без ``doc.md`` не
     входят — их появление (после конвертации) меняет отпечаток и триггерит
-    пересборку. На ~200 документах — ~400 ``stat()``, миллисекунды.
+    пересборку. На ~200 документах — ~600 ``stat()``, миллисекунды.
+
+    State-aware (spec convert-knowledge-seam-hardening §3): в отпечаток входит и
+    ``.state.yaml``, потому что из него теперь собираются provenance-фасеты. Без этого
+    находка recheck (``drift``) или новый lint-дефект не сдвигали бы отпечаток, и
+    ``run_pipeline`` счёл бы индекс актуальным — фасет остался бы протухшим ровно там,
+    где он и нужен. Пере-чанковки это не вызывает: ``doc_state`` по-прежнему считается
+    только по ``doc.md``, поэтому дорогая часть (токенизация, эмбеддинг) не трогается.
     """
     parts = [
         f"{rec.id}:{_doc_fingerprint(md)}:{_doc_fingerprint(md.parent / 'meta.yaml')}"
+        f":{_optional_fingerprint(state_file(rec, sources_root))}"
         for rec in load_records(sources_root)
         if (md := md_file(rec, sources_root)).exists()
     ]
@@ -244,6 +264,9 @@ def _ensure_facet_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "doc_facets", "superseded", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "chunks", "reconstruction", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "chunks", "markup_heavy", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "doc_facets", "fidelity", "TEXT")
+    _ensure_column(conn, "doc_facets", "ocr_model", "TEXT")
+    _ensure_column(conn, "doc_facets", "quality_flags", "TEXT NOT NULL DEFAULT ''")
 
 
 def create_db(db_path: Path) -> sqlite3.Connection:
@@ -260,7 +283,38 @@ def create_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> None:
+def _flag_name(entry: str) -> str:
+    """Имя дефекта/находки без евидентности: ``"cloud-ocr-numeric-divergence: -12/+18"``
+    -> ``"cloud-ocr-numeric-divergence"``. В фасет идёт ИМЯ, не полная строка: фасет —
+    короткий сигнал «посмотри в .state.yaml», а не его дубликат (полные строки несут
+    списки чисел)."""
+    return entry.split(":", 1)[0].strip()
+
+
+def _provenance_facets(rec: SourceRecord, sources_root: Path) -> tuple[str | None, str | None, str]:
+    """``(fidelity, ocr_model, quality_flags)`` документа из его ``.state.yaml``
+    (spec convert-knowledge-seam-hardening §3).
+
+    До этого спека НИ ОДИН читатель операционного состояния не жил в index/analyze/graph
+    (grep-верификация аудита): acquire и convert прилежно писали fidelity, находки
+    recheck и lint-дефекты, а выдача о них молчала — документ из Wayback-снимка был
+    неотличим от живого оригинала, а скан с непогашенным расхождением чисел — от
+    чистого. Отсутствующий сайдкар (документ ещё не добывался) — пустые значения, не
+    ошибка."""
+    state = load_state(state_file(rec, sources_root))
+    flags = [_flag_name(d) for d in state.lint_defects]
+    if state.recheck_finding:
+        flags.append(_flag_name(state.recheck_finding))
+    return (
+        state.fidelity.value if state.fidelity else None,
+        state.cloud_ocr_model,
+        ";".join(dict.fromkeys(f for f in flags if f)),  # дедуп с сохранением порядка
+    )
+
+
+def _rebuild_facets(
+    conn: sqlite3.Connection, records: list[SourceRecord], sources_root: Path | None = None
+) -> None:
     """Перезаписать ``doc_facets``/``topics_map`` из курируемых записей (полная
     перезапись — O(сотен строк), дешевле любой инкрементальности diff'а). ``axis``/
     ``target_fit``/``assessed_stage`` — ``None``, если у записи ещё нет ``relevance``
@@ -269,15 +323,24 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
     ``superseded`` (spec graph-v2 §2) — кросс-документный фасет: считается общим
     ``schema.superseded_ids`` (тем же, которым recheck-контур исключает записи из
     ротации — одно определение на двух потребителей) на УЖЕ загруженном списке записей,
-    ноль новых чтений с диска."""
+    ноль новых чтений с диска.
+
+    ``sources_root`` (spec convert-knowledge-seam-hardening §3) включает provenance-
+    фасеты из ``.state.yaml`` (~1 мелкое чтение на документ, та же частота, что сам
+    rebuild). ``None`` — фасеты пустые: герметичные тесты и легаси-вызовы, у которых
+    корня нет, не должны требовать выдуманного пути."""
     superseded = schema_superseded_ids(records)
+    provenance = {
+        rec.id: (_provenance_facets(rec, sources_root) if sources_root is not None else (None, None, ""))
+        for rec in records
+    }
     conn.execute("DELETE FROM doc_facets")
     conn.execute("DELETE FROM topics_map")
     conn.executemany(
         "INSERT INTO doc_facets "
         "(doc_id, entity_id, track, doc_type, authority, language, axis, target_fit, "
-        "assessed_stage, sensitivity, superseded) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assessed_stage, sensitivity, superseded, fidelity, ocr_model, quality_flags) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 rec.id,
@@ -291,6 +354,7 @@ def _rebuild_facets(conn: sqlite3.Connection, records: list[SourceRecord]) -> No
                 rec.relevance.assessed_stage.value if rec.relevance else None,
                 rec.sensitivity.value,
                 int(rec.id in superseded),
+                *provenance[rec.id],
             )
             for rec in records
         ],
@@ -308,6 +372,7 @@ def index_chunks(
     corpus_fingerprint: str | None = None,
     chunk_max_tokens: int | None = None,
     records: list[SourceRecord] | None = None,
+    sources_root: Path | None = None,
 ) -> None:
     """Полная переиндексация: заменить содержимое и перестроить FTS (идемпотентно).
 
@@ -346,7 +411,7 @@ def index_chunks(
     )
     conn.execute("INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild')")
     if records is not None:
-        _rebuild_facets(conn, records)
+        _rebuild_facets(conn, records, sources_root)
     if corpus_fingerprint is not None:
         write_meta(conn, "corpus_fingerprint", corpus_fingerprint)
     if chunk_max_tokens is not None:
@@ -482,7 +547,7 @@ def index_corpus_incremental(
             )
         for doc_id in vanished:
             conn.execute("DELETE FROM doc_state WHERE doc_id = ?", (doc_id,))
-        _rebuild_facets(conn, all_records)
+        _rebuild_facets(conn, all_records, sources_root)
         write_meta(conn, "corpus_fingerprint", corpus_fp)
         write_meta(conn, "chunk_max_tokens", str(max_tokens))
     return len(pending), len(vanished)
@@ -547,6 +612,7 @@ def index_corpus(
             corpus_fingerprint=corpus_fingerprint(sources_root),
             chunk_max_tokens=max_tokens,
             records=list(load_records(sources_root)),
+            sources_root=sources_root,
         )
         _rebuild_doc_state(conn, sources_root)
         return f"полная пересборка: {len(chunks)} чанков" + _oversize_suffix(conn, max_tokens)

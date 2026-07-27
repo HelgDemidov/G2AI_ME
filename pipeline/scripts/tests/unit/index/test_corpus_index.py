@@ -30,7 +30,7 @@ from index.corpus_index import (
     sanitize_fts_query,
     write_meta,
 )
-from core import markers
+from core import markers, schema
 from core.schema import SourceRecord
 from tests.support import valid_record, write_doc
 
@@ -1036,3 +1036,88 @@ def test_status_has_no_provenance_suffix_on_plain_corpus(tmp_path: Path) -> None
     status = index_corpus(conn, root, _fake_counter, 10_000)
     assert "(" not in status
     conn.close()
+
+
+# --- provenance-фасеты из .state.yaml (spec convert-knowledge-seam-hardening §3) ---
+
+
+def _write_state(doc_dir: Path, **fields: Any) -> None:
+    state = schema.OperationalState(**fields)
+    schema.save_state(doc_dir / ".state.yaml", state)
+
+
+def test_provenance_facets_read_from_state(tmp_path: Path) -> None:
+    """Сигналы acquire/convert доезжают до фасетов: до §3 ни один потребитель
+    index/analyze/graph не читал .state.yaml вовсе (grep-верификация аудита, Б2)."""
+    root = tmp_path / "src"
+    doc_dir = _doc(root, "doc-scan-2026", "sc", _A_BODY)
+    _write_state(
+        doc_dir,
+        fidelity=schema.Fidelity.archived_snapshot,
+        cloud_ocr_model="google/gemini-3-flash-preview",
+        lint_defects=["cloud-ocr-numeric-divergence: witness_only=[12] cloud_only=[18]"],
+        recheck_finding="drift: etag changed",
+    )
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, _MAX, force=True)
+
+    row = conn.execute(
+        "SELECT fidelity, ocr_model, quality_flags FROM doc_facets WHERE doc_id = ?",
+        ("doc-scan-2026",),
+    ).fetchone()
+    assert row[0] == "archived_snapshot"
+    assert row[1] == "google/gemini-3-flash-preview"
+    # в фасет идут ИМЕНА, не полные строки с евидентностью
+    assert row[2] == "cloud-ocr-numeric-divergence;drift"
+    conn.close()
+
+
+def test_provenance_facets_empty_without_state(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    _doc(root, "doc-clean-2026", "cl", _A_BODY)
+    conn = create_db(tmp_path / "c.db")
+    index_corpus(conn, root, _fake_counter, _MAX, force=True)
+
+    row = conn.execute(
+        "SELECT fidelity, ocr_model, quality_flags FROM doc_facets WHERE doc_id = ?",
+        ("doc-clean-2026",),
+    ).fetchone()
+    assert row == (None, None, "")
+    conn.close()
+
+
+def test_provenance_facets_on_incremental_path(tmp_path: Path) -> None:
+    root = tmp_path / "src"
+    doc_dir = _doc(root, "doc-scan-2026", "sc", _A_BODY)
+    _write_state(doc_dir, fidelity=schema.Fidelity.live, lint_defects=["no-headings"])
+    conn = create_db(tmp_path / "c.db")
+    index_corpus_incremental(conn, root, _fake_counter, _MAX)
+
+    row = conn.execute("SELECT fidelity, quality_flags FROM doc_facets").fetchone()
+    assert row == ("live", "no-headings")
+    conn.close()
+
+
+def test_rebuild_facets_without_root_leaves_provenance_empty(tmp_path: Path) -> None:
+    """Герметичные вызовы (тесты, легаси) не обязаны выдумывать корень корпуса."""
+    conn = create_db(tmp_path / "c.db")
+    rec = SourceRecord.model_validate(valid_record())
+    _rebuild_facets(conn, [rec])
+    assert conn.execute("SELECT fidelity, ocr_model, quality_flags FROM doc_facets").fetchone() == (
+        None, None, "",
+    )
+    conn.close()
+
+
+def test_corpus_fingerprint_is_state_aware(tmp_path: Path) -> None:
+    """Находка recheck/новый lint-дефект обязаны сдвинуть отпечаток — иначе фасет
+    останется протухшим ровно там, где он и нужен (§3)."""
+    doc_dir = _write_corpus_doc(tmp_path)
+    fp_before = corpus_fingerprint(tmp_path)
+    _write_state(doc_dir, recheck_finding="drift: etag changed")
+    assert corpus_fingerprint(tmp_path) != fp_before
+
+
+def test_corpus_fingerprint_stable_without_state_change(tmp_path: Path) -> None:
+    _write_corpus_doc(tmp_path)
+    assert corpus_fingerprint(tmp_path) == corpus_fingerprint(tmp_path)
