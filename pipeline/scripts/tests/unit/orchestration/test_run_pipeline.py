@@ -2062,11 +2062,19 @@ def _seed_three_populations(sources: Path) -> None:
 def test_main_recheck_dry_run_is_noop(tmp_path: Path, monkeypatch: Any) -> None:
     """Регресс репро E аудита: прежде флаг молча игнорировался — брал лок, ходил в
     сеть, писал probe-поля/findings. Сеть замонкипатчена на assert-fail — падение
-    теста доказывало бы, что dry-run всё же дозвонился до probe_url."""
+    теста доказывало бы, что dry-run всё же дозвонился до probe_url.
+
+    ``.state.yaml`` сверяется по stat (К6 спека), а не по разобранной модели: запись
+    байт-идентичного содержимого — тоже запись (mtime-чурн ломает бэкапы и
+    наблюдаемость «что тронул прогон»), и через модель она была бы невидима."""
     sources = tmp_path / "sources"
     _seed_three_populations(sources)
     records_before = schema.load_records(sources)
     candidates_before = store.load(sources)
+    states_before = {
+        p: p.stat().st_mtime_ns for p in sorted(sources.rglob(schema.STATE_SIDECAR_NAME))
+    }
+    assert states_before  # фикстура действительно положила .state.yaml — сверка не пустая
 
     def boom(*a: Any, **kw: Any) -> Any:
         raise AssertionError("--recheck --dry-run не должен ходить в сеть")
@@ -2078,6 +2086,9 @@ def test_main_recheck_dry_run_is_noop(tmp_path: Path, monkeypatch: Any) -> None:
     assert not schema.corpus_lock_path(sources).exists()  # лок не берётся
     assert schema.load_records(sources) == records_before
     assert store.load(sources) == candidates_before
+    assert {
+        p: p.stat().st_mtime_ns for p in sorted(sources.rglob(schema.STATE_SIDECAR_NAME))
+    } == states_before
 
 
 def test_main_recheck_dry_run_prints_all_three_populations(tmp_path: Path, caplog: Any) -> None:

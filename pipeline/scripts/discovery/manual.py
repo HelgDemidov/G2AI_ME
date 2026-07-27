@@ -366,7 +366,7 @@ def render_worksheet(
                     _md_cell(cand.raw_hash[:12]),
                     _md_cell(cand.title or ""),
                     _md_cell(cand.issuer or ""),
-                    cand.probe_checked.isoformat() if cand.probe_checked else "—",
+                    _md_cell(cand.probe_checked.isoformat() if cand.probe_checked else "—"),
                     _md_cell(cand.probe_finding or "—"),
                     _md_cell(cand.source_url or ""),
                     _md_cell(alternates or "—"),

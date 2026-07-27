@@ -274,8 +274,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with fsio.exclusive_flock(schema.corpus_lock_path(args.root)):
                 return int(args.func(args))
-        except fsio.AlreadyLocked:
-            print("✗ другой прогон run_pipeline/discover работает с этим корпусом")
+        except fsio.AlreadyLocked as exc:
+            # Текст исключения несёт ПУТЬ лока — без него куратор, гоняющий несколько
+            # корпусов (`--root`), не видит, какой именно занят.
+            print(f"✗ другой прогон run_pipeline/discover работает с этим корпусом ({exc})")
             return 1
     result: int = args.func(args)
     return result
