@@ -119,11 +119,11 @@ eu-ai-act-2024:
   CELEX:32022R0868: eu_act
   CELEX:32022R2065: eu_act
   CELEX:32023R0988: eu_act
-  CELEX:32023R2854: eu_act
-  CELEX:32024R0900: eu_act
+  CELEX:32023R2854: eli_uri
+  CELEX:32024R0900: eli_uri
   CELEX:32024R1315: eu_act
-  CELEX:32024R1358: eu_act
-  CELEX:32024R1689: eu_act
+  CELEX:32024R1358: eli_uri
+  CELEX:32024R1689: eli_uri
 me-crps-registration-law-2025:
   SLCG:146/2021: sluzbeni_list_cg
   SLCG:4/2024: sluzbeni_list_cg
