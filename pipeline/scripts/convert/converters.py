@@ -181,11 +181,19 @@ def _ocr_normalize(raw: Path, language: str | None) -> None:
     двойное хранение того же документа; убрано по решению пользователя). Кэширование
     получается «бесплатно» иначе: после успеха `raw` САМ содержит текст-слой, поэтому
     следующий `_detect_scan(raw)` больше не поднимет `NeedsOCR`, и `_ocr_normalize` не
-    вызовется повторно без явного `--force`/бампа версии конвертера. Вызывающий
-    (`_do_convert` в run_pipeline.py) ОБЯЗАН пересчитать sha256/размер/mtime в
-    `.state.yaml` после конвертации — raw физически изменился (его собственный
-    `load_state`/`save_state`-раунд-трип идёт ПОСЛЕ этой функции и подхватит уже
-    записанный `_capture_original_sha256` результат с диска — гонки нет).
+    вызовется повторно без явного `--force`/бампа версии конвертера.
+
+    Бухгалтерия sha256/размер/mtime обновляется ЗДЕСЬ, сразу после `staging.replace(raw)`
+    (spec acquire-convert-seam-hardening §1, В1) — не в конце стадии `_do_convert`. Между
+    мутацией raw и завершением конвертации лежат минуты `pdf_convert`/облачного пути;
+    прерывание в этом окне (kill -9/OOM — документированный живой класс машины,
+    `ConversionError`) раньше оставляло мутированный raw при sha, записанном для СКАЧАННОГО
+    оригинала — следующий `needed_stages` трактовал расхождение как порчу и планировал
+    ПЕРЕДОБЫЧУ поверх уже выполненной OCR-работы. Мутация и её бухгалтерия — один шаг
+    (WAL-принцип: интент фиксируется с мутацией, а не в конце длинной транзакции).
+    Завершающий пересчёт в `_do_convert` (run_pipeline.py) остаётся — он реконсиляционный
+    «ремень» на случай мутации raw НЕ через эту функцию (напр. `--no-download`-замена)
+    и покрывает born-digital путь, которого эта функция не касается.
     """
     if shutil.which("ocrmypdf") is None:
         raise NeedsOCR(
@@ -219,6 +227,15 @@ def _ocr_normalize(raw: Path, language: str | None) -> None:
             f"{result.stderr[-_OCR_STDERR_TAIL:]}"
         )
     staging.replace(raw)
+
+    # Бухгалтерия — сразу после мутации, не в конце стадии (§1, В1: см. докстроку выше).
+    state_path = schema.state_file_for_raw(raw)
+    state = schema.load_state(state_path)
+    st = raw.stat()
+    state.sha256 = fsio.sha256_file(raw)
+    state.raw_size = st.st_size
+    state.raw_mtime_ns = st.st_mtime_ns
+    schema.save_state(state_path, state)
 
 
 _CLOUD_DISABLED = False   # spec convert-cloud-tier §6.3 — settable через set_cloud_disabled (--no-cloud)

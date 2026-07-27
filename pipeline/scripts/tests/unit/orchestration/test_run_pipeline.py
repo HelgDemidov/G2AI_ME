@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -236,6 +237,63 @@ def test_do_convert_refreshes_sha256_when_converter_mutates_raw_in_place(
     assert state.raw_mtime_ns == raw.stat().st_mtime_ns
     # реконсиляция после мутации не должна ложно требовать передобычу
     assert Stage.download not in needed_stages(rec, tmp_path)
+
+
+class _FakeOcrPdf:
+    """Минимальная замена pdfplumber.open для _ocr_normalize — использует только
+    len(pdf.pages) (потолок OCR_PAGE_WARN)."""
+
+    def __init__(self, n_pages: int) -> None:
+        self.pages = [object()] * n_pages
+
+    def __enter__(self) -> "_FakeOcrPdf":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+def test_needed_stages_no_download_after_ocr_normalize_crash_window(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """spec acquire-convert-seam-hardening §1, В1 — герметичный репро краш-окна
+    аудита (docs/pipeline/audit/acquire_convert_seam_review_2026-07-27.md, репро A):
+    прерывание МЕЖДУ OCR-мутацией raw и завершением _do_convert (kill -9/OOM —
+    документированный живой класс машины). Здесь имитируется вызовом
+    converters._ocr_normalize НАПРЯМУЮ, минуя _do_convert целиком — doc.md
+    так и не появляется, converter_name/version не проставляются, ровно как
+    при реальном краше. До фикса needed_stages увидел бы sha скачанного
+    оригинала при уже-мутированном raw и спланировал бы передобычу поверх
+    выполненной OCR-работы."""
+    rec = make()
+    original_bytes = b"%PDF-1.4 acquired original scan bytes"
+    _place(rec, tmp_path, raw=original_bytes)
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    st = raw.stat()
+    # Состояние, как его оставил _do_download при добыче — ДО OCR-мутации.
+    schema.save_state(
+        schema.state_file(rec, tmp_path),
+        schema.OperationalState(
+            sha256=hashlib.sha256(original_bytes).hexdigest(),
+            raw_size=st.st_size, raw_mtime_ns=st.st_mtime_ns,
+        ),
+    )
+
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    monkeypatch.setattr("convert.converters.pdfplumber.open", lambda path: _FakeOcrPdf(1))
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        Path(cmd[-1]).write_bytes(b"%PDF-1.4 ocr-mutated bytes with text layer")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+
+    converters._ocr_normalize(raw, "en")  # мутация происходит; _do_convert НИКОГДА не вызывается — «краш»
+
+    assert Stage.download not in needed_stages(rec, tmp_path)
+    assert Stage.convert in needed_stages(rec, tmp_path)  # конвертация честно доигрывается заново
 
 
 def test_do_convert_passes_record_language_to_converter(tmp_path: Path, monkeypatch: Any) -> None:
