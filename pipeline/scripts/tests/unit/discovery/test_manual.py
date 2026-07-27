@@ -174,6 +174,19 @@ def test_pending_candidates_without_url_stays_pending() -> None:
     assert manual.pending_candidates([cand], []) == [cand]
 
 
+def test_registered_pairs_public_and_includes_supersedes_edge() -> None:
+    """spec discovery-acquire-seam-hardening §4: ``registered_pairs`` — публичное имя
+    (было ``_registered_pairs``), общий примитив реконсиляции для discovery
+    (``unacquirable_candidates``) И acquire (``recheck.due_candidates``)."""
+    rec_data = valid_record()
+    rec_data["source_url"] = "https://gov.example.org/a.pdf"
+    rec_data["relations"] = [{"type": "supersedes", "target": "me-old-law-2024"}]
+    rec = schema.SourceRecord.model_validate(rec_data)
+    pairs = manual.registered_pairs([rec])
+    assert ("https://gov.example.org/a.pdf", None) in pairs
+    assert ("https://gov.example.org/a.pdf", "me-old-law-2024") in pairs
+
+
 def test_render_worksheet_includes_header_and_row() -> None:
     cand = _candidate(jurisdiction="me", doc_date="2026-03-01", native_tags=["ai-governance"])
     text = manual.render_worksheet([cand])

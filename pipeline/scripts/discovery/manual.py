@@ -130,9 +130,10 @@ def inject(
     return matched or cand, False
 
 
-def _registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
+def registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
     """Пары ``(нормализованный source_url, заменяемый doc-id | None)``, уже представленные
-    в реестре — правая часть реконсиляции ``pending_candidates``.
+    в реестре — правая часть реконсиляции ``pending_candidates``/``unacquirable_candidates``
+    (discovery) и ``recheck.due_candidates`` (acquire, spec discovery-acquire-seam-hardening §4).
 
     Каждая запись регистрирует ``(url, None)`` — URL как таковой корпусом покрыт — И
     ``(url, target)`` для каждого своего ребра ``supersedes``: последнее означает «редакция,
@@ -156,7 +157,7 @@ def pending_candidates(
     """«Ждущие» кандидаты — вычисляется реконсиляцией, не хранимым статусом (spec §3).
 
     Кандидат «ждущий», если у него нет ``rejected_reason`` И его пара
-    ``(URL, supersedes)`` не представлена в реестре (см. ``_registered_pairs``). Кандидат
+    ``(URL, supersedes)`` не представлена в реестре (см. ``registered_pairs``). Кандидат
     без URL вовсе (совпадение только по ``content_hash``/тайтлу) реконсиляцией по URL
     отфильтровать нельзя — остаётся ждущим (безопасный дефолт: не прячем от куратора то,
     чего не можем уверенно сопоставить).
@@ -170,7 +171,7 @@ def pending_candidates(
     Куратор, переписавший авто-ребро при триаже, вернёт кандидата в worksheet — видимый
     сбой, не тихий.
     """
-    registered = _registered_pairs(records)
+    registered = registered_pairs(records)
     pending: list[schema.CandidateRecord] = []
     for cand in candidates:
         if cand.rejected_reason is not None:
@@ -264,15 +265,34 @@ _UNACQUIRABLE_SECTION_HEADER = """\
 
 
 def unacquirable_candidates(
-    candidates: list[schema.CandidateRecord],
+    candidates: list[schema.CandidateRecord], records: list[schema.SourceRecord]
 ) -> list[schema.CandidateRecord]:
     """Кандидаты, отклонённые как «нужен, но недобываем» (spec post-acquisition-lifecycle §5).
 
-    Вычисляется реконсиляцией по ``rejected_kind``, как и всё остальное в этом модуле —
-    отдельного хранимого «статуса очереди» нет. Самые давно не пробованные первыми:
-    тот же порядок, в котором их берёт recheck, — куратор видит список в его логике.
+    Вычисляется реконсиляцией по ``rejected_kind`` — как и всё остальное в этом
+    модуле — отдельного хранимого «статуса очереди» нет. Самые давно не пробованные
+    первыми: тот же порядок, в котором их берёт recheck, — куратор видит список в
+    его логике.
+
+    ``records`` (spec discovery-acquire-seam-hardening §4, Г3) — реконсиляция с
+    реестром, симметрично ``pending_candidates``: кандидат, чья пара ``(URL,
+    supersedes)`` уже представлена в реестре (``registered_pairs``), из секции
+    выбывает. До этого спека эта очередь была ЕДИНСТВЕННОЙ в слое кандидатов, не
+    выводимой реконсиляцией — admit недобываемого кандидата напрямую (код
+    разрешает молча; штатный revive→admit требует двух батчей, и срезать угол
+    естественно при ``probe_finding: acquirable``) оставлял его НАВСЕГДА видимым
+    здесь, хотя документ уже в корпусе. Кандидат без URL реконсиляции не поддаётся —
+    остаётся видимым (тот же безопасный дефолт, что у ``pending_candidates``).
     """
-    due = [c for c in candidates if c.rejected_kind is schema.RejectionKind.unacquirable]
+    registered = registered_pairs(records)
+    due: list[schema.CandidateRecord] = []
+    for cand in candidates:
+        if cand.rejected_kind is not schema.RejectionKind.unacquirable:
+            continue
+        url = cand.normalized_url or (dedup.normalize_url(cand.source_url) if cand.source_url else None)
+        if url is not None and (url, cand.supersedes) in registered:
+            continue
+        due.append(cand)
     due.sort(key=lambda c: (c.probe_checked is not None, c.probe_checked or dt.date.min, c.raw_hash))
     return due
 

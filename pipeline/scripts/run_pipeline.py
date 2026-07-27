@@ -52,7 +52,7 @@ from core import pdfmeta
 from core import schema
 from core import validate_sources
 from core.env import load_dotenv
-from discovery import store
+from discovery import manual, store
 from index import vector_store
 from index.chunking import strip_frontmatter
 from index.embed import (
@@ -1145,12 +1145,15 @@ def main(argv: list[str] | None = None) -> int:
             with fsio.exclusive_flock(schema.corpus_lock_path(args.sources)):
                 # Слой кандидатов (популяция (c)) грузится/сохраняется ЗДЕСЬ: оркестратор
                 # сшивает слои по определению своей роли, а сам ACQUIRE о раскладке store
-                # слоя DISCOVERY не знает (и не должен).
+                # слоя DISCOVERY не знает (и не должен). Симметрично, реконсиляция
+                # популяции (c) с реестром (spec discovery-acquire-seam-hardening §4,
+                # Г3) — тоже забота оркестратора: пары считает manual.registered_pairs
+                # (discovery), acquire остаётся discovery-агностичным (plain-data параметр).
                 candidates = store.load(args.sources)
                 summary = recheck.run_recheck(
                     records, args.sources,
                     user_agent=USER_AGENT, limit=args.recheck_limit, deep=args.recheck_deep,
-                    candidates=candidates,
+                    candidates=candidates, registered=manual.registered_pairs(records),
                 )
                 if summary.candidates_changed:
                     store.save(candidates, args.sources)

@@ -72,7 +72,7 @@ def _cmd_worksheet(args: argparse.Namespace) -> int:
     candidates = store.load(args.root)
     records = schema.load_records(args.root)
     pending = manual.pending_candidates(candidates, records)
-    unacquirable = manual.unacquirable_candidates(candidates)
+    unacquirable = manual.unacquirable_candidates(candidates, records)
     text = manual.render_worksheet(pending, unacquirable)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
