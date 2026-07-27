@@ -34,7 +34,6 @@ from core.schema import (
     SourceRecord,
     TargetFit,
     Track,
-    TranslationStatus,
     check_layout,
     doc_dir,
     external_disclosure_allowed,
@@ -608,8 +607,15 @@ def test_operational_state_default() -> None:
     st = OperationalState()
     assert st.sha256 is None
     assert st.acquisition_method is None
-    assert st.translation_status == TranslationStatus.not_started
     assert st.lint_defects == []
+
+
+def test_operational_state_rejects_removed_translation_status_field() -> None:
+    """spec acquire-convert-seam-hardening §10, В14: поле удалено ИЗ СХЕМЫ, не
+    просто перестало читаться — extra="forbid" обязан отвергнуть его возврат
+    «на всякий случай» (тот же паттерн, что слим in_force/dates.last_checked)."""
+    with pytest.raises(ValidationError):
+        OperationalState.model_validate({"translation_status": "not_started"})
 
 
 def test_operational_state_legacy_yaml_without_lint_defects_still_valid() -> None:
