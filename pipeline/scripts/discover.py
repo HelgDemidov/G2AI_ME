@@ -11,15 +11,17 @@ import dataclasses
 import datetime as dt
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from core import fsio, schema, validate_sources
 from core.env import load_dotenv
 from discovery import connectors, manual, store  # noqa: F401 — connectors: манифест реальных коннекторов (§4.3)
-from discovery.connectors import snowball
 from discovery.orchestrate import DiscoverySummary, discover
+
+if TYPE_CHECKING:  # только аннотации — рантайм-импорт ленивый, см. ниже
+    from discovery.connectors import snowball
 
 
 def _print_summary(summary: DiscoverySummary) -> None:
@@ -121,6 +123,8 @@ def _build_snowball_config_override(args: argparse.Namespace) -> snowball.Snowba
     (спек discovery-snowball §3). Заданный флаг ЗАМЕЩАЕТ соответствующее поле yaml
     целиком (не сливается поэлементно); незаданный (``None``/пустой список) — yaml как
     есть. Файл на диске не трогается."""
+    from discovery.connectors import snowball  # ленивый: см. _cmd_snowball
+
     base = snowball.load_config()
     source_filter = base.source_filter
     if args.doc:
@@ -150,6 +154,17 @@ def _build_snowball_config_override(args: argparse.Namespace) -> snowball.Snowba
 
 
 def _cmd_snowball(args: argparse.Namespace) -> int:
+    # Импорт коннектора ЛЕНИВЫЙ, внутри его собственной подкоманды — иначе изоляция
+    # отказа загрузки (`connectors._load_all`, spec discovery-acquire-seam-hardening §7,
+    # Г6) обходится ровно так же, как раньше обходилась изоляция оркестратора: манифест
+    # ловит битый `discovery_snowball.yaml` и пишет warning, а следующий же модульный
+    # `from discovery.connectors import snowball` в этом файле поднимает его заново и
+    # роняет ВЕСЬ CLI, включая inject/worksheet/apply, которым snowball не нужен вовсе
+    # (проверено живьём на ревью PR #54: битый snowball-конфиг -> exit 1 и worksheet не
+    # отрендерен, битый agora-конфиг -> exit 0 и worksheet на месте). Здесь громкий отказ
+    # уместен и остаётся: подкоманду `snowball` без её конфига исполнить нечем.
+    from discovery.connectors import snowball
+
     merged_config = _build_snowball_config_override(args)
     if merged_config.emit.text_citations:
         load_dotenv()  # §5 LLM-стадии нужен OPENROUTER_API_KEY из .env (зеркало run_pipeline)

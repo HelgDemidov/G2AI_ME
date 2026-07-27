@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from typing import Any
@@ -45,6 +46,56 @@ def test_load_all_isolates_broken_connector_module(monkeypatch: Any, caplog: Any
 
     assert any("broken_connector" in r.message for r in caplog.records)
     assert "agora" in registry.CONNECTORS  # остальные коннекторы регистрируются штатно
+
+
+def test_discover_cli_imports_no_connector_submodule_at_module_level() -> None:
+    """Изоляция ``_load_all`` действительна ровно настолько, насколько ``discover.py``
+    сам не переподнимает то, что манифест изолировал.
+
+    Ревью PR #54 нашло пробел: модульный ``from discovery.connectors import snowball``
+    в ``discover.py`` заново исполнял импорт-тайм ``registry.register(...(enabled=
+    load_config().enabled))`` snowball'а сразу после того, как ``_load_all`` погасил его
+    отказ warning'ом — битый ``discovery_snowball.yaml`` ронял ВЕСЬ CLI (exit 1,
+    worksheet не отрендерен), тогда как битый ``discovery_agora.yaml`` изолировался
+    штатно (exit 0). Правило общее и на будущие коннекторы: подмодуль коннектора
+    импортируется ЛЕНИВО, внутри своей подкоманды. Пакет ``discovery.connectors``
+    (манифест) импортировать на уровне модуля обязательно — он и есть точка регистрации.
+
+    Сканируются ТОЛЬКО безусловные операторы верхнего уровня: блок ``if TYPE_CHECKING:``
+    в рантайме не исполняется и под правило не подпадает.
+    """
+    tree = ast.parse((_SCRIPTS_DIR / "discover.py").read_text(encoding="utf-8"))
+    offenders: list[str] = []
+    for node in tree.body:  # именно body, не walk: тело функций и TYPE_CHECKING — не рантайм-импорт модуля
+        if isinstance(node, ast.Import):
+            offenders += [a.name for a in node.names if a.name.startswith("discovery.connectors.")]
+        elif isinstance(node, ast.ImportFrom) and node.module == "discovery.connectors":
+            offenders += [f"discovery.connectors.{a.name}" for a in node.names]
+    assert not offenders, f"модули коннекторов импортируются на уровне discover.py: {offenders}"
+
+
+def test_broken_snowball_module_does_not_break_discover_cli_import() -> None:
+    """Поведенческое зеркало теста выше: отказ загрузки ИМЕННО snowball'а (пятый
+    коннектор, чей конфиг куратор правит руками чаще прочих) изолируется так же, как
+    отказ любого registry-коннектора. Подпроцесс — по той же причине, что и у прочих
+    тестов файла: в текущей сессии `discovery.connectors` уже импортирован."""
+    code = (
+        "import sys\n"
+        "from importlib.abc import MetaPathFinder\n"
+        "class Boom(MetaPathFinder):\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'discovery.connectors.snowball':\n"
+        "            raise RuntimeError('битый discovery_snowball.yaml')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Boom())\n"
+        "import discover\n"  # не должен упасть: манифест изолировал, CLI не поднимает заново
+        "from discovery import registry\n"
+        "assert 'snowball' not in registry.CONNECTORS\n"  # незагруженный отсутствует в реестре
+        "assert {'agora', 'eurlex', 'aiforgood', 'oecd'} <= set(registry.CONNECTORS)\n"
+        "assert discover.main is not None\n"
+    )
+    result = _run_check(code)
+    assert result.returncode == 0, result.stderr
 
 
 def _run_check(code: str) -> subprocess.CompletedProcess[str]:
