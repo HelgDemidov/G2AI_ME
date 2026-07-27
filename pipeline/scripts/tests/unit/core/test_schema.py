@@ -1,6 +1,7 @@
 """Тесты pydantic-схем корпуса (meta.yaml / .state.yaml / candidates.yaml) и рендера frontmatter."""
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import re
 
 import yaml
 
+from core.env import REPO_ROOT
 from core.schema import (
     ENTITY_PATTERN,
     VOCAB_DIR,
@@ -32,9 +34,9 @@ from core.schema import (
     SourceRecord,
     TargetFit,
     Track,
-    TranslationStatus,
     check_layout,
     doc_dir,
+    external_disclosure_allowed,
     load_candidates,
     load_records,
     load_state,
@@ -45,6 +47,8 @@ from core.schema import (
     render_frontmatter,
     save_record,
     save_state,
+    state_file,
+    state_file_for_raw,
 )
 
 
@@ -121,6 +125,70 @@ def test_curated_provenance_fields() -> None:
     rec2 = SourceRecord.model_validate(data)
     assert rec2.official_alt_url == "https://example.org/alt.pdf"
     assert rec2.sensitivity == Sensitivity.confidential
+
+
+# --- external_disclosure_allowed: единый предикат sensitivity-политики
+# (spec acquire-convert-seam-hardening §5, В5) ---
+
+
+def test_external_disclosure_allowed_true_for_normal() -> None:
+    assert external_disclosure_allowed(Sensitivity.normal) is True
+
+
+def test_external_disclosure_allowed_false_for_confidential() -> None:
+    assert external_disclosure_allowed(Sensitivity.confidential) is False
+
+
+def test_external_disclosure_allowed_true_for_none() -> None:
+    """None == normal-семантика: best-effort записи слоя discovery (CandidateRecord.sensitivity
+    ещё не финализирован триажем) — раскрытие разрешено по умолчанию, симметрично
+    SourceRecord.sensitivity = Sensitivity.normal."""
+    assert external_disclosure_allowed(None) is True
+
+
+_PIPELINE_DIR = REPO_ROOT / "pipeline" / "scripts"
+
+
+def _confidential_attribute_lines(path: Path) -> list[int]:
+    """Номера строк, где КОД (не докстрока/комментарий — AST не видит текст внутри
+    строковых констант как выражения) обращается к атрибуту ``confidential`` объекта
+    по имени ``Sensitivity`` — ``schema.Sensitivity.confidential`` или прямой импорт
+    ``Sensitivity.confidential``."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute) and node.attr == "confidential"):
+            continue
+        value = node.value
+        is_dotted = isinstance(value, ast.Attribute) and value.attr == "Sensitivity"
+        is_direct = isinstance(value, ast.Name) and value.id == "Sensitivity"
+        if is_dotted or is_direct:
+            lines.append(node.lineno)
+    return lines
+
+
+def test_sensitivity_confidential_compared_only_in_schema_module() -> None:
+    """Guard-тест единого предиката (spec acquire-convert-seam-hardening §5, В5,
+    зеркало К6-guard'а convert-knowledge-seam-hardening §6): политика «confidential
+    не раскрывается третьим сторонам» раньше была реализована 8 независимыми
+    сравнениями в 7 модулях — булев близнец класса «строка в N копиях». Новая точка
+    раскрытия ОБЯЗАНА пройти через ``external_disclosure_allowed``, иначе этот тест
+    красный. ``index/vector_store.py::confidential_doc_ids`` — единственное
+    санкционированное ВТОРОЕ определение (SQL по doc_facets, записей в руках нет),
+    исключено явным путём в скане ниже (в её коде нет ни одного ``Attribute``-узла
+    ``Sensitivity.confidential`` — только SQL-строковый литерал, AST его не видит)."""
+    violations: dict[str, list[int]] = {}
+    for path in sorted(_PIPELINE_DIR.rglob("*.py")):
+        rel = path.relative_to(_PIPELINE_DIR)
+        if rel.parts[0] == "tests" or rel == Path("core", "schema.py"):
+            continue
+        lines = _confidential_attribute_lines(path)
+        if lines:
+            violations[str(rel)] = lines
+    assert not violations, (
+        f"прямое сравнение с Sensitivity.confidential вне core/schema.py: {violations} — "
+        f"используйте core.schema.external_disclosure_allowed"
+    )
 
 
 def test_source_format_default_pdf() -> None:
@@ -539,8 +607,15 @@ def test_operational_state_default() -> None:
     st = OperationalState()
     assert st.sha256 is None
     assert st.acquisition_method is None
-    assert st.translation_status == TranslationStatus.not_started
     assert st.lint_defects == []
+
+
+def test_operational_state_rejects_removed_translation_status_field() -> None:
+    """spec acquire-convert-seam-hardening §10, В14: поле удалено ИЗ СХЕМЫ, не
+    просто перестало читаться — extra="forbid" обязан отвергнуть его возврат
+    «на всякий случай» (тот же паттерн, что слим in_force/dates.last_checked)."""
+    with pytest.raises(ValidationError):
+        OperationalState.model_validate({"translation_status": "not_started"})
 
 
 def test_operational_state_legacy_yaml_without_lint_defects_still_valid() -> None:
@@ -613,6 +688,15 @@ def test_load_real_vocab_nonempty() -> None:
 def test_raw_target_default_ext(tmp_path: Path) -> None:
     rec = SourceRecord.model_validate(valid_record())
     assert raw_target(rec, tmp_path) == doc_dir(rec, tmp_path) / "raw.pdf"
+
+
+def test_state_file_for_raw_matches_state_file(tmp_path: Path) -> None:
+    """spec acquire-convert-seam-hardening §1/В12: единственное определение пути
+    сайдкара, адресуемое и от записи (state_file), и от голого raw (state_file_for_raw) —
+    должны совпасть для одного и того же документа."""
+    rec = SourceRecord.model_validate(valid_record())
+    raw = raw_target(rec, tmp_path)  # <doc_dir>/raw.pdf — путь не обязан существовать
+    assert state_file_for_raw(raw) == state_file(rec, tmp_path)
 
 
 def test_raw_target_custom_ext(tmp_path: Path) -> None:

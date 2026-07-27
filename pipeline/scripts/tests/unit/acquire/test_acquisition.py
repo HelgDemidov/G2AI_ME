@@ -28,6 +28,7 @@ from acquire.acquisition import (
     run_ladder,
     title_matcher,
     watch_and_ingest,
+    _FORMAT_PROFILES,
     _looks_like_candidate_pdf,
 )
 from tests.support import valid_record
@@ -214,6 +215,54 @@ def test_classify_server_bigip_header_with_valid_html_is_ok_not_flagged() -> Non
 def test_classify_f5_and_akamai_markers_present_in_registry() -> None:
     for marker in (b"Request Rejected", b"Unauthorized Access", b"errors.edgesuite.net"):
         assert marker in CHALLENGE_BODY_MARKERS
+
+
+# --- _FORMAT_PROFILES: реестр формат-профилей добычи
+# (spec acquire-convert-seam-hardening §6, В6) ---
+
+
+def test_format_profiles_registers_every_source_format() -> None:
+    """Sync-тест полноты (двойник К11-sync-теста языковых карт прошлого спека):
+    новый член SourceFormat без зарегистрированного профиля ломает ЭТОТ тест, а не
+    молча даёт KeyError где-то в проде на первом же документе нового формата."""
+    assert set(_FORMAT_PROFILES) == set(schema.SourceFormat)
+
+
+def test_format_profiles_watch_folder_only_pdf() -> None:
+    assert _FORMAT_PROFILES[schema.SourceFormat.pdf].watch_folder is True
+    for fmt in (schema.SourceFormat.html, schema.SourceFormat.docx, schema.SourceFormat.xlsx):
+        assert _FORMAT_PROFILES[fmt].watch_folder is False
+
+
+def test_format_profiles_browser_rung_only_html() -> None:
+    assert _FORMAT_PROFILES[schema.SourceFormat.html].browser_rung is True
+    for fmt in (schema.SourceFormat.pdf, schema.SourceFormat.docx, schema.SourceFormat.xlsx):
+        assert _FORMAT_PROFILES[fmt].browser_rung is False
+
+
+def test_format_profiles_dispatch_to_the_same_classify_functions() -> None:
+    """Реестр диспетчеризует РОВНО те же функции, что classify_response вызывал
+    напрямую if/elif-цепочкой до рефакторинга (identity, не поведенческое
+    сравнение) — behavior-preserving по построению, не по совпадению исхода."""
+    from acquire.acquisition import _classify_docx, _classify_html, _classify_pdf, _classify_xlsx
+
+    assert _FORMAT_PROFILES[schema.SourceFormat.pdf].classify is _classify_pdf
+    assert _FORMAT_PROFILES[schema.SourceFormat.html].classify is _classify_html
+    assert _FORMAT_PROFILES[schema.SourceFormat.docx].classify is _classify_docx
+    assert _FORMAT_PROFILES[schema.SourceFormat.xlsx].classify is _classify_xlsx
+
+
+def test_format_profiles_cdx_mimetypes() -> None:
+    """CDX-mimetype реестра — та же карта, что была в удалённом
+    _CDX_MIMETYPE_BY_FORMAT (плюс pdf теперь явной записью, не .get()-дефолтом)."""
+    assert _FORMAT_PROFILES[schema.SourceFormat.pdf].cdx_mimetype == "application/pdf"
+    assert _FORMAT_PROFILES[schema.SourceFormat.html].cdx_mimetype == "text/html"
+    assert _FORMAT_PROFILES[schema.SourceFormat.docx].cdx_mimetype == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert _FORMAT_PROFILES[schema.SourceFormat.xlsx].cdx_mimetype == (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 # --- expected=html: мультиформатная классификация (convert-html spec §3) ---
@@ -1046,6 +1095,23 @@ def test_fetch_from_archive_success(tmp_path: Path, monkeypatch: Any) -> None:
     assert result.method == ARCHIVE
     assert result.fidelity == schema.Fidelity.archived_snapshot
     assert result.retrieved_snapshot_date == dt.date(2022, 8, 6)
+
+
+def test_fetch_from_archive_raises_for_confidential_defense_in_depth(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """spec acquire-convert-seam-hardening §5, В5: next_rung уже маршрутизирует
+    confidential мимо archive (см. test_run_ladder_dead_confidential_raises_blocked_not_dead),
+    но эта функция — единственная в модуле, реально раскрывающая байты третьей
+    стороне (Wayback) — несёт собственный head-guard на случай будущего вызывающего,
+    добравшегося сюда иным путём."""
+    called: list[str] = []
+    monkeypatch.setattr(
+        "acquire.acquisition.find_wayback_snapshot", lambda *a, **kw: called.append("called")
+    )
+    with pytest.raises(RuntimeError, match="confidential"):
+        fetch_from_archive(_rec(sensitivity="confidential"), tmp_path / "doc.pdf", user_agent="test-ua")
+    assert called == []  # ни одного сетевого похода — отказ ДО CDX-запроса
 
 
 def test_fetch_from_archive_raises_when_no_snapshot(tmp_path: Path, monkeypatch: Any) -> None:

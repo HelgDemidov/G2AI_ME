@@ -291,7 +291,7 @@ def deep_baseline(rec: schema.SourceRecord, root: Path, state: schema.Operationa
     from convert import converters  # ленивый импорт: acquire не зависит от convert по слоям
 
     try:
-        return None if converters._was_ocr_normalized(raw) else state.sha256
+        return None if converters.was_ocr_normalized(raw) else state.sha256
     except Exception:  # noqa: BLE001 — диагностический проход не должен ронять проверку
         logger.debug("не удалось определить OCR-происхождение %s", raw, exc_info=True)
         return None
@@ -416,13 +416,18 @@ def _recheck_one(
     # SPN на дрейфе (§4): снять ИЗМЕНИВШУЮСЯ редакцию, пока она жива, — до того как
     # куратор дошёл до разбора. Строго при УСТАНОВКЕ/ИЗМЕНЕНИИ строки, не при её
     # повторном подтверждении: иначе каждая ротация стреляла бы в Wayback заново.
+    # Цель снимка — probe_url_for(rec, state) (spec acquire-convert-seam-hardening
+    # §7, В9-код), НЕ голый rec.source_url: дрейф НАБЛЮДЁН на том URL, с которого
+    # сняты валидаторы (source_url либо official_alt_url, если добыча шла этой
+    # ступенью) — снимать нужно ТУ редакцию, что реально изменилась, а не всегда
+    # каноническую ссылку издателя.
     if (
         verdict.finding is not None
         and verdict.finding != previous_finding
         and verdict.finding.startswith("drift:")
-        and rec.sensitivity is not schema.Sensitivity.confidential
+        and schema.external_disclosure_allowed(rec.sensitivity)
     ):
-        acquisition.request_snapshot(rec.source_url)
+        acquisition.request_snapshot(probe_url_for(rec, state))
     schema.save_state(state_path, state)
     return RecheckItem(rec.id, verdict.note, finding=verdict.finding)
 

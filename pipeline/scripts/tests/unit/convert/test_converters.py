@@ -945,6 +945,38 @@ def test_ocr_normalize_mutates_raw_in_place_no_sidecar_file(monkeypatch: Any, tm
     assert not (tmp_path / ".ocr.pdf").exists()  # никакого сайдкара
 
 
+def test_ocr_normalize_updates_sha_triple_immediately_after_mutation(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """spec acquire-convert-seam-hardening §1, В1 — живой репро краш-окна аудита
+    (закрывается этим тестом): бухгалтерия sha256/raw_size/raw_mtime_ns обновляется
+    ВНУТРИ _ocr_normalize, сразу после staging.replace(raw) — не в конце стадии
+    _do_convert (run_pipeline.py), которую этот юнит-тест даже не вызывает. Раньше
+    прерывание МЕЖДУ мутацией и завершением конвертации оставляло sha скачанного
+    оригинала при уже-мутированном raw — needed_stages трактовал бы это как порчу
+    файла и планировал передобычу поверх выполненной OCR-работы (см. регресс-тест
+    на уровне оркестратора: test_needed_stages_no_download_after_ocr_normalize_crash_window)."""
+    raw = tmp_path / "raw.pdf"
+    raw.write_bytes(b"%PDF-1.4 fake scan")
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    _patch_open(monkeypatch, [_FakePage("")])
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        Path(cmd[-1]).write_bytes(b"%PDF-1.4 ocr result")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+
+    _ocr_normalize(raw, "en")
+
+    state = schema.load_state(schema.state_file_for_raw(raw))
+    st = raw.stat()
+    assert state.sha256 == fsio.sha256_file(raw)  # хэш ПОСЛЕ мутации, не скачанного оригинала
+    assert state.raw_size == st.st_size
+    assert state.raw_mtime_ns == st.st_mtime_ns
+
+
 def test_ocr_normalize_always_calls_subprocess_no_cache_check(monkeypatch: Any, tmp_path: Path) -> None:
     """Без сайдкара нечего и проверять на свежесть — _ocr_normalize безусловно
     вызывает subprocess при каждом вызове (кэш получается «бесплатно» иначе: после

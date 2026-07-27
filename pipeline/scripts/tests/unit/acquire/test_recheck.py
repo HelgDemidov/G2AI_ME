@@ -219,7 +219,7 @@ def test_deep_baseline_falls_back_to_sha_for_born_digital(tmp_path: Path, monkey
 
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 born digital")
-    monkeypatch.setattr(converters, "_was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: False)
     assert recheck.deep_baseline(rec, tmp_path, _state()) == "a" * 64
 
 
@@ -230,7 +230,7 @@ def test_deep_baseline_is_none_for_ocr_normalized_scan(tmp_path: Path, monkeypat
 
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 scanned")
-    monkeypatch.setattr(converters, "_was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: True)
     assert recheck.deep_baseline(rec, tmp_path, _state()) is None
 
 
@@ -535,6 +535,28 @@ def test_drift_triggers_snapshot_once(tmp_path: Path, monkeypatch: Any) -> None:
     recheck.run_recheck(records, tmp_path, user_agent="ua", today=TODAY)
 
     assert len(calls) == 1
+
+
+def test_drift_snapshot_targets_official_alt_when_acquired_via_it(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """spec acquire-convert-seam-hardening §7, В9-код: если добыча шла через
+    official_alt (валидаторы сняты с НЕГО — probe_url_for это отражает), дрейф
+    наблюдён на official_alt_url — SPN обязан снять ТУ же редакцию, не голый
+    rec.source_url, о котором мы вообще ничего не знаем в этом сценарии."""
+    data = valid_record() | {
+        "id": "aa-alt-2026", "official_alt_url": "https://mirror.example.org/doc.pdf",
+    }
+    write_doc(
+        tmp_path, data, raw=b"%PDF",
+        state={"etag": '"v1"', "etag_confirms": 3, "acquisition_method": "official_alt"},
+    )
+    monkeypatch.setattr(recheck, "probe_url", lambda *a, **kw: _probe(etag='"v2"'))
+    calls = _spy_snapshot(monkeypatch)
+
+    recheck.run_recheck(schema.load_records(tmp_path), tmp_path, user_agent="ua", today=TODAY)
+
+    assert calls == ["https://mirror.example.org/doc.pdf"]
 
 
 def test_confidential_drift_does_not_snapshot(tmp_path: Path, monkeypatch: Any) -> None:

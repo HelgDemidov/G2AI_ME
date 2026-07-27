@@ -107,14 +107,6 @@ class SourceFormat(str, Enum):
     xlsx = "xlsx"
 
 
-class TranslationStatus(str, Enum):
-    """Статус перевода (RU/ME — вторая фаза)."""
-
-    not_started = "not_started"
-    in_progress = "in_progress"
-    done = "done"
-
-
 class AcquisitionMethod(str, Enum):
     """Последний-известный канал добычи байтов.
 
@@ -144,6 +136,31 @@ class Sensitivity(str, Enum):
 
     normal = "normal"
     confidential = "confidential"
+
+
+def external_disclosure_allowed(sensitivity: Sensitivity | None) -> bool:
+    """Единый предикат политики «confidential не раскрывается третьим сторонам»
+    (spec acquire-convert-seam-hardening §5, В5).
+
+    До этого спека политика была реализована 8 независимыми точками ветвления в
+    7 модулях (лестница добычи/SPN×2/облачный OCR-VLM/эмбеддинг×3/snowball-цитаты) —
+    булев близнец класса «строка в N копиях»: новый внешний touchpoint должен САМ
+    вспомнить про гейт, а забытая копия не падает, а молча раскрывает. Единая точка
+    не устраняет необходимость КАЖДОЙ точке её вызвать, но делает нарушение видимым
+    (guard-тест: прямое сравнение с ``Sensitivity.confidential`` вне этого модуля —
+    красный тест).
+
+    ``None`` == ``normal``-семантика (best-effort записи слоя discovery, где
+    ``CandidateRecord.sensitivity`` ещё не финализирован триажем) — раскрытие
+    разрешено, симметрично дефолту ``SourceRecord.sensitivity = Sensitivity.normal``.
+
+    Граница политики (важно для корректного применения): «третья сторона» — любой
+    сервис, НЕ являющийся самим издателем документа (облачный API эмбеддинга/OCR/VLM,
+    Wayback CDX/SavePageNow, LLM-стадия snowball). Условный GET recheck-контура к
+    ОФИЦИАЛЬНОМУ URL издателя этим предикатом НЕ гейтится — третьих сторон там нет
+    (spec post-acquisition-lifecycle §1: confidential сознательно остаётся в
+    ротации (a), в отличие от archive-ступени лестницы и SPN)."""
+    return sensitivity is not Sensitivity.confidential
 
 
 class Rights(str, Enum):
@@ -285,7 +302,13 @@ class OperationalState(BaseModel):
     acquisition_checked: _dt.date | None = None
     fidelity: Fidelity | None = None
     retrieved_snapshot_date: _dt.date | None = None
-    translation_status: TranslationStatus = TranslationStatus.not_started
+    # Поля ``translation_status`` здесь БОЛЬШЕ НЕТ (spec acquire-convert-seam-hardening
+    # §10, В14): резервировалось под фазу перевода корпуса, отменённую решением
+    # 2026-07-23 (перевод живёт в точке использования — ad-hoc/JIT, не стадия
+    # конвейера) — ноль читателей/писателей поля к этому моменту. ``extra="forbid"``:
+    # удаление требует одноразовой миграции существующих ``.state.yaml`` (ключ
+    # сериализован в каждом — иначе каждый документ падал бы на планировании), не в
+    # git (файлы локальные, машиннописаные).
     converter_name: str | None = None     # какой конвертер породил текущий doc.md
     converter_version: str | None = None  # его версия (реконсиляция реконверсии)
     # C1 (spec convert-hardening): авто-QA вместо ручного аудита каждого документа —
@@ -327,6 +350,18 @@ class OperationalState(BaseModel):
     # добыча очищает оба поля.
     acquisition_failed: _dt.date | None = None
     acquisition_failure_reason: str | None = None
+    # Backoff отказов КОНВЕРТАЦИИ (spec acquire-convert-seam-hardening §8, В11) —
+    # зеркало пары полей выше, но для стадии convert, у которой backoff не было
+    # вовсе: патологический документ (напр. 2-часовой OCR_TIMEOUT) повторял бы
+    # полную стоимость КАЖДЫЙ прогон, след оставался только в логе. Успешная
+    # конвертация ИЛИ свежая добыча (новые байты = новый вход) очищают все три поля.
+    convert_failed: _dt.date | None = None
+    convert_failure_reason: str | None = None
+    # Конвертер, на котором провалилась ПОСЛЕДНЯЯ попытка — "имя@версия" одним
+    # значением (компактный контекст инвалидации: бамп версии конвертера пробивает
+    # backoff немедленно, детерминированный отказ старой версии не предсказывает
+    # исход новой).
+    convert_failed_converter: str | None = None
 
 
 class SourceRecord(BaseModel):
@@ -472,9 +507,25 @@ def md_file(rec: SourceRecord, root: Path) -> Path:
     return doc_dir(rec, root) / "doc.md"
 
 
+STATE_SIDECAR_NAME = ".state.yaml"
+"""Имя пер-документного операционного сайдкара — единственное определение (spec
+acquire-convert-seam-hardening §1/В12): до этого спека литерал жил в 3 копиях
+(здесь + ``convert/converters.py`` дважды), и расхождение при смене раскладки не
+падало бы, а тихо читало ПУСТОЕ состояние (``load_state`` несуществующего пути
+честно возвращает ``OperationalState()``) — конвертер решил бы, что кэш невалиден,
+и заново заплатил бы за облачный вызов."""
+
+
 def state_file(rec: SourceRecord, root: Path) -> Path:
     """Операционный sidecar: ``<doc_dir>/.state.yaml``."""
-    return doc_dir(rec, root) / ".state.yaml"
+    return doc_dir(rec, root) / STATE_SIDECAR_NAME
+
+
+def state_file_for_raw(raw: Path) -> Path:
+    """Тот же сайдкар, адресованный от пути ``raw.*`` — для точек convert-слоя,
+    у которых есть только файл raw, без записи/корня (``converters._capture_original_sha256``/
+    ``_cached_or_call_cloud``/``_ocr_normalize``)."""
+    return raw.parent / STATE_SIDECAR_NAME
 
 
 STATE_DIRNAME = ".state"

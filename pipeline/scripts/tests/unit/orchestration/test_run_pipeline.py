@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +33,10 @@ from run_pipeline import (
     _do_frontmatter,
     _needs_index_rebuild,
     _read_index_fingerprint,
+    _record_convert_failure,
     _report,
-    _sha256,
+    _run_lock_path,
+    convert_deferred,
     needed_stages,
     process_docs,
     rebuild_index,
@@ -231,11 +234,68 @@ def test_do_convert_refreshes_sha256_when_converter_mutates_raw_in_place(
     raw = schema.raw_file(rec, tmp_path)
     assert raw is not None
     state = schema.load_state(schema.state_file(rec, tmp_path))
-    assert state.sha256 == _sha256(raw)
+    assert state.sha256 == fsio.sha256_file(raw)
     assert state.raw_size == raw.stat().st_size
     assert state.raw_mtime_ns == raw.stat().st_mtime_ns
     # реконсиляция после мутации не должна ложно требовать передобычу
     assert Stage.download not in needed_stages(rec, tmp_path)
+
+
+class _FakeOcrPdf:
+    """Минимальная замена pdfplumber.open для _ocr_normalize — использует только
+    len(pdf.pages) (потолок OCR_PAGE_WARN)."""
+
+    def __init__(self, n_pages: int) -> None:
+        self.pages = [object()] * n_pages
+
+    def __enter__(self) -> "_FakeOcrPdf":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+def test_needed_stages_no_download_after_ocr_normalize_crash_window(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """spec acquire-convert-seam-hardening §1, В1 — герметичный репро краш-окна
+    аудита (docs/pipeline/audit/acquire_convert_seam_review_2026-07-27.md, репро A):
+    прерывание МЕЖДУ OCR-мутацией raw и завершением _do_convert (kill -9/OOM —
+    документированный живой класс машины). Здесь имитируется вызовом
+    converters._ocr_normalize НАПРЯМУЮ, минуя _do_convert целиком — doc.md
+    так и не появляется, converter_name/version не проставляются, ровно как
+    при реальном краше. До фикса needed_stages увидел бы sha скачанного
+    оригинала при уже-мутированном raw и спланировал бы передобычу поверх
+    выполненной OCR-работы."""
+    rec = make()
+    original_bytes = b"%PDF-1.4 acquired original scan bytes"
+    _place(rec, tmp_path, raw=original_bytes)
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    st = raw.stat()
+    # Состояние, как его оставил _do_download при добыче — ДО OCR-мутации.
+    schema.save_state(
+        schema.state_file(rec, tmp_path),
+        schema.OperationalState(
+            sha256=hashlib.sha256(original_bytes).hexdigest(),
+            raw_size=st.st_size, raw_mtime_ns=st.st_mtime_ns,
+        ),
+    )
+
+    monkeypatch.setattr("convert.converters.shutil.which", lambda name: "/usr/bin/ocrmypdf")
+    monkeypatch.setattr("convert.converters._check_langs_available", lambda langs: None)
+    monkeypatch.setattr("convert.converters.pdfplumber.open", lambda path: _FakeOcrPdf(1))
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        Path(cmd[-1]).write_bytes(b"%PDF-1.4 ocr-mutated bytes with text layer")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("convert.converters.subprocess.run", fake_run)
+
+    converters._ocr_normalize(raw, "en")  # мутация происходит; _do_convert НИКОГДА не вызывается — «краш»
+
+    assert Stage.download not in needed_stages(rec, tmp_path)
+    assert Stage.convert in needed_stages(rec, tmp_path)  # конвертация честно доигрывается заново
 
 
 def test_do_convert_passes_record_language_to_converter(tmp_path: Path, monkeypatch: Any) -> None:
@@ -528,13 +588,18 @@ def test_do_download_skips_snapshot_for_confidential(tmp_path: Path, monkeypatch
         (schema.AcquisitionMethod.official_alt, schema.Fidelity.rehost),
         (schema.AcquisitionMethod.manual, schema.Fidelity.manual),
         (schema.AcquisitionMethod.archive, schema.Fidelity.archived_snapshot),
+        (schema.AcquisitionMethod.browser, schema.Fidelity.rendered),
     ],
 )
 def test_do_download_skips_snapshot_for_non_own_edition(
     tmp_path: Path, monkeypatch: Any, method: schema.AcquisitionMethod, fidelity: schema.Fidelity
 ) -> None:
     """Снимать нечего: rehost — чужой хост, manual — файл из папки загрузок,
-    archived_snapshot — снимок уже существует (им мы и добыли документ)."""
+    archived_snapshot — снимок уже существует (им мы и добыли документ), rendered —
+    ступень достигается ТОЛЬКО когда WAF отбил curl (spec acquire-convert-seam-
+    hardening §7, В8): датацентровый краулер Wayback почти наверняка получит тот же
+    челлендж — страховка объявляется неприменимой, а не имитируется ложной пометкой
+    snapshot_requested."""
     rec = make()
     calls = _spy_snapshot(monkeypatch)
     monkeypatch.setattr(
@@ -545,6 +610,7 @@ def test_do_download_skips_snapshot_for_non_own_edition(
     _do_download(rec, tmp_path, pause=0)
 
     assert calls == []
+    assert schema.load_state(schema.state_file(rec, tmp_path)).snapshot_requested is None
 
 
 def test_do_download_snapshot_is_idempotent_for_unchanged_bytes(tmp_path: Path, monkeypatch: Any) -> None:
@@ -582,6 +648,83 @@ def test_do_download_snapshot_refires_when_bytes_changed(tmp_path: Path, monkeyp
         _do_download(rec, tmp_path, pause=0)
 
     assert calls == [rec.source_url, rec.source_url]
+
+
+def test_do_download_resets_original_sha256_when_bytes_change(tmp_path: Path, monkeypatch: Any) -> None:
+    """spec acquire-convert-seam-hardening §2, В2 — живой репро аудита (docs/pipeline/audit/
+    acquire_convert_seam_review_2026-07-27.md, репро B): original_sha256 захватывается
+    ТОЛЬКО once-if-None (converters._capture_original_sha256) и раньше не сбрасывался
+    передобычей вовсе — после --force --only (путь, который сам recheck рекомендует для
+    drift) поле навсегда несло хэш ПРЕЖНЕЙ редакции, --recheck-deep врал бы вечным drift
+    даже на наших же байтах. Свежескачанный raw сам есть новый издательский оригинал —
+    поле обязано сброситься в None (перезахватится честно при следующей OCR-нормализации)."""
+    rec = make()
+    _place(rec, tmp_path, state={"original_sha256": "a" * 64})  # хэш от прежнего скана-редакции
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=b"%PDF-1.4 new edition bytes",
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert schema.load_state(schema.state_file(rec, tmp_path)).original_sha256 is None
+
+
+def test_do_download_preserves_original_sha256_when_bytes_unchanged(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Обратная сторона: --force на ТЕХ ЖЕ байтах (sha256 совпал с previous_sha) не
+    должен сбрасывать original_sha256 — нечего перезахватывать, поле остаётся валидным."""
+    rec = make()
+    body = b"%PDF-1.4 same bytes"
+    _place(rec, tmp_path, state={"original_sha256": "b" * 64, "sha256": hashlib.sha256(body).hexdigest()})
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=body,
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    assert schema.load_state(schema.state_file(rec, tmp_path)).original_sha256 == "b" * 64
+
+
+def test_do_download_reset_unblocks_deep_baseline_from_stale_edition(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Сквозной регресс репро B: до фикса --recheck-deep после передобычи сравнивал бы
+    ответ издателя со СТАРЫМ original_sha256 (edition1) и получал бы вечный ложный
+    drift даже на наших же байтах (edition2). После сброса в _do_download
+    recheck.deep_baseline честно падает на sha ТЕКУЩЕГО (ещё не OCR-нормализованного)
+    raw — свежую редакцию, а не хвост от предыдущей."""
+    from acquire import recheck
+
+    rec = make()
+    _place(rec, tmp_path, state={"original_sha256": "1" * 64})  # хэш прежней (edition1) редакции
+    new_body = b"%PDF-1.4 edition-2 corrected publisher bytes"
+    monkeypatch.setattr(
+        "acquire.acquisition.run_ladder",
+        _fake_ladder(
+            schema.AcquisitionMethod.direct, schema.Fidelity.live,
+            ClassifiedResponse(AcquisitionOutcome.ok, 200, "valid PDF"), body=new_body,
+        ),
+    )
+
+    _do_download(rec, tmp_path, pause=0)
+
+    # deep_baseline открывает raw через pdfplumber, только если original_sha256 уже None
+    # (первая ветка функции) — фейковые байты не обязаны быть валидным PDF, born-digital
+    # путь детерминируется явным патчем, тем же приёмом, что test_deep_baseline_falls_back_to_sha_for_born_digital.
+    monkeypatch.setattr("convert.converters.was_ocr_normalized", lambda raw: False)
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    baseline = recheck.deep_baseline(rec, tmp_path, state)
+    assert baseline == hashlib.sha256(new_body).hexdigest()  # НЕ протухший edition1-хэш
+    assert baseline == state.sha256
 
 
 def test_do_download_survives_snapshot_failure(tmp_path: Path, monkeypatch: Any) -> None:
@@ -761,6 +904,211 @@ def test_backoff_does_not_defer_document_that_already_has_raw(tmp_path: Path) ->
     _place(rec, tmp_path, raw=b"%PDF-1.4 existing", state=_failed_state(1))
     stages = needed_stages(rec, tmp_path)
     assert Stage.download not in stages and Stage.convert in stages
+
+
+# --- backoff отказов конвертации (spec acquire-convert-seam-hardening §8, В11) ---
+
+
+def _pdf_converter_key() -> str:
+    conv = converters._CONVERTERS["pdf"]
+    return f"{conv.name}@{conv.version}"
+
+
+def _state_with(**kw: Any) -> schema.OperationalState:
+    return schema.OperationalState.model_validate({"sha256": "a" * 64, **kw})
+
+
+def test_convert_deferred_fresh_failure_same_converter_same_raw() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", True) is True
+
+
+def test_convert_deferred_pierced_by_force() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", True, force=True) is False
+
+
+def test_convert_deferred_pierced_by_ignore_backoff() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", True, ignore_backoff=True) is False
+
+
+def test_convert_deferred_pierced_by_converter_version_bump() -> None:
+    """Детерминированный отказ старой версии не предсказывает исход новой —
+    бамп версии конвертера пробивает backoff немедленно."""
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@7", True) is False
+
+
+def test_convert_deferred_pierced_by_raw_change() -> None:
+    state = _state_with(convert_failed=dt.date.today(), convert_failed_converter="pdf@6")
+    assert convert_deferred(state, "pdf@6", False) is False
+
+
+def test_convert_deferred_expired_window_pierces() -> None:
+    state = _state_with(
+        convert_failed=dt.date.today() - dt.timedelta(days=RETRY_BACKOFF_DAYS),
+        convert_failed_converter="pdf@6",
+    )
+    assert convert_deferred(state, "pdf@6", True) is False
+
+
+def test_convert_deferred_no_prior_failure_pierces() -> None:
+    assert convert_deferred(_state_with(), "pdf@6", True) is False
+
+
+def test_record_convert_failure_writes_date_reason_and_converter(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _record_convert_failure(rec, tmp_path, RuntimeError("ocrmypdf timeout"))
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed == dt.date.today()
+    assert state.convert_failure_reason == "ocrmypdf timeout"
+    assert state.convert_failed_converter == _pdf_converter_key()
+
+
+def test_record_convert_failure_truncates_long_reason(tmp_path: Path) -> None:
+    from run_pipeline import _FAILURE_REASON_MAX
+
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+    _record_convert_failure(rec, tmp_path, RuntimeError("x" * (_FAILURE_REASON_MAX + 100)))
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failure_reason is not None
+    assert len(state.convert_failure_reason) == _FAILURE_REASON_MAX
+
+
+def test_record_convert_failure_without_raw_leaves_converter_key_none(tmp_path: Path) -> None:
+    rec = make()  # ни raw, ни папки документа вовсе нет
+    _record_convert_failure(rec, tmp_path, RuntimeError("нет raw-файла для конвертации"))
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed == dt.date.today()
+    assert state.convert_failed_converter is None
+
+
+def _convert_failed_state(days_ago: int, *, converter_key: str | None = None) -> dict[str, Any]:
+    failed = dt.date.today() - dt.timedelta(days=days_ago)
+    return {
+        "convert_failed": failed.isoformat(),
+        "convert_failure_reason": "ocrmypdf timeout",
+        "convert_failed_converter": converter_key or _pdf_converter_key(),
+    }
+
+
+def test_needed_stages_defers_convert_after_fresh_failure(tmp_path: Path) -> None:
+    """Живой сценарий В11: первая попытка конвертации патологического скана
+    провалилась сегодня — raw присутствует и стабилен (нет download), doc.md так и
+    не появился (`not md.exists()` иначе бы требовал Stage.convert). Следующее
+    планирование НЕ повторяет заведомо дорогую попытку в тот же день."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _adopt_untracked_raw(rec, tmp_path)  # заполняет guard-тройку под raw_stat_matches
+    state_path = schema.state_file(rec, tmp_path)
+    state = schema.load_state(state_path)
+    state.convert_failed = dt.date.today()
+    state.convert_failed_converter = _pdf_converter_key()
+    schema.save_state(state_path, state)
+
+    assert needed_stages(rec, tmp_path) == []
+
+
+def test_needed_stages_convert_backoff_pierced_by_raw_stat_mismatch(tmp_path: Path) -> None:
+    """Изолирует raw_stat_matches=False-ветку convert_deferred от download-путя:
+    touch БЕЗ смены содержимого меняет mtime (guard-тройка не совпадёт), но sha256
+    остаётся прежним -> Stage.download сам по себе НЕ требуется (в отличие от замены
+    байт, которая пробила бы backoff через download-need, не через convert_deferred).
+    Детерминированный отказ на другом (по стату) входе мог бы не повториться —
+    backoff пробивается немедленно."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _adopt_untracked_raw(rec, tmp_path)
+    state_path = schema.state_file(rec, tmp_path)
+    state = schema.load_state(state_path)
+    state.convert_failed = dt.date.today()
+    state.convert_failed_converter = _pdf_converter_key()
+    schema.save_state(state_path, state)
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.touch()  # тот же контент, новый mtime -> guard-тройка не совпадёт
+
+    stages = needed_stages(rec, tmp_path)
+    assert Stage.download not in stages  # sha всё ещё совпадает — download НЕ нужен
+    assert Stage.convert in stages       # но stat разошёлся -> backoff пробит
+
+
+def test_needed_stages_convert_backoff_pierced_by_force(tmp_path: Path) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+    _adopt_untracked_raw(rec, tmp_path)
+    state_path = schema.state_file(rec, tmp_path)
+    state = schema.load_state(state_path)
+    state.convert_failed = dt.date.today()
+    state.convert_failed_converter = _pdf_converter_key()
+    schema.save_state(state_path, state)
+
+    assert Stage.convert in needed_stages(rec, tmp_path, force=True)
+
+
+def test_process_docs_records_convert_failure_and_defers_on_next_planning(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Сквозной регресс §8: process_docs фиксирует провал стадии convert, а
+    СЛЕДУЮЩЕЕ планирование того же документа честно откладывает конвертацию —
+    класс waiting_convert, не error, сводка несёт отдельную строку ⏳."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 pathological scan")
+
+    def boom(raw: Path, out: Path, language: str | None) -> None:
+        raise RuntimeError("ocrmypdf timeout after 7200s")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(boom))
+
+    first = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+    assert first[0].error is not None and first[0].error.startswith("convert:")
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed == dt.date.today()
+    assert state.convert_failed_converter == "pdf@test"
+
+    second = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+    assert second[0].waiting_convert is not None
+    assert second[0].error is None and second[0].up_to_date is False
+
+    rc = _report(second)
+    assert rc == 0  # ждущая конвертация — НЕ ошибка прогона
+
+
+def test_process_docs_report_shows_convert_waiting_class(tmp_path: Path, caplog: Any) -> None:
+    rec = make()
+    _place(rec, tmp_path, raw=b"%PDF-1.4 scan", state=_convert_failed_state(1))
+
+    with caplog.at_level("INFO", logger="run_pipeline"):
+        results = process_docs([rec], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+        _report(results)
+
+    assert results[0].waiting_convert is not None
+    assert "конвертация отложена: 1" in caplog.text
+
+
+def test_do_convert_success_clears_prior_failure_trio(tmp_path: Path, monkeypatch: Any) -> None:
+    """Успешная конвертация — один из двух путей разрешения backoff'а (второй —
+    свежая добыча, spec §2/В2 — _do_download сбрасывает трио аналогично)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", state=_convert_failed_state(1))
+
+    def fake_convert(raw: Path, out: Path, language: str | None) -> None:
+        out.write_text("body", encoding="utf-8")
+
+    monkeypatch.setitem(converters._CONVERTERS, "pdf", _fake_converter(fake_convert))
+    _do_convert(rec, tmp_path)
+
+    state = schema.load_state(schema.state_file(rec, tmp_path))
+    assert state.convert_failed is None
+    assert state.convert_failure_reason is None
+    assert state.convert_failed_converter is None
 
 
 def test_process_docs_reports_waiting_class_not_error(tmp_path: Path, caplog: Any) -> None:
@@ -980,6 +1328,80 @@ def test_adopt_untracked_raw_does_not_backfill_when_sha_mismatches(tmp_path: Pat
     assert Stage.download in needed_stages(rec, tmp_path)  # расхождение всё равно поймано
 
 
+# --- stat-refresh при совпавшем sha (spec acquire-convert-seam-hardening §9, В10) ---
+
+
+def test_adopt_untracked_raw_refreshes_stat_when_content_unchanged(tmp_path: Path) -> None:
+    """Touched-but-identical raw (бэкап/restore, touch): guard-тройка ПЕРЕУСТАНАВЛИВАЕТСЯ
+    под текущий stat, раз содержимое (sha) не изменилось — без этого needed_stages
+    пересчитывала бы полный sha256 на КАЖДОМ планировании навсегда."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"stable content")
+    _adopt_untracked_raw(rec, tmp_path)  # первое усыновление: guard-тройка зафиксирована
+    before = schema.load_state(schema.state_file(rec, tmp_path))
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.touch()  # тот же контент, новый mtime
+
+    _adopt_untracked_raw(rec, tmp_path)
+
+    after = schema.load_state(schema.state_file(rec, tmp_path))
+    st = raw.stat()
+    assert after.raw_mtime_ns == st.st_mtime_ns
+    assert after.raw_mtime_ns != before.raw_mtime_ns  # действительно переустановлена
+    assert after.sha256 == before.sha256  # контент/хэш не тронуты
+
+
+def test_adopt_untracked_raw_refresh_avoids_sha_recompute_on_next_planning(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Регресс основной находки В10: после переустановки guard-тройки следующее
+    needed_stages НЕ пересчитывает sha256 — ровно расход, от которого stat-guard
+    защищает (двойник test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"stable content", md=_compose_md(rec, ""))
+    _adopt_untracked_raw(rec, tmp_path)
+    _stamp_converter_state(rec, tmp_path)
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.touch()
+    schema.md_file(rec, tmp_path).touch()  # md тоже свежее raw — иначе «stale» сама планирует convert
+    _adopt_untracked_raw(rec, tmp_path)  # переустанавливает guard-тройку под новый stat
+
+    calls = {"n": 0}
+    real_sha256 = fsio.sha256_file
+
+    def counting_sha256(path: Path) -> str:
+        calls["n"] += 1
+        return real_sha256(path)
+
+    monkeypatch.setattr("core.fsio.sha256_file", counting_sha256)
+
+    assert needed_stages(rec, tmp_path) == []
+    assert calls["n"] == 0  # guard-тройка актуальна — полное чтение не потребовалось
+
+
+def test_adopt_untracked_raw_does_not_refresh_when_sha_mismatches(tmp_path: Path) -> None:
+    """Sha НЕ совпал — НЕ трогаем: это кандидат на передобычу, порча не получает
+    благословения (needed_stages сама поймает расхождение)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"original content")
+    _adopt_untracked_raw(rec, tmp_path)
+    before = schema.load_state(schema.state_file(rec, tmp_path))
+
+    raw = schema.raw_file(rec, tmp_path)
+    assert raw is not None
+    raw.write_bytes(b"corrupted, DIFFERENT content, different size")  # реальная порча
+
+    _adopt_untracked_raw(rec, tmp_path)
+
+    after = schema.load_state(schema.state_file(rec, tmp_path))
+    assert after.raw_size == before.raw_size  # НЕ переустановлена
+    assert after.raw_mtime_ns == before.raw_mtime_ns
+    assert Stage.download in needed_stages(rec, tmp_path)  # расхождение поймано honestly
+
+
 def test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -989,13 +1411,13 @@ def test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged(
     _stamp_converter_state(rec, tmp_path)  # + converter-поля, сохраняя guard-поля
 
     calls = {"n": 0}
-    real_sha256 = _sha256
+    real_sha256 = fsio.sha256_file
 
     def counting_sha256(path: Path) -> str:
         calls["n"] += 1
         return real_sha256(path)
 
-    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+    monkeypatch.setattr("core.fsio.sha256_file", counting_sha256)
 
     assert needed_stages(rec, tmp_path) == []
     assert calls["n"] == 0  # stat совпал — полное чтение файла не потребовалось
@@ -1012,13 +1434,13 @@ def test_needed_stages_stat_guard_recomputes_when_mtime_changed(
     raw.touch()  # тот же контент, новый mtime -> guard не совпадёт
 
     calls = {"n": 0}
-    real_sha256 = _sha256
+    real_sha256 = fsio.sha256_file
 
     def counting_sha256(path: Path) -> str:
         calls["n"] += 1
         return real_sha256(path)
 
-    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+    monkeypatch.setattr("core.fsio.sha256_file", counting_sha256)
 
     needed_stages(rec, tmp_path)
     assert calls["n"] == 1  # stat разошёлся -> честно перечитан
@@ -1036,6 +1458,86 @@ def test_corrupted_raw_after_adoption_triggers_download(tmp_path: Path) -> None:
     raw.write_bytes(b"corrupted, different content, different size")
 
     assert Stage.download in needed_stages(rec, tmp_path)
+
+
+# --- инвариант формата: расширение raw.* == rec.source_format
+# (spec acquire-convert-seam-hardening §4, В4) ---
+
+
+def test_needed_stages_raises_on_format_mismatch(tmp_path: Path) -> None:
+    """Живой репро аудита (докс/pipeline/audit/acquire_convert_seam_review_2026-07-27.md,
+    репро C): rec.source_format=pdf (дефолт), но на диске raw.html — рассинхрон,
+    возможный после ручной замены файла/прерванного флоу смены формата. Громкий
+    отказ ЭТОГО документа (изоляция — забота process_docs), а не молчаливая
+    конвертация «по файлу»."""
+    rec = make()  # source_format дефолтит pdf
+    d = schema.doc_dir(rec, tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "raw.html").write_bytes(b"<html><body>not a pdf</body></html>")
+    with pytest.raises(RuntimeError, match="raw имеет расширение '.html'"):
+        needed_stages(rec, tmp_path)
+
+
+def test_needed_stages_format_mismatch_is_isolated_per_document(tmp_path: Path) -> None:
+    """Регресс: рассинхрон формата ОДНОГО документа не должен рвать весь батч —
+    process_docs уже изолирует планирование (test_planning_failure_isolated_from_batch),
+    needed_stages лишь обязана поднять исключение, а не упасть иначе (AttributeError и
+    т.п.) на самой проверке."""
+    broken = make(id="broken-fmt-2026", entity_id="bb")
+    d = schema.doc_dir(broken, tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "raw.html").write_bytes(b"<html></html>")
+
+    ok = make(id="ok-doc-2026", entity_id="oo")
+    _place(ok, tmp_path, raw=b"pdf", md=_compose_md(ok, ""), state=_current_converter_state())
+
+    results = process_docs([broken, ok], tmp_path, force=False, dry_run=False, no_download=False, pause=0)
+
+    r_broken = next(r for r in results if r.doc_id == "broken-fmt-2026")
+    r_ok = next(r for r in results if r.doc_id == "ok-doc-2026")
+    assert r_broken.error is not None and r_broken.error.startswith("planning:")
+    assert r_ok.up_to_date is True
+
+
+def test_needed_stages_format_match_is_unaffected(tmp_path: Path) -> None:
+    """Консистентная запись (расширение == source_format) продолжает работать как
+    раньше — регресс-guard на отсутствие ложных срабатываний нового инварианта."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf")
+    assert needed_stages(rec, tmp_path) == [Stage.convert, Stage.frontmatter]
+
+
+def test_needed_stages_format_invariant_skipped_when_raw_absent(tmp_path: Path) -> None:
+    """Документ без raw вовсе (ещё не скачан) — новый инвариант неприменим, обычная
+    реконсиляция (Stage.download) отрабатывает как раньше."""
+    rec = make()
+    assert needed_stages(rec, tmp_path) == [Stage.download, Stage.convert, Stage.frontmatter]
+
+
+def test_no_download_hint_mentions_sha_mismatch_when_raw_present(tmp_path: Path) -> None:
+    """spec §4, В4: подсказка --no-download отличается, когда raw физически ЕСТЬ
+    (сознательная замена/порча — не «скачайте вручную» о файле, который уже на месте)."""
+    rec = make()
+    _place(rec, tmp_path, raw=b"pdf", state={"sha256": "0" * 64})  # sha заведомо не совпадёт
+
+    results = process_docs(
+        [rec], tmp_path, force=False, dry_run=False, no_download=True, pause=0
+    )
+
+    assert results[0].error is not None
+    assert "не совпадает с записанным sha256" in results[0].error
+    assert "--force --only" in results[0].error
+
+
+def test_no_download_hint_unchanged_when_raw_absent(tmp_path: Path) -> None:
+    rec = make()  # раw вовсе нет
+
+    results = process_docs(
+        [rec], tmp_path, force=False, dry_run=False, no_download=True, pause=0
+    )
+
+    assert results[0].error is not None
+    assert "скачайте raw вручную" in results[0].error
 
 
 # --- дефолты API-first: --embed-backend / изоляция отказа индексной стадии
@@ -1433,6 +1935,46 @@ def test_main_dry_run_logs_index_not_touched(tmp_path: Path, caplog: Any) -> Non
     assert any("dry-run" in r.message for r in caplog.records)
 
 
+# --- эксклюзивный лок mutating-прогонов (spec acquire-convert-seam-hardening §3, В3) ---
+
+
+def test_main_dry_run_never_touches_lock_file(tmp_path: Path) -> None:
+    """--dry-run обязан быть no-op и не мешать живому прогону: файл лока не создаётся
+    вовсе (contextlib.nullcontext, не fsio.exclusive_flock)."""
+    sources = tmp_path / "sources"
+    assert main([str(sources), "--dry-run"]) == 0
+    assert not _run_lock_path(sources).exists()
+
+
+def test_main_returns_one_when_another_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
+    sources = tmp_path / "sources"
+    lock_path = _run_lock_path(sources)
+    with fsio.exclusive_flock(lock_path):
+        with caplog.at_level("ERROR", logger="run_pipeline"):
+            rc = main([str(sources), "--db", str(tmp_path / "c.db")])
+    assert rc == 1
+    assert any("уже занято" in r.message for r in caplog.records)
+
+
+def test_main_recheck_returns_one_when_batch_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
+    """--recheck и штатный прогон стадий — писатели ОДНОГО и того же .state.yaml,
+    поэтому делят один лок-файл."""
+    sources = tmp_path / "sources"
+    with fsio.exclusive_flock(_run_lock_path(sources)):
+        with caplog.at_level("ERROR", logger="run_pipeline"):
+            rc = main([str(sources), "--recheck"])
+    assert rc == 1
+    assert any("уже занято" in r.message for r in caplog.records)
+
+
+def test_main_normal_run_releases_lock_for_the_next_one(tmp_path: Path) -> None:
+    """Лок не остаётся протухшим: два последовательных (не параллельных) прогона
+    оба успевают отработать."""
+    sources = tmp_path / "sources"
+    assert main([str(sources), "--db", str(tmp_path / "c.db")]) == 0
+    assert main([str(sources), "--db", str(tmp_path / "c.db")]) == 0
+
+
 # --- _embed_namespace / _report_unembedded: напоминание об отставании векторного слоя ---
 
 
@@ -1513,7 +2055,7 @@ def test_scan_fallback_counts_counts_cloud_allowed_scan_without_model_as_fallbac
     write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
@@ -1528,7 +2070,7 @@ def test_scan_fallback_counts_counts_confidential_scan_separately(tmp_path: Path
     write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
 
     assert scan_fallback_counts([rec], sources) == (0, 1)
@@ -1545,7 +2087,7 @@ def test_scan_fallback_counts_ignores_scan_with_successful_cloud_ocr(tmp_path: P
     )
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
 
     assert scan_fallback_counts([rec], sources) == (0, 0)
 
@@ -1560,7 +2102,7 @@ def test_scan_fallback_counts_ignores_born_digital(tmp_path: Path, monkeypatch: 
     write_doc(sources, rec_data, raw=b"%PDF fake digital", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: False)
 
     assert scan_fallback_counts([rec], sources) == (0, 0)
 
@@ -1579,7 +2121,7 @@ def test_scan_fallback_counts_ignores_missing_raw(tmp_path: Path) -> None:
 def test_scan_fallback_counts_skips_non_pdf_source_format(tmp_path: Path) -> None:
     """Регрессия на живой краш (реальный корпус, eu-ai-act-2024, raw.html):
     OCR-путь существует только для PDF — без гейта по source_format
-    _was_ocr_normalized безусловно открывает файл через pdfplumber и падает
+    was_ocr_normalized безусловно открывает файл через pdfplumber и падает
     (PdfminerException) на не-PDF содержимом. write_doc пишет raw.* с
     расширением .pdf независимо от переданных байт — html-файл дописан
     вручную, чтобы честно воспроизвести форму реального документа."""
@@ -1594,6 +2136,51 @@ def test_scan_fallback_counts_skips_non_pdf_source_format(tmp_path: Path) -> Non
     assert scan_fallback_counts([rec], sources) == (0, 0)  # не падает, тихо пропускает
 
 
+def test_scan_fallback_counts_survives_record_source_format_desync_with_actual_file(
+    tmp_path: Path,
+) -> None:
+    """spec acquire-convert-seam-hardening §4, В4 — герметичный репро репро C аудита:
+    ЗАПИСЬ заявляет source_format=pdf (дефолт), но ФАЙЛ на диске — raw.html (рассинхрон,
+    возможный после ручной замены). Существующий гейт по rec.source_format (см. тест
+    выше) НЕ ловит этот случай — он смотрит на курируемое поле, не на файл; новый
+    гейт по raw.suffix закрывает именно эту дыру."""
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    rec_data = {**valid_record(), "id": "sg-desync-2026"}  # source_format=pdf по дефолту
+    doc_dir = write_doc(sources, rec_data)
+    (doc_dir / "raw.html").write_bytes(b"<html><body>not actually a pdf</body></html>")
+    rec = SourceRecord.model_validate(rec_data)
+
+    assert scan_fallback_counts([rec], sources) == (0, 0)  # не падает (репро C: было PdfminerException)
+
+
+def test_scan_fallback_counts_isolates_ambiguous_raw_per_record(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Броня per-record try/except (§4): папка с двумя raw.* роняет schema.raw_file
+    (ValueError) на ОДНОМ документе — сводка по ОСТАЛЬНЫМ записям обязана честно
+    досчитаться (не просто «не упасть», а реально учесть вклад здорового документа —
+    иначе broken-запись могла бы молча проглотить и чужой вклад тоже)."""
+    from run_pipeline import scan_fallback_counts
+
+    sources = tmp_path / "sources"
+    broken_data = {**valid_record(), "id": "sg-broken-2026"}
+    broken_dir = write_doc(sources, broken_data, raw=b"%PDF fake", raw_ext="pdf")
+    (broken_dir / "raw.html").write_bytes(b"<html></html>")  # второй raw.* -> raw_file ValueError
+    broken_rec = SourceRecord.model_validate(broken_data)
+
+    ok_data = {**valid_record(), "id": "sg-ok-2026"}
+    write_doc(sources, ok_data, raw=b"%PDF fake scan", state={})
+    ok_rec = SourceRecord.model_validate(ok_data)
+
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    assert scan_fallback_counts([broken_rec, ok_rec], sources) == (1, 0)  # только ok_rec посчитан
+
+
 def test_report_scan_fallback_logs_warning_for_fallback_and_info_for_confidential(
     tmp_path: Path, monkeypatch: Any, caplog: Any
 ) -> None:
@@ -1606,7 +2193,7 @@ def test_report_scan_fallback_logs_warning_for_fallback_and_info_for_confidentia
     write_doc(sources, conf_data, raw=b"%PDF fake", state={})
     records = [SourceRecord.model_validate(fb_data), SourceRecord.model_validate(conf_data)]
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 

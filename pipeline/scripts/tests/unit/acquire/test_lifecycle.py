@@ -147,6 +147,23 @@ def test_request_snapshot_returns_false_on_curl_error(monkeypatch: Any) -> None:
     assert _REAL_REQUEST_SNAPSHOT("https://example.gov/doc.pdf") is False
 
 
+def test_request_snapshot_quotes_url_with_space(monkeypatch: Any) -> None:
+    """spec acquire-convert-seam-hardening §7, В9-код: пробел/не-URL-символ в
+    query-строке ломал бы итоговый SPN-запрос без квотинга — argv-элемент, не
+    shell, поэтому эффект «отказ», не инъекция, но всё равно ломающий страховку."""
+    calls = _capture_curl(monkeypatch)
+    _REAL_REQUEST_SNAPSHOT("https://example.gov/doc?title=two words")
+    assert calls[0][-1] == "https://web.archive.org/save/https://example.gov/doc?title=two%20words"
+
+
+def test_request_snapshot_preserves_plain_url_unchanged(monkeypatch: Any) -> None:
+    """Квотинг сохраняет структурные символы САМОГО url (:/?&=#%) — типовой URL без
+    пробелов проходит байт-в-байт, регресс-guard на test_request_snapshot_hits_savepagenow_endpoint."""
+    calls = _capture_curl(monkeypatch)
+    _REAL_REQUEST_SNAPSHOT("https://example.gov/path?a=1&b=2#frag")
+    assert calls[0][-1] == "https://web.archive.org/save/https://example.gov/path?a=1&b=2#frag"
+
+
 def test_request_snapshot_survives_missing_curl(monkeypatch: Any) -> None:
     def boom(cmd: list[str], **kw: Any) -> None:
         raise OSError("curl не найден")

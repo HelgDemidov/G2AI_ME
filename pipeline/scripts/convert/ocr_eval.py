@@ -319,11 +319,11 @@ def run_tesseract(raw: Path, workdir: Path) -> dict[int, str] | None:
     которым нужен раздельный сетевой вызов на каждую конфигурацию, здесь
     текст уже физически лежит в PDF и резать на отдельные файлы незачем.
 
-    ``None``, если у документа нет текст-слоя (``converters._was_ocr_normalized``
-    вернул ``False``) — кандидат пропускается с сообщением, не роняет прогон
-    (spec §3)."""
+    ``None``, если у документа нет текст-слоя (``converters.was_ocr_normalized`` —
+    публичный алиас, spec acquire-convert-seam-hardening §10, В13 — вернул
+    ``False``) — кандидат пропускается с сообщением, не роняет прогон (spec §3)."""
     copy = _copy_raw(raw, workdir)
-    if not converters._was_ocr_normalized(copy):
+    if not converters.was_ocr_normalized(copy):
         return None
     with pdfplumber.open(copy) as pdf:
         return {i: (page.extract_text() or "") for i, page in enumerate(pdf.pages, start=1)}
@@ -379,7 +379,7 @@ def _tesseract_result(raw: Path, workdir: Path, pages: list[int]) -> CandidateRe
     if pages_map is None:
         return CandidateResult(
             name="tesseract", document_text="", page_text={}, scores=[],
-            failed="raw не нормализован OCR (нет текст-слоя, converters._was_ocr_normalized=False)",
+            failed="raw не нормализован OCR (нет текст-слоя, converters.was_ocr_normalized=False)",
         )
     document_text = "\n\n".join(pages_map[p] for p in sorted(pages_map))
     page_text = {p: pages_map[p] for p in pages if p in pages_map}
