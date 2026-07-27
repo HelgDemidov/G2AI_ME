@@ -36,7 +36,6 @@ from run_pipeline import (
     _record_convert_failure,
     _report,
     _run_lock_path,
-    _sha256,
     convert_deferred,
     needed_stages,
     process_docs,
@@ -235,7 +234,7 @@ def test_do_convert_refreshes_sha256_when_converter_mutates_raw_in_place(
     raw = schema.raw_file(rec, tmp_path)
     assert raw is not None
     state = schema.load_state(schema.state_file(rec, tmp_path))
-    assert state.sha256 == _sha256(raw)
+    assert state.sha256 == fsio.sha256_file(raw)
     assert state.raw_size == raw.stat().st_size
     assert state.raw_mtime_ns == raw.stat().st_mtime_ns
     # реконсиляция после мутации не должна ложно требовать передобычу
@@ -721,7 +720,7 @@ def test_do_download_reset_unblocks_deep_baseline_from_stale_edition(
     # deep_baseline открывает raw через pdfplumber, только если original_sha256 уже None
     # (первая ветка функции) — фейковые байты не обязаны быть валидным PDF, born-digital
     # путь детерминируется явным патчем, тем же приёмом, что test_deep_baseline_falls_back_to_sha_for_born_digital.
-    monkeypatch.setattr("convert.converters._was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr("convert.converters.was_ocr_normalized", lambda raw: False)
     state = schema.load_state(schema.state_file(rec, tmp_path))
     baseline = recheck.deep_baseline(rec, tmp_path, state)
     assert baseline == hashlib.sha256(new_body).hexdigest()  # НЕ протухший edition1-хэш
@@ -1371,13 +1370,13 @@ def test_adopt_untracked_raw_refresh_avoids_sha_recompute_on_next_planning(
     _adopt_untracked_raw(rec, tmp_path)  # переустанавливает guard-тройку под новый stat
 
     calls = {"n": 0}
-    real_sha256 = _sha256
+    real_sha256 = fsio.sha256_file
 
     def counting_sha256(path: Path) -> str:
         calls["n"] += 1
         return real_sha256(path)
 
-    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+    monkeypatch.setattr("core.fsio.sha256_file", counting_sha256)
 
     assert needed_stages(rec, tmp_path) == []
     assert calls["n"] == 0  # guard-тройка актуальна — полное чтение не потребовалось
@@ -1412,13 +1411,13 @@ def test_needed_stages_stat_guard_skips_sha_recompute_when_unchanged(
     _stamp_converter_state(rec, tmp_path)  # + converter-поля, сохраняя guard-поля
 
     calls = {"n": 0}
-    real_sha256 = _sha256
+    real_sha256 = fsio.sha256_file
 
     def counting_sha256(path: Path) -> str:
         calls["n"] += 1
         return real_sha256(path)
 
-    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+    monkeypatch.setattr("core.fsio.sha256_file", counting_sha256)
 
     assert needed_stages(rec, tmp_path) == []
     assert calls["n"] == 0  # stat совпал — полное чтение файла не потребовалось
@@ -1435,13 +1434,13 @@ def test_needed_stages_stat_guard_recomputes_when_mtime_changed(
     raw.touch()  # тот же контент, новый mtime -> guard не совпадёт
 
     calls = {"n": 0}
-    real_sha256 = _sha256
+    real_sha256 = fsio.sha256_file
 
     def counting_sha256(path: Path) -> str:
         calls["n"] += 1
         return real_sha256(path)
 
-    monkeypatch.setattr("run_pipeline._sha256", counting_sha256)
+    monkeypatch.setattr("core.fsio.sha256_file", counting_sha256)
 
     needed_stages(rec, tmp_path)
     assert calls["n"] == 1  # stat разошёлся -> честно перечитан
@@ -2056,7 +2055,7 @@ def test_scan_fallback_counts_counts_cloud_allowed_scan_without_model_as_fallbac
     write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
@@ -2071,7 +2070,7 @@ def test_scan_fallback_counts_counts_confidential_scan_separately(tmp_path: Path
     write_doc(sources, rec_data, raw=b"%PDF fake scan", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
 
     assert scan_fallback_counts([rec], sources) == (0, 1)
@@ -2088,7 +2087,7 @@ def test_scan_fallback_counts_ignores_scan_with_successful_cloud_ocr(tmp_path: P
     )
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
 
     assert scan_fallback_counts([rec], sources) == (0, 0)
 
@@ -2103,7 +2102,7 @@ def test_scan_fallback_counts_ignores_born_digital(tmp_path: Path, monkeypatch: 
     write_doc(sources, rec_data, raw=b"%PDF fake digital", state={})
     rec = SourceRecord.model_validate(rec_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: False)
 
     assert scan_fallback_counts([rec], sources) == (0, 0)
 
@@ -2122,7 +2121,7 @@ def test_scan_fallback_counts_ignores_missing_raw(tmp_path: Path) -> None:
 def test_scan_fallback_counts_skips_non_pdf_source_format(tmp_path: Path) -> None:
     """Регрессия на живой краш (реальный корпус, eu-ai-act-2024, raw.html):
     OCR-путь существует только для PDF — без гейта по source_format
-    _was_ocr_normalized безусловно открывает файл через pdfplumber и падает
+    was_ocr_normalized безусловно открывает файл через pdfplumber и падает
     (PdfminerException) на не-PDF содержимом. write_doc пишет raw.* с
     расширением .pdf независимо от переданных байт — html-файл дописан
     вручную, чтобы честно воспроизвести форму реального документа."""
@@ -2175,7 +2174,7 @@ def test_scan_fallback_counts_isolates_ambiguous_raw_per_record(
     write_doc(sources, ok_data, raw=b"%PDF fake scan", state={})
     ok_rec = SourceRecord.model_validate(ok_data)
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
@@ -2194,7 +2193,7 @@ def test_report_scan_fallback_logs_warning_for_fallback_and_info_for_confidentia
     write_doc(sources, conf_data, raw=b"%PDF fake", state={})
     records = [SourceRecord.model_validate(fb_data), SourceRecord.model_validate(conf_data)]
 
-    monkeypatch.setattr("run_pipeline.converters._was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr("run_pipeline.converters.was_ocr_normalized", lambda raw: True)
     monkeypatch.setattr("run_pipeline.converters._CLOUD_DISABLED", False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 

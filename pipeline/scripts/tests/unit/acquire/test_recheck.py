@@ -219,7 +219,7 @@ def test_deep_baseline_falls_back_to_sha_for_born_digital(tmp_path: Path, monkey
 
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 born digital")
-    monkeypatch.setattr(converters, "_was_ocr_normalized", lambda raw: False)
+    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: False)
     assert recheck.deep_baseline(rec, tmp_path, _state()) == "a" * 64
 
 
@@ -230,7 +230,7 @@ def test_deep_baseline_is_none_for_ocr_normalized_scan(tmp_path: Path, monkeypat
 
     rec = schema.SourceRecord.model_validate(valid_record())
     write_doc(tmp_path, valid_record(), raw=b"%PDF-1.4 scanned")
-    monkeypatch.setattr(converters, "_was_ocr_normalized", lambda raw: True)
+    monkeypatch.setattr(converters, "was_ocr_normalized", lambda raw: True)
     assert recheck.deep_baseline(rec, tmp_path, _state()) is None
 
 

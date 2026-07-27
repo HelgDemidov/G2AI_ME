@@ -291,7 +291,7 @@ def deep_baseline(rec: schema.SourceRecord, root: Path, state: schema.Operationa
     from convert import converters  # ленивый импорт: acquire не зависит от convert по слоям
 
     try:
-        return None if converters._was_ocr_normalized(raw) else state.sha256
+        return None if converters.was_ocr_normalized(raw) else state.sha256
     except Exception:  # noqa: BLE001 — диагностический проход не должен ронять проверку
         logger.debug("не удалось определить OCR-происхождение %s", raw, exc_info=True)
         return None

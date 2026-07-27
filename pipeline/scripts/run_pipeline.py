@@ -33,7 +33,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
-import hashlib
 import logging
 import shutil
 import sqlite3
@@ -106,12 +105,9 @@ _FAILURE_REASON_MAX = 300  # причина живёт в .state.yaml ради �
 
 
 # --- пути и хеши (пути выводятся из папки-документа: schema.raw_file/md_file/state_file) ---
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+# sha256 — fsio.sha256_file (spec acquire-convert-seam-hardening §10, В13): байт-в-байт
+# дубликат жил здесь отдельно от convert/converters.py, который уже использовал
+# fsio.sha256_file напрямую — одна реализация на оба слоя шва.
 
 
 # --- реконсиляция (чистая логика) ---
@@ -211,7 +207,7 @@ def needed_stages(
     elif state.sha256:
         st = raw.stat()
         stat_matches = st.st_size == state.raw_size and st.st_mtime_ns == state.raw_mtime_ns
-        if not stat_matches and _sha256(raw) != state.sha256:
+        if not stat_matches and fsio.sha256_file(raw) != state.sha256:
             download_needed = True            # файл повреждён/изменился vs записанный sha
 
     if download_needed and download_deferred(state, force=force, ignore_backoff=ignore_backoff):
@@ -316,18 +312,18 @@ def _adopt_untracked_raw(rec: schema.SourceRecord, root: Path) -> None:
     state = schema.load_state(state_path)
     st = raw.stat()
     if state.sha256 is None:
-        state.sha256 = _sha256(raw)
+        state.sha256 = fsio.sha256_file(raw)
         state.raw_size = st.st_size
         state.raw_mtime_ns = st.st_mtime_ns
         schema.save_state(state_path, state)
         logger.info("  %s: усыновлён ручной raw, sha зафиксирован", rec.id)
     elif state.raw_size is None or state.raw_mtime_ns is None:
-        if _sha256(raw) == state.sha256:
+        if fsio.sha256_file(raw) == state.sha256:
             state.raw_size = st.st_size
             state.raw_mtime_ns = st.st_mtime_ns
             schema.save_state(state_path, state)
     elif st.st_size != state.raw_size or st.st_mtime_ns != state.raw_mtime_ns:
-        if _sha256(raw) == state.sha256:
+        if fsio.sha256_file(raw) == state.sha256:
             state.raw_size = st.st_size
             state.raw_mtime_ns = st.st_mtime_ns
             schema.save_state(state_path, state)
@@ -531,7 +527,7 @@ def _do_download(
     state = schema.load_state(state_path)
     st = raw.stat()
     previous_sha = state.sha256
-    state.sha256 = _sha256(raw)
+    state.sha256 = fsio.sha256_file(raw)
     state.raw_size = st.st_size
     state.raw_mtime_ns = st.st_mtime_ns
     state.acquisition_method = result.method
@@ -642,7 +638,7 @@ def _do_convert(rec: schema.SourceRecord, root: Path) -> None:
     # convert-cloud-tier сверяет ТЕКУЩИЙ sha256 raw с тем, что зафиксировал облачный
     # вызов при конвертации; устаревшая пара sha/model — это фолбэк-путь ЭТОГО
     # прогона, а не облачный vintage, witness тут неприменим).
-    raw_sha256 = _sha256(raw)
+    raw_sha256 = fsio.sha256_file(raw)
     defects = _conversion_defects(raw, md_text, conv.name, state, raw_sha256)
 
     for defect in defects:
@@ -690,7 +686,7 @@ def _do_figures(rec: schema.SourceRecord, root: Path) -> None:
     state = schema.load_state(state_path)
     conv = converters.resolve_converter(raw)
     defects = _conversion_defects(
-        raw, md.read_text(encoding="utf-8"), conv.name, state, _sha256(raw)
+        raw, md.read_text(encoding="utf-8"), conv.name, state, fsio.sha256_file(raw)
     ) + figure_defects
     # Логируем только НОВОЕ относительно того, что уже записал этот прогон конвертации:
     # стадия figures планируется сразу после convert, и повтор тех же строк удваивал бы
@@ -946,12 +942,13 @@ def _report_unembedded(db_path: Path, backend: str) -> None:
 def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tuple[int, int]:
     """``(n_fallback, n_confidential)`` среди ОТСКАНИРОВАННЫХ документов без
     успешного облачного OCR (spec ocr-eval-harness §8.3, S5). Скан определяется
-    метаданными ocrmypdf (``converters._was_ocr_normalized`` — та же проверка,
-    что ветвит ``_convert_pdf``), не повторной детекцией ``NeedsOCR``. OCR-путь
-    существует только для PDF (``rec.source_format`` — курируемый источник
+    метаданными ocrmypdf (``converters.was_ocr_normalized`` — та же проверка,
+    что ветвит ``_convert_pdf``, публичный алиас: эта функция вне convert-слоя, spec
+    acquire-convert-seam-hardening §10, В13), не повторной детекцией ``NeedsOCR``.
+    OCR-путь существует только для PDF (``rec.source_format`` — курируемый источник
     истины, не переоткрытие по расширению файла) — живой прогон на реальном
     корпусе поймал `PdfminerException` на `eu-ai-act-2024` (raw.html) ДО того,
-    как этот гейт появился: `_was_ocr_normalized` безусловно открывает файл
+    как этот гейт появился: `was_ocr_normalized` безусловно открывает файл
     через `pdfplumber`, что валится на не-PDF.
 
     - ``fallback`` — ``cloud_allowed(rec)`` было True, но ``cloud_ocr_model`` в
@@ -978,11 +975,11 @@ def scan_fallback_counts(records: list[schema.SourceRecord], root: Path) -> tupl
     for rec in records:
         try:
             if rec.source_format is not schema.SourceFormat.pdf:
-                continue  # OCR-путь существует только для PDF; _was_ocr_normalized падает на html/docx/xlsx
+                continue  # OCR-путь существует только для PDF; was_ocr_normalized падает на html/docx/xlsx
             raw = schema.raw_file(rec, root)
             if raw is None or not raw.exists() or raw.suffix.lower() != ".pdf":
                 continue  # born-digital/ещё не сконвертирован/рассинхрон формата — не скан
-            if not converters._was_ocr_normalized(raw):
+            if not converters.was_ocr_normalized(raw):
                 continue  # born-digital — не скан
             state = schema.load_state(schema.state_file(rec, root))
             if state.cloud_ocr_model is not None:
