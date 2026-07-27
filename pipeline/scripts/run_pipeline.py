@@ -1039,24 +1039,6 @@ def _report_scan_fallback(records: list[schema.SourceRecord], root: Path) -> Non
         )
 
 
-def _run_lock_path(sources_root: Path) -> Path:
-    """Путь эксклюзивного лока прогона (spec acquire-convert-seam-hardening §3, В3):
-    пер-корпусный (``args.sources``), в ``sources/.state/`` — та же конвенция, что и
-    прочие операционные артефакты КОРПУСА (``schema.state_dir``). Скоуп — РОВНО
-    писатели ``.state.yaml``: штатный прогон стадий и ``--recheck``. ``discover.py``/
-    ``vector_store.py`` этот лок не берут — они не пишут ``.state.yaml`` (кандидаты —
-    свой слой со своей save-семантикой; индекс — SQLite с собственным локингом).
-
-    Честная граница скоупа (ревью PR #53): ``--recheck`` пишет и слой КАНДИДАТОВ
-    (популяция (c) — probe-поля/revive), который делит с ``discover.py``; эта пара
-    писателей локом сознательно НЕ покрыта — save шардов кандидатов есть полная
-    перезапись файла, одновременные ``--recheck`` и ``discover`` могут потерять
-    запись друг друга (last-writer-wins). Принятый остаточный риск: обе — ручные
-    команды куратора, одновременный запуск маловероятен; расширение скоупа лока на
-    ``discover.py`` — при первом живом инциденте, не превентивно."""
-    return schema.state_dir(sources_root) / "run_pipeline.lock"
-
-
 def _report(results: list[DocResult]) -> int:
     up = sum(r.up_to_date for r in results)
     failed = [r for r in results if r.error]
@@ -1152,14 +1134,15 @@ def main(argv: list[str] | None = None) -> int:
     # скачивает, не конвертирует и не трогает индекс, а только спрашивает издателей
     # «изменилось ли». Возврат здесь и есть эта взаимоисключимость.
     if args.recheck:
-        # Эксклюзивный лок (spec acquire-convert-seam-hardening §3, В3): recheck и
-        # штатный прогон стадий — оба писатели .state.yaml (recheck пишет findings,
-        # держит state загруженным на время сетевого условного GET); без лока
+        # Эксклюзивный корпусный лок (spec discovery-acquire-seam-hardening §2, Г1) —
+        # тот же файл, что берут mutating-подкоманды discover.py: recheck пишет и
+        # .state.yaml (findings), и слой кандидатов (популяция (c) — probe-поля/
+        # revive), который делят inject/apply/discover/snowball. Без лока
         # интерливание load->save двух одновременных прогонов теряет поля полной
-        # перезаписью модели (живой репро аудита — единственное невосстановимое
-        # поле original_sha256).
+        # перезаписью модели (живой репро аудита — вплоть до физического удаления
+        # шарда кандидатов, не только «потеря записи друг друга»).
         try:
-            with fsio.exclusive_flock(_run_lock_path(args.sources)):
+            with fsio.exclusive_flock(schema.corpus_lock_path(args.sources)):
                 # Слой кандидатов (популяция (c)) грузится/сохраняется ЗДЕСЬ: оркестратор
                 # сшивает слои по определению своей роли, а сам ACQUIRE о раскладке store
                 # слоя DISCOVERY не знает (и не должен).
@@ -1176,14 +1159,17 @@ def main(argv: list[str] | None = None) -> int:
             logger.error(str(exc))
             return 1
 
-    # Эксклюзивный лок (spec acquire-convert-seam-hardening §3, В3) — тот же файл,
-    # что и --recheck-ветка выше: батч-прогон стадий пишет .state.yaml документов
-    # (download/convert/figures/frontmatter), одновременный --recheck держит своё
-    # состояние загруженным на время сетевого запроса — без лока запись теряется.
+    # Эксклюзивный корпусный лок (spec discovery-acquire-seam-hardening §2, Г1) — тот
+    # же файл, что и --recheck-ветка выше и mutating-подкоманды discover.py: батч-
+    # прогон стадий пишет .state.yaml документов (download/convert/figures/
+    # frontmatter), одновременный --recheck/discover держит своё состояние
+    # загруженным на время сетевого запроса — без лока запись теряется.
     # --dry-run НЕ берёт лок вовсе (nullcontext) — обязан быть no-op и не мешать
     # живому прогону; process_docs(dry_run=True) и так не пишет .state.yaml.
     lock_ctx = (
-        contextlib.nullcontext() if args.dry_run else fsio.exclusive_flock(_run_lock_path(args.sources))
+        contextlib.nullcontext()
+        if args.dry_run
+        else fsio.exclusive_flock(schema.corpus_lock_path(args.sources))
     )
     try:
         with lock_ctx:

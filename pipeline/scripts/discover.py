@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from core import schema, validate_sources
+from core import fsio, schema, validate_sources
 from core.env import load_dotenv
 from discovery import connectors, manual, store  # noqa: F401 — connectors: манифест реальных коннекторов (§4.3)
 from discovery.connectors import snowball
@@ -169,6 +169,23 @@ def _cmd_snowball(args: argparse.Namespace) -> int:
     return 1 if summary.failed else 0
 
 
+# Мутирующие подкоманды берут общий корпусный лок (spec discovery-acquire-seam-
+# hardening §2, Г1) — тот же файл, что и run_pipeline.py (штатный прогон/--recheck):
+# `inject` мутирует всегда (нет `--dry-run`); `apply`/`discover`/`snowball` — когда
+# НЕ dry-run (dry-run обязан быть no-op и не мешать живому прогону, конвенция
+# run_pipeline). `worksheet` — read-only, лока не берёт никогда.
+_MUTATING_ALWAYS = frozenset({"inject"})
+_MUTATING_UNLESS_DRY_RUN = frozenset({"apply", "discover", "snowball"})
+
+
+def _needs_corpus_lock(args: argparse.Namespace) -> bool:
+    if args.cmd in _MUTATING_ALWAYS:
+        return True
+    if args.cmd in _MUTATING_UNLESS_DRY_RUN:
+        return not args.dry_run
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DISCOVERY: генератор кандидатов источников")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -238,6 +255,13 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if _needs_corpus_lock(args):
+        try:
+            with fsio.exclusive_flock(schema.corpus_lock_path(args.root)):
+                return int(args.func(args))
+        except fsio.AlreadyLocked:
+            print("✗ другой прогон run_pipeline/discover работает с этим корпусом")
+            return 1
     result: int = args.func(args)
     return result
 

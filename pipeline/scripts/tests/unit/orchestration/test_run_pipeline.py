@@ -35,7 +35,6 @@ from run_pipeline import (
     _read_index_fingerprint,
     _record_convert_failure,
     _report,
-    _run_lock_path,
     convert_deferred,
     needed_stages,
     process_docs,
@@ -2007,7 +2006,7 @@ def test_main_dry_run_logs_index_not_touched(tmp_path: Path, caplog: Any) -> Non
     assert any("dry-run" in r.message for r in caplog.records)
 
 
-# --- эксклюзивный лок mutating-прогонов (spec acquire-convert-seam-hardening §3, В3) ---
+# --- эксклюзивный корпусный лок mutating-прогонов (spec discovery-acquire-seam-hardening §2, Г1) ---
 
 
 def test_main_dry_run_never_touches_lock_file(tmp_path: Path) -> None:
@@ -2015,12 +2014,12 @@ def test_main_dry_run_never_touches_lock_file(tmp_path: Path) -> None:
     вовсе (contextlib.nullcontext, не fsio.exclusive_flock)."""
     sources = tmp_path / "sources"
     assert main([str(sources), "--dry-run"]) == 0
-    assert not _run_lock_path(sources).exists()
+    assert not schema.corpus_lock_path(sources).exists()
 
 
 def test_main_returns_one_when_another_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
     sources = tmp_path / "sources"
-    lock_path = _run_lock_path(sources)
+    lock_path = schema.corpus_lock_path(sources)
     with fsio.exclusive_flock(lock_path):
         with caplog.at_level("ERROR", logger="run_pipeline"):
             rc = main([str(sources), "--db", str(tmp_path / "c.db")])
@@ -2029,10 +2028,10 @@ def test_main_returns_one_when_another_run_holds_the_lock(tmp_path: Path, caplog
 
 
 def test_main_recheck_returns_one_when_batch_run_holds_the_lock(tmp_path: Path, caplog: Any) -> None:
-    """--recheck и штатный прогон стадий — писатели ОДНОГО и того же .state.yaml,
-    поэтому делят один лок-файл."""
+    """--recheck и штатный прогон стадий — писатели ОДНОГО и того же корпусного
+    лока (делят его также с mutating-подкомандами discover.py)."""
     sources = tmp_path / "sources"
-    with fsio.exclusive_flock(_run_lock_path(sources)):
+    with fsio.exclusive_flock(schema.corpus_lock_path(sources)):
         with caplog.at_level("ERROR", logger="run_pipeline"):
             rc = main([str(sources), "--recheck"])
     assert rc == 1

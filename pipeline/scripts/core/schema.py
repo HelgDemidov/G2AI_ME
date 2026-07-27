@@ -541,6 +541,26 @@ def state_dir(root: Path = DEFAULT_SOURCES) -> Path:
     return root / STATE_DIRNAME
 
 
+def corpus_lock_path(root: Path = DEFAULT_SOURCES) -> Path:
+    """Эксклюзивный лок мутаторов КОРПУСА (spec discovery-acquire-seam-hardening §2, Г1):
+    ``<root>/.state/corpus_mutation.lock`` — рядом с ``state_dir``, тот же владелец раскладки.
+
+    Держатели: ``run_pipeline.py`` (штатный прогон стадий и ``--recheck`` — оба
+    писатели ``.state.yaml``) и mutating-подкоманды ``discover.py`` (``inject``/
+    ``apply``/``discover``/``snowball``, все без ``--dry-run`` — писатели слоя
+    кандидатов, ``sources/candidates/``). Прежняя конвенция «имя файла — писатель»
+    (см. ``state_dir`` выше) для ОБЩЕГО лока не работает по построению: у лока
+    ВСЕГДА больше одного держателя, имя фиксирует НАЗНАЧЕНИЕ (взаимоисключение
+    мутаторов корпуса), а не единственного писателя. До этого спека лок
+    (``run_pipeline._run_lock_path``) взаимоисключал только штатный прогон и
+    ``--recheck`` — пара ``--recheck`` ↔ ``discover.py`` оставалась «принятым
+    остаточным риском», который живой репро аудита показал недооценённым (окно —
+    минуты-часы сетевой работы, а не секунды; исход — физическое удаление шарда
+    кандидатов или откат целого apply-батча, не «потеря записи друг друга»).
+    """
+    return state_dir(root) / "corpus_mutation.lock"
+
+
 def check_layout(meta_path: Path, rec: SourceRecord, seen_ids: set[str]) -> list[str]:
     """Чистые инварианты раскладки corpus-layout-v2: папка документа == ``id``;
     папка сущности == ``entity_id``; верхняя папка == ``track``; глобальная
