@@ -635,21 +635,29 @@ def test_unacquired_population_does_not_extend_backoff_when_still_blocked(
     """Регресс репро B аудита (spec discovery-acquire-seam-hardening §3, Г2): probe
     заведомо слабее полной лестницы (один GET по source_url, без official_alt/
     browser/archive) и не имеет права переустанавливать якорь backoff — иначе окно
-    не истекает никогда при регулярном --recheck. Курсор ротации сдвигается,
-    якорь — нет; причина всё же обновляется свежей (полезна сводке)."""
+    не истекает никогда при регулярном --recheck. Сдвигается только курсор ротации.
+
+    Причину неуспешный probe тоже не трогает (ревью PR #54): пара «дата + причина»
+    описывает ОДНО событие — провал полной лестницы — и читается вместе
+    (``run_pipeline._acquisition_wait_note``: «с {дата}: {причина}»). Свежая причина
+    возвращается в ``note`` прогона, а не персистится под чужой датой."""
     _doc(
         tmp_path, "aa-blocked-2026", raw=None,
-        state={"acquisition_failed": "2026-07-01", "acquisition_failure_reason": "old reason"},
+        state={"acquisition_failed": "2026-07-01", "acquisition_failure_reason": "manual timeout"},
     )
     monkeypatch.setattr(
         recheck, "probe_url",
         lambda *a, **kw: _probe(outcome=acquisition.AcquisitionOutcome.blocked, reason="WAF challenge"),
     )
 
-    recheck.run_recheck(schema.load_records(tmp_path), tmp_path, user_agent="ua", today=TODAY)
+    summary = recheck.run_recheck(
+        schema.load_records(tmp_path), tmp_path, user_agent="ua", today=TODAY
+    )
 
     rec = schema.load_records(tmp_path)[0]
     st = schema.load_state(schema.state_file(rec, tmp_path))
     assert st.acquisition_failed == dt.date(2026, 7, 1)  # якорь backoff НЕ переустановлен
-    assert st.acquisition_failure_reason == "WAF challenge"  # причина всё же свежая
+    assert st.acquisition_failure_reason == "manual timeout"  # причина лестницы НЕ подменена
     assert st.acquisition_probe_checked == TODAY  # курсор ротации сдвинут
+    # свежая причина не потеряна — её несёт отчёт прогона
+    assert any("WAF challenge" in item.note for item in summary.items)

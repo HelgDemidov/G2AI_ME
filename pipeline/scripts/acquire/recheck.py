@@ -480,10 +480,19 @@ def _reprobe_unacquired(
     ``acquisition_probe_checked`` бампается на ЛЮБОМ исходе (курсор ротации — иначе
     голодание хвоста популяции); ``acquisition_failed`` (якорь backoff полной
     лестницы, spec §3, Г2) probe трогает ТОЛЬКО на успехе (снимает backoff — лестница
-    добудет сама на ближайшем прогоне). Неуспех probe НЕ переустанавливает якорь —
-    он заведомо слабее полной лестницы (один GET по ``source_url``, без official_alt/
-    browser/archive) и не имеет права продлевать её окно; ``acquisition_failure_reason``
-    всё же обновляется свежей причиной — полезно сводке, реестра backoff не касается."""
+    добудет сама на ближайшем прогоне). Неуспех probe НЕ переустанавливает якорь — он
+    заведомо слабее полной лестницы (один GET по ``source_url``, без official_alt/
+    browser/archive) и не имеет права продлевать её окно.
+
+    **И ``acquisition_failure_reason`` неуспешный probe тоже не трогает** (ревью PR #54):
+    пара «дата + причина» описывает ОДНО событие — провал полной лестницы, и оба поля
+    читаются вместе (``run_pipeline._acquisition_wait_note`` печатает «с {дата}: {причина}»
+    в классе сводки «ждут добычи»). Первая редакция §3 развела дату, но оставила probe'у
+    причину — куратор получал дату лестницы, склеенную с причиной другого, более слабого
+    события, которого в тот день не было: ровно тот класс «одно поле, две роли», который
+    §3 и разбирал, только в поле-соседе. Свежая причина при этом не теряется — она
+    возвращается в ``note`` и печатается отчётом прогона в момент самого probe; персист
+    её в поле, датированное чужим событием, — не польза, а порча пары."""
     state_path = schema.state_file(rec, root)
     state = schema.load_state(state_path)
     probe = probe_url(
@@ -497,7 +506,6 @@ def _reprobe_unacquired(
         state.acquisition_failure_reason = None
         note = "стало добываемо — ближайший прогон run_pipeline доберёт"
     else:
-        state.acquisition_failure_reason = classified.reason
         note = f"по-прежнему недобываем: {classified.reason}"
     schema.save_state(state_path, state)
     return RecheckItem(rec.id, note)
