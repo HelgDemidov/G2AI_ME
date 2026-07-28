@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,11 +72,30 @@ def _cmd_inject(args: argparse.Namespace) -> int:
 
 
 def _cmd_worksheet(args: argparse.Namespace) -> int:
+    """spec triage-intake-hardening §2: ``--connector``/``--limit`` — отбор над списком
+    ждущих ДО рендера (worksheet read-only, лока не берёт, как и раньше). ``total`` для
+    аннотации «показано N из M» — размер пула ПОСЛЕ ``--connector`` (если задан), но ДО
+    ``--limit``: отвечает на «сколько ещё в том, что я запросил», не «сколько во всей
+    очереди» (обе величины были бы неверны при узком коннекторе на большой очереди)."""
     candidates = store.load(args.root)
     records = schema.load_records(args.root)
     pending = manual.pending_candidates(candidates, records)
     unacquirable = manual.unacquirable_candidates(candidates, records)
-    text = manual.render_worksheet(pending, unacquirable)
+
+    selection_active = bool(args.connector) or args.limit is not None
+    if args.connector:
+        pending = [c for c in pending if c.connector_id in args.connector]
+        unacquirable = [c for c in unacquirable if c.connector_id in args.connector]
+    total_for_message = len(pending) if selection_active else None
+    if args.limit is not None:
+        pending = pending[: args.limit]
+
+    if args.format == "json":
+        payload = manual.worksheet_payload(pending, unacquirable, total=total_for_message)
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+    else:
+        text = manual.render_worksheet(pending, unacquirable, total=total_for_message)
+
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text, encoding="utf-8")
@@ -83,7 +103,7 @@ def _cmd_worksheet(args: argparse.Namespace) -> int:
     else:
         print(text)
     if unacquirable:
-        print(f"(+ {len(unacquirable)} недобываемых в отдельной секции — ждут смены обстоятельств)")
+        print(f"(+ {len(unacquirable)} недобываемых кандидатов — ждут смены обстоятельств)")
     return 0
 
 
@@ -241,6 +261,15 @@ def main(argv: list[str] | None = None) -> int:
     p_worksheet = sub.add_parser("worksheet", help="таблица ждущих кандидатов (реконсиляция)")
     p_worksheet.add_argument("--out", type=Path, default=None, help="дефолт — stdout")
     p_worksheet.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
+    p_worksheet.add_argument(
+        "--connector", action="append", default=None,
+        help="ограничить коннектором (флаг повторяем для нескольких)",
+    )
+    p_worksheet.add_argument("--limit", type=int, default=None, help="показать не более N ждущих")
+    p_worksheet.add_argument(
+        "--format", choices=("json", "md"), default="json",
+        help="json (дефолт, машинный контракт решений как данные) | md (человеческие таблицы)",
+    )
     p_worksheet.set_defaults(func=_cmd_worksheet)
 
     p_apply = sub.add_parser("apply", help="применить batch-решения triage (promote/reject)")

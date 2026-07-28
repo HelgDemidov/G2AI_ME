@@ -335,6 +335,8 @@ def _map_group(
 
     return schema.CandidateRecord(
         title=title,
+        # Реестр отдаёт заголовок КАК заголовок (spec triage-intake-hardening §3).
+        title_provenance=schema.TitleProvenance.stated,
         issuer=issuer,
         jurisdiction="European Union",
         doc_date=doc_date,

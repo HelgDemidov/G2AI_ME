@@ -207,6 +207,45 @@ class RejectionKind(str, Enum):
     unacquirable = "unacquirable"      # нужен, но недобываем (WAF/мёртвая ссылка) — ждёт смены обстоятельств
 
 
+class TitleProvenance(str, Enum):
+    """Откуда у кандидата взялся ``title`` (spec triage-intake-hardening §3).
+
+    Enum, а не bool, по правилу проекта: код ВЕТВИТСЯ по значению — ``derived``
+    ОБЯЗЫВАЕТ admit-решение задать ``title`` явно, ``stated`` нет. Отсутствие поля
+    (легаси-кандидаты) читается как «неизвестно» и требования не поднимает: молча
+    заблокировать допуск записей, заведённых до этого спека, было бы хуже, чем
+    пропустить их с прежним поведением.
+
+    Живая мотивация: у snowball 117 заголовков из 227 (52%) непригодны — ``map_link``
+    берёт либо текст, вырезанный ГЕОМЕТРИЕЙ прямоугольника гиперссылки (режет слова,
+    склеивает колонки), либо ЦЕЛУЮ строку ``doc.md``, в которой встретился URL. Ни то,
+    ни другое никогда не было заголовком, а ``title`` становится МЕТКОЙ УЗЛА графа —
+    мусор, допущенный дверью, застывает структурой слоя знаний.
+    """
+
+    stated = "stated"      # пришёл КАК заголовок: поле реестра, --title, verbatim-гейт цитат
+    derived = "derived"    # реконструкция из позиционного артефакта — требует явного title при admit
+
+
+class UrlProvenance(str, Enum):
+    """Достоверность ``source_url`` кандидата (spec triage-intake-hardening §6).
+
+    Тот же механизм и то же правило, что у ``TitleProvenance``: код ВЕТВИТСЯ по значению
+    (``suspect`` обязывает admit-решение задать ``source_url`` явно), отсутствие поля —
+    «неизвестно», требования не поднимает.
+
+    Живая мотивация: в экспорте OECD.AI одно значение ``website`` принадлежит нескольким
+    записям с РАЗНЫМИ заголовками (49 URL на 104 записи снапшота) — испанская стратегия
+    несёт ссылку на норвежский Helsedirektoratet, немецкий «AI Action Plan» — на
+    французский La French Tech. Опасность именно в правдоподобии: URL настоящий, рабочий
+    и тематически смежный, а заголовок/издатель/юрисдикция ВЕРНЫЕ, поэтому карточка
+    проходит любую проверку формы — а добыча молча скачает документ другой страны.
+    """
+
+    stated = "stated"      # источник назвал URL именно этого документа
+    suspect = "suspect"    # значение делят записи с разными заголовками — владельца не определить
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -427,11 +466,17 @@ class CandidateRecord(BaseModel):
 
     # best-effort библиография (Optional — данные upstream неполны)
     title: str | None = None
+    # Откуда взялся title (spec triage-intake-hardening §3). ``None`` у легаси-записей
+    # = «неизвестно», требования явного title при admit не поднимает.
+    title_provenance: TitleProvenance | None = None
     issuer: str | None = None
     jurisdiction: str | None = None
     doc_date: _dt.date | None = None
     language: str | None = None
     source_url: str | None = Field(default=None, pattern=r"^https?://")
+    # Достоверность source_url (spec triage-intake-hardening §6). ``None`` у легаси-записей
+    # = «неизвестно», требования явного source_url при admit не поднимает.
+    url_provenance: UrlProvenance | None = None
     rights: Rights | None = None  # best-effort от коннектора; финализирует триаж
     sensitivity: Sensitivity | None = None  # best-effort; несётся в acquisition-гейт
     # passthrough-обогащение источника (Optional; None -> не пишется в YAML вовсе)
@@ -451,9 +496,13 @@ class CandidateRecord(BaseModel):
     connector_id: str = Field(min_length=1)
     retrieved_at: _dt.date
     raw_hash: str = Field(min_length=1)
-    # dedup-ключи (заполняет discovery)
+    # dedup-ключ (заполняет discovery). Поля ``content_hash`` здесь БОЛЬШЕ НЕТ (spec
+    # triage-intake-hardening §4): за всю историю его не заполнил ни один из шести
+    # конструкторов кандидата — «хэш содержания» на этом слое неполучаем ПО
+    # ПОСТРОЕНИЮ (до добычи байтов документа не существует), поэтому третья стратегия
+    # дедупа не срабатывала ни разу и не могла. Легаси-ключ в старых шардах поглощает
+    # ``extra="allow"``.
     normalized_url: str | None = None
-    content_hash: str | None = None
     # Заявленная РЕДАКЦИЯ: doc-id записи корпуса, которую этот кандидат сознательно
     # заменяет (spec discovery-candidates-sharding §5). Идентичность кандидата — не URL,
     # а пара (URL-идентичность, редакция): новая редакция закона живёт на ТОМ ЖЕ URL
@@ -699,6 +748,9 @@ def promote_candidate(
     relations: list[Relation] | None = None,
     language: str | None = None,
     official_alt_url: str | None = None,
+    title: str | None = None,
+    issuer: str | None = None,
+    source_url: str | None = None,
 ) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
@@ -718,11 +770,17 @@ def promote_candidate(
     Словарную принадлежность ``topics``/``g2ai_pattern`` эта функция не проверяет — как и раньше,
     это ``validate_sources.py`` (schema словарей не грузит).
 
-    ``language`` (v3, spec discovery-agora §7) — опциональный override триажа: registry-каналы
+    ``language`` (v3, спек discovery-agora §7) — опциональный override триажа: registry-каналы
     (AGORA и т.п.) структурно не дают язык в метаданных реестра, а ``promote_candidate`` требует
     его non-None — резолюция ``language if language is not None else cand.language`` (override
     побеждает, ``None`` -> прежнее поведение). manual/directed_search-кандидаты с языком на
     ``inject`` продолжают работать без override (обратная совместимость).
+
+    ``title``/``issuer``/``source_url`` (v6, спек triage-intake-hardening §1/§6) — override'ы
+    ТОЙ ЖЕ формы, что ``language``: у части каналов этих полей нет вовсе (``issuer`` — 22%
+    очереди на момент спека) либо значение недостоверно (OECD: делённый между записями
+    ``website`` — §6). Резолюция та же (override побеждает, ``None`` -> кандидат, оба ``None``
+    -> прежний ``ValueError``) — четвёртое симметричное применение одного механизма.
 
     ``cand.supersedes`` (v4, spec discovery-candidates-sharding §5) — ЕДИНСТВЕННАЯ точка, где
     временнáя цепочка редакций материализуется в курируемое ядро: непустое значение
@@ -737,15 +795,17 @@ def promote_candidate(
     вносит САМ в admit-решение. ``None`` -> прежнее поведение (поле ``SourceRecord``
     уже существовало, просто не имело двери промоушена).
     """
-    title, issuer, source_url = cand.title, cand.issuer, cand.source_url
+    resolved_title = title if title is not None else cand.title
+    resolved_issuer = issuer if issuer is not None else cand.issuer
     resolved_language = language if language is not None else cand.language
+    resolved_source_url = source_url if source_url is not None else cand.source_url
     missing = [
         name
         for name, val in (
-            ("title", title),
-            ("issuer", issuer),
+            ("title", resolved_title),
+            ("issuer", resolved_issuer),
             ("language", resolved_language),
-            ("source_url", source_url),
+            ("source_url", resolved_source_url),
         )
         if val is None
     ]
@@ -755,8 +815,8 @@ def promote_candidate(
             f"кандидат ({cand.connector_id}: {ident}): "
             f"нельзя промоутить без полей: {', '.join(missing)}"
         )
-    assert title is not None and issuer is not None
-    assert resolved_language is not None and source_url is not None
+    assert resolved_title is not None and resolved_issuer is not None
+    assert resolved_language is not None and resolved_source_url is not None
 
     resolved_relations = list(relations or [])
     if cand.supersedes is not None:
@@ -768,15 +828,15 @@ def promote_candidate(
         id=id,
         entity_id=entity_id,
         track=track,
-        title=title,
-        issuer=issuer,
+        title=resolved_title,
+        issuer=resolved_issuer,
         issuer_type=issuer_type,
         geo_scope=geo_scope,
         language=resolved_language,
         dates=Dates(published=cand.doc_date),
         doc_type=doc_type,
         authority=authority,
-        source_url=source_url,
+        source_url=resolved_source_url,
         official_alt_url=official_alt_url,
         source_format=source_format,
         rights=cand.rights or Rights.unknown,

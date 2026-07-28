@@ -270,6 +270,10 @@ def test_resolution_from_source_url() -> None:
         # поправка резолвилась бы в базовый акт (неверная связь).
         ("https://x.example/?uri=CELEX:02016R0679-20160504", ["CELEX:02016R0679-20160504"]),
         ("https://x.example/?uri=CELEX:32004L0018R(01)", ["CELEX:32004L0018R(01)"]),
+        # ...и порядковый номер документа в выпуске OJ — БЕЗ литеры `R` (spec
+        # triage-intake-hardening §5): до фикса обрывалось на `52026M12391`, т.е.
+        # резолвилось бы в ДРУГОЙ реальный документ.
+        ("https://x.example/?uri=CELEX:52026M12391(01)", ["CELEX:52026M12391(01)"]),
         # Без якоря догадки не строятся — OJ-форма остаётся нерезолвнутой.
         ("https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=OJ:L_202401689", []),
     ],
@@ -278,6 +282,19 @@ def test_url_anchor_reads_celex_verbatim(url: str, expected: list[str]) -> None:
     """Префикс `CELEX:` снимает неоднозначность формы полностью — сектор/литеры/длину
     гадать не нужно, поэтому URL-канал шире прозаической границы v1 сознательно."""
     assert cite_mining.identifiers_from_url(url) == expected
+
+
+def test_url_anchor_sequential_number_is_not_the_base_act() -> None:
+    """spec triage-intake-hardening §5: `(NN)` без литеры и `R(NN)` — РАЗНЫЕ документы
+    (порядковая позиция в выпуске OJ против поправки к акту), и ни один из них не
+    равен базовому акту. Фикс не должен ни схлопнуть их, ни обрезать до базы."""
+    base = cite_mining.identifiers_from_url("?uri=CELEX:32004L0018")
+    sequential = cite_mining.identifiers_from_url("?uri=CELEX:32004L0018(01)")
+    corrigendum = cite_mining.identifiers_from_url("?uri=CELEX:32004L0018R(01)")
+    assert base == ["CELEX:32004L0018"]
+    assert sequential == ["CELEX:32004L0018(01)"]
+    assert corrigendum == ["CELEX:32004L0018R(01)"]
+    assert len({base[0], sequential[0], corrigendum[0]}) == 3
 
 
 def test_url_anchor_grammar_stays_out_of_prose() -> None:

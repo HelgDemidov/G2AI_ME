@@ -94,17 +94,10 @@ def test_edition_not_absorbed_by_match_key_strategy() -> None:
     assert outcome.absorbed == 0
 
 
-def test_edition_not_absorbed_by_content_hash_strategy() -> None:
-    predecessor_cand = _candidate(raw_hash="p" * 64, normalized_url=None, title=None, content_hash="c1")
-    edition = _candidate(
-        raw_hash="e" * 64, normalized_url=None, title=None, content_hash="c1",
-        supersedes="sg-imda-mgf-agentic-2026",
-    )
-
-    outcome = dedup([edition], existing=[predecessor_cand])
-
-    assert outcome.fresh == [edition]
-    assert outcome.absorbed == 0
+# Вариант этого теста для стратегии 3 (``content_hash``) снят вместе с самой стратегией
+# (spec triage-intake-hardening §4): поле удалено со схемы, писателей у него не было ни
+# одного. Дискриминатор редакций по-прежнему проверен на ОБЕИХ живых стратегиях — тесты
+# `..._same_url` (стратегия 1) и `..._match_key_strategy` (стратегия 2) выше.
 
 
 def test_same_edition_twice_is_still_deduplicated() -> None:

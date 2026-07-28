@@ -29,7 +29,7 @@ def _oracle_key(cand: schema.CandidateRecord) -> tuple[str, str, str] | None:
 def _oracle_find(
     cand: schema.CandidateRecord, pool: list[schema.CandidateRecord]
 ) -> schema.CandidateRecord | None:
-    """Три линейных скана по ЕДИНОМУ пулу в порядке приоритета стратегий."""
+    """Линейные сканы по ЕДИНОМУ пулу в порядке приоритета стратегий."""
     if cand.normalized_url:
         for other in pool:
             if other.normalized_url == cand.normalized_url:
@@ -38,10 +38,6 @@ def _oracle_find(
     if key is not None:
         for other in pool:
             if _oracle_key(other) == key:
-                return other
-    if cand.content_hash:
-        for other in pool:
-            if other.content_hash == cand.content_hash:
                 return other
     return None
 
@@ -74,7 +70,6 @@ _URLS = st.sampled_from([None, "https://a.gov/1", "https://a.gov/2"])
 _TITLES = st.sampled_from([None, "Doc One", "doc  one!", "Doc Two"])
 _ISSUERS = st.sampled_from([None, "MinDigital", "MinFin"])
 _DATES = st.sampled_from([None, dt.date(2026, 1, 1), dt.date(2026, 2, 2)])
-_HASHES = st.sampled_from([None, "c1", "c2"])
 _CONNECTORS = st.sampled_from(["manual", "agora", "search:wb"])
 _REJECTED = st.sampled_from([None, "вне обеих осей"])
 
@@ -90,7 +85,6 @@ def _candidate(draw: st.DrawFn, raw_hash: str) -> schema.CandidateRecord:
             "issuer": draw(_ISSUERS),
             "doc_date": draw(_DATES),
             "normalized_url": draw(_URLS),
-            "content_hash": draw(_HASHES),
             "rejected_reason": draw(_REJECTED),
         }
     )
@@ -115,14 +109,15 @@ def _provenance(records: list[schema.CandidateRecord]) -> list[list[str] | None]
 
 
 def _has_dedup_key(cand: schema.CandidateRecord) -> bool:
-    """Несёт ли кандидат хоть ОДИН из трёх ключей сравнения.
+    """Несёт ли кандидат хоть ОДИН из ключей сравнения.
 
-    Кандидат без всех трёх (ни URL, ни пары issuer+title, ни content_hash) не имеет
-    идентичности для dedup и потому не дедуплицируется вовсе — свойство ИСХОДНОГО
-    дизайна трёх стратегий (прежний линейный ``_find_match`` возвращал None так же),
-    а не следствие индексации. Пинится тестом в ``test_dedup.py``.
+    Кандидат без обоих (ни URL, ни пары issuer+title) не имеет идентичности для dedup
+    и потому не дедуплицируется вовсе — свойство ИСХОДНОГО дизайна (прежний линейный
+    ``_find_match`` возвращал None так же), а не следствие индексации. Пинится тестом
+    в ``test_dedup.py``. Третья стратегия (``content_hash``) снята вместе с полем —
+    писателя у неё не было ни одного (spec triage-intake-hardening §4).
     """
-    return bool(cand.normalized_url or (cand.title and cand.issuer) or cand.content_hash)
+    return bool(cand.normalized_url or (cand.title and cand.issuer))
 
 
 @given(pools=_pools())

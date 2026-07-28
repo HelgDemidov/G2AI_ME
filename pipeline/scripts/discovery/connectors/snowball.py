@@ -403,6 +403,26 @@ def _fallback_title(url: str) -> str:
     return segment or parts.netloc
 
 
+# Канал текстовых цитат — ЕДИНСТВЕННЫЙ, где заголовок пришёл КАК заголовок: его назвала
+# модель и подтвердил verbatim-гейт (`passes_verbatim_gate`) — строка обязана буквально
+# встречаться в тексте секции. Три URL-канала (pdf-аннотации / html-href / напечатанные
+# URL) заголовка не несут в принципе: anchor у них — позиционный артефакт (текст, вырезанный
+# ГЕОМЕТРИЕЙ прямоугольника ссылки, либо ЦЕЛАЯ строка doc.md с URL).
+_STATED_TITLE_LOCATION = "citation"
+
+
+def _is_url_like(text: str) -> bool:
+    """Anchor, который сам является ссылкой, заголовком не является (spec
+    triage-intake-hardening §3).
+
+    Живой случай: строка ``doc.md`` состоит из одного URL — anchor непуст, поэтому
+    ``anchor or _fallback_title(...)`` отдавал сырую ссылку в ``title`` (6 кандидатов на
+    боевом слое). ``_fallback_title`` в этом не виноват: до него просто не доходило
+    управление, а результат он даёт ЛУЧШЕ (``charts`` против
+    ``https://digital-decade-desi…``)."""
+    return text.lower().startswith(("http://", "https://"))
+
+
 def map_link(
     link: RawLink,
     *,
@@ -411,12 +431,16 @@ def map_link(
     vocab_terms: list[tuple[str, str]],
 ) -> schema.CandidateRecord:
     """``RawLink`` -> ``CandidateRecord`` (спек §4). ``location_kind`` — какой экстрактор
-    породил находку (``"pdf"``/``"html"``/``"md"``) — определяет форму ``native_id``,
-    вызывающая сторона знает это по построению (какой экстрактор вызван), а не сама
-    находка (§2/§2.3: ``page_number`` есть только у pdf-находок)."""
+    породил находку (``"pdf"``/``"html"``/``"md"``/``"citation"``) — определяет форму
+    ``native_id`` И провенанс заголовка (spec triage-intake-hardening §3), вызывающая
+    сторона знает это по построению (какой экстрактор вызван), а не сама находка
+    (§2/§2.3: ``page_number`` есть только у pdf-находок)."""
     normalized = normalize_url(link.url)
     anchor = link.anchor.strip()
-    title = anchor or _fallback_title(link.url)
+    stated = location_kind == _STATED_TITLE_LOCATION
+    # Anchor-ссылка заголовком не является — пусть отработает фолбэк по сегменту пути.
+    usable_anchor = "" if (not stated and _is_url_like(anchor)) else anchor
+    title = usable_anchor or _fallback_title(link.url)
     native_summary = anchor[: schema.CANDIDATE_SUMMARY_MAX] if anchor else None
     host = urlsplit(link.url).netloc
     native_tags = [f"domain: {host}", f"source: {source_record.id}"]
@@ -431,6 +455,9 @@ def map_link(
 
     return schema.CandidateRecord(
         title=title,
+        title_provenance=(
+            schema.TitleProvenance.stated if stated else schema.TitleProvenance.derived
+        ),
         source_url=link.url,
         native_summary=native_summary,
         native_id=native_id,

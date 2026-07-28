@@ -1,18 +1,26 @@
 """discovery/dedup.py — кросс-коннекторный dedup кандидатов (spec discovery-core §3).
 
 Ключи сравнения по убыванию надёжности (чартер §4.4): ``normalized_url`` -> ``(issuer,
-normalized_title, doc_date)`` -> ``content_hash``. Без fuzzy-библиотек — детерминизм важнее
-recall (остаточные дубли дочистит человек на worksheet, discovery-manual).
+normalized_title, doc_date)``. Без fuzzy-библиотек — детерминизм важнее recall
+(остаточные дубли дочистит человек на worksheet, discovery-manual).
 
-**Один проход вместо трёх сканов (spec discovery-candidates-sharding §4).** Раньше на
-КАЖДОГО нового кандидата шли три последовательных линейных скана по всему пулу — при
+**Третьей стратегии (``content_hash``) БОЛЬШЕ НЕТ** (spec triage-intake-hardening §4):
+поле не заполнил ни один из шести конструкторов кандидата за всю историю — «хэш
+содержания» на слое кандидатов неполучаем ПО ПОСТРОЕНИЮ (до добычи байтов документа не
+существует), так что стратегия не срабатывала ни разу и не могла. Ключ по ФОРМАЛЬНОМУ
+идентификатору из URL рассмотрен как замена и отвергнут (разбор — Design rationale
+спека): измеренная польза один дубль на 1790 кандидатов, цена — общая для discovery и
+graph точка извлечения идентификаторов, которой сегодня негде жить без компромисса.
+
+**Один проход вместо линейных сканов (spec discovery-candidates-sharding §4).** Раньше
+на КАЖДОГО нового кандидата шли последовательные линейные сканы по всему пулу — при
 масштабе одного харвеста (1790 existing × сотни fresh) это сотни тысяч сравнений, и
-росло квадратично с корпусом кандидатов. Теперь пул индексируется ОДИН раз (три dict),
-поиск — три точных lookup: O(M+N) вместо O(M×N).
+росло квадратично с корпусом кандидатов. Теперь пул индексируется ОДИН раз (dict на
+стратегию), поиск — точные lookup: O(M+N) вместо O(M×N).
 
 **Каноническая семантика (решение куратора 2026-07-25): строгий приоритет СТРАТЕГИЙ
 над пулом.** Кандидат сверяется с ЕДИНЫМ пулом (existing + уже принятые в этом прогоне
-fresh) в порядке url -> key -> hash, остановка на первом попадании. Прежняя форма
+fresh) в порядке url -> key, остановка на первом попадании. Прежняя форма
 (``_find_match(cand, existing) or _find_match(cand, fresh)``) давала приоритет ПУЛУ над
 стратегией: в кросс-стратегийном углу (новый кандидат совпадает с existing-записью по
 ключу-2 И с fresh-записью по URL) она выбирала existing, единый пул выбирает fresh по URL.
@@ -83,11 +91,11 @@ def _match_key(cand: CandidateRecord) -> tuple[str, str, str, str | None] | None
 
 
 class _PoolIndex:
-    """Три индекса над пулом кандидатов: ``normalized_url`` / ключ-2 / ``content_hash``.
+    """Два индекса над пулом кандидатов: ``normalized_url`` / ключ-2.
 
-    **Дискриминатор редакций входит во ВСЕ ТРИ ключа единообразно** (spec
+    **Дискриминатор редакций входит в ОБА ключа единообразно** (spec
     discovery-candidates-sharding §5): кандидат с ``supersedes=X`` сопоставляется только
-    с записями с тем же ``supersedes=X``. Это единое правило, а не три особых случая —
+    с записями с тем же ``supersedes=X``. Это единое правило, а не особые случаи —
     редакция есть другая identity по определению, какой бы стратегией её ни ловили.
     Стратегия 2 обычно спасена новой ``doc_date``, но одинаковая дата переиздания —
     реальный кейс; единообразие снимает его. ``supersedes=None`` (все существующие
@@ -102,7 +110,6 @@ class _PoolIndex:
     def __init__(self) -> None:
         self.by_url: dict[tuple[str, str | None], CandidateRecord] = {}
         self.by_key: dict[tuple[str, str, str, str | None], CandidateRecord] = {}
-        self.by_hash: dict[tuple[str, str | None], CandidateRecord] = {}
 
     def add(self, cand: CandidateRecord) -> None:
         if cand.normalized_url:
@@ -110,11 +117,9 @@ class _PoolIndex:
         key = _match_key(cand)
         if key is not None:
             self.by_key.setdefault(key, cand)
-        if cand.content_hash:
-            self.by_hash.setdefault((cand.content_hash, cand.supersedes), cand)
 
     def find(self, cand: CandidateRecord) -> CandidateRecord | None:
-        """Строгий порядок стратегий url -> key -> hash, остановка на первом попадании."""
+        """Строгий порядок стратегий url -> key, остановка на первом попадании."""
         if cand.normalized_url:
             hit = self.by_url.get((cand.normalized_url, cand.supersedes))
             if hit is not None:
@@ -122,10 +127,6 @@ class _PoolIndex:
         key = _match_key(cand)
         if key is not None:
             hit = self.by_key.get(key)
-            if hit is not None:
-                return hit
-        if cand.content_hash:
-            hit = self.by_hash.get((cand.content_hash, cand.supersedes))
             if hit is not None:
                 return hit
         return None
@@ -137,7 +138,7 @@ def _merge_provenance(existing: CandidateRecord, dup: CandidateRecord) -> None:
     ``alternate_source_urls`` (spec discovery-acquire-seam-hardening §5, Г4): если
     URL дубля расходится (после нормализации) с URL поглотителя, он копится в
     extra-поле-списке поглотителя (``extra="allow"`` уже позволяет; дедуп внутри
-    списка). Стратегии 2/3 (issuer+title+date / content_hash) МОГУТ поглотить
+    списка). Стратегия 2 (issuer+title+date) МОЖЕТ поглотить
     кандидата с другим URL — живой сценарий: зеркало WAF-заблокированного
     первоисточника (тот же документ, официальный alt-хост/национальный портал). До
     этого спека такой URL терялся НИГДЕ — тупик ровно на популяции (c), ради

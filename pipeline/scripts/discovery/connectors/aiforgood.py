@@ -276,6 +276,8 @@ def _map_record(
 
     return schema.CandidateRecord(
         title=title,
+        # Реестр отдаёт заголовок КАК заголовок (spec triage-intake-hardening §3).
+        title_provenance=schema.TitleProvenance.stated,
         issuer=issuer_full_name,
         jurisdiction=None,
         doc_date=None,

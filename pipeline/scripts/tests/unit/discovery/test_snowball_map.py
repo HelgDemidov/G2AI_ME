@@ -66,6 +66,51 @@ def test_map_link_fallback_title_when_anchor_empty() -> None:
     assert cand.native_summary is None
 
 
+# --- title_provenance (spec triage-intake-hardening §3) ---
+
+
+def test_map_link_url_channels_mark_title_derived() -> None:
+    """Три URL-канала заголовка не несут в принципе: anchor у них — позиционный
+    артефакт (вырезка по геометрии прямоугольника ссылки / целая строка doc.md)."""
+    for kind in ("pdf", "html", "md"):
+        link = RawLink(url="https://example.org/x.pdf", anchor="e Model AI Governance F ramework")
+        cand = map_link(link, source_record=_source_record(), location_kind=kind, vocab_terms=[])
+        assert cand.title_provenance is schema.TitleProvenance.derived, kind
+
+
+def test_map_link_citation_channel_marks_title_stated() -> None:
+    """Канал текстовых цитат — единственный, где заголовок назван КАК заголовок:
+    его выдала модель и подтвердил verbatim-гейт против галлюцинаций."""
+    link = RawLink(url="https://example.org/x.pdf", anchor="Model AI Governance Framework")
+    cand = map_link(link, source_record=_source_record(), location_kind="citation", vocab_terms=[])
+    assert cand.title_provenance is schema.TitleProvenance.stated
+    assert cand.title == "Model AI Governance Framework"
+
+
+def test_map_link_url_like_anchor_falls_back_to_path_segment() -> None:
+    """Строка doc.md из одного URL: anchor непуст, поэтому раньше сырая ссылка
+    попадала в title (6 живых случаев). Фолбэк даёт результат ЛУЧШЕ."""
+    url = "https://digital-decade-desi.digital-strategy.ec.europa.eu/datasets/desi/charts"
+    cand = map_link(
+        RawLink(url=url, anchor=url), source_record=_source_record(),
+        location_kind="md", vocab_terms=[],
+    )
+    assert cand.title == "charts"
+    assert not cand.title.startswith("http")
+    assert cand.native_summary == url  # контекст не теряется — уходит в summary
+
+
+def test_map_link_citation_channel_keeps_url_like_title_verbatim() -> None:
+    """Verbatim-гейт цитат уже подтвердил строку — подменять её фолбэком нельзя,
+    даже если она выглядит как ссылка."""
+    url = "https://example.org/doc"
+    cand = map_link(
+        RawLink(url=url, anchor=url), source_record=_source_record(),
+        location_kind="citation", vocab_terms=[],
+    )
+    assert cand.title == url
+
+
 def test_map_link_ocr_text_url_flag_adds_native_tag() -> None:
     link = RawLink(url="https://example.org/x", anchor="anchor", ocr_text_url=True)
     cand = map_link(link, source_record=_source_record(), location_kind="md", vocab_terms=[])
