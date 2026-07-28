@@ -767,123 +767,76 @@ def save_record(rec: SourceRecord, root: Path) -> Path:
     return path
 
 
-def promote_candidate(
-    cand: CandidateRecord,
-    *,
-    id: str,
-    entity_id: str,
-    track: Track,
-    issuer_type: IssuerType,
-    geo_scope: GeoScope,
-    doc_type: str,
-    authority: str,
-    admission: Admission,
-    source_format: SourceFormat = SourceFormat.pdf,
-    topics: list[str] | None = None,
-    g2ai_pattern: list[str] | None = None,
-    summary: str | None = None,
-    relations: list[Relation] | None = None,
-    language: str | None = None,
-    official_alt_url: str | None = None,
-    title: str | None = None,
-    issuer: str | None = None,
-    source_url: str | None = None,
-) -> SourceRecord:
+CONTROL_DECISION_KEYS = frozenset({"raw_hash", "action", "reason", "reject_kind", "hidden_fields"})
+"""Служебные ключи решения триажа — адресуют САМО решение (кого/что делать), а не запись
+корпуса, и в ``curated`` не попадают. Единственное определение (spec drop-cursors-and-
+decision-overlay §3): ``manual._build_admit_record`` фильтрует по нему."""
+
+
+def promote_candidate(cand: CandidateRecord, curated: dict[str, Any]) -> SourceRecord:
     """Промоутнуть кандидата в курируемый ``SourceRecord`` (конверсия типа для ``meta.yaml``).
 
-    Издательские/классификационные решения (``id``/``entity_id``/``track``/``issuer_type``/
-    ``geo_scope``/``doc_type``/``authority``) и вердикт ``admission`` — аргументы (решение
-    триажа), не выводятся из кандидата. Обязательные поля, которых у кандидата может не быть
-    (``title``/``issuer``/``language``/``source_url``), берутся из кандидата и обязаны
-    присутствовать — иначе ``ValueError``. Провенанс добычи остаётся в ``candidates.yaml``
-    (в ``meta.yaml`` НЕ копируется — corpus-layout-v2).
+    **Решение триажа ЕСТЬ курируемая часть записи** — не двадцать именованных параметров,
+    в которые каждое новое поле схемы приходилось добавлять правкой (шесть версий такого
+    накопления подряд: ``topics``/``g2ai_pattern``/``summary``/``relations`` -> ``language``
+    -> ``supersedes`` -> ``official_alt_url`` -> ``title``/``issuer``/``source_url``).
+    ``curated`` накладывается ПОВЕРХ того, что кандидат уже знает о документе, поэтому:
 
-    ``topics``/``g2ai_pattern``/``summary``/``relations`` (v2, spec discovery-manual) — опциональная
-    аналитика в то же одно касание документа (нужно для manual-каналов, где Стадии триажа слиты,
-    второго прохода по документу не будет; ``relations`` дополнительно — pre-wave требование
-    graph-v2). ``None`` -> прежние пустые дефолты (обратная совместимость); для батч-каналов
-    опустить эти аргументы по-прежнему штатно — заполняются позже, при первом аналитическом
-    использовании документа (не формальная стадия, а естественный момент готовности).
-    Словарную принадлежность ``topics``/``g2ai_pattern`` эта функция не проверяет — как и раньше,
-    это ``validate_sources.py`` (schema словарей не грузит).
+    * любое поле ``SourceRecord`` выразимо решением без единой строки кода;
+    * ключ ``dates`` наконец выразим — до этого дверь жёстко ставила
+      ``Dates(published=cand.doc_date)``, и 76% очереди дали бы корпус с пустой временнóй
+      осью (``validity_known=False`` в графе);
+    * опечатка в ключе — ГРОМКИЙ отказ (``SourceRecord`` объявлен ``extra="forbid"``), а не
+      молча потерянное поле: для машинного судьи это разница между «не записалось» и «не
+      записалось, и никто не узнал».
 
-    ``language`` (v3, спек discovery-agora §7) — опциональный override триажа: registry-каналы
-    (AGORA и т.п.) структурно не дают язык в метаданных реестра, а ``promote_candidate`` требует
-    его non-None — резолюция ``language if language is not None else cand.language`` (override
-    побеждает, ``None`` -> прежнее поведение). manual/directed_search-кандидаты с языком на
-    ``inject`` продолжают работать без override (обратная совместимость).
+    Размен назван явно: статическая типизация вызова меняется на рантайм-валидацию. Вход и
+    так приходит из YAML, где mypy никогда не работал, а pydantic отказывает громко; но
+    поверхность записи расширяется с курируемого подмножества до всей записи. Компенсация —
+    ``extra="forbid"``, ``pattern`` полей и постбатчевый ``validate_sources`` (уже есть).
 
-    ``title``/``issuer``/``source_url`` (v6, спек triage-intake-hardening §1/§6) — override'ы
-    ТОЙ ЖЕ формы, что ``language``: у части каналов этих полей нет вовсе (``issuer`` — 22%
-    очереди на момент спека) либо значение недостоверно (OECD: делённый между записями
-    ``website`` — §6). Резолюция та же (override побеждает, ``None`` -> кандидат, оба ``None``
-    -> прежний ``ValueError``) — четвёртое симметричное применение одного механизма.
+    Из кандидата берутся ``title``/``issuer``/``language``/``source_url`` (любое ``curated``
+    их перекрывает — у части каналов их нет вовсе либо значение недостоверно), ``rights``/
+    ``sensitivity`` с прежними дефолтами и ``doc_date`` -> ``dates.published``. Провенанс
+    добычи остаётся в слое кандидатов (в ``meta.yaml`` НЕ копируется — corpus-layout-v2).
 
-    ``cand.supersedes`` (v4, spec discovery-candidates-sharding §5) — ЕДИНСТВЕННАЯ точка, где
-    временнáя цепочка редакций материализуется в курируемое ядро: непустое значение
-    добавляет ребро ``Relation(supersedes, target=cand.supersedes)``. Слияние с переданными
-    ``relations`` — без дублей по ключу ``(type, target)``: куратор, вписавший то же ребро
-    руками в decisions.yaml, не получает двойного. Потребитель ребра — вывод валидности
-    (спек graph-v2): именно из него следует, что предшественник больше не действует.
-
-    ``official_alt_url`` (v5, spec discovery-acquire-seam-hardening §9, Г13) — вторая
-    ступень лестницы добычи; НЕ приходит от кандидата (ни один существующий коннектор
-    не знает про альтернативный хост) — суждение об официальности зеркала куратор
-    вносит САМ в admit-решение. ``None`` -> прежнее поведение (поле ``SourceRecord``
-    уже существовало, просто не имело двери промоушена).
+    ``cand.supersedes`` — ЕДИНСТВЕННАЯ точка, где временнáя цепочка редакций материализуется
+    в курируемое ядро: непустое значение добавляет ребро ``supersedes`` без дубля по ключу
+    ``(type, target)`` (куратор, вписавший то же ребро руками, не получает двойного).
+    Потребитель ребра — вывод валидности graph-v2.
     """
-    resolved_title = title if title is not None else cand.title
-    resolved_issuer = issuer if issuer is not None else cand.issuer
-    resolved_language = language if language is not None else cand.language
-    resolved_source_url = source_url if source_url is not None else cand.source_url
-    missing = [
-        name
-        for name, val in (
-            ("title", resolved_title),
-            ("issuer", resolved_issuer),
-            ("language", resolved_language),
-            ("source_url", resolved_source_url),
-        )
-        if val is None
-    ]
-    if missing:
-        ident = cand.source_url or cand.title or cand.raw_hash[:12]
-        raise ValueError(
-            f"кандидат ({cand.connector_id}: {ident}): "
-            f"нельзя промоутить без полей: {', '.join(missing)}"
-        )
-    assert resolved_title is not None and resolved_issuer is not None
-    assert resolved_language is not None and resolved_source_url is not None
+    base: dict[str, Any] = {
+        "title": cand.title,
+        "issuer": cand.issuer,
+        "language": cand.language,
+        "source_url": cand.source_url,
+        "rights": cand.rights or Rights.unknown,
+        "sensitivity": cand.sensitivity or Sensitivity.normal,
+    }
+    if cand.doc_date is not None:
+        base["dates"] = {"published": cand.doc_date}
+    data = {key: value for key, value in base.items() if value is not None}
+    data.update(curated)
 
-    resolved_relations = list(relations or [])
+    relations = list(data.get("relations") or [])
     if cand.supersedes is not None:
-        auto_edge = Relation(type=RelationType.supersedes, target=cand.supersedes)
-        if not any((r.type, r.target) == (auto_edge.type, auto_edge.target) for r in resolved_relations):
-            resolved_relations.append(auto_edge)
+        present = any(
+            _relation_key(rel) == (RelationType.supersedes.value, cand.supersedes)
+            for rel in relations
+        )
+        if not present:
+            relations.append({"type": RelationType.supersedes.value, "target": cand.supersedes})
+    if relations:
+        data["relations"] = relations
 
-    return SourceRecord(
-        id=id,
-        entity_id=entity_id,
-        track=track,
-        title=resolved_title,
-        issuer=resolved_issuer,
-        issuer_type=issuer_type,
-        geo_scope=geo_scope,
-        language=resolved_language,
-        dates=Dates(published=cand.doc_date),
-        doc_type=doc_type,
-        authority=authority,
-        source_url=resolved_source_url,
-        official_alt_url=official_alt_url,
-        source_format=source_format,
-        rights=cand.rights or Rights.unknown,
-        sensitivity=cand.sensitivity or Sensitivity.normal,
-        admission=admission,
-        topics=topics or [],
-        g2ai_pattern=g2ai_pattern or [],
-        summary=summary,
-        relations=resolved_relations,
-    )
+    return SourceRecord.model_validate(data)
+
+
+def _relation_key(rel: Any) -> tuple[str, str]:
+    """``(тип, цель)`` ребра, пришедшего либо словарём из решения, либо объектом ``Relation``."""
+    if isinstance(rel, Relation):
+        return (rel.type.value, rel.target)
+    return (str(rel["type"]), str(rel["target"]))
 
 
 def load_vocab(name: str, vocab_dir: Path = VOCAB_DIR) -> set[str]:

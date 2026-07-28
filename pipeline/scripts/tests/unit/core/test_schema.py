@@ -19,6 +19,7 @@ from core.schema import (
     ENTITY_PATTERN,
     VOCAB_DIR,
     AcquisitionMethod,
+    CONTROL_DECISION_KEYS,
     Admission,
     CandidateRecord,
     Fidelity,
@@ -483,14 +484,16 @@ def test_promote_candidate_success() -> None:
     admission = _admission()
     rec = promote_candidate(
         cand,
-        id="ae-cabinet-agentic-2026",
-        entity_id="ae",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="framework",
-        authority="soft_law",
-        admission=admission,
+        {
+            "id": "ae-cabinet-agentic-2026",
+            "entity_id": "ae",
+            "track": Track.intl_xperience,
+            "issuer_type": IssuerType.government,
+            "geo_scope": GeoScope.national,
+            "doc_type": "framework",
+            "authority": "soft_law",
+            "admission": admission,
+        },
     )
     assert isinstance(rec, SourceRecord)
     assert rec.id == "ae-cabinet-agentic-2026"
@@ -509,15 +512,17 @@ def test_promote_candidate_source_format_passthrough() -> None:
     cand = CandidateRecord.model_validate(data)
     rec = promote_candidate(
         cand,
-        id="eu-doc-2024",
-        entity_id="eu",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.igo,
-        geo_scope=GeoScope.regional,
-        doc_type="legislation",
-        authority="binding_law",
-        admission=_admission(),
-        source_format=SourceFormat.html,
+        {
+            "id": "eu-doc-2024",
+            "entity_id": "eu",
+            "track": Track.intl_xperience,
+            "issuer_type": IssuerType.igo,
+            "geo_scope": GeoScope.regional,
+            "doc_type": "legislation",
+            "authority": "binding_law",
+            "admission": _admission(),
+            "source_format": SourceFormat.html,
+        },
     )
     assert rec.source_format == SourceFormat.html
 
@@ -530,15 +535,17 @@ def test_promote_candidate_official_alt_url_passthrough() -> None:
     cand = CandidateRecord.model_validate(data)
     rec = promote_candidate(
         cand,
-        id="eu-doc-2024",
-        entity_id="eu",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.igo,
-        geo_scope=GeoScope.regional,
-        doc_type="legislation",
-        authority="binding_law",
-        admission=_admission(),
-        official_alt_url="https://mirror.example.org/d.pdf",
+        {
+            "id": "eu-doc-2024",
+            "entity_id": "eu",
+            "track": Track.intl_xperience,
+            "issuer_type": IssuerType.igo,
+            "geo_scope": GeoScope.regional,
+            "doc_type": "legislation",
+            "authority": "binding_law",
+            "admission": _admission(),
+            "official_alt_url": "https://mirror.example.org/d.pdf",
+        },
     )
     assert rec.official_alt_url == "https://mirror.example.org/d.pdf"
 
@@ -549,14 +556,16 @@ def test_promote_candidate_official_alt_url_none_is_prior_behavior() -> None:
     cand = CandidateRecord.model_validate(data)
     rec = promote_candidate(
         cand,
-        id="eu-doc-2024",
-        entity_id="eu",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.igo,
-        geo_scope=GeoScope.regional,
-        doc_type="legislation",
-        authority="binding_law",
-        admission=_admission(),
+        {
+            "id": "eu-doc-2024",
+            "entity_id": "eu",
+            "track": Track.intl_xperience,
+            "issuer_type": IssuerType.igo,
+            "geo_scope": GeoScope.regional,
+            "doc_type": "legislation",
+            "authority": "binding_law",
+            "admission": _admission(),
+        },
     )
     assert rec.official_alt_url is None
 
@@ -567,18 +576,20 @@ def test_promote_candidate_v2_analytics_fields_populated() -> None:
     cand = CandidateRecord.model_validate(data)
     rec = promote_candidate(
         cand,
-        id="me-example-strategy-2026",
-        entity_id="me",
-        track=Track.target_entity,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="strategy",
-        authority="official",
-        admission=_admission(),
-        topics=["ai-governance"],
-        g2ai_pattern=["agent-governance-framework"],
-        summary="2-3 sentences EN",
-        relations=[Relation(type=RelationType.implements, target="eu-ai-act-2024")],
+        {
+            "id": "me-example-strategy-2026",
+            "entity_id": "me",
+            "track": Track.target_entity,
+            "issuer_type": IssuerType.government,
+            "geo_scope": GeoScope.national,
+            "doc_type": "strategy",
+            "authority": "official",
+            "admission": _admission(),
+            "topics": ["ai-governance"],
+            "g2ai_pattern": ["agent-governance-framework"],
+            "summary": "2-3 sentences EN",
+            "relations": [Relation(type=RelationType.implements, target="eu-ai-act-2024")],
+        },
     )
     assert rec.topics == ["ai-governance"]
     assert rec.g2ai_pattern == ["agent-governance-framework"]
@@ -593,14 +604,16 @@ def test_promote_candidate_v2_fields_default_empty_when_omitted() -> None:
     cand = CandidateRecord.model_validate(data)
     rec = promote_candidate(
         cand,
-        id="me-example-strategy-2026",
-        entity_id="me",
-        track=Track.target_entity,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="strategy",
-        authority="official",
-        admission=_admission(),
+        {
+            "id": "me-example-strategy-2026",
+            "entity_id": "me",
+            "track": Track.target_entity,
+            "issuer_type": IssuerType.government,
+            "geo_scope": GeoScope.national,
+            "doc_type": "strategy",
+            "authority": "official",
+            "admission": _admission(),
+        },
     )
     assert rec.topics == []
     assert rec.g2ai_pattern == []
@@ -615,178 +628,136 @@ def test_promote_candidate_missing_source_url_raises() -> None:
     with pytest.raises(ValueError, match="source_url"):
         promote_candidate(
             cand,
-            id="x-y-2026",
-            entity_id="xx",
-            track=Track.intl_xperience,
-            issuer_type=IssuerType.government,
-            geo_scope=GeoScope.national,
-            doc_type="framework",
-            authority="soft_law",
-            admission=_admission(),
+            {
+                "id": "x-y-2026",
+                "entity_id": "xx",
+                "track": Track.intl_xperience,
+                "issuer_type": IssuerType.government,
+                "geo_scope": GeoScope.national,
+                "doc_type": "framework",
+                "authority": "soft_law",
+                "admission": _admission(),
+            },
         )
 
 
-def test_promote_candidate_language_override_success() -> None:
-    """spec discovery-agora §7: registry-каналы (AGORA) не дают язык — триаж подаёт
-    его через override при admit, симметрично doc_type/authority."""
+_BASE_DECISION: dict[str, object] = {
+    "id": "us-cabinet-agentic-2026",
+    "entity_id": "us",
+    "track": Track.intl_xperience,
+    "issuer_type": IssuerType.government,
+    "geo_scope": GeoScope.national,
+    "doc_type": "framework",
+    "authority": "soft_law",
+}
+
+
+def _decision(**extra: object) -> dict[str, object]:
+    return {**_BASE_DECISION, "admission": _admission(), **extra}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("language", "en"),
+        ("title", "Real Title"),
+        ("issuer", "Ministry of Justice"),
+        ("source_url", "https://ex.org/override.pdf"),
+    ],
+)
+def test_promote_candidate_overlay_wins_over_candidate(field: str, value: str) -> None:
+    """Решение накладывается ПОВЕРХ кандидата — механизм ОДИН для всех полей записи
+    (spec drop-cursors-and-decision-overlay §3). Раньше это были четыре именованных
+    override-параметра с четырьмя копиями резолюции; здесь проверяется, что копия одна.
+
+    Живые поводы у каждого свои: registry-каналы структурно не дают ``language``
+    (discovery-agora §7), у snowball 52% заголовков — реконструкция из позиционного
+    артефакта, OECD делит один ``website`` между разными документами (§6).
+    """
     data = valid_candidate()
-    data.update(title="Doc", issuer="Gov", source_url="https://ex.org/d.pdf")  # без language
-    cand = CandidateRecord.model_validate(data)
-    assert cand.language is None
-    rec = promote_candidate(
-        cand,
-        id="us-cabinet-agentic-2026",
-        entity_id="us",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="framework",
-        authority="soft_law",
-        admission=_admission(),
-        language="en",
+    data.update(
+        title="cand title", issuer="cand issuer", language="cnr",
+        source_url="https://ex.org/cand.pdf",
     )
-    assert rec.language == "en"
-
-
-def test_promote_candidate_language_override_none_and_candidate_none_raises() -> None:
-    """Без override И без языка у кандидата — прежнее поведение (ValueError), не тихий None."""
-    data = valid_candidate()
-    data.update(title="Doc", issuer="Gov", source_url="https://ex.org/d.pdf")  # без language
     cand = CandidateRecord.model_validate(data)
-    with pytest.raises(ValueError, match="language"):
-        promote_candidate(
-            cand,
-            id="x-y-2026",
-            entity_id="xx",
-            track=Track.intl_xperience,
-            issuer_type=IssuerType.government,
-            geo_scope=GeoScope.national,
-            doc_type="framework",
-            authority="soft_law",
-            admission=_admission(),
-        )
+
+    rec = promote_candidate(cand, _decision(**{field: value}))
+
+    assert getattr(rec, field) == value
 
 
-def test_promote_candidate_language_on_candidate_wins_without_override() -> None:
-    """manual-кандидат с языком (inject) продолжает работать без override — обратная совместимость."""
+@pytest.mark.parametrize("field", ["language", "title", "issuer", "source_url"])
+def test_promote_candidate_missing_in_both_is_loud(field: str) -> None:
+    """Ни у кандидата, ни в решении — ГРОМКИЙ отказ, не тихий ``None``."""
     data = valid_candidate()
-    data.update(title="Doc", issuer="Gov", language="cnr", source_url="https://ex.org/d.pdf")
+    data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
+    data.pop(field, None)
+    data[field] = None
     cand = CandidateRecord.model_validate(data)
-    rec = promote_candidate(
-        cand,
-        id="me-example-2026",
-        entity_id="me",
-        track=Track.target_entity,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="framework",
-        authority="soft_law",
-        admission=_admission(),
+
+    with pytest.raises(ValueError, match=field):
+        promote_candidate(cand, _decision())
+
+
+def test_promote_candidate_dates_from_decision() -> None:
+    """Блокер закрыт: ``dates`` выразим решением. До этого дверь жёстко ставила
+    ``Dates(published=cand.doc_date)``, и 76% очереди дали бы корпус с пустой временнóй
+    осью — ``validity_known=False`` в графе на массовом допуске."""
+    data = valid_candidate()
+    data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
+    cand = CandidateRecord.model_validate(data)
+    assert cand.doc_date is None
+
+    rec = promote_candidate(cand, _decision(dates={"published": "2024-02-02"}))
+
+    assert rec.dates.published is not None and rec.dates.published.isoformat() == "2024-02-02"
+
+
+def test_promote_candidate_candidate_date_used_when_decision_silent() -> None:
+    data = valid_candidate()
+    data.update(
+        title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf",
+        doc_date="2026-03-01",
     )
-    assert rec.language == "cnr"
-
-
-def test_promote_candidate_title_override_success() -> None:
-    """spec triage-intake-hardening §1: title override той же формы, что language (spec
-    discovery-agora §7) — snowball массово не даёт настоящий заголовок (title_provenance
-    §3), решение подаёт его через override."""
-    data = valid_candidate()
-    data.update(issuer="Gov", language="en", source_url="https://ex.org/d.pdf")  # без title
     cand = CandidateRecord.model_validate(data)
-    assert cand.title is None
-    rec = promote_candidate(
-        cand,
-        id="us-cabinet-agentic-2026",
-        entity_id="us",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="framework",
-        authority="soft_law",
-        admission=_admission(),
-        title="Overridden Title",
-    )
-    assert rec.title == "Overridden Title"
+
+    rec = promote_candidate(cand, _decision())
+
+    assert rec.dates.published is not None and rec.dates.published.isoformat() == "2026-03-01"
 
 
-def test_promote_candidate_title_override_none_and_candidate_none_raises() -> None:
+def test_promote_candidate_unknown_key_is_loud() -> None:
+    """``SourceRecord`` объявлен ``extra="forbid"``: опечатка в ключе решения падает, а не
+    теряется молча. Для машинного судьи это разница между «поле не записалось» и «поле не
+    записалось, и никто не узнал»."""
     data = valid_candidate()
-    data.update(issuer="Gov", language="en", source_url="https://ex.org/d.pdf")  # без title
+    data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
     cand = CandidateRecord.model_validate(data)
-    with pytest.raises(ValueError, match="title"):
-        promote_candidate(
-            cand,
-            id="x-y-2026",
-            entity_id="xx",
-            track=Track.intl_xperience,
-            issuer_type=IssuerType.government,
-            geo_scope=GeoScope.national,
-            doc_type="framework",
-            authority="soft_law",
-            admission=_admission(),
-        )
+
+    with pytest.raises(ValidationError, match="titel"):
+        promote_candidate(cand, _decision(titel="опечатка"))
 
 
-def test_promote_candidate_issuer_override_success() -> None:
-    """spec triage-intake-hardening §1: issuer override — 22% очереди (oecd/snowball) его
-    не дают вовсе, дверь для override отсутствовала (в отличие от language) до этого спека."""
+def test_promote_candidate_control_keys_would_be_rejected() -> None:
+    """Почему ``_build_admit_record`` фильтрует по ``CONTROL_DECISION_KEYS``: служебные ключи
+    адресуют САМО решение, а не запись, и запись их не принимает."""
     data = valid_candidate()
-    data.update(title="Doc", language="en", source_url="https://ex.org/d.pdf")  # без issuer
+    data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
     cand = CandidateRecord.model_validate(data)
-    assert cand.issuer is None
-    rec = promote_candidate(
-        cand,
-        id="us-cabinet-agentic-2026",
-        entity_id="us",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="framework",
-        authority="soft_law",
-        admission=_admission(),
-        issuer="Overridden Gov",
-    )
-    assert rec.issuer == "Overridden Gov"
+
+    for key in CONTROL_DECISION_KEYS:
+        with pytest.raises(ValidationError, match=key):
+            promote_candidate(cand, _decision(**{key: "что угодно"}))
 
 
-def test_promote_candidate_issuer_override_none_and_candidate_none_raises() -> None:
+def test_promote_candidate_invalid_official_alt_url_caught_by_schema() -> None:
+    """Ручная валидация формы URL в двери снята — её делает ``pattern`` поля схемы."""
     data = valid_candidate()
-    data.update(title="Doc", language="en", source_url="https://ex.org/d.pdf")  # без issuer
+    data.update(title="Doc", issuer="Gov", language="en", source_url="https://ex.org/d.pdf")
     cand = CandidateRecord.model_validate(data)
-    with pytest.raises(ValueError, match="issuer"):
-        promote_candidate(
-            cand,
-            id="x-y-2026",
-            entity_id="xx",
-            track=Track.intl_xperience,
-            issuer_type=IssuerType.government,
-            geo_scope=GeoScope.national,
-            doc_type="framework",
-            authority="soft_law",
-            admission=_admission(),
-        )
 
-
-def test_promote_candidate_source_url_override_success() -> None:
-    """spec triage-intake-hardening §1/§6: source_url override — OECD-значение может быть
-    недостоверным (§6, url_provenance: suspect), куратор подаёт верный адрес через решение."""
-    data = valid_candidate()
-    data.update(title="Doc", issuer="Gov", language="en")  # без source_url
-    cand = CandidateRecord.model_validate(data)
-    assert cand.source_url is None
-    rec = promote_candidate(
-        cand,
-        id="us-cabinet-agentic-2026",
-        entity_id="us",
-        track=Track.intl_xperience,
-        issuer_type=IssuerType.government,
-        geo_scope=GeoScope.national,
-        doc_type="framework",
-        authority="soft_law",
-        admission=_admission(),
-        source_url="https://ex.org/override.pdf",
-    )
-    assert rec.source_url == "https://ex.org/override.pdf"
+    with pytest.raises(ValidationError, match="official_alt_url"):
+        promote_candidate(cand, _decision(official_alt_url="ftp://mirror.example.org/d.pdf"))
 
 
 def test_operational_state_default() -> None:

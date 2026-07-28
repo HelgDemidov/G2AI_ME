@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -591,6 +590,11 @@ def _build_admit_record(
 ) -> tuple[schema.SourceRecord, list[str]]:
     """Построить ``SourceRecord`` из ``admit``-решения (промоушен, ничего не пишет на диск).
 
+    Решение МИНУС служебные ключи (``schema.CONTROL_DECISION_KEYS``) есть курируемая часть
+    записи и уходит в ``promote_candidate`` как есть (spec drop-cursors-and-decision-overlay
+    §3). Здесь остаётся ровно то, что специфично двери допуска: проверка обязательных и
+    условно-обязательных ключей с внятной для куратора формулировкой, плюс три дефолта.
+
     Возвращает ``(запись, применённые_дефолты)`` — второй элемент вида
     ``["authority=soft_law", "track=target-entity"]`` для эха в сводке apply (куратор
     видит, во что развернулись опущенные поля)."""
@@ -602,7 +606,7 @@ def _build_admit_record(
     # title/issuer/language/source_url (agora/aiforgood/oecd/snowball массово их не дают,
     # либо OECD-значение недостоверно — §6); в этом случае решение обязано задать ключ явно.
     # Ошибка называет ИМЕННО недостающее поле и ключ, который его чинит — а не долетает
-    # до ValueError из глубины promote_candidate, где контекста решения уже нет.
+    # до ValidationError из глубины promote_candidate, где контекста решения уже нет.
     missing_conditional = _missing_conditional_fields(cand, decision)
     if missing_conditional:
         field_name = missing_conditional[0]
@@ -625,23 +629,22 @@ def _build_admit_record(
             f"admit: у кандидата нет `{field_name}`, задайте его ключом `{field_name}:` в решении"
         )
 
+    curated = {k: v for k, v in decision.items() if k not in schema.CONTROL_DECISION_KEYS}
     defaulted: list[str] = []
-    issuer_type = schema.IssuerType(decision["issuer_type"])
 
-    authority = decision.get("authority")
-    if authority is None:
+    if "authority" not in curated:
         authority = _AUTHORITY_BY_DOC_TYPE.get(decision["doc_type"])
         if authority is None:
             raise ValueError(
                 f"admit: authority не указан, а для doc_type '{decision['doc_type']}' "
                 "нет дефолта — задайте authority явно"
             )
+        curated["authority"] = authority
         defaulted.append(f"authority={authority}")
 
-    if "track" in decision:
-        track = schema.Track(decision["track"])
-    else:
-        track = _default_track(cand.jurisdiction, issuer_type)
+    if "track" not in curated:
+        track = _default_track(cand.jurisdiction, schema.IssuerType(decision["issuer_type"]))
+        curated["track"] = track.value
         defaulted.append(f"track={track.value}")
 
     # Резолюция формата (spec discovery-acquire-seam-hardening §8, Г7): явный ключ
@@ -649,44 +652,14 @@ def _build_admit_record(
     # молчаливый дефолт "pdf". Выведенное из подсказки значение эхается в defaulted
     # той же механикой, что authority/track — куратор видит, во что развернулась
     # подсказка, не только счёт документов.
-    if "source_format" in decision:
-        source_format = schema.SourceFormat(decision["source_format"])
-    elif cand.native_format_hint is not None:
-        source_format = cand.native_format_hint
-        defaulted.append(f"source_format={source_format.value} (подсказка кандидата)")
-    else:
-        source_format = schema.SourceFormat.pdf
+    if "source_format" not in curated:
+        if cand.native_format_hint is not None:
+            curated["source_format"] = cand.native_format_hint.value
+            defaulted.append(f"source_format={cand.native_format_hint.value} (подсказка кандидата)")
+        else:
+            curated["source_format"] = schema.SourceFormat.pdf.value
 
-    # official_alt_url (spec discovery-acquire-seam-hardening §9, Г13): вторая
-    # ступень лестницы через дверь промоушена — суждение об официальности зеркала
-    # куратор вносит явно, ни один коннектор этого знания не несёт (rationale спека).
-    official_alt_url = decision.get("official_alt_url")
-    if official_alt_url is not None and not re.match(r"^https?://", official_alt_url):
-        raise ValueError(f"admit: official_alt_url не похож на URL: {official_alt_url!r}")
-
-    relations_raw = decision.get("relations")
-    rec = schema.promote_candidate(
-        cand,
-        id=decision["id"],
-        entity_id=decision["entity_id"],
-        track=track,
-        issuer_type=issuer_type,
-        geo_scope=schema.GeoScope(decision["geo_scope"]),
-        doc_type=decision["doc_type"],
-        authority=authority,
-        admission=schema.Admission.model_validate(decision["admission"]),
-        source_format=source_format,
-        official_alt_url=official_alt_url,
-        topics=decision.get("topics"),
-        g2ai_pattern=decision.get("g2ai_pattern"),
-        summary=decision.get("summary"),
-        relations=[schema.Relation.model_validate(r) for r in relations_raw] if relations_raw else None,
-        language=decision.get("language"),
-        title=decision.get("title"),
-        issuer=decision.get("issuer"),
-        source_url=decision.get("source_url"),
-    )
-    return rec, defaulted
+    return schema.promote_candidate(cand, curated), defaulted
 
 
 def apply_decisions(

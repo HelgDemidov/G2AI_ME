@@ -439,18 +439,20 @@ def test_candidate_requires_language_override_like_agora() -> None:
     assert cand is not None
     record = schema.promote_candidate(
         cand,
-        id="itu-t-e475-test",
-        entity_id="itu-t",
-        track=schema.Track.tech_standards,
-        issuer_type=schema.IssuerType.standards_body,
-        geo_scope=schema.GeoScope.international,
-        doc_type="technical_standard",
-        authority="voluntary_standard",
-        admission=schema.Admission(
+        {
+            "id": "itu-t-e475-test",
+            "entity_id": "itu-t",
+            "track": schema.Track.tech_standards,
+            "issuer_type": schema.IssuerType.standards_body,
+            "geo_scope": schema.GeoScope.international,
+            "doc_type": "technical_standard",
+            "authority": "voluntary_standard",
+            "admission": schema.Admission(
             axis="digital_sovereignty",
             rationale="test",
         ),
-        language="en",
+            "language": "en",
+        },
     )
     assert record.language == "en"
 

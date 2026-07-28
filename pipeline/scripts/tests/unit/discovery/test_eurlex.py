@@ -535,18 +535,20 @@ def test_candidate_promotable_without_language_override() -> None:
     candidates, _ = eurlex.map_rows_to_candidates(rows)
     record = schema.promote_candidate(
         candidates[0],
-        id="eu-ai-act-test",
-        entity_id="eu",
-        track=schema.Track.intl_xperience,
-        issuer_type=schema.IssuerType.igo,
-        geo_scope=schema.GeoScope.regional,
-        doc_type="legislation",
-        authority="binding_law",
-        admission=schema.Admission(
+        {
+            "id": "eu-ai-act-test",
+            "entity_id": "eu",
+            "track": schema.Track.intl_xperience,
+            "issuer_type": schema.IssuerType.igo,
+            "geo_scope": schema.GeoScope.regional,
+            "doc_type": "legislation",
+            "authority": "binding_law",
+            "admission": schema.Admission(
             axis="digital_sovereignty",
             rationale="test",
         ),
-        source_format=schema.SourceFormat.html,
+            "source_format": schema.SourceFormat.html,
+        },
     )
     assert record.language == "en"
 
