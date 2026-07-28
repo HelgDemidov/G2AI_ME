@@ -374,19 +374,27 @@ def worksheet_payload(
     unacquirable: list[schema.CandidateRecord] | None = None,
     *,
     total: int | None = None,
+    unacquirable_total: int | None = None,
 ) -> dict[str, Any]:
     """Структура worksheet (spec triage-intake-hardening §2) — общий источник данных для
     обоих рендереров (`--format json|md`): гарантирует один и тот же набор кандидатов
     (по ``raw_hash``) в обоих форматах, а не две расходящиеся реализации.
 
-    ``total`` — размер пула ДО ``--limit`` (после ``--connector``, если задан); ``None`` —
-    отбор не применялся, ``pending_total`` тогда равен ``len(pending)``."""
+    ``total``/``unacquirable_total`` — размеры пулов ДО ``--limit`` (после ``--connector``,
+    если задан). ``None`` — усечения не было, счётчик равен длине показанного списка.
+    Обе секции считаются ОТДЕЛЬНО: ``--limit`` режет каждую до N, и усечённой может
+    оказаться любая из них независимо от другой."""
+    shown_unacq = list(unacquirable or [])
     return {
         "contract": _worksheet_contract(),
         "pending_total": total if total is not None else len(pending),
         "shown": len(pending),
+        "unacquirable_total": (
+            unacquirable_total if unacquirable_total is not None else len(shown_unacq)
+        ),
+        "unacquirable_shown": len(shown_unacq),
         "candidates": [_candidate_payload(c) for c in pending],
-        "unacquirable": [_candidate_payload(c) for c in (unacquirable or [])],
+        "unacquirable": [_candidate_payload(c) for c in shown_unacq],
     }
 
 
@@ -395,22 +403,37 @@ def render_worksheet(
     unacquirable: list[schema.CandidateRecord] | None = None,
     *,
     total: int | None = None,
+    unacquirable_total: int | None = None,
 ) -> str:
     """Markdown-таблица ждущих кандидатов + шапка-инструкция (spec §3, `missing`-колонка
-    и `total`-аннотация — spec triage-intake-hardening §1/§2).
+    и аннотация усечения — spec triage-intake-hardening §1/§2).
 
     ``unacquirable`` — вторая секция (spec post-acquisition-lifecycle §5): очередь
     ожидания обстоятельств. Пустая -> секция не печатается вовсе (шум в типовом
-    прогоне не нужен). ``total`` — см. ``worksheet_payload``; при отборе (``--connector``/
-    ``--limit``) печатает строку «показано N из M ждущих» — молчаливое усечение читалось
-    бы как «это вся очередь».
+    прогоне не нужен).
+
+    ``total``/``unacquirable_total`` — см. ``worksheet_payload``. Строка «показано N из M»
+    печатается ТОЛЬКО когда секция реально усечена (``shown < total``): молчаливое
+    усечение читалось бы как «это вся очередь», но и «показано 717 из 717» на КАЖДОМ
+    отборе — шум, от которого строку перестают читать ровно тогда, когда она наконец
+    что-то значит. Секции считаются независимо — усечённой может быть любая.
     """
-    payload = worksheet_payload(pending, unacquirable, total=total)
+    payload = worksheet_payload(
+        pending, unacquirable, total=total, unacquirable_total=unacquirable_total
+    )
     missing_by_hash = {row["raw_hash"]: row["missing"] for row in payload["candidates"]}
 
     lines = [_WORKSHEET_HEADER, ""]
-    if total is not None:
-        lines.append(f"Показано {payload['shown']} из {payload['pending_total']} ждущих.\n")
+    truncation: list[str] = []
+    if payload["shown"] < payload["pending_total"]:
+        truncation.append(f"Показано {payload['shown']} из {payload['pending_total']} ждущих.")
+    if payload["unacquirable_shown"] < payload["unacquirable_total"]:
+        truncation.append(
+            f"Показано {payload['unacquirable_shown']} из "
+            f"{payload['unacquirable_total']} недобываемых."
+        )
+    if truncation:
+        lines.append(" ".join(truncation) + "\n")
     lines.append(
         "| raw_hash | title | issuer | jurisdiction | doc_date | supersedes | connector_id "
         "| native_tags/matched_query | source_url | format_hint | missing |"

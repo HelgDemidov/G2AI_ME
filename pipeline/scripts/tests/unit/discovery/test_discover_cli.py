@@ -371,6 +371,47 @@ def test_worksheet_subcommand_limit_truncates_and_reports_total(
     assert payload["pending_total"] == 3
 
 
+def test_worksheet_subcommand_connector_without_limit_reports_no_truncation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Регресс дефекта `/review` PR #56: `--connector` без `--limit` ничего не усекает,
+    поэтому `shown == pending_total` и строки «Показано N из M» быть не должно."""
+    main(
+        [
+            "inject", "--root", str(tmp_path), "--url", "https://gov.example.org/a.pdf",
+            "--title", "T", "--issuer", "I", "--language", "en",
+        ]
+    )
+    capsys.readouterr()
+    code = main(["worksheet", "--root", str(tmp_path), "--connector", "manual", "--format", "md"])
+    assert code == 0
+    assert "Показано" not in capsys.readouterr().out
+
+
+def test_worksheet_subcommand_limit_cuts_unacquirable_section_too(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--limit N` — «дай партию», и это относится к ОБЕИМ очередям: иначе `--limit 20`
+    при сотне недобываемых отдавал бы 20 + 100."""
+    cands = [
+        schema.CandidateRecord.model_validate(
+            {
+                "connector_id": "manual", "retrieved_at": "2026-07-28", "raw_hash": str(i) * 64,
+                "title": f"T{i}", "issuer": "I", "language": "en",
+                "source_url": f"https://gov.example.org/{i}.pdf",
+                "rejected_reason": "WAF", "rejected_kind": "unacquirable",
+            }
+        )
+        for i in range(1, 4)
+    ]
+    store.save(cands, tmp_path)
+    code = main(["worksheet", "--root", str(tmp_path), "--limit", "2"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out.split("\n(+", 1)[0])
+    assert payload["unacquirable_shown"] == 2
+    assert payload["unacquirable_total"] == 3
+
+
 def test_worksheet_subcommand_no_selection_omits_total_annotation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

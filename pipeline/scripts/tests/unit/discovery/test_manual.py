@@ -283,9 +283,34 @@ def test_render_worksheet_no_total_line_without_total() -> None:
     assert "Показано" not in text
 
 
-def test_render_worksheet_total_line_appears_with_total() -> None:
+def test_render_worksheet_total_line_appears_when_truncated() -> None:
     text = manual.render_worksheet([_candidate()], total=42)
     assert "Показано 1 из 42 ждущих." in text
+
+
+def test_render_worksheet_no_total_line_when_nothing_truncated() -> None:
+    """Регресс дефекта, найденного `/review` PR #56: строка печаталась при ЛЮБОМ отборе,
+    поэтому `--connector oecd` без `--limit` давал «Показано 717 из 717 ждущих» — шум,
+    от которого строку перестают читать ровно тогда, когда она наконец что-то значит.
+    Прежний тест проверял только положительный случай (1 из 42) и дефект не ловил."""
+    text = manual.render_worksheet([_candidate()], total=1)
+    assert "Показано" not in text
+
+
+def test_render_worksheet_truncated_unacquirable_section_is_announced() -> None:
+    """Усечение ЛЮБОЙ секции обязано быть объявлено — молчаливое читалось бы как
+    «это вся очередь»."""
+    unacq = _candidate(raw_hash="c" * 64, rejected_reason="WAF", rejected_kind="unacquirable")
+    text = manual.render_worksheet([_candidate()], [unacq], total=1, unacquirable_total=9)
+    assert "Показано 1 из 9 недобываемых." in text
+    assert text.count("Показано") == 1  # ждущие не усечены — про них строки нет
+
+
+def test_render_worksheet_announces_both_sections_when_both_truncated() -> None:
+    unacq = _candidate(raw_hash="c" * 64, rejected_reason="WAF", rejected_kind="unacquirable")
+    text = manual.render_worksheet([_candidate()], [unacq], total=5, unacquirable_total=9)
+    assert "Показано 1 из 5 ждущих." in text
+    assert "Показано 1 из 9 недобываемых." in text
 
 
 # --- worksheet_payload / --format json (spec triage-intake-hardening §2) ---

@@ -72,29 +72,36 @@ def _cmd_inject(args: argparse.Namespace) -> int:
 
 
 def _cmd_worksheet(args: argparse.Namespace) -> int:
-    """spec triage-intake-hardening §2: ``--connector``/``--limit`` — отбор над списком
-    ждущих ДО рендера (worksheet read-only, лока не берёт, как и раньше). ``total`` для
-    аннотации «показано N из M» — размер пула ПОСЛЕ ``--connector`` (если задан), но ДО
-    ``--limit``: отвечает на «сколько ещё в том, что я запросил», не «сколько во всей
-    очереди» (обе величины были бы неверны при узком коннекторе на большой очереди)."""
+    """spec triage-intake-hardening §2: ``--connector``/``--limit`` — отбор над списками
+    ДО рендера (worksheet read-only, лока не берёт, как и раньше).
+
+    ``--limit N`` режет ОБЕ секции до N независимо: «дай партию» относится и к ждущим, и к
+    недобываемым — иначе ``--limit 20`` при сотне недобываемых отдавал бы 20 + 100, то есть
+    не партию. Полные размеры снимаются ПОСЛЕ ``--connector``, но ДО ``--limit`` — они
+    отвечают на «сколько ещё в том, что я запросил», а не «сколько во всей очереди»."""
     candidates = store.load(args.root)
     records = schema.load_records(args.root)
     pending = manual.pending_candidates(candidates, records)
     unacquirable = manual.unacquirable_candidates(candidates, records)
 
-    selection_active = bool(args.connector) or args.limit is not None
     if args.connector:
         pending = [c for c in pending if c.connector_id in args.connector]
         unacquirable = [c for c in unacquirable if c.connector_id in args.connector]
-    total_for_message = len(pending) if selection_active else None
+    pending_total = len(pending)
+    unacquirable_total = len(unacquirable)
     if args.limit is not None:
         pending = pending[: args.limit]
+        unacquirable = unacquirable[: args.limit]
 
     if args.format == "json":
-        payload = manual.worksheet_payload(pending, unacquirable, total=total_for_message)
+        payload = manual.worksheet_payload(
+            pending, unacquirable, total=pending_total, unacquirable_total=unacquirable_total
+        )
         text = json.dumps(payload, ensure_ascii=False, indent=2)
     else:
-        text = manual.render_worksheet(pending, unacquirable, total=total_for_message)
+        text = manual.render_worksheet(
+            pending, unacquirable, total=pending_total, unacquirable_total=unacquirable_total
+        )
 
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +110,12 @@ def _cmd_worksheet(args: argparse.Namespace) -> int:
     else:
         print(text)
     if unacquirable:
-        print(f"(+ {len(unacquirable)} недобываемых кандидатов — ждут смены обстоятельств)")
+        shown_of = (
+            f"{len(unacquirable)} из {unacquirable_total}"
+            if len(unacquirable) < unacquirable_total
+            else str(len(unacquirable))
+        )
+        print(f"(+ {shown_of} недобываемых кандидатов — ждут смены обстоятельств)")
     return 0
 
 
