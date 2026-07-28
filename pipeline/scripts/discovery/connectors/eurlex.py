@@ -26,7 +26,7 @@ import yaml
 
 from core import schema
 from core.env import REPO_ROOT
-from discovery import dedup, registry
+from discovery import registry
 from discovery.base import ConnectorCursor, DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_eurlex.yaml"
@@ -349,7 +349,6 @@ def _map_group(
         connector_id=CONNECTOR_ID,
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash,
-        normalized_url=dedup.normalize_url(source_url),
         # by construction: _build_source_url всегда строит /TXT/HTML/ — коннектор
         # ЗНАЕТ формат (spec discovery-acquire-seam-hardening §8, Г7), в отличие от
         # молчаливого дефолта "pdf" на admit-двери.

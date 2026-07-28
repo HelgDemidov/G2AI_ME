@@ -1,16 +1,9 @@
 """discovery/dedup.py — кросс-коннекторный dedup кандидатов (spec discovery-core §3).
 
-Ключи сравнения по убыванию надёжности (чартер §4.4): ``normalized_url`` -> ``(issuer,
-normalized_title, doc_date)``. Без fuzzy-библиотек — детерминизм важнее recall
-(остаточные дубли дочистит человек на worksheet, discovery-manual).
-
-**Третьей стратегии (``content_hash``) БОЛЬШЕ НЕТ** (spec triage-intake-hardening §4):
-поле не заполнил ни один из шести конструкторов кандидата за всю историю — «хэш
-содержания» на слое кандидатов неполучаем ПО ПОСТРОЕНИЮ (до добычи байтов документа не
-существует), так что стратегия не срабатывала ни разу и не могла. Ключ по ФОРМАЛЬНОМУ
-идентификатору из URL рассмотрен как замена и отвергнут (разбор — Design rationale
-спека): измеренная польза один дубль на 1790 кандидатов, цена — общая для discovery и
-graph точка извлечения идентификаторов, которой сегодня негде жить без компромисса.
+Ключи сравнения по убыванию надёжности (чартер §4.4): URL-идентичность ->
+``(issuer, normalized_title, doc_date)`` -> идентичность записи в источнике. Без
+fuzzy-библиотек — детерминизм важнее recall (остаточные дубли дочистит человек на
+worksheet, discovery-manual).
 
 **Один проход вместо линейных сканов (spec discovery-candidates-sharding §4).** Раньше
 на КАЖДОГО нового кандидата шли последовательные линейные сканы по всему пулу — при
@@ -35,7 +28,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
-from core.schema import CandidateRecord, SourceFormat
+from core.schema import CandidateRecord, SourceFormat, UrlProvenance
 
 _NON_WORD_RE = re.compile(r"[\W_]+", re.UNICODE)
 
@@ -90,16 +83,47 @@ def _match_key(cand: CandidateRecord) -> tuple[str, str, str, str | None] | None
     return (cand.issuer, normalized_title(cand.title), str(cand.doc_date), cand.supersedes)
 
 
-class _PoolIndex:
-    """Два индекса над пулом кандидатов: ``normalized_url`` / ключ-2.
+def _identity_url(cand: CandidateRecord) -> str | None:
+    """URL как КЛЮЧ ИДЕНТИЧНОСТИ — ``None``, если адресу объявлено недоверие.
 
-    **Дискриминатор редакций входит в ОБА ключа единообразно** (spec
+    Значение, помеченное ``url_provenance: suspect`` (spec triage-intake-hardening §6 —
+    OECD отдаёт один ``website`` нескольким РАЗНЫМ документам), ключом не служит: иначе
+    дедуп схлопывает эти документы в одного, и они не доходят до триажа вовсе (замер на
+    боевом снапшоте: 23 группы коллизий, 25 поглощённых кандидатов). Метку ставит
+    коннектор, но до этого гейта её не читал никто — dedup отрабатывал раньше двери.
+    """
+    if cand.url_provenance is UrlProvenance.suspect:
+        return None
+    return normalize_url(cand.source_url) if cand.source_url else None
+
+
+def _source_identity(cand: CandidateRecord) -> tuple[str, str, str | None]:
+    """Стратегия 3 — СОБСТВЕННАЯ идентичность записи в источнике.
+
+    Ключ — ``native_id`` (идентификатор источника), а не ``raw_hash``: последний есть
+    дайджест ОПИСАНИЯ и меняется при любом редактировании записи (замер: правка
+    ``updatedAt`` обнуляет совпадение 749/749, ``native_id`` переживает 749/749).
+    ``raw_hash`` остаётся фолбэком там, где ``native_id`` нет вовсе.
+    """
+    return (cand.connector_id, cand.native_id or cand.raw_hash, cand.supersedes)
+
+
+class _PoolIndex:
+    """Три индекса над пулом кандидатов: URL-идентичность / ключ-2 / идентичность в источнике.
+
+    **Дискриминатор редакций входит во ВСЕ ключи единообразно** (spec
     discovery-candidates-sharding §5): кандидат с ``supersedes=X`` сопоставляется только
     с записями с тем же ``supersedes=X``. Это единое правило, а не особые случаи —
     редакция есть другая identity по определению, какой бы стратегией её ни ловили.
     Стратегия 2 обычно спасена новой ``doc_date``, но одинаковая дата переиздания —
-    реальный кейс; единообразие снимает его. ``supersedes=None`` (все существующие
-    кандидаты) даёт ключи, эквивалентные прежним.
+    реальный кейс; единообразие снимает его.
+
+    ⚠ **Стратегия 3 — идентичность ПОСЛЕДНЕЙ ИНСТАНЦИИ, а не фолбэк промаха первых
+    двух.** Применяется только к ``_keyless``-кандидату (нет ни достоверного URL, ни пары
+    issuer+title). Кандидат с достоверным URL, который ни с чем не совпал, — это НОВЫЙ
+    документ, и добирать его по чему-то ещё нельзя: у snowball ``native_id`` это
+    «документ#канал» (227 кандидатов на 55 значений в боевом store), и фолбэк схлопнул бы
+    разные ссылки одного документа в одну (найдено живьём при прототипировании).
 
     **First-seen-wins:** если два кандидата пула дают один ключ (легаси-дубли внутри
     ``existing``), индекс хранит ПЕРВОГО в порядке добавления — ровно то, что возвращал
@@ -110,18 +134,32 @@ class _PoolIndex:
     def __init__(self) -> None:
         self.by_url: dict[tuple[str, str | None], CandidateRecord] = {}
         self.by_key: dict[tuple[str, str, str, str | None], CandidateRecord] = {}
+        self.by_source: dict[tuple[str, str, str | None], CandidateRecord] = {}
+
+    @staticmethod
+    def _keyless(cand: CandidateRecord) -> bool:
+        return _identity_url(cand) is None and _match_key(cand) is None
 
     def add(self, cand: CandidateRecord) -> None:
-        if cand.normalized_url:
-            self.by_url.setdefault((cand.normalized_url, cand.supersedes), cand)
+        url = _identity_url(cand)
+        if url:
+            self.by_url.setdefault((url, cand.supersedes), cand)
         key = _match_key(cand)
         if key is not None:
             self.by_key.setdefault(key, cand)
+        if self._keyless(cand):
+            self.by_source.setdefault(_source_identity(cand), cand)
 
     def find(self, cand: CandidateRecord) -> CandidateRecord | None:
-        """Строгий порядок стратегий url -> key, остановка на первом попадании."""
-        if cand.normalized_url:
-            hit = self.by_url.get((cand.normalized_url, cand.supersedes))
+        """Строгий порядок стратегий url -> key, остановка на первом попадании.
+
+        Цепочка 1->2 обязана сохраняться: промах по URL добирается парой issuer+title —
+        живой сценарий зеркала WAF-заблокированного первоисточника с ДРУГИМ адресом
+        (spec discovery-acquire-seam-hardening §5).
+        """
+        url = _identity_url(cand)
+        if url:
+            hit = self.by_url.get((url, cand.supersedes))
             if hit is not None:
                 return hit
         key = _match_key(cand)
@@ -129,6 +167,8 @@ class _PoolIndex:
             hit = self.by_key.get(key)
             if hit is not None:
                 return hit
+        if self._keyless(cand):
+            return self.by_source.get(_source_identity(cand))
         return None
 
 
@@ -149,8 +189,8 @@ def _merge_provenance(existing: CandidateRecord, dup: CandidateRecord) -> None:
         existing.merged_connector_ids = merged  # type: ignore[attr-defined]  # extra="allow"
 
     if dup.source_url:
-        dup_normalized = dup.normalized_url or normalize_url(dup.source_url)
-        existing_normalized = existing.normalized_url or (
+        dup_normalized = normalize_url(dup.source_url)
+        existing_normalized = (
             normalize_url(existing.source_url) if existing.source_url else None
         )
         if dup_normalized != existing_normalized:

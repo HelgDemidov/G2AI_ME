@@ -466,7 +466,6 @@ def map_link(
         connector_id=CONNECTOR_ID,
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash,
-        normalized_url=normalized,
         native_format_hint=format_hint_from_url(link.url),
     )
 

@@ -289,7 +289,6 @@ def _map_record(
         connector_id=CONNECTOR_ID,
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash,
-        normalized_url=dedup.normalize_url(source_url),
         native_format_hint=dedup.format_hint_from_url(source_url),
     )
 

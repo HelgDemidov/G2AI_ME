@@ -75,10 +75,9 @@ def inject(
     куратора. Валидация — предшественник обязан существовать в реестре: опечатка падает
     здесь, а не при промоушене (реестр читается только когда флаг задан).
 
-    Возвращает ``(candidate, is_new)``: при ``is_new=False`` — по возможности возвращается
-    СУЩЕСТВУЮЩАЯ запись (по совпадению пары ``(normalized_url, supersedes)``), чтобы
-    вызывающая сторона могла сообщить куратору причину (уже есть / уже отклонён и почему),
-    не только сам факт дубля.
+    Возвращает ``(candidate, is_new)``: при ``is_new=False`` — реальный поглотитель из
+    ``DedupOutcome.absorptions``, чтобы вызывающая сторона могла сообщить куратору причину
+    (уже есть / уже отклонён и почему), не только сам факт дубля.
     """
     if kind == schema.ConnectorKind.directed_search:
         if not campaign:
@@ -117,7 +116,6 @@ def inject(
         sensitivity=sensitivity,
         native_summary=summary,
         matched_query=query,
-        normalized_url=normalized,
         supersedes=supersedes,
         native_format_hint=dedup.format_hint_from_url(url),
     )

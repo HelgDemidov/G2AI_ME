@@ -119,14 +119,14 @@ def test_dedup_no_duplicates_passthrough() -> None:
     assert outcome.absorbed == 0
 
 
-def test_dedup_matches_by_normalized_url_against_existing() -> None:
+def test_dedup_matches_by_url_against_existing() -> None:
     existing_cand = _candidate(
         connector_id="agora", raw_hash="ha",
-        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
     )
     new_cand = _candidate(
         connector_id="manual", raw_hash="hb",
-        normalized_url=normalize_url("http://EXAMPLE.gov/doc/"),
+        source_url="http://EXAMPLE.gov/doc/",
     )
     outcome = dedup([new_cand], existing=[existing_cand])
     assert outcome.fresh == []
@@ -152,12 +152,12 @@ def test_dedup_rejected_existing_not_resurrected() -> None:
     """Отклонённый триажем кандидат (rejected_reason) не должен ре-инжектиться как свежий."""
     rejected = _candidate(
         connector_id="agora", raw_hash="ha",
-        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
         rejected_reason="вне обеих осей",
     )
     new_cand = _candidate(
         connector_id="manual", raw_hash="hb",
-        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
     )
     outcome = dedup([new_cand], existing=[rejected])
     assert outcome.fresh == []
@@ -191,11 +191,11 @@ def test_dedup_same_connector_rediscovery_does_not_self_reference() -> None:
     """Тот же коннектор повторно нашёл тот же URL — не плодим self-referential provenance."""
     existing_cand = _candidate(
         connector_id="agora", raw_hash="ha",
-        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
     )
     dup_same_connector = _candidate(
         connector_id="agora", raw_hash="hb",
-        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
     )
     outcome = dedup([dup_same_connector], existing=[existing_cand])
     assert outcome.fresh == []
@@ -203,13 +203,17 @@ def test_dedup_same_connector_rediscovery_does_not_self_reference() -> None:
     assert getattr(existing_cand, "merged_connector_ids", None) is None
 
 
-def test_legacy_content_hash_key_is_absorbed_as_extra_and_ignored() -> None:
-    """spec triage-intake-hardening §4: поле снято со схемы (писателей не было ни
-    одного), но старые шарды с ключом ``content_hash`` обязаны грузиться — ``extra=
-    "allow"``. Дедупом значение больше не участвует: два кандидата с одинаковым
-    легаси-хэшем и без общих url/issuer+title остаются РАЗНЫМИ."""
-    existing_cand = _candidate(raw_hash="ha", content_hash="deadbeef")
-    dup = _candidate(connector_id="agora", raw_hash="hb", content_hash="deadbeef")
+def test_legacy_keys_load_as_extra_and_are_ignored() -> None:
+    """Старые шарды с ключами ``content_hash``/``normalized_url`` обязаны грузиться
+    (``extra="allow"``), но дедупом их значения не участвуют: ключ URL считается на лету
+    из ``source_url``, а идентичность записи в источнике — из ``connector_id``/``native_id``."""
+    existing_cand = _candidate(
+        raw_hash="ha", content_hash="deadbeef", normalized_url="https://example.gov/doc"
+    )
+    dup = _candidate(
+        connector_id="agora", raw_hash="hb",
+        content_hash="deadbeef", normalized_url="https://example.gov/doc",
+    )
     assert existing_cand.content_hash == "deadbeef"  # type: ignore[attr-defined]  # extra="allow"
     outcome = dedup([dup], existing=[existing_cand])
     assert outcome.fresh == [dup]
@@ -225,11 +229,11 @@ def test_dedup_absorptions_pairs_dup_with_real_absorber() -> None:
     стороне (``inject``), а не только счётчик."""
     existing_cand = _candidate(
         connector_id="agora", raw_hash="ha",
-        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
     )
     dup = _candidate(
         connector_id="manual", raw_hash="hb",
-        normalized_url=normalize_url("https://example.gov/doc"),
+        source_url="https://example.gov/doc",
     )
     outcome = dedup([dup], existing=[existing_cand])
     assert outcome.absorptions == [(dup, existing_cand)]
@@ -242,13 +246,11 @@ def test_merge_provenance_accumulates_alternate_source_url_on_mismatch() -> None
         connector_id="agora", raw_hash="ha",
         title="AI Governance Framework", issuer="MinDigital", doc_date=dt.date(2026, 1, 1),
         source_url="https://blocked.gov/doc.pdf",
-        normalized_url=normalize_url("https://blocked.gov/doc.pdf"),
     )
     mirror = _candidate(
         connector_id="manual", raw_hash="hb",
         title="ai-governance framework", issuer="MinDigital", doc_date=dt.date(2026, 1, 1),
         source_url="https://mirror.example.org/doc.pdf",
-        normalized_url=normalize_url("https://mirror.example.org/doc.pdf"),
     )
     dedup([mirror], existing=[existing_cand])
     assert existing_cand.alternate_source_urls == ["https://mirror.example.org/doc.pdf"]  # type: ignore[attr-defined]
@@ -259,12 +261,10 @@ def test_merge_provenance_no_alternate_when_url_matches() -> None:
     URL, копить его же в alternate_source_urls незачем."""
     existing_cand = _candidate(
         connector_id="agora", raw_hash="ha",
-        normalized_url=normalize_url("https://example.gov/doc"),
         source_url="https://example.gov/doc",
     )
     dup = _candidate(
         connector_id="manual", raw_hash="hb",
-        normalized_url=normalize_url("http://EXAMPLE.gov/doc/"),
         source_url="http://EXAMPLE.gov/doc/",
     )
     dedup([dup], existing=[existing_cand])
@@ -276,40 +276,109 @@ def test_merge_provenance_deduplicates_repeated_alternate_url() -> None:
         connector_id="agora", raw_hash="ha",
         title="Doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
         source_url="https://blocked.gov/doc.pdf",
-        normalized_url=normalize_url("https://blocked.gov/doc.pdf"),
     )
     mirror_a = _candidate(
         connector_id="manual", raw_hash="hb",
         title="doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
         source_url="https://mirror.example.org/doc.pdf",
-        normalized_url=normalize_url("https://mirror.example.org/doc.pdf"),
     )
     mirror_b = _candidate(
         connector_id="search:x", raw_hash="hc",
         title="doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
         source_url="https://mirror.example.org/doc.pdf",
-        normalized_url=normalize_url("https://mirror.example.org/doc.pdf"),
     )
     dedup([mirror_a, mirror_b], existing=[existing_cand])
     assert existing_cand.alternate_source_urls == ["https://mirror.example.org/doc.pdf"]  # type: ignore[attr-defined]
 
 
-def test_dedup_candidate_without_any_key_is_never_absorbed() -> None:
-    """Кандидат без ОБОИХ ключей (ни URL, ни пары issuer+title) не имеет идентичности
-    для dedup — приходит «свежим» даже против побитово такого же.
+# --- недостоверный URL и идентичность записи в источнике (spec candidate-identity-
+# hardening §2) ---
 
-    Свойство ИСХОДНОГО дизайна (прежний линейный ``_find_match`` возвращал
-    None на тех же входах), не следствие индексации — найдено property-тестом
-    (``test_dedup_properties``) и запинено здесь, чтобы поведение было видимым. Схема
-    такое допускает (всё, кроме connector_id/retrieved_at/raw_hash, опционально), но
-    реальные каналы его не порождают: ``inject`` требует url+title, registry-коннекторы
-    дают native-URL. ``raw_hash`` (идентичность для worksheet/apply) СТРАТЕГИЕЙ dedup
-    сознательно не является — набор ключей задан чартером §4.4.
-    """
-    keyless = _candidate(raw_hash="ha")
-    twin = _candidate(connector_id="agora", raw_hash="hb")
 
-    outcome = dedup([twin], existing=[keyless])
+def test_suspect_url_does_not_collapse_different_documents() -> None:
+    """Замер на боевом снапшоте OECD: один ``website`` у записей с РАЗНЫМИ заголовками —
+    23 группы, 25 кандидатов поглощалось до триажа. Метка ``suspect`` снимает адрес с
+    роли ключа, и документы доходят до очереди."""
+    norway = _candidate(
+        connector_id="oecd", raw_hash="ha", native_id="1",
+        title="Joint AI plan", issuer="Norway",
+        source_url="https://oecd.example/shared", url_provenance="suspect",
+    )
+    ukraine = _candidate(
+        connector_id="oecd", raw_hash="hb", native_id="2",
+        title="Operational Plan for the WINWIN Strategy", issuer="Ukraine",
+        source_url="https://oecd.example/shared", url_provenance="suspect",
+    )
 
-    assert outcome.fresh == [twin]
+    outcome = dedup([norway, ukraine], existing=[])
+
+    assert outcome.fresh == [norway, ukraine]
     assert outcome.absorbed == 0
+
+
+def test_suspect_url_candidates_do_not_double_on_rerun() -> None:
+    """Снятие ключа не должно оборачиваться задвоением: те же записи на следующем
+    харвесте ловятся парой issuer+title."""
+    first = _candidate(
+        connector_id="oecd", raw_hash="ha", native_id="1",
+        title="Joint AI plan", issuer="Norway",
+        source_url="https://oecd.example/shared", url_provenance="suspect",
+    )
+    again = first.model_copy(deep=True, update={"raw_hash": "hb"})
+
+    outcome = dedup([again], existing=[first])
+
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
+
+
+def test_keyless_candidate_absorbed_by_source_identity() -> None:
+    """§23 бэклога: кандидат без обоих ключей раньше приходил «свежим» каждый прогон.
+    Идентичность записи в источнике (``connector_id`` + ``native_id``) закрывает класс."""
+    existing_cand = _candidate(connector_id="oecd", raw_hash="ha", native_id="42")
+    same_record_again = _candidate(connector_id="oecd", raw_hash="hb", native_id="42")
+
+    outcome = dedup([same_record_again], existing=[existing_cand])
+
+    assert outcome.fresh == []
+    assert outcome.absorbed == 1
+
+
+def test_keyless_source_identity_survives_record_edit() -> None:
+    """Ключ — ``native_id``, а не ``raw_hash``: правка записи в источнике (``updatedAt``
+    и т.п.) меняет дайджест описания, но не идентификатор источника. Замер: на
+    ``raw_hash`` совпадение обнулялось 749/749."""
+    before = _candidate(connector_id="oecd", raw_hash="ha", native_id="42")
+    after_edit = _candidate(connector_id="oecd", raw_hash="hz", native_id="42")
+
+    assert dedup([after_edit], existing=[before]).absorbed == 1
+
+
+def test_keyless_candidates_from_different_sources_stay_distinct() -> None:
+    existing_cand = _candidate(connector_id="oecd", raw_hash="ha", native_id="42")
+    other_source = _candidate(connector_id="agora", raw_hash="hb", native_id="42")
+
+    outcome = dedup([other_source], existing=[existing_cand])
+
+    assert outcome.fresh == [other_source]
+    assert outcome.absorbed == 0
+
+
+def test_source_identity_is_not_a_fallback_for_missed_url() -> None:
+    """⚠ Живой репро при прототипировании: у snowball ``native_id`` — «документ#канал»
+    (227 кандидатов на 55 значений), поэтому стратегия 3 применяется ТОЛЬКО к кандидату
+    без обоих ключей. Кандидат с достоверным URL, который ни с чем не совпал, — НОВЫЙ
+    документ; фолбэк схлопнул бы разные ссылки одного документа в одну."""
+    first_link = _candidate(
+        connector_id="snowball", raw_hash="ha", native_id="me-law-2025#p3",
+        source_url="https://a.example/one.pdf",
+    )
+    second_link = _candidate(
+        connector_id="snowball", raw_hash="hb", native_id="me-law-2025#p3",
+        source_url="https://b.example/two.pdf",
+    )
+
+    outcome = dedup([second_link], existing=[first_link])
+
+    assert outcome.fresh == [second_link]
+    assert second_link.source_url == "https://b.example/two.pdf"
