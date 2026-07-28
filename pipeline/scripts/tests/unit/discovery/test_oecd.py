@@ -679,6 +679,17 @@ def test_ambiguous_websites_ignores_duplicate_records_of_same_initiative() -> No
     assert oecd.ambiguous_websites(records) == set()
 
 
+def test_ambiguous_websites_ignores_records_without_title() -> None:
+    """Запись без заголовка сравнивать не с чем — она не может ни доказать спорность
+    значения, ни опровергнуть её (сравниваются именно ЗАГОЛОВКИ)."""
+    shared = "https://shared.example/doc"
+    records = [
+        _base_record(id=1, englishName="Only Titled One", website=shared),
+        _base_record(id=2, englishName=None, originalName=None, website=shared),
+    ]
+    assert oecd.ambiguous_websites(records) == set()
+
+
 def test_ambiguous_websites_ignores_unique_and_invalid_values() -> None:
     records = [
         _base_record(id=1, englishName="A", website="https://a.example/x"),

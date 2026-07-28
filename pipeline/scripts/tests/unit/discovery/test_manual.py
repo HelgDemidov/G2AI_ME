@@ -587,6 +587,37 @@ def test_apply_admit_derived_title_with_override_succeeds(tmp_path: Path) -> Non
     assert schema.load_records(tmp_path)[0].title == "Accelerate Estonia Programme"
 
 
+def test_apply_admit_suspect_url_without_override_errors(tmp_path: Path) -> None:
+    """spec triage-intake-hardening §6: адрес ЕСТЬ и выглядит рабочим, но источник отдал
+    его нескольким разным документам — добыча по нему скачает чужой документ."""
+    cand = _candidate(
+        raw_hash="b" * 64,
+        source_url="https://www.helsedirektoratet.no/rapporter/joint-ai-plan",
+        url_provenance="suspect",
+    )
+    store.save([cand], tmp_path)
+
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert len(summary.errors) == 1
+    detail = summary.errors[0].detail
+    assert "suspect" in detail and "`source_url:`" in detail
+    assert "helsedirektoratet.no" in detail  # видно, ЧТО именно забраковано
+
+
+def test_apply_admit_suspect_url_with_override_succeeds(tmp_path: Path) -> None:
+    cand = _candidate(
+        raw_hash="b" * 64,
+        source_url="https://www.helsedirektoratet.no/rapporter/joint-ai-plan",
+        url_provenance="suspect",
+    )
+    store.save([cand], tmp_path)
+
+    decision = _admit_decision("b" * 64, source_url="https://sanidad.gob.es/estrategia-ia.pdf")
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].source_url == "https://sanidad.gob.es/estrategia-ia.pdf"
+
+
 def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Path) -> None:
     good = _candidate(raw_hash="b" * 64)
     bad = _candidate(raw_hash="c" * 64)
