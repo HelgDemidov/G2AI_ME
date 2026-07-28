@@ -105,6 +105,9 @@ def inject(
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash_for_manual(normalized, title, date, supersedes),
         title=title,
+        # Заголовок назвал человек (--title обязателен) — по определению stated
+        # (spec triage-intake-hardening §3).
+        title_provenance=schema.TitleProvenance.stated,
         issuer=issuer,
         jurisdiction=jurisdiction,
         source_url=url,
@@ -239,6 +242,12 @@ _WORKSHEET_HEADER = """\
   колонка `missing` таблицы ниже показывает, каких из четырёх условно-обязательных полей
   (`title`/`issuer`/`language`/`source_url`) у кандидата нет — задайте недостающее ключом
   того же имени в решении; отсутствие И у кандидата, И в решении — отказ с именем поля.
+- `missing: title` бывает и при НЕПУСТОМ заголовке в таблице: у snowball-кандидатов из
+  URL-каналов заголовок реконструирован из позиционного артефакта (текст, вырезанный
+  геометрией прямоугольника ссылки, или целая строка doc.md), а не назван источником —
+  такие помечены `title_provenance: derived` и требуют настоящего заголовка ключом
+  `title:`. Взять его неоткуда, кроме WebSearch по документу, — который для батч-каналов
+  и так обязателен (политика triage-channel-policy).
 - Дефолты (сводка apply напечатает, во что развернулись; RAG/фасеты видят полные значения):
   `authority` — из doc_type: legislation→binding_law, regulation→regulation,
   report/academic_paper→report, guidance/framework/national_strategy→soft_law,
@@ -471,10 +480,19 @@ def _missing_conditional_fields(
 ) -> list[str]:
     """Поля из ``_CONDITIONAL_ADMIT_FIELDS``, отсутствующие у кандидата (и, если передано
     решение, не заданные override'ом в нём). ``decision=None`` — аннотация worksheet ДО
-    того, как решение написано (проверяется только кандидат)."""
+    того, как решение написано (проверяется только кандидат).
+
+    ``title_provenance: derived`` (spec triage-intake-hardening §3) приравнивается к
+    ОТСУТСТВИЮ заголовка: значение есть, но это реконструкция из позиционного артефакта,
+    а не заголовок — допускать её в реестр (где она станет меткой узла графа) нельзя.
+    ``None``-провенанс у легаси-записей требования не поднимает.
+    """
     missing = []
     for name in _CONDITIONAL_ADMIT_FIELDS:
-        if getattr(cand, name) is not None:
+        unusable = getattr(cand, name) is None or (
+            name == "title" and cand.title_provenance is schema.TitleProvenance.derived
+        )
+        if not unusable:
             continue
         if decision is not None and decision.get(name) is not None:
             continue
@@ -589,6 +607,15 @@ def _build_admit_record(
     missing_conditional = _missing_conditional_fields(cand, decision)
     if missing_conditional:
         field_name = missing_conditional[0]
+        # `title` может физически присутствовать, но быть непригодным (derived —
+        # реконструкция из позиционного артефакта): «у кандидата нет title» при
+        # видимом в worksheet заголовке читалось бы как баг, а не как требование.
+        if field_name == "title" and cand.title is not None:
+            raise ValueError(
+                "admit: `title` кандидата — реконструкция из позиционного артефакта "
+                f"(title_provenance: derived), а не заголовок: {cand.title!r}. "
+                "Задайте настоящий заголовок ключом `title:` в решении"
+            )
         raise ValueError(
             f"admit: у кандидата нет `{field_name}`, задайте его ключом `{field_name}:` в решении"
         )

@@ -280,6 +280,8 @@ def _map_row(row: dict[str, Any], *, match_terms: tuple[str, ...]) -> schema.Can
 
     return schema.CandidateRecord(
         title=title,
+        # Реестр отдаёт заголовок КАК заголовок (spec triage-intake-hardening §3).
+        title_provenance=schema.TitleProvenance.stated,
         issuer=row["authority"],
         jurisdiction=jurisdiction,
         doc_date=doc_date,

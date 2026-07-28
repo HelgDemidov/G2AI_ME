@@ -551,6 +551,42 @@ def test_apply_admit_without_field_override_and_candidate_without_field_errors(
     assert f"`{field_name}:`" in summary.errors[0].detail
 
 
+# --- title_provenance: derived требует явного title (spec triage-intake-hardening §3) ---
+
+
+def test_missing_flags_derived_title_despite_non_empty_value() -> None:
+    """Заголовок ЕСТЬ, но это реконструкция из позиционного артефакта — в реестре он
+    станет меткой узла графа, поэтому считается непригодным наравне с отсутствующим."""
+    cand = _candidate(title="e Model AI Governance F ramework", title_provenance="derived")
+    assert manual._missing_conditional_fields(cand) == ["title"]
+
+
+def test_missing_does_not_flag_stated_or_legacy_title() -> None:
+    assert manual._missing_conditional_fields(_candidate(title_provenance="stated")) == []
+    assert manual._missing_conditional_fields(_candidate()) == []  # легаси: провенанс None
+
+
+def test_apply_admit_derived_title_without_override_errors(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, title="s AccelerateEstonia,", title_provenance="derived")
+    store.save([cand], tmp_path)
+
+    summary = manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
+    assert len(summary.errors) == 1
+    detail = summary.errors[0].detail
+    assert "derived" in detail and "`title:`" in detail
+    assert "s AccelerateEstonia," in detail  # видно, ЧТО именно забраковано
+
+
+def test_apply_admit_derived_title_with_override_succeeds(tmp_path: Path) -> None:
+    cand = _candidate(raw_hash="b" * 64, title="s AccelerateEstonia,", title_provenance="derived")
+    store.save([cand], tmp_path)
+
+    decision = _admit_decision("b" * 64, title="Accelerate Estonia Programme")
+    summary = manual.apply_decisions([decision], root=tmp_path)
+    assert summary.errors == []
+    assert schema.load_records(tmp_path)[0].title == "Accelerate Estonia Programme"
+
+
 def test_apply_incomplete_admit_reports_error_rest_of_batch_applied(tmp_path: Path) -> None:
     good = _candidate(raw_hash="b" * 64)
     bad = _candidate(raw_hash="c" * 64)

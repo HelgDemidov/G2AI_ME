@@ -207,6 +207,26 @@ class RejectionKind(str, Enum):
     unacquirable = "unacquirable"      # нужен, но недобываем (WAF/мёртвая ссылка) — ждёт смены обстоятельств
 
 
+class TitleProvenance(str, Enum):
+    """Откуда у кандидата взялся ``title`` (spec triage-intake-hardening §3).
+
+    Enum, а не bool, по правилу проекта: код ВЕТВИТСЯ по значению — ``derived``
+    ОБЯЗЫВАЕТ admit-решение задать ``title`` явно, ``stated`` нет. Отсутствие поля
+    (легаси-кандидаты) читается как «неизвестно» и требования не поднимает: молча
+    заблокировать допуск записей, заведённых до этого спека, было бы хуже, чем
+    пропустить их с прежним поведением.
+
+    Живая мотивация: у snowball 117 заголовков из 227 (52%) непригодны — ``map_link``
+    берёт либо текст, вырезанный ГЕОМЕТРИЕЙ прямоугольника гиперссылки (режет слова,
+    склеивает колонки), либо ЦЕЛУЮ строку ``doc.md``, в которой встретился URL. Ни то,
+    ни другое никогда не было заголовком, а ``title`` становится МЕТКОЙ УЗЛА графа —
+    мусор, допущенный дверью, застывает структурой слоя знаний.
+    """
+
+    stated = "stated"      # пришёл КАК заголовок: поле реестра, --title, verbatim-гейт цитат
+    derived = "derived"    # реконструкция из позиционного артефакта — требует явного title при admit
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -427,6 +447,9 @@ class CandidateRecord(BaseModel):
 
     # best-effort библиография (Optional — данные upstream неполны)
     title: str | None = None
+    # Откуда взялся title (spec triage-intake-hardening §3). ``None`` у легаси-записей
+    # = «неизвестно», требования явного title при admit не поднимает.
+    title_provenance: TitleProvenance | None = None
     issuer: str | None = None
     jurisdiction: str | None = None
     doc_date: _dt.date | None = None

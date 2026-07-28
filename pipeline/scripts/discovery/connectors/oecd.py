@@ -286,6 +286,8 @@ def _map_record(record: dict[str, Any]) -> schema.CandidateRecord | None:
 
     return schema.CandidateRecord(
         title=title,
+        # Реестр отдаёт заголовок КАК заголовок (spec triage-intake-hardening §3).
+        title_provenance=schema.TitleProvenance.stated,
         issuer=issuer,
         jurisdiction=jurisdiction,
         doc_date=None,
