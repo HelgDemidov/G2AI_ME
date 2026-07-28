@@ -235,6 +235,10 @@ _WORKSHEET_HEADER = """\
 Заполняя `admit`:
 - `rationale` ≠ `summary`: summary описывает документ, rationale — ТОЛЬКО факторы релевантности
   (почему эта ось); не дублировать одно в другом.
+- `title`/`issuer`/`source_url` — опциональные override'ы (той же формы, что `language` ниже):
+  колонка `missing` таблицы ниже показывает, каких из четырёх условно-обязательных полей
+  (`title`/`issuer`/`language`/`source_url`) у кандидата нет — задайте недостающее ключом
+  того же имени в решении; отсутствие И у кандидата, И в решении — отказ с именем поля.
 - Дефолты (сводка apply напечатает, во что развернулись; RAG/фасеты видят полные значения):
   `authority` — из doc_type: legislation→binding_law, regulation→regulation,
   report/academic_paper→report, guidance/framework/national_strategy→soft_law,
@@ -326,26 +330,84 @@ def _md_cell(value: str) -> str:
     return flattened.replace("|", "\\|")
 
 
+def _worksheet_contract() -> dict[str, Any]:
+    """Контракт формата решений КАК ДАННЫЕ (spec triage-intake-hardening §2) — то же
+    содержание, что шапка-проза ``_WORKSHEET_HEADER``, но машинно-проверяемое: `defaults`/
+    `vocab` эмитируются из живых источников истины, не литералом (то же правило, что для
+    help-текстов CLI и SKILL.md — иначе дрейф между текстом и кодом)."""
+    return {
+        "required": list(_ADMIT_REQUIRED),
+        "conditional": {
+            "|".join(_CONDITIONAL_ADMIT_FIELDS): "обязательны, если пусты у кандидата",
+        },
+        "actions": list(_ACTIONS),
+        "defaults": {"authority_by_doc_type": dict(_AUTHORITY_BY_DOC_TYPE)},
+        "vocab": {
+            "axes": sorted(schema.load_vocab("axes")),
+            "doc_types": sorted(schema.load_vocab("doc_types")),
+            "authority": sorted(schema.load_vocab("authority")),
+        },
+    }
+
+
+def _candidate_payload(cand: schema.CandidateRecord) -> dict[str, Any]:
+    data = cand.model_dump(mode="json", exclude_none=True)
+    data["missing"] = _missing_conditional_fields(cand)
+    return data
+
+
+def worksheet_payload(
+    pending: list[schema.CandidateRecord],
+    unacquirable: list[schema.CandidateRecord] | None = None,
+    *,
+    total: int | None = None,
+) -> dict[str, Any]:
+    """Структура worksheet (spec triage-intake-hardening §2) — общий источник данных для
+    обоих рендереров (`--format json|md`): гарантирует один и тот же набор кандидатов
+    (по ``raw_hash``) в обоих форматах, а не две расходящиеся реализации.
+
+    ``total`` — размер пула ДО ``--limit`` (после ``--connector``, если задан); ``None`` —
+    отбор не применялся, ``pending_total`` тогда равен ``len(pending)``."""
+    return {
+        "contract": _worksheet_contract(),
+        "pending_total": total if total is not None else len(pending),
+        "shown": len(pending),
+        "candidates": [_candidate_payload(c) for c in pending],
+        "unacquirable": [_candidate_payload(c) for c in (unacquirable or [])],
+    }
+
+
 def render_worksheet(
     pending: list[schema.CandidateRecord],
     unacquirable: list[schema.CandidateRecord] | None = None,
+    *,
+    total: int | None = None,
 ) -> str:
-    """Markdown-таблица ждущих кандидатов + шапка-инструкция (spec §3).
+    """Markdown-таблица ждущих кандидатов + шапка-инструкция (spec §3, `missing`-колонка
+    и `total`-аннотация — spec triage-intake-hardening §1/§2).
 
     ``unacquirable`` — вторая секция (spec post-acquisition-lifecycle §5): очередь
     ожидания обстоятельств. Пустая -> секция не печатается вовсе (шум в типовом
-    прогоне не нужен).
+    прогоне не нужен). ``total`` — см. ``worksheet_payload``; при отборе (``--connector``/
+    ``--limit``) печатает строку «показано N из M ждущих» — молчаливое усечение читалось
+    бы как «это вся очередь».
     """
+    payload = worksheet_payload(pending, unacquirable, total=total)
+    missing_by_hash = {row["raw_hash"]: row["missing"] for row in payload["candidates"]}
+
     lines = [_WORKSHEET_HEADER, ""]
+    if total is not None:
+        lines.append(f"Показано {payload['shown']} из {payload['pending_total']} ждущих.\n")
     lines.append(
         "| raw_hash | title | issuer | jurisdiction | doc_date | supersedes | connector_id "
-        "| native_tags/matched_query | source_url | format_hint |"
+        "| native_tags/matched_query | source_url | format_hint | missing |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for cand in pending:
         tags = ", ".join(cand.native_tags) if cand.native_tags else (cand.matched_query or "")
+        missing = missing_by_hash.get(cand.raw_hash, [])
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 _md_cell(cand.raw_hash[:12]),
                 _md_cell(cand.title or ""),
                 _md_cell(cand.issuer or ""),
@@ -357,6 +419,7 @@ def render_worksheet(
                 _md_cell(tags),
                 _md_cell(cand.source_url or ""),
                 _md_cell(cand.native_format_hint.value if cand.native_format_hint else ""),
+                _md_cell(", ".join(missing)),
             )
         )
     if unacquirable:
@@ -393,6 +456,30 @@ _ADMIT_REQUIRED = (
     "doc_type",
     "admission",
 )
+
+# Условно-обязательные при admit (spec triage-intake-hardening §1): не входят в
+# _ADMIT_REQUIRED, т.к. обязательны, ТОЛЬКО если их нет у кандидата — большинство
+# каналов issuer/title/source_url дают, требовать их переписывания вручную было бы
+# налогом на нормальный случай. ЕДИНСТВЕННОЕ определение — используется и дверью
+# (_build_admit_record), и аннотацией `missing` worksheet (§2): разошедшиеся копии
+# этой проверки — ровно класс дефекта Г-находок PR #54 (discovery-acquire-seam-hardening).
+_CONDITIONAL_ADMIT_FIELDS = ("title", "issuer", "language", "source_url")
+
+
+def _missing_conditional_fields(
+    cand: schema.CandidateRecord, decision: dict[str, Any] | None = None
+) -> list[str]:
+    """Поля из ``_CONDITIONAL_ADMIT_FIELDS``, отсутствующие у кандидата (и, если передано
+    решение, не заданные override'ом в нём). ``decision=None`` — аннотация worksheet ДО
+    того, как решение написано (проверяется только кандидат)."""
+    missing = []
+    for name in _CONDITIONAL_ADMIT_FIELDS:
+        if getattr(cand, name) is not None:
+            continue
+        if decision is not None and decision.get(name) is not None:
+            continue
+        missing.append(name)
+    return missing
 
 # Дефолты admit-решения (ревью 2026-07-21): куратор в типовом решении НЕ пишет
 # authority/track — apply выводит их и МАТЕРИАЛИЗУЕТ в meta.yaml полными значениями
@@ -499,16 +586,12 @@ def _build_admit_record(
     # либо OECD-значение недостоверно — §6); в этом случае решение обязано задать ключ явно.
     # Ошибка называет ИМЕННО недостающее поле и ключ, который его чинит — а не долетает
     # до ValueError из глубины promote_candidate, где контекста решения уже нет.
-    for field_name, cand_value in (
-        ("title", cand.title),
-        ("issuer", cand.issuer),
-        ("language", cand.language),
-        ("source_url", cand.source_url),
-    ):
-        if decision.get(field_name) is None and cand_value is None:
-            raise ValueError(
-                f"admit: у кандидата нет `{field_name}`, задайте его ключом `{field_name}:` в решении"
-            )
+    missing_conditional = _missing_conditional_fields(cand, decision)
+    if missing_conditional:
+        field_name = missing_conditional[0]
+        raise ValueError(
+            f"admit: у кандидата нет `{field_name}`, задайте его ключом `{field_name}:` в решении"
+        )
 
     defaulted: list[str] = []
     issuer_type = schema.IssuerType(decision["issuer_type"])

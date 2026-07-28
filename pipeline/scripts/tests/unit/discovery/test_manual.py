@@ -243,6 +243,105 @@ def test_render_worksheet_empty_pending_still_has_header() -> None:
     assert "raw_hash" in text
 
 
+# --- missing-колонка + total-аннотация (spec triage-intake-hardening §1/§2) ---
+
+
+def test_missing_conditional_fields_flags_absent_fields() -> None:
+    cand = _candidate(issuer=None, language=None)
+    assert manual._missing_conditional_fields(cand) == ["issuer", "language"]
+
+
+def test_missing_conditional_fields_empty_when_all_present() -> None:
+    cand = _candidate()
+    assert manual._missing_conditional_fields(cand) == []
+
+
+def test_missing_conditional_fields_decision_override_satisfies() -> None:
+    """Override в решении закрывает недостачу — та же семантика, что admit-дверь."""
+    cand = _candidate(issuer=None)
+    assert manual._missing_conditional_fields(cand, {"issuer": "Overridden"}) == []
+
+
+def test_render_worksheet_missing_column_shows_absent_fields() -> None:
+    cand = _candidate(issuer=None, language=None)
+    text = manual.render_worksheet([cand])
+    row = next(line for line in text.splitlines() if cand.raw_hash[:12] in line)
+    assert row.rstrip().endswith("issuer, language |")
+
+
+def test_render_worksheet_missing_column_empty_when_all_present() -> None:
+    cand = _candidate()
+    text = manual.render_worksheet([cand])
+    row = next(line for line in text.splitlines() if cand.raw_hash[:12] in line)
+    assert row.rstrip().endswith("|  |")  # пустая ячейка missing
+
+
+def test_render_worksheet_no_total_line_without_total() -> None:
+    text = manual.render_worksheet([_candidate()])
+    assert "Показано" not in text
+
+
+def test_render_worksheet_total_line_appears_with_total() -> None:
+    text = manual.render_worksheet([_candidate()], total=42)
+    assert "Показано 1 из 42 ждущих." in text
+
+
+# --- worksheet_payload / --format json (spec triage-intake-hardening §2) ---
+
+
+def test_worksheet_payload_contract_vocab_matches_live_source() -> None:
+    """`vocab`/`defaults` эмитируются из живых источников истины, не литералом —
+    иначе дрейф между JSON-контрактом и `vocab_axes.yaml`/картой authority."""
+    payload = manual.worksheet_payload([])
+    assert payload["contract"]["vocab"]["axes"] == sorted(schema.load_vocab("axes"))
+    assert payload["contract"]["defaults"]["authority_by_doc_type"] == dict(
+        manual._AUTHORITY_BY_DOC_TYPE
+    )
+
+
+def test_worksheet_payload_shown_and_total() -> None:
+    payload = manual.worksheet_payload([_candidate()], total=42)
+    assert payload["shown"] == 1
+    assert payload["pending_total"] == 42
+
+
+def test_worksheet_payload_total_none_defaults_to_shown() -> None:
+    payload = manual.worksheet_payload([_candidate(), _candidate(raw_hash="b" * 64)])
+    assert payload["pending_total"] == payload["shown"] == 2
+
+
+def test_worksheet_payload_candidate_carries_missing_and_full_raw_hash() -> None:
+    cand = _candidate(issuer=None)
+    payload = manual.worksheet_payload([cand])
+    row = payload["candidates"][0]
+    assert row["raw_hash"] == cand.raw_hash  # полный хэш, не усечённый (машинный формат)
+    assert row["missing"] == ["issuer"]
+
+
+def test_worksheet_payload_unacquirable_included() -> None:
+    unacq = _candidate(rejected_reason="WAF", rejected_kind="unacquirable")
+    payload = manual.worksheet_payload([], [unacq])
+    assert len(payload["unacquirable"]) == 1
+    assert payload["unacquirable"][0]["raw_hash"] == unacq.raw_hash
+
+
+def test_worksheet_md_and_json_share_same_raw_hash_set() -> None:
+    """Оба формата строятся из одного worksheet_payload — набор кандидатов не может
+    разъехаться между `--format md` и `--format json`."""
+    pending = [_candidate(), _candidate(raw_hash="b" * 64, issuer=None)]
+    unacq = [_candidate(raw_hash="c" * 64, rejected_reason="WAF", rejected_kind="unacquirable")]
+
+    md_text = manual.render_worksheet(pending, unacq)
+    payload = manual.worksheet_payload(pending, unacq)
+
+    md_hashes = {c.raw_hash[:12] for c in pending} | {c.raw_hash[:12] for c in unacq}
+    json_hashes = {row["raw_hash"][:12] for row in payload["candidates"]} | {
+        row["raw_hash"][:12] for row in payload["unacquirable"]
+    }
+    assert json_hashes == md_hashes
+    assert all(h in md_text for h in md_hashes)
+
+
 # --- экранирование `|` в ячейках worksheet (spec discovery-acquire-seam-hardening §12) ---
 
 
@@ -257,7 +356,7 @@ def test_render_worksheet_escapes_pipe_in_pending_row() -> None:
     ]
     assert len(lines) == 1
     # число колонок сохранено: экранированный `|` не создаёт лишних разделителей
-    assert lines[0].count(" | ") == 9  # 10 колонок таблицы pending
+    assert lines[0].count(" | ") == 10  # 11 колонок таблицы pending (+ missing, §2)
 
 
 def test_render_worksheet_escapes_pipe_in_unacquirable_row() -> None:
@@ -287,7 +386,7 @@ def test_render_worksheet_flattens_newline_in_cell() -> None:
     rows = [line for line in text.splitlines() if line.startswith("| ") and line.endswith(" |")]
     body = [line for line in rows if cand.raw_hash[:12] in line]
     assert len(body) == 1  # одна физическая строка, а не три
-    assert body[0].count(" | ") == 9  # 10 колонок таблицы pending
+    assert body[0].count(" | ") == 10  # 11 колонок таблицы pending (+ missing, §2)
     assert "Standardization gaps" in body[0]  # текст не потерян, только схлопнут
 
 

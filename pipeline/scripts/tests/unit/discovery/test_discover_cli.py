@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -262,7 +263,7 @@ def test_worksheet_subcommand_prints_to_stdout(
             "en",
         ]
     )
-    code = main(["worksheet", "--root", str(tmp_path)])
+    code = main(["worksheet", "--root", str(tmp_path), "--format", "md"])
     assert code == 0
     out = capsys.readouterr().out
     assert "Триаж-worksheet" in out
@@ -288,7 +289,9 @@ def test_worksheet_subcommand_writes_to_out_file(
         ]
     )
     out_path = tmp_path / "triage_worksheet.md"
-    code = main(["worksheet", "--root", str(tmp_path), "--out", str(out_path)])
+    code = main(
+        ["worksheet", "--root", str(tmp_path), "--out", str(out_path), "--format", "md"]
+    )
     assert code == 0
     assert out_path.exists()
     assert "Триаж-worksheet" in out_path.read_text(encoding="utf-8")
@@ -298,6 +301,90 @@ def test_worksheet_subcommand_writes_to_out_file(
 def test_worksheet_subcommand_empty_root_no_candidates(tmp_path: Path) -> None:
     code = main(["worksheet", "--root", str(tmp_path)])
     assert code == 0
+
+
+# --- --format/--connector/--limit (spec triage-intake-hardening §2) ---
+
+
+def test_worksheet_subcommand_default_format_is_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Смена дефолта (spec §2): без --format машинный контракт, не человеческая таблица."""
+    main(
+        [
+            "inject", "--root", str(tmp_path), "--url", "https://gov.example.org/a.pdf",
+            "--title", "T", "--issuer", "I", "--language", "en",
+        ]
+    )
+    capsys.readouterr()  # смыть вывод inject — worksheet проверяем изолированно
+    code = main(["worksheet", "--root", str(tmp_path)])
+    assert code == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["shown"] == 1
+    assert "Триаж-worksheet" not in out
+
+
+def test_worksheet_subcommand_connector_filters(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(
+        [
+            "inject", "--root", str(tmp_path), "--url", "https://gov.example.org/a.pdf",
+            "--title", "T", "--issuer", "I", "--language", "en",
+        ]
+    )
+    existing = store.load(tmp_path)
+    existing.append(
+        schema.CandidateRecord.model_validate(
+            {
+                "connector_id": "oecd", "retrieved_at": "2026-07-21", "raw_hash": "o" * 64,
+                "title": "Other", "issuer": "Gov", "language": "en",
+                "source_url": "https://oecd.example.org/x.pdf",
+            }
+        )
+    )
+    store.save(existing, tmp_path)
+    capsys.readouterr()  # смыть вывод inject — worksheet проверяем изолированно
+    code = main(["worksheet", "--root", str(tmp_path), "--connector", "manual"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["shown"] == 1
+    assert payload["candidates"][0]["connector_id"] == "manual"
+
+
+def test_worksheet_subcommand_limit_truncates_and_reports_total(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for i in range(3):
+        main(
+            [
+                "inject", "--root", str(tmp_path), "--url", f"https://gov.example.org/{i}.pdf",
+                "--title", f"T{i}", "--issuer", "I", "--language", "en",
+            ]
+        )
+    capsys.readouterr()  # смыть вывод трёх inject — worksheet проверяем изолированно
+    code = main(["worksheet", "--root", str(tmp_path), "--limit", "2"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["shown"] == 2
+    assert payload["pending_total"] == 3
+
+
+def test_worksheet_subcommand_no_selection_omits_total_annotation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(
+        [
+            "inject", "--root", str(tmp_path), "--url", "https://gov.example.org/a.pdf",
+            "--title", "T", "--issuer", "I", "--language", "en",
+        ]
+    )
+    capsys.readouterr()  # смыть вывод inject — worksheet проверяем изолированно
+    code = main(["worksheet", "--root", str(tmp_path)])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pending_total"] == payload["shown"] == 1
 
 
 # --- apply (spec discovery-manual §4) ---
