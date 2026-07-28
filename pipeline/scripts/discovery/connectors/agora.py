@@ -158,6 +158,34 @@ def ingest_dump(
             conn.close()
 
 
+def bronze_has_version(version: str, db_path: Path = registry_store.DEFAULT_DB_PATH) -> bool:
+    """Проглочен ли дамп этой версии в bronze-слой (spec drop-cursors-and-decision-overlay §2).
+
+    Вопрос задаётся ТАБЛИЦЕ, которая и так несёт ``_source_version`` на каждой строке;
+    прежний курсор хранил вторую копию того, что кэш знает сам. Отсутствие БД или самой
+    таблицы — честное «нет», а не отказ: первый прогон на свежей машине обязан проглотить
+    дамп, а не упасть. Существование таблицы проверяется явным запросом к
+    ``information_schema``, не перехватом ошибки — иначе гейт глотал бы и настоящие сбои
+    DuckDB, тихо переходя к повторному ingest.
+    """
+    if not db_path.exists():
+        return False
+    conn = registry_store.connect(db_path)
+    try:
+        table_exists = conn.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'agora' AND table_name = 'documents_raw'"
+        ).fetchone()
+        if table_exists is None:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM agora.documents_raw WHERE _source_version = ? LIMIT 1", [version]
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
 # --- §4: гибрид-фильтр (все не-US + US-проба по узкой оси agentic_g2ai) ---
 
 _ROW_FIELDS = (
@@ -340,7 +368,9 @@ def discover_agora(
     zip_path = cache_dir / f"agora-{version}.zip"
     if not zip_path.exists():
         download(download_url_from_metadata(record), zip_path)
-    ingest_dump(zip_path, source_version=version, db_path=db_path)
+    ingest_skipped = bronze_has_version(version, db_path)
+    if not ingest_skipped:
+        ingest_dump(zip_path, source_version=version, db_path=db_path)
 
     conn = registry_store.connect(db_path)
     try:
@@ -355,6 +385,7 @@ def discover_agora(
         "found": len(candidates),
         "skipped_invalid_url": skipped,
         "dump_version": version,
+        "ingest_skipped": ingest_skipped,
     }
     return DiscoverResult(candidates=candidates, diagnostics=diagnostics)
 

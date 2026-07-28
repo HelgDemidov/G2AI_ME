@@ -496,6 +496,54 @@ def test_discover_agora_caches_zip_does_not_redownload_same_version(tmp_path: Pa
     assert len(calls) == 1  # второй вызов нашёл zip в кэше и не скачивал повторно
 
 
+# --- bronze_has_version: «дамп уже проглочен?» спрашивается у КЭША, не у курсора ---
+
+
+def test_bronze_has_version_no_db_is_false(tmp_path: Path) -> None:
+    """Свежая машина: БД ещё нет — честное «нет», а не отказ."""
+    assert agora.bronze_has_version("1.31.0", tmp_path / "absent.duckdb") is False
+
+
+def test_bronze_has_version_db_without_table_is_false(tmp_path: Path) -> None:
+    """БД есть (её создал другой коннектор архетипа), таблицы agora ещё нет."""
+    db_path = tmp_path / "registry.duckdb"
+    conn = registry_store.connect(db_path)
+    conn.close()
+    assert agora.bronze_has_version("1.31.0", db_path) is False
+
+
+def test_bronze_has_version_true_after_ingest_and_false_for_other_version(tmp_path: Path) -> None:
+    zip_path = tmp_path / "agora-1.31.0.zip"
+    _build_fixture_zip(zip_path)
+    db_path = tmp_path / "registry.duckdb"
+    agora.ingest_dump(zip_path, source_version="1.31.0", db_path=db_path)
+
+    assert agora.bronze_has_version("1.31.0", db_path) is True
+    assert agora.bronze_has_version("1.32.0", db_path) is False
+
+
+def test_discover_agora_skips_ingest_when_bronze_already_has_version(tmp_path: Path) -> None:
+    """Замена version-гейта курсора: повторный прогон отдаёт ПОЛНЫЙ вид дампа (кандидаты
+    те же), но не платит за ingest второй раз."""
+    def fake_fetch(doi: str) -> dict[str, object]:
+        return _fake_zenodo_record(metadata={"version": "1.31.0"})
+
+    def fake_download(url: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _build_fixture_zip(dest)
+
+    call = dict(
+        config=_fake_config(), fetch_metadata=fake_fetch, download=fake_download,
+        cache_dir=tmp_path / "cache", db_path=tmp_path / "registry.duckdb",
+    )
+    first = agora.discover_agora(**call)  # type: ignore[arg-type]
+    second = agora.discover_agora(**call)  # type: ignore[arg-type]
+
+    assert first.diagnostics["ingest_skipped"] is False
+    assert second.diagnostics["ingest_skipped"] is True
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
+
+
 def test_agora_connector_implements_protocol() -> None:
     conn = agora.AgoraConnector(enabled=True)
     assert conn.id == "agora"
