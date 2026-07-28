@@ -10,7 +10,7 @@ Spec `docs/pipeline/discovery/tech_specs/discovery-snowball/spec.md`. Пятый
 Коммит 2 — экстрактор PDF-аннотаций (§2.1/§2.4): группировка/склейка по ``uri``,
 crop anchor-текста, санитизация URL, отсев самоссылок/уже-в-корпусе.
 Коммит 3 — экстракторы href raw.html и напечатанных URL doc.md (§2.2/§2.3).
-Коммит 4 — маппинг в CandidateRecord, pre-signal, курсор/fingerprint,
+Коммит 4 — маппинг в CandidateRecord, pre-signal, fingerprint,
 регистрация коннектора в ядре (§3/§4).
 Коммит 5 — CLI-подкоманда `snowball` + `orchestrate.connectors_override` (§3).
 Коммит 6 — LLM-стадия текстовых цитат без URL, opt-in `emit.text_citations` (§5).
@@ -37,7 +37,7 @@ from lxml import html as lxml_html
 from core import fsio, openrouter, pdfmeta, schema
 from core.env import REPO_ROOT
 from discovery import registry, store
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 from discovery.dedup import format_hint_from_url, normalize_url
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_snowball.yaml"
@@ -452,7 +452,7 @@ def map_link(
     )
 
 
-# --- §4: курсор — fingerprint по документу (sha256 raw + sha256 doc.md) ---
+# --- §4: fingerprint документа (sha256 raw + sha256 doc.md) ---
 
 
 def document_fingerprint(rec: schema.SourceRecord, root: Path) -> str:
@@ -758,9 +758,7 @@ def leads_path(root: Path) -> Path:
 def save_leads(leads: list[dict[str, Any]], root: Path) -> None:
     """Записать ``sources/.snowball_leads.yaml`` (спек §5) — ПЕРЕЗАПИСЫВАЕТСЯ целиком
     каждым прогоном с ``--with-citations`` (не аппендится): лиды — сырьё СЛЕДУЮЩЕЙ
-    directed-search мини-кампании, не постоянное состояние; известное ограничение —
-    лиды документа, не пере-майненного в этом прогоне (курсор его пропустил), в
-    файл не попадают, пока документ не изменится или курсор не будет сброшен.
+    directed-search мини-кампании, не постоянное состояние.
     Путь — ``leads_path`` (каталог операционного состояния корпуса, ``store.state_dir``).
 
     Каждый лид дампится отдельно, записи разделяются пустой строкой — тот же приём
@@ -785,7 +783,6 @@ def _default_call_model(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def discover_snowball(
-    cursor: ConnectorCursor | None,
     *,
     config: SnowballConfig | None = None,
     root: Path = schema.DEFAULT_SOURCES,
@@ -793,11 +790,11 @@ def discover_snowball(
     call_model: Callable[[dict[str, Any]], dict[str, Any]] = _default_call_model,
 ) -> DiscoverResult:
     """``Connector.discover()`` для snowball (спек §4): отфильтровать документы (§3) ->
-    для каждого НЕизменившегося (по курсору) — скип; иначе прогнать включённые
-    экстракторы (§2, + §5 LLM-стадия цитат, если ``emit.text_citations`` и документ не
-    ``confidential``) -> отсеять самоссылки/уже-в-корпусе/url_filter -> замаппить ->
-    обновить курсор. Ширина прогона задаётся ДОКУМЕНТАМИ (``source_filter``/CLI
-    ``--doc``/``--track``), а не потолком числа находок.
+    прогнать включённые экстракторы (§2, + §5 LLM-стадия цитат, если ``emit.text_citations``
+    и документ не ``confidential``) -> отсеять самоссылки/уже-в-корпусе/url_filter ->
+    замаппить. Отдаёт ПОЛНЫЙ текущий вид корпуса; «что здесь новое» решает
+    кросс-коннекторный ``dedup`` оркестратора. Ширина прогона задаётся ДОКУМЕНТАМИ
+    (``source_filter``/CLI ``--doc``/``--track``), а не потолком числа находок.
 
     ``records`` — инжектируемый список документов корпуса (тесты подставляют фикстуры;
     по умолчанию читается с диска, как у остальных потребителей ``schema.load_records``).
@@ -808,13 +805,9 @@ def discover_snowball(
     filtered = apply_source_filter(all_records, cfg.source_filter)
     vocab_terms = _load_vocab_terms()
 
-    mined_before = dict((cursor or {}).get("mined") or {})
-    mined_after = dict(mined_before)
-
     candidates: list[schema.CandidateRecord] = []
     all_leads: list[CitationLead] = []
     docs_scanned = 0
-    docs_skipped_cursor = 0
     filtered_self_or_corpus = 0
     filtered_by_url_filter = 0
     per_extractor = {"pdf_annotations": 0, "html_hrefs": 0, "printed_urls": 0, "text_citations": 0}
@@ -825,10 +818,6 @@ def discover_snowball(
         if raw_path is None or not md_path.exists():
             continue  # документ ещё не добыт/не сконвертирован — просто нечего майнить
 
-        fingerprint = document_fingerprint(rec, root)
-        if mined_before.get(rec.id) == fingerprint:
-            docs_skipped_cursor += 1
-            continue
         docs_scanned += 1
 
         raw_links: list[tuple[RawLink, str]] = []
@@ -871,15 +860,10 @@ def discover_snowball(
             )
 
         candidates.extend(doc_candidates)
-        mined_after[rec.id] = fingerprint
 
-    status = "no_new" if cursor is not None and not candidates else "fetched"
     diagnostics: dict[str, Any] = {
-        "status": status,
         "docs_scanned": docs_scanned,
-        "docs_skipped_cursor": docs_skipped_cursor,
         "found": sum(per_extractor.values()),
-        "fresh": len(candidates),
         "filtered_self_or_corpus": filtered_self_or_corpus,
         "filtered_by_url_filter": filtered_by_url_filter,
         "per_extractor": dict(per_extractor),
@@ -891,7 +875,7 @@ def discover_snowball(
             for lead in all_leads
         ],
     }
-    return DiscoverResult(candidates=candidates, cursor={"mined": mined_after}, diagnostics=diagnostics)
+    return DiscoverResult(candidates=candidates, diagnostics=diagnostics)
 
 
 @dataclass
@@ -911,8 +895,8 @@ class SnowballConnector:
     # передаёт его явно) — иначе коннектор молча сканирует боевой sources/ вместо тестового/
     # переданного корня (живой дефект, пойманный test_discover_cli.py при написании коммита 5).
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return discover_snowball(cursor, config=self.config, root=self.root)
+    def discover(self) -> DiscoverResult:
+        return discover_snowball(config=self.config, root=self.root)
 
 
 # Регистрация при импорте (чартер §4.3 «манифест», спек §1): `enabled` — из конфига,

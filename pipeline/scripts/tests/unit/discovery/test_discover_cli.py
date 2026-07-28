@@ -12,7 +12,7 @@ import pytest
 from core import fsio, schema
 from discover import main
 from discovery import registry, store
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 
 
 class _StaticConnector:
@@ -21,7 +21,7 @@ class _StaticConnector:
         self.kind = schema.ConnectorKind.manual
         self.enabled = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
+    def discover(self) -> DiscoverResult:
         cand = schema.CandidateRecord.model_validate(
             {
                 "connector_id": self.id,
@@ -29,7 +29,7 @@ class _StaticConnector:
                 "raw_hash": f"doc-{self.id}",
             }
         )
-        return DiscoverResult(candidates=[cand], cursor={})
+        return DiscoverResult(candidates=[cand])
 
 
 class _BoomConnector:
@@ -37,7 +37,7 @@ class _BoomConnector:
     kind = schema.ConnectorKind.manual
     enabled = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
+    def discover(self) -> DiscoverResult:
         raise RuntimeError("down")
 
 

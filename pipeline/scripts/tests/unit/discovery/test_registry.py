@@ -10,7 +10,7 @@ import pytest
 
 from core import schema
 from discovery import registry
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 
 
 class _FakeConnector:
@@ -19,8 +19,8 @@ class _FakeConnector:
         self.kind = schema.ConnectorKind.manual
         self.enabled = enabled
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return DiscoverResult(candidates=[], cursor={})
+    def discover(self) -> DiscoverResult:
+        return DiscoverResult(candidates=[])
 
 
 @pytest.fixture(autouse=True)
@@ -73,5 +73,5 @@ def test_enabled_connectors_only_unknown_id_raises() -> None:
 def test_fake_connector_registers_without_core_edits() -> None:
     """Доказательство требования чартера §4: реестр ничего не знает о _FakeConnector заранее."""
     registry.register(_FakeConnector("proof"))
-    result = registry.enabled_connectors(only=["proof"])[0].discover(None)
+    result = registry.enabled_connectors(only=["proof"])[0].discover()
     assert result.candidates == []

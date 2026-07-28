@@ -1,6 +1,5 @@
-"""Тесты discovery/connectors/snowball.py — discover_snowball() целиком: курсор/fingerprint-
-скип, реконсиляционный no-op, диагностика (spec discovery-snowball
-§3/§4, коммит 4)."""
+"""Тесты discovery/connectors/snowball.py — discover_snowball() целиком: полная выдача,
+фильтры источника/URL, диагностика (spec discovery-snowball §3/§4)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -52,46 +51,28 @@ def test_document_without_raw_or_doc_md_is_skipped_not_errored(tmp_path: Path) -
     data = valid_record() | {"id": "no-raw-doc", "entity_id": "me", "track": "target-entity"}
     write_doc(tmp_path, data)  # только meta.yaml — ни raw, ни doc.md
     rec = schema.SourceRecord.model_validate(data)
-    result = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
+    result = discover_snowball(config=_config(), root=tmp_path, records=[rec])
     assert result.candidates == []
     assert result.diagnostics["docs_scanned"] == 0
 
 
-def test_first_run_mines_document_and_records_fingerprint(tmp_path: Path) -> None:
+def test_first_run_mines_document(tmp_path: Path) -> None:
     rec = _seed_doc(tmp_path, doc_id="first-run-doc", raw_sha="a" * 64, links=[("https://example.org/a", "Doc A")])
-    result = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
+    result = discover_snowball(config=_config(), root=tmp_path, records=[rec])
     assert len(result.candidates) == 1
     assert result.candidates[0].source_url == "https://example.org/a"
-    assert rec.id in result.cursor["mined"]
     assert result.diagnostics["docs_scanned"] == 1
-    assert result.diagnostics["docs_skipped_cursor"] == 0
 
 
-def test_second_run_unchanged_corpus_is_noop(tmp_path: Path) -> None:
+def test_second_run_returns_same_full_view(tmp_path: Path) -> None:
+    """Коннектор — чистая функция от ИСТОЧНИКА (здесь источник = собственный корпус):
+    повторный прогон отдаёт ТО ЖЕ, документ не «пропускается». Инвариант «повторный
+    прогон — no-op» держит ``dedup`` оркестратора, и это проверено в test_orchestrate."""
     rec = _seed_doc(tmp_path, doc_id="noop-doc", raw_sha="a" * 64, links=[("https://example.org/b", "Doc B")])
-    first = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
-    second = discover_snowball(first.cursor, config=_config(), root=tmp_path, records=[rec])
-    assert second.candidates == []
-    assert second.cursor == first.cursor
-    assert second.diagnostics["docs_skipped_cursor"] == 1
-    assert second.diagnostics["docs_scanned"] == 0
-
-
-def test_changed_doc_md_triggers_remine(tmp_path: Path) -> None:
-    data = valid_record() | {"id": "remine-doc", "entity_id": "me", "track": "target-entity"}
-    rec = schema.SourceRecord.model_validate(data)
-    raw_bytes = _pdf_with_link("https://example.org/c", "Doc C")
-    write_doc(tmp_path, data, raw=raw_bytes, md="version one", state={"sha256": "a" * 64})
-    first = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
-    assert len(first.candidates) == 1
-
-    write_doc(tmp_path, data, raw=raw_bytes, md="version TWO, changed", state={"sha256": "a" * 64})
-    second = discover_snowball(first.cursor, config=_config(), root=tmp_path, records=[rec])
-    # doc.md изменился -> fingerprint изменился -> пере-майнинг (та же ссылка снова найдена,
-    # но она уже персистнута кросс-коннекторным dedup'ом на уровне оркестратора — здесь
-    # discover_snowball() эмитит её заново, это ожидаемо для чистой функции коннектора)
+    first = discover_snowball(config=_config(), root=tmp_path, records=[rec])
+    second = discover_snowball(config=_config(), root=tmp_path, records=[rec])
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
     assert second.diagnostics["docs_scanned"] == 1
-    assert second.diagnostics["docs_skipped_cursor"] == 0
 
 
 def test_self_link_and_corpus_link_are_excluded_end_to_end(tmp_path: Path) -> None:
@@ -115,9 +96,7 @@ def test_self_link_and_corpus_link_are_excluded_end_to_end(tmp_path: Path) -> No
     )
     write_doc(tmp_path, self_data, raw=raw_bytes, md="no urls in md", state={"sha256": "a" * 64})
 
-    result = discover_snowball(
-        None, config=_config(), root=tmp_path, records=[self_rec, other_rec]
-    )
+    result = discover_snowball(config=_config(), root=tmp_path, records=[self_rec, other_rec])
     urls = {c.source_url for c in result.candidates}
     assert urls == {"https://example.org/genuinely-new"}
     assert result.diagnostics["filtered_self_or_corpus"] == 2
@@ -139,7 +118,7 @@ def test_url_filter_excludes_matching_domain_end_to_end(tmp_path: Path) -> None:
         citations_model=cfg.citations_model,
         citations_model_fallback=cfg.citations_model_fallback,
     )
-    result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec])
+    result = discover_snowball(config=cfg, root=tmp_path, records=[rec])
     urls = {c.source_url for c in result.candidates}
     assert urls == {"https://gov.example.org/law"}
     assert result.diagnostics["filtered_by_url_filter"] == 1
@@ -164,8 +143,8 @@ def test_emit_toggle_disables_printed_urls_extractor(tmp_path: Path) -> None:
         citations_model="test/model",
         citations_model_fallback=None,
     )
-    result_off = discover_snowball(None, config=cfg_off, root=tmp_path, records=[rec])
+    result_off = discover_snowball(config=cfg_off, root=tmp_path, records=[rec])
     assert result_off.candidates == []
 
-    result_on = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
+    result_on = discover_snowball(config=_config(), root=tmp_path, records=[rec])
     assert len(result_on.candidates) == 1

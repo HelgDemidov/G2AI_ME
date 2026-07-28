@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 
 from core import schema
-from discovery.base import Connector, ConnectorCursor, DiscoverResult
+from discovery.base import Connector, DiscoverResult
 
 
 def _candidate(**overrides: object) -> schema.CandidateRecord:
@@ -17,19 +17,18 @@ def _candidate(**overrides: object) -> schema.CandidateRecord:
     return schema.CandidateRecord.model_validate(fields)
 
 
-def test_discover_result_holds_candidates_cursor_and_default_diagnostics() -> None:
+def test_discover_result_holds_candidates_and_default_diagnostics() -> None:
     cand = _candidate()
-    result = DiscoverResult(candidates=[cand], cursor={"seen": ["abc123"]})
+    result = DiscoverResult(candidates=[cand])
 
     assert result.candidates == [cand]
-    assert result.cursor == {"seen": ["abc123"]}
     assert result.diagnostics == {}  # default_factory, не мутирует между инстансами
 
 
 def test_discover_result_is_frozen() -> None:
-    result = DiscoverResult(candidates=[], cursor={})
+    result = DiscoverResult(candidates=[])
     try:
-        result.cursor = {"x": 1}  # type: ignore[misc]
+        result.candidates = []  # type: ignore[misc]
     except AttributeError:
         pass
     else:
@@ -37,25 +36,29 @@ def test_discover_result_is_frozen() -> None:
 
 
 def test_discover_result_diagnostics_not_shared_between_instances() -> None:
-    a = DiscoverResult(candidates=[], cursor={})
-    b = DiscoverResult(candidates=[], cursor={})
+    a = DiscoverResult(candidates=[])
+    b = DiscoverResult(candidates=[])
     assert a.diagnostics is not b.diagnostics
 
 
 class _FakeConnector:
-    """Минимальная реализация Connector protocol — доказательство структурной типизации."""
+    """Минимальная реализация Connector protocol — доказательство структурной типизации.
+
+    ``discover()`` без аргументов: коннектор — чистая функция от ИСТОЧНИКА, ядро не
+    передаёт ему состояния и не принимает от него (spec drop-cursors-and-decision-overlay §1).
+    """
 
     id = "fake"
     kind = schema.ConnectorKind.manual
     enabled = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return DiscoverResult(candidates=[_candidate()], cursor={"seen": True}, diagnostics={"found": 1})
+    def discover(self) -> DiscoverResult:
+        return DiscoverResult(candidates=[_candidate()], diagnostics={"found": 1})
 
 
 def test_fake_connector_satisfies_protocol_structurally() -> None:
     connector: Connector = _FakeConnector()  # mypy: структурная проверка; рантайм: просто вызов
-    result = connector.discover(None)
+    result = connector.discover()
     assert connector.id == "fake"
     assert connector.kind == schema.ConnectorKind.manual
     assert connector.enabled is True

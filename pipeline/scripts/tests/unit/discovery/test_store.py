@@ -1,4 +1,4 @@
-"""Тесты discovery/store.py: персист слоя кандидатов + курсоров (.state/cursors.yaml)
+"""Тесты discovery/store.py: персист слоя кандидатов
 (spec discovery-core §4; шардированная раскладка — spec discovery-candidates-sharding §1–§3)."""
 from __future__ import annotations
 
@@ -262,35 +262,10 @@ def test_crash_between_shards_converges_on_next_save(tmp_path: Path, monkeypatch
     assert {c.raw_hash for c in store.load(tmp_path)} == {"hm", "ho"}
 
 
-# --- cursors ------------------------------------------------------------------------
-
-
-def test_load_cursors_missing_file_returns_empty_dict(tmp_path: Path) -> None:
-    assert store.load_cursors(tmp_path) == {}
-
-
-def test_save_load_cursors_round_trip(tmp_path: Path) -> None:
-    cursors = {"agora": {"dataset_version": "2026-05-16"}, "manual": {}}
-
-    store.save_cursors(cursors, tmp_path)
-
-    assert store.load_cursors(tmp_path) == cursors
-
-
-def test_save_cursors_creates_state_dir(tmp_path: Path) -> None:
-    """``.state/`` может ещё не существовать (свежий корпус) — писатель его создаёт."""
-    store.save_cursors({"agora": {}}, tmp_path)
-
-    assert store.cursors_path(tmp_path).parent == store.state_dir(tmp_path)
-    assert store.cursors_path(tmp_path).exists()
-
-
-def test_cursors_live_under_state_dir_of_default_sources() -> None:
+def test_state_dir_of_default_sources() -> None:
     """Операционное состояние корпуса — в ``sources/.state/`` (2026-07-25), одним словом
-    с пер-документным ``.state.yaml``; курсоры больше не валяются в корне корпуса."""
+    с пер-документным ``.state.yaml``."""
     assert store.state_dir() == store.STATE_DIR == schema.DEFAULT_SOURCES / ".state"
-    assert store.CURSORS_PATH == store.STATE_DIR / "cursors.yaml"
-    assert store.cursors_path() == store.CURSORS_PATH
 
 
 # --- слим CandidateRecord + человекочитаемый дамп (2026-07-21) ---

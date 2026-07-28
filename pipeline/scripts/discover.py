@@ -201,7 +201,7 @@ def _cmd_snowball(args: argparse.Namespace) -> int:
 
     # §5: лиды (цитаты без URL) — перезаписываются целиком каждым прогоном с
     # emit.text_citations включённым; --dry-run ничего не пишет на диск (симметрично
-    # candidates.yaml/cursors), отключённая стадия файл не трогает вовсе.
+    # шардам кандидатов), отключённая стадия файл не трогает вовсе.
     if not args.dry_run and merged_config.emit.text_citations and summary.connectors:
         leads: list[dict[str, Any]] = summary.connectors[0].diagnostics.get("leads") or []  # type: ignore[assignment]
         snowball.save_leads(leads, args.root)
@@ -237,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         "--only", nargs="+", default=None, metavar="ID", help="ограничиться этими id коннекторов"
     )
     p_discover.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
-    p_discover.add_argument("--dry-run", action="store_true", help="сводка без записи store/cursors")
+    p_discover.add_argument("--dry-run", action="store_true", help="сводка без записи store")
     p_discover.set_defaults(func=_cmd_discover)
 
     p_inject = sub.add_parser("inject", help="ручной/directed-search кандидат")
@@ -297,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         "--with-citations", action="store_true", help="включить LLM-стадию текстовых цитат (§5)"
     )
     p_snowball.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
-    p_snowball.add_argument("--dry-run", action="store_true", help="сводка без записи store/cursors")
+    p_snowball.add_argument("--dry-run", action="store_true", help="сводка без записи store")
     p_snowball.set_defaults(func=_cmd_snowball)
 
     args = parser.parse_args(argv)

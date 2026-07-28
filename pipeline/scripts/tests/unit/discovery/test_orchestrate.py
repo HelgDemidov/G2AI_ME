@@ -9,7 +9,7 @@ import pytest
 
 from core import schema
 from discovery import registry, store
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 from discovery.orchestrate import discover
 
 
@@ -32,11 +32,11 @@ class _StaticConnector:
         self.kind = schema.ConnectorKind.manual
         self.enabled = True
         self._candidates = candidates
-        self.calls: list[ConnectorCursor | None] = []
+        self.calls = 0
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        self.calls.append(cursor)
-        return DiscoverResult(candidates=list(self._candidates), cursor={"n": len(self.calls)})
+    def discover(self) -> DiscoverResult:
+        self.calls += 1
+        return DiscoverResult(candidates=list(self._candidates))
 
 
 class _FailingConnector:
@@ -44,7 +44,7 @@ class _FailingConnector:
     kind = schema.ConnectorKind.manual
     enabled = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
+    def discover(self) -> DiscoverResult:
         raise RuntimeError("upstream недоступен")
 
 
@@ -69,10 +69,17 @@ def test_discover_persists_fresh_candidates(tmp_path: Path) -> None:
     assert loaded[0].raw_hash == "doc1"
 
 
-def test_discover_persists_cursor_returned_by_connector(tmp_path: Path) -> None:
+def test_status_is_computed_by_orchestrator_from_dedup(tmp_path: Path) -> None:
+    """``status`` считает ОРКЕСТРАТОР из исхода dedup, один раз (spec drop-cursors-and-
+    decision-overlay §1) — раньше его выводил каждый коннектор сам, пятью реализациями.
+    «Новое» есть свойство корпуса кандидатов, а не источника."""
     registry.register(_StaticConnector("a", [_candidate("a", "doc1")]))
-    discover(root=tmp_path)
-    assert store.load_cursors(tmp_path) == {"a": {"n": 1}}
+
+    first = discover(root=tmp_path)
+    second = discover(root=tmp_path)
+
+    assert first.connectors[0].diagnostics["status"] == "fetched"
+    assert second.connectors[0].diagnostics["status"] == "no_new"
 
 
 def test_failing_connector_does_not_abort_run(tmp_path: Path) -> None:
@@ -101,14 +108,13 @@ def test_repeat_run_with_unchanged_upstream_is_idempotent(tmp_path: Path) -> Non
     assert len(store.load(tmp_path)) == 1  # без дублей на диске
 
 
-def test_dry_run_does_not_write_store_or_cursors(tmp_path: Path) -> None:
+def test_dry_run_does_not_write_store(tmp_path: Path) -> None:
     registry.register(_StaticConnector("a", [_candidate("a", "doc1")]))
 
     summary = discover(root=tmp_path, dry_run=True)
 
     assert summary.total_fresh == 1  # сводка честная...
     assert store.load(tmp_path) == []  # ...но store пуст (проверка через API — раскладка store её дело)
-    assert store.load_cursors(tmp_path) == {}  # через API — раскладку знает store
 
 
 def test_two_connectors_same_run_fold_into_one_candidate(tmp_path: Path) -> None:
@@ -133,8 +139,8 @@ def test_only_narrows_which_connectors_run(tmp_path: Path) -> None:
 
     discover(root=tmp_path, only=["a"])
 
-    assert conn_a.calls == [None]
-    assert conn_b.calls == []
+    assert conn_a.calls == 1
+    assert conn_b.calls == 0
 
 
 # --- connectors_override (discovery-snowball §3): CLI-подкоманда `snowball` строит
@@ -142,18 +148,16 @@ def test_only_narrows_which_connectors_run(tmp_path: Path) -> None:
 
 
 def test_connectors_override_used_when_registry_is_empty(tmp_path: Path) -> None:
-    """Реестр пуст (ничего не зарегистрировано) — override всё равно работает, dedup/
-    персист/cursor-запись идут тем же путём, что и для обычных registry-коннекторов."""
+    """Реестр пуст (ничего не зарегистрировано) — override всё равно работает, dedup и
+    персист идут тем же путём, что и для обычных registry-коннекторов."""
     assert registry.CONNECTORS == {}
     override_conn = _StaticConnector("snowball", [_candidate("snowball", "found1")])
 
     summary = discover(root=tmp_path, connectors_override=[override_conn])
 
     assert summary.total_fresh == 1
-    assert override_conn.calls == [None]
+    assert override_conn.calls == 1
     assert len(store.load(tmp_path)) == 1
-    cursors = store.load_cursors(tmp_path)
-    assert cursors["snowball"] == {"n": 1}
 
 
 def test_connectors_override_ignores_only_param(tmp_path: Path) -> None:

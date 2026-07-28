@@ -1,4 +1,4 @@
-"""discovery/store.py — персист слоя кандидатов + курсоров (spec discovery-core §4).
+"""discovery/store.py — персист слоя кандидатов (spec discovery-core §4).
 
 Раскладка кандидатов — **шард на коннектор**: ``sources/candidates/<shard>.yaml``, где
 ``shard`` — санитизированный ``connector_id`` (spec discovery-candidates-sharding §1).
@@ -14,23 +14,21 @@
 (``dedup._merge_provenance``, probe-поля recheck-контура) корректна автоматически —
 вопрос «какие шарды переписать» исчезает как класс, а не решается dirty-трекингом.
 
-Оба артефакта (кандидаты, курсоры) машиннописаные (комментарии не выживают перезапись) —
-тот же прецедент, что у ``.state.yaml`` (corpus-layout-v2): производные/операционные
-файлы, не курируемые человеком напрямую.
+Шарды машиннописаные (комментарии не выживают перезапись) — тот же прецедент, что у
+``.state.yaml`` (corpus-layout-v2): производные/операционные файлы, не курируемые
+человеком напрямую.
 
 **Операционное состояние уровня КОРПУСА живёт в ``sources/.state/``** (2026-07-25):
-курсоры коннекторов (``cursors.yaml``), лиды snowball (``snowball_leads.yaml``, пишет
-``connectors/snowball.py``), dangling-цитаты graph-v2 (``cite_leads.yaml``, пишет
-``graph/cite_mining.py``). Каталог перерос «владение» discovery (три писателя из ДВУХ
-слоёв) — владелец переехал в ``core.schema.state_dir`` (knowledge-hardening §2);
-``state_dir`` здесь — реэкспорт для обратной совместимости вызывающих (``connectors/
-snowball.py`` и др.), имя файла внутри остаётся за каждым писателем.
+лиды snowball (``snowball_leads.yaml``, пишет ``connectors/snowball.py``),
+dangling-цитаты graph-v2 (``cite_leads.yaml``, пишет ``graph/cite_mining.py``). Каталог
+перерос «владение» discovery (писатели из ДВУХ слоёв) — владелец переехал в
+``core.schema.state_dir`` (knowledge-hardening §2); ``state_dir`` здесь — реэкспорт для
+обратной совместимости вызывающих, имя файла внутри остаётся за каждым писателем.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -38,14 +36,12 @@ from core import fsio, schema
 
 CANDIDATES_DIRNAME = "candidates"
 LEGACY_CANDIDATES_FILENAME = "candidates.yaml"
-CURSORS_FILENAME = "cursors.yaml"
 
 CANDIDATES_DIR = schema.DEFAULT_SOURCES / CANDIDATES_DIRNAME
 LEGACY_CANDIDATES_PATH = schema.DEFAULT_SOURCES / LEGACY_CANDIDATES_FILENAME
 state_dir = schema.state_dir
 """Реэкспорт (knowledge-hardening §2) — владелец каталога переехал в ``core.schema``."""
 STATE_DIR = schema.state_dir(schema.DEFAULT_SOURCES)
-CURSORS_PATH = STATE_DIR / CURSORS_FILENAME
 """Операционное состояние корпуса — вне git по deny-default `/sources/**` (см. docstring модуля)."""
 
 # Имя шарда: всё, что не буква/цифра/подчёркивание/дефис, схлопывается в "__".
@@ -54,7 +50,6 @@ CURSORS_PATH = STATE_DIR / CURSORS_FILENAME
 # каталога store) и ведущую точку (``Path.glob("*.yaml")`` матчит скрытые файлы —
 # проверено эмпирически, поэтому шард `.foo.yaml` был бы прочитан как обычный).
 _SHARD_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
-
 
 def candidates_dir(root: Path = schema.DEFAULT_SOURCES) -> Path:
     """Каталог шардов слоя кандидатов под корнем корпуса.
@@ -65,26 +60,17 @@ def candidates_dir(root: Path = schema.DEFAULT_SOURCES) -> Path:
     """
     return root / CANDIDATES_DIRNAME
 
-
 def legacy_candidates_path(root: Path = schema.DEFAULT_SOURCES) -> Path:
     """Монолит ``sources/candidates.yaml`` — вход авто-миграции (§3), не цель записи."""
     return root / LEGACY_CANDIDATES_FILENAME
-
-
-def cursors_path(root: Path = schema.DEFAULT_SOURCES) -> Path:
-    """Курсоры коннекторов: ``<root>/.state/cursors.yaml``."""
-    return schema.state_dir(root) / CURSORS_FILENAME
-
 
 def shard_name(connector_id: str) -> str:
     """``connector_id`` -> имя файла шарда БЕЗ расширения (санитизация — см. ``_SHARD_UNSAFE_RE``)."""
     return _SHARD_UNSAFE_RE.sub("__", connector_id)
 
-
 def shard_path(connector_id: str, root: Path = schema.DEFAULT_SOURCES) -> Path:
     """Путь шарда коннектора: ``<root>/candidates/<санитизированный id>.yaml``."""
     return candidates_dir(root) / f"{shard_name(connector_id)}.yaml"
-
 
 def load(root: Path = schema.DEFAULT_SOURCES) -> list[schema.CandidateRecord]:
     """Слой кандидатов целиком; отсутствующий store — пустой корпус кандидатов, не ошибка.
@@ -106,7 +92,6 @@ def load(root: Path = schema.DEFAULT_SOURCES) -> list[schema.CandidateRecord]:
         records.extend(schema.load_candidates(shard))
     return records
 
-
 def _dump_records(candidates: list[schema.CandidateRecord]) -> str:
     """Сериализация списка кандидатов в текст одного YAML-файла store.
 
@@ -120,7 +105,6 @@ def _dump_records(candidates: list[schema.CandidateRecord]) -> str:
         for c in candidates
     ]
     return "\n".join(parts)
-
 
 def _partition(candidates: list[schema.CandidateRecord]) -> dict[str, list[schema.CandidateRecord]]:
     """Разложить полный список по имени шарда; коллизия санитизации — громкий отказ.
@@ -140,7 +124,6 @@ def _partition(candidates: list[schema.CandidateRecord]) -> dict[str, list[schem
             )
         by_shard.setdefault(name, []).append(cand)
     return by_shard
-
 
 def save(candidates: list[schema.CandidateRecord], root: Path = schema.DEFAULT_SOURCES) -> None:
     """Полный перезапись store шардами (§2): партиционирование ВСЕГО списка по
@@ -172,22 +155,3 @@ def save(candidates: list[schema.CandidateRecord], root: Path = schema.DEFAULT_S
 
     legacy_candidates_path(root).unlink(missing_ok=True)  # авто-миграция завершена
 
-
-def load_cursors(root: Path = schema.DEFAULT_SOURCES) -> dict[str, dict[str, Any]]:
-    """``connector_id -> ConnectorCursor``; отсутствующий файл — пустой словарь (первый прогон).
-
-    Принимает КОРЕНЬ корпуса, а не путь файла — знание раскладки живёт только здесь
-    (тот же контракт, что у ``load``/``save`` кандидатов).
-    """
-    path = cursors_path(root)
-    if not path.exists():
-        return {}
-    raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return raw if raw is not None else {}
-
-
-def save_cursors(
-    cursors: dict[str, dict[str, Any]], root: Path = schema.DEFAULT_SOURCES
-) -> None:
-    text = yaml.safe_dump(cursors, allow_unicode=True, sort_keys=False)
-    fsio.atomic_write_text(cursors_path(root), text)  # создаёт .state/ при необходимости
