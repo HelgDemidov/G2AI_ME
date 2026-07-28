@@ -165,30 +165,27 @@ def test_unacquirable_stays_out_of_pending() -> None:
 # --- реконсиляция с реестром (spec discovery-acquire-seam-hardening §4, Г3) ---
 
 
-def test_unacquirable_candidates_excludes_registered_pair() -> None:
-    """До этого спека — единственная очередь слоя, НЕ выводимая реконсиляцией:
-    admit недобываемого кандидата напрямую (revive→admit требует двух батчей)
-    оставлял его НАВСЕГДА видимым здесь, хотя документ уже в корпусе."""
-    registered_cand = _cand(
-        "1a" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
-        source_url="https://gov.example.org/registered.pdf",
-        normalized_url="https://gov.example.org/registered.pdf",
+def test_unacquirable_candidates_excludes_admitted() -> None:
+    """Очередь выводится реконсиляцией по штампу: admit недобываемого кандидата напрямую
+    (revive→admit требует двух батчей) не оставляет его НАВСЕГДА видимым здесь, хотя
+    документ уже в корпусе."""
+    rec = schema.SourceRecord.model_validate(valid_record())
+    admitted = _cand(
+        "1a" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable", admitted_as=rec.id
     )
     still_waiting = _cand("2b" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
-    rec_data = valid_record() | {"source_url": "https://gov.example.org/registered.pdf"}
-    rec = schema.SourceRecord.model_validate(rec_data)
 
-    due = manual.unacquirable_candidates([registered_cand, still_waiting], [rec])
+    due = manual.unacquirable_candidates([admitted, still_waiting], [rec])
 
     assert [c.raw_hash for c in due] == [still_waiting.raw_hash]
 
 
-def test_unacquirable_candidates_without_url_stays_visible_even_with_records() -> None:
-    """Безопасный дефолт, симметричный ``pending_candidates``: кандидат без URL
-    реконсиляцией не поддаётся — не прячем от куратора то, чего не можем сопоставить."""
+def test_unacquirable_candidates_stale_stamp_returns_candidate() -> None:
+    """Самовосстановление, симметричное ``pending_candidates``: штамп сверяется с реестром,
+    а не принимается на веру."""
     cand = _cand(
         "3c" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
-        source_url=None, normalized_url=None,
+        admitted_as="me-deleted-doc-2026",
     )
     rec = schema.SourceRecord.model_validate(valid_record())
     assert manual.unacquirable_candidates([cand], [rec]) == [cand]
@@ -206,47 +203,19 @@ def test_due_candidates_only_unacquirable_with_url() -> None:
 
 def test_due_candidates_reconciliation_is_the_callers_job() -> None:
     """Ревью PR #54: реконсиляция с реестром живёт в ЕДИНСТВЕННОЙ реализации
-    (``manual.unacquirable_candidates``), а не второй копией внутри ``due_candidates`` —
-    там она сравнивала ``c.normalized_url`` напрямую и на легаси-форме расходилась с
-    worksheet-очередью. Сама ``due_candidates`` знает только то, что выражается в
-    терминах ACQUIRE: непробиваемый (без URL) выбывает, остальное — сортировка и лимит."""
-    registered_cand = _cand(
-        "8e" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
-        source_url="https://gov.example.org/registered.pdf",
-        normalized_url="https://gov.example.org/registered.pdf",
+    (``manual.unacquirable_candidates``), а не второй копией внутри ``due_candidates``.
+    Сама ``due_candidates`` знает только то, что выражается в терминах ACQUIRE:
+    непробиваемый (без URL) выбывает, остальное — сортировка и лимит."""
+    rec = schema.SourceRecord.model_validate(valid_record())
+    admitted = _cand(
+        "8e" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable", admitted_as=rec.id
     )
-    still_waiting = _cand(
-        "9f" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
-        source_url="https://gov.example.org/waiting.pdf",
-        normalized_url="https://gov.example.org/waiting.pdf",
-    )
-    rec_data = valid_record() | {"source_url": "https://gov.example.org/registered.pdf"}
-    rec = schema.SourceRecord.model_validate(rec_data)
+    still_waiting = _cand("9f" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable")
 
-    pool = [registered_cand, still_waiting]
+    pool = [admitted, still_waiting]
     assert recheck.due_candidates(pool, limit=10) == pool  # сама по себе — не реконсилирует
     reconciled = manual.unacquirable_candidates(pool, [rec])
     assert recheck.due_candidates(reconciled, limit=10) == [still_waiting]
-
-
-def test_legacy_candidate_without_normalized_url_leaves_both_queues() -> None:
-    """Регресс ревью PR #54: кандидат с ``source_url``, но БЕЗ ``normalized_url`` —
-    живая легаси-форма (4 из 6 записей ``manual.yaml`` боевого store). Прежняя вторая
-    реализация реконсиляции внутри ``due_candidates`` строила ключ ``(None, supersedes)``,
-    который в множестве пар реестра не встречается никогда: worksheet-секция кандидата
-    отпускала, а ротация recheck держала его вечно — ровно тот зомби-класс, ради
-    которого §4 писался, только в одной из двух очередей."""
-    legacy = _cand(
-        "7d" + "0" * 62, rejected_reason="WAF", rejected_kind="unacquirable",
-        source_url="https://gov.example.org/legacy.pdf",
-        normalized_url=None,  # <-- поле не заполнено (inject до конвенции пары)
-    )
-    rec_data = valid_record() | {"source_url": "https://gov.example.org/legacy.pdf"}
-    rec = schema.SourceRecord.model_validate(rec_data)
-
-    reconciled = manual.unacquirable_candidates([legacy], [rec])
-    assert reconciled == []
-    assert recheck.due_candidates(reconciled, limit=10) == []
 
 
 def test_admit_unacquirable_candidate_directly_disappears_from_both_queues(tmp_path: Path) -> None:

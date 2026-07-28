@@ -523,6 +523,12 @@ class CandidateRecord(BaseModel):
     # прежним). Заполняется ТОЛЬКО явным `inject --supersedes` (решение человека, не
     # автоматика); `promote_candidate` материализует его в ребро графа.
     supersedes: str | None = Field(default=None, pattern=ID_PATTERN)
+    # doc-id записи, которой кандидат стал при допуске (spec candidate-identity-hardening §1).
+    # Штампуется ``apply_decisions`` после успешного ``save_record`` и служит ЕДИНСТВЕННЫМ
+    # ключом реконсиляции обеих очередей слоя. Штамп сверяется с реестром, а не принимается
+    # на веру: удаление папки документа (документированный путь исправления ошибки допуска)
+    # возвращает кандидата в ждущие само.
+    admitted_as: str | None = Field(default=None, pattern=ID_PATTERN)
     # причина отказа (если триаж отклонил — кандидат остаётся в слое кандидатов)
     rejected_reason: str | None = None
     # Природа отказа (spec post-acquisition-lifecycle §5): None у легаси-записей ==

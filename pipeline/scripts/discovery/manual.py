@@ -137,31 +137,24 @@ def inject(
     return absorber, False
 
 
-def registered_pairs(records: list[schema.SourceRecord]) -> set[tuple[str, str | None]]:
-    """Пары ``(нормализованный source_url, заменяемый doc-id | None)``, уже представленные
-    в реестре — правая часть реконсиляции ``pending_candidates``/``unacquirable_candidates``,
-    двух очередей слоя кандидатов (spec discovery-acquire-seam-hardening §4).
+def admitted_ids(records: list[schema.SourceRecord]) -> set[str]:
+    """doc-id, реально присутствующие в реестре — правая часть реконсиляции обеих очередей
+    слоя кандидатов (``pending_candidates``/``unacquirable_candidates``).
 
-    Публично, хотя оба вызывающих — соседи по модулю: это словарь предметной области
-    слоя (реконсиляция «что уже в реестре»), а не деталь одной функции. Кросс-слойного
-    потребителя у него нет и быть не должно — ротацию recheck кормит уже реконсилированным
-    списком оркестратор (ревью PR #54, см. ``acquire.recheck.due_candidates``): здесь
-    нормализуются URL, а ``normalize_url`` — знание слоя DISCOVERY.
-
-    Каждая запись регистрирует ``(url, None)`` — URL как таковой корпусом покрыт — И
-    ``(url, target)`` для каждого своего ребра ``supersedes``: последнее означает «редакция,
-    заменяющая target, УЖЕ промоутнута». Разделение нужно, чтобы обычное пере-обнаружение
-    того же URL не всплывало ждущим, а конкретная редакция гасилась только собственным
-    промоушеном.
+    Публично, хотя оба вызывающих — соседи по модулю: это словарь предметной области слоя
+    («что уже допущено»), а не деталь одной функции.
     """
-    pairs: set[tuple[str, str | None]] = set()
-    for rec in records:
-        url = dedup.normalize_url(rec.source_url)
-        pairs.add((url, None))
-        for rel in rec.relations:
-            if rel.type is schema.RelationType.supersedes:
-                pairs.add((url, rel.target))
-    return pairs
+    return {rec.id for rec in records}
+
+
+def _is_admitted(cand: schema.CandidateRecord, known: set[str]) -> bool:
+    """Кандидат допущен, если его штамп ``admitted_as`` указывает на ЖИВУЮ запись реестра.
+
+    Сверка, а не доверие штампу (spec candidate-identity-hardening §1): удаление папки
+    документа — документированный путь исправления ошибки допуска, и после него кандидат
+    обязан вернуться в очередь. Битый/устаревший штамп никого не прячет.
+    """
+    return cand.admitted_as is not None and cand.admitted_as in known
 
 
 def pending_candidates(
@@ -169,31 +162,12 @@ def pending_candidates(
 ) -> list[schema.CandidateRecord]:
     """«Ждущие» кандидаты — вычисляется реконсиляцией, не хранимым статусом (spec §3).
 
-    Кандидат «ждущий», если у него нет ``rejected_reason`` И его пара
-    ``(URL, supersedes)`` не представлена в реестре (см. ``registered_pairs``). Кандидат
-    без URL вовсе (совпадение только по паре issuer+тайтл) реконсиляцией по URL
-    отфильтровать нельзя — остаётся ждущим (безопасный дефолт: не прячем от куратора то,
-    чего не можем уверенно сопоставить).
-
-    **Почему пара, а не голый URL** (spec discovery-candidates-sharding §5): новая редакция
-    живёт на ТОМ ЖЕ URL, что предшественник. При сверке по одному URL кандидат-редакция
-    гасился бы НЕМЕДЛЕННО — совпадением с предшественником — и никогда не попадал бы в
-    worksheet; штатный батч-триаж редакций был бы физически невозможен, а цикл разрешения
-    дрейфа (спек post-acquisition-lifecycle §6) обрывался бы на первом же шаге. Редакция
-    перестаёт быть ждущей, когда промоутнута ОНА САМА (её ребро ``supersedes`` в реестре).
-    Куратор, переписавший авто-ребро при триаже, вернёт кандидата в worksheet — видимый
-    сбой, не тихий.
+    Кандидат ждущий, если триаж его не отклонил и он ещё не допущен (``_is_admitted``).
+    Новая редакция ждёт СВОЕГО штампа: она живёт на том же URL, что предшественник, но
+    становится отдельной записью корпуса — и гаснет только собственным промоушеном.
     """
-    registered = registered_pairs(records)
-    pending: list[schema.CandidateRecord] = []
-    for cand in candidates:
-        if cand.rejected_reason is not None:
-            continue
-        url = cand.normalized_url or (dedup.normalize_url(cand.source_url) if cand.source_url else None)
-        if url is not None and (url, cand.supersedes) in registered:
-            continue
-        pending.append(cand)
-    return pending
+    known = admitted_ids(records)
+    return [c for c in candidates if c.rejected_reason is None and not _is_admitted(c, known)]
 
 
 _WORKSHEET_HEADER = """\
@@ -302,25 +276,18 @@ def unacquirable_candidates(
     первыми: тот же порядок, в котором их берёт recheck, — куратор видит список в
     его логике.
 
-    ``records`` (spec discovery-acquire-seam-hardening §4, Г3) — реконсиляция с
-    реестром, симметрично ``pending_candidates``: кандидат, чья пара ``(URL,
-    supersedes)`` уже представлена в реестре (``registered_pairs``), из секции
-    выбывает. До этого спека эта очередь была ЕДИНСТВЕННОЙ в слое кандидатов, не
-    выводимой реконсиляцией — admit недобываемого кандидата напрямую (код
-    разрешает молча; штатный revive→admit требует двух батчей, и срезать угол
-    естественно при ``probe_finding: acquirable``) оставлял его НАВСЕГДА видимым
-    здесь, хотя документ уже в корпусе. Кандидат без URL реконсиляции не поддаётся —
-    остаётся видимым (тот же безопасный дефолт, что у ``pending_candidates``).
+    ``records`` (spec discovery-acquire-seam-hardening §4, Г3) — реконсиляция с реестром
+    ТОЙ ЖЕ единственной реализацией, что у ``pending_candidates`` (``_is_admitted``):
+    admit недобываемого кандидата напрямую (код разрешает молча; штатный revive→admit
+    требует двух батчей, и срезать угол естественно при ``probe_finding: acquirable``)
+    иначе оставлял бы его НАВСЕГДА видимым здесь, хотя документ уже в корпусе.
     """
-    registered = registered_pairs(records)
-    due: list[schema.CandidateRecord] = []
-    for cand in candidates:
-        if cand.rejected_kind is not schema.RejectionKind.unacquirable:
-            continue
-        url = cand.normalized_url or (dedup.normalize_url(cand.source_url) if cand.source_url else None)
-        if url is not None and (url, cand.supersedes) in registered:
-            continue
-        due.append(cand)
+    known = admitted_ids(records)
+    due = [
+        c
+        for c in candidates
+        if c.rejected_kind is schema.RejectionKind.unacquirable and not _is_admitted(c, known)
+    ]
     due.sort(key=lambda c: (c.probe_checked is not None, c.probe_checked or dt.date.min, c.raw_hash))
     return due
 
@@ -861,6 +828,12 @@ def apply_decisions(
         except ValueError as exc:
             outcomes.append(ApplyOutcome(raw_hash=cand.raw_hash, action=action, ok=False, detail=str(exc)))
             continue
+
+        # Штамп идентичности допущенного (spec candidate-identity-hardening §1) — ставится
+        # ТОЛЬКО после реально записанной meta.yaml: отказ save_record оставляет кандидата
+        # ждущим, а не помечает допущенным в никуда.
+        cand.admitted_as = rec.id
+        store_changed = True
 
         outcomes.append(
             ApplyOutcome(
