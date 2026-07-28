@@ -200,7 +200,9 @@ def test_pending_candidates_normalizes_url_before_comparing() -> None:
 
 
 def test_pending_candidates_without_url_stays_pending() -> None:
-    cand = _candidate(source_url=None, normalized_url=None, content_hash="deadbeef")
+    """Безопасный дефолт: чего не можем уверенно сопоставить с реестром по URL — не
+    прячем от куратора."""
+    cand = _candidate(source_url=None, normalized_url=None)
     assert manual.pending_candidates([cand], []) == [cand]
 
 

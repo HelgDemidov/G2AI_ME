@@ -203,12 +203,17 @@ def test_dedup_same_connector_rediscovery_does_not_self_reference() -> None:
     assert getattr(existing_cand, "merged_connector_ids", None) is None
 
 
-def test_dedup_content_hash_fallback_when_no_url_or_title() -> None:
+def test_legacy_content_hash_key_is_absorbed_as_extra_and_ignored() -> None:
+    """spec triage-intake-hardening §4: поле снято со схемы (писателей не было ни
+    одного), но старые шарды с ключом ``content_hash`` обязаны грузиться — ``extra=
+    "allow"``. Дедупом значение больше не участвует: два кандидата с одинаковым
+    легаси-хэшем и без общих url/issuer+title остаются РАЗНЫМИ."""
     existing_cand = _candidate(raw_hash="ha", content_hash="deadbeef")
     dup = _candidate(connector_id="agora", raw_hash="hb", content_hash="deadbeef")
+    assert existing_cand.content_hash == "deadbeef"  # type: ignore[attr-defined]  # extra="allow"
     outcome = dedup([dup], existing=[existing_cand])
-    assert outcome.fresh == []
-    assert outcome.absorbed == 1
+    assert outcome.fresh == [dup]
+    assert outcome.absorbed == 0
 
 
 # --- DedupOutcome.absorptions / alternate_source_urls (spec discovery-acquire-
@@ -290,10 +295,10 @@ def test_merge_provenance_deduplicates_repeated_alternate_url() -> None:
 
 
 def test_dedup_candidate_without_any_key_is_never_absorbed() -> None:
-    """Кандидат без ВСЕХ трёх ключей (ни URL, ни пары issuer+title, ни content_hash) не
-    имеет идентичности для dedup — приходит «свежим» даже против побитово такого же.
+    """Кандидат без ОБОИХ ключей (ни URL, ни пары issuer+title) не имеет идентичности
+    для dedup — приходит «свежим» даже против побитово такого же.
 
-    Свойство ИСХОДНОГО дизайна трёх стратегий (прежний линейный ``_find_match`` возвращал
+    Свойство ИСХОДНОГО дизайна (прежний линейный ``_find_match`` возвращал
     None на тех же входах), не следствие индексации — найдено property-тестом
     (``test_dedup_properties``) и запинено здесь, чтобы поведение было видимым. Схема
     такое допускает (всё, кроме connector_id/retrieved_at/raw_hash, опционально), но

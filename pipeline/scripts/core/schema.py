@@ -451,9 +451,13 @@ class CandidateRecord(BaseModel):
     connector_id: str = Field(min_length=1)
     retrieved_at: _dt.date
     raw_hash: str = Field(min_length=1)
-    # dedup-ключи (заполняет discovery)
+    # dedup-ключ (заполняет discovery). Поля ``content_hash`` здесь БОЛЬШЕ НЕТ (spec
+    # triage-intake-hardening §4): за всю историю его не заполнил ни один из шести
+    # конструкторов кандидата — «хэш содержания» на этом слое неполучаем ПО
+    # ПОСТРОЕНИЮ (до добычи байтов документа не существует), поэтому третья стратегия
+    # дедупа не срабатывала ни разу и не могла. Легаси-ключ в старых шардах поглощает
+    # ``extra="allow"``.
     normalized_url: str | None = None
-    content_hash: str | None = None
     # Заявленная РЕДАКЦИЯ: doc-id записи корпуса, которую этот кандидат сознательно
     # заменяет (spec discovery-candidates-sharding §5). Идентичность кандидата — не URL,
     # а пара (URL-идентичность, редакция): новая редакция закона живёт на ТОМ ЖЕ URL
