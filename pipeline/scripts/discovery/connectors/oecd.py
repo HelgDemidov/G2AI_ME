@@ -316,8 +316,9 @@ def _map_record(
         native_tags.append(f"type: {itype_name}")
     if extent_binding:
         native_tags.append(f"binding: {extent_binding}")
-    if start_year:
-        native_tags.append(f"start_year: {start_year}")
+    # ``start_year`` в native_tags БОЛЬШЕ НЕ дублируется (решение куратора 2026-07-28):
+    # год стал структурным полем ``doc_year``, а native_tags остаются рубриками источника
+    # в ЕГО таксономии — держать одно значение в двух местах значит дать им разойтись.
 
     canonical = "|".join([native_id_str, english_name, str(record.get("updatedAt"))])
     raw_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -328,7 +329,8 @@ def _map_record(
         title_provenance=schema.TitleProvenance.stated,
         issuer=issuer,
         jurisdiction=jurisdiction,
-        doc_date=None,
+        doc_date=None,   # источник даёт только год — фабриковать 1 января нельзя
+        doc_year=int(start_year) if start_year else None,
         language=None,
         source_url=source_url,
         native_summary=native_summary,

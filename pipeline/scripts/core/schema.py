@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core import fsio
 from core.env import REPO_ROOT
@@ -472,6 +472,15 @@ class CandidateRecord(BaseModel):
     issuer: str | None = None
     jurisdiction: str | None = None
     doc_date: _dt.date | None = None
+    # Год документа — сигнал триажа (планка `frontier_year`, `pipeline/config/triage.yaml`).
+    # ОТДЕЛЬНОЕ поле, а не замена ``doc_date``: три источника из пяти дают только год
+    # (oecd `startYear`), а два — настоящую дату с точностью до дня (agora/eurlex, 430
+    # кандидатов на 2026-07-28, из них ровно 1 приходится на 1 января). Огрубление
+    # ``doc_date`` до года было бы фабрикацией наоборот: `dates.published` кормит
+    # `valid_from` -> интервалы валидности -> срезы `--as-of`, и акт, действующий с
+    # 2024-12-01, попал бы в срезы, где его ещё не было. Год выводится ЕДИНСТВЕННОЙ
+    # точкой — валидатором ниже, поэтому коннектор не может его забыть или вывести иначе.
+    doc_year: int | None = Field(default=None, ge=1000, le=2999)
     language: str | None = None
     source_url: str | None = Field(default=None, pattern=r"^https?://")
     # Достоверность source_url (spec triage-intake-hardening §6). ``None`` у легаси-записей
@@ -526,6 +535,35 @@ class CandidateRecord(BaseModel):
     # ТОЛЬКО машиной через store load-mutate-save; курируемого смысла не несут.
     probe_checked: _dt.date | None = None
     probe_finding: str | None = None
+
+    @model_validator(mode="after")
+    def _derive_doc_year(self) -> "CandidateRecord":
+        """``doc_year`` выводится из ``doc_date``, если коннектор не дал год явно.
+
+        ЕДИНСТВЕННАЯ точка вывода (решение куратора 2026-07-28): источники разнородны —
+        agora/eurlex/manual дают полную дату, oecd только ``startYear``, aiforgood и
+        snowball не дают ничего, — но обрабатываться год обязан ОДИНАКОВО, иначе пятый
+        коннектор выведет его шестым способом. Валидатор на модели, а не хелпер в
+        `dedup`, ровно поэтому: забыть вызов невозможно, поле заполняется самим фактом
+        конструирования записи.
+
+        **Противоречие даты и года — ГРОМКИЙ отказ, не тихая резолюция.** Источник
+        с годом-без-даты (oecd) остаётся хозяином своего значения, но если коннектор
+        подал ОБА и они расходятся — это его баг, а не выбор между двумя правдами:
+        молча предпочесть любое значило бы отдать `valid_from` (а через него срезы
+        `--as-of`) на волю случайности. Сегодня ни один путь противоречия не порождает
+        (замер 2026-07-28: 430 записей с обоими полями, расхождений 0), поэтому запрет
+        ничего не ломает и закрывает класс на будущее.
+        """
+        if self.doc_date is not None:
+            if self.doc_year is None:
+                self.doc_year = self.doc_date.year
+            elif self.doc_year != self.doc_date.year:
+                raise ValueError(
+                    f"doc_year={self.doc_year} противоречит doc_date={self.doc_date.isoformat()} "
+                    "— коннектор обязан подать либо согласованные значения, либо только одно"
+                )
+        return self
 
 
 def doc_dir(rec: SourceRecord, root: Path) -> Path:

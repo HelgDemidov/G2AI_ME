@@ -471,14 +471,16 @@ def test_map_record_field_mapping() -> None:
     assert cand.title == "Justice Practical Guide"
     assert cand.issuer == "Ministry of Justice"
     assert cand.jurisdiction == "Portugal"
-    assert cand.doc_date is None
+    assert cand.doc_date is None  # источник даёт только год, 1 января не фабрикуем
     assert cand.language is None
     assert cand.source_url == "https://justica.gov.pt/Servicos/Guia-pratico-da-Justica"
     assert cand.native_id == "2526"
     assert cand.connector_id == oecd.CONNECTOR_ID
     assert "category: AI policy initiatives, programmes and projects" in (cand.native_tags or [])
     assert "type: AI use cases/projects in the public sector" in (cand.native_tags or [])
-    assert "start_year: 2023" in (cand.native_tags or [])
+    # Год БОЛЬШЕ НЕ дублируется в native_tags — он структурное поле (2026-07-28).
+    assert cand.doc_year == 2023
+    assert not any(tag.startswith("start_year") for tag in (cand.native_tags or []))
 
 
 def test_map_record_extent_binding_tag_when_present() -> None:

@@ -383,7 +383,7 @@ def test_render_worksheet_escapes_pipe_in_pending_row() -> None:
     ]
     assert len(lines) == 1
     # число колонок сохранено: экранированный `|` не создаёт лишних разделителей
-    assert lines[0].count(" | ") == 10  # 11 колонок таблицы pending (+ missing, §2)
+    assert lines[0].count(" | ") == 11  # 12 колонок таблицы pending (+ doc_year, 2026-07-28)
 
 
 def test_render_worksheet_escapes_pipe_in_unacquirable_row() -> None:
@@ -413,7 +413,7 @@ def test_render_worksheet_flattens_newline_in_cell() -> None:
     rows = [line for line in text.splitlines() if line.startswith("| ") and line.endswith(" |")]
     body = [line for line in rows if cand.raw_hash[:12] in line]
     assert len(body) == 1  # одна физическая строка, а не три
-    assert body[0].count(" | ") == 10  # 11 колонок таблицы pending (+ missing, §2)
+    assert body[0].count(" | ") == 11  # 12 колонок таблицы pending (+ doc_year, 2026-07-28)
     assert "Standardization gaps" in body[0]  # текст не потерян, только схлопнут
 
 

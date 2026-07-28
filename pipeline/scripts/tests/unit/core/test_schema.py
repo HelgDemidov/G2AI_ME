@@ -414,6 +414,56 @@ def test_load_candidates_empty(tmp_path: Path) -> None:
     assert load_candidates(path) == []
 
 
+# --- doc_year: единственная точка вывода года (решение куратора 2026-07-28) ---
+
+
+def test_doc_year_derived_from_doc_date() -> None:
+    """Коннектор с полной датой год не передаёт — валидатор выводит сам."""
+    data = valid_candidate()
+    data["doc_date"] = "2024-12-01"
+    cand = CandidateRecord.model_validate(data)
+    assert cand.doc_year == 2024
+    assert cand.doc_date is not None and cand.doc_date.isoformat() == "2024-12-01"  # день НЕ огрублён
+
+
+def test_doc_year_explicit_without_date_is_kept() -> None:
+    """Источник с годом-без-даты (oecd `startYear`) — хозяин своего значения;
+    фабриковать 1 января ради `doc_date` запрещено."""
+    data = valid_candidate()
+    data["doc_year"] = 2023
+    cand = CandidateRecord.model_validate(data)
+    assert cand.doc_year == 2023 and cand.doc_date is None
+
+
+def test_doc_year_consistent_with_date_is_accepted() -> None:
+    """Согласованная пара — норма: коннектор вправе подать оба поля."""
+    data = valid_candidate()
+    data.update(doc_date="2024-12-01", doc_year=2024)
+    assert CandidateRecord.model_validate(data).doc_year == 2024
+
+
+def test_doc_year_contradicting_date_is_rejected_loudly() -> None:
+    """Противоречие — БАГ коннектора, а не выбор между двумя правдами: молча
+    предпочесть любое значило бы отдать `valid_from` (и срезы `--as-of`) случайности."""
+    data = valid_candidate()
+    data.update(doc_date="2024-12-01", doc_year=2019)
+    with pytest.raises(ValidationError, match="противоречит"):
+        CandidateRecord.model_validate(data)
+
+
+def test_doc_year_absent_when_no_source_at_all() -> None:
+    """aiforgood/snowball: года нет в источнике вовсе — честный None, не выдумка."""
+    assert CandidateRecord.model_validate(valid_candidate()).doc_year is None
+
+
+@pytest.mark.parametrize("bad", [999, 3000])
+def test_doc_year_rejects_implausible_values(bad: int) -> None:
+    data = valid_candidate()
+    data["doc_year"] = bad
+    with pytest.raises(ValidationError):
+        CandidateRecord.model_validate(data)
+
+
 def _admission() -> Admission:
     return Admission.model_validate({"axis": "agentic_g2ai", "rationale": "ok"})
 

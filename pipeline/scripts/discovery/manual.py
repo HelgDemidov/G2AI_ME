@@ -435,19 +435,22 @@ def render_worksheet(
     if truncation:
         lines.append(" ".join(truncation) + "\n")
     lines.append(
-        "| raw_hash | title | issuer | jurisdiction | doc_date | supersedes | connector_id "
+        "| raw_hash | title | issuer | jurisdiction | doc_year | doc_date | supersedes | connector_id "
         "| native_tags/matched_query | source_url | format_hint | missing |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for cand in pending:
         tags = ", ".join(cand.native_tags) if cand.native_tags else (cand.matched_query or "")
         missing = missing_by_hash.get(cand.raw_hash, [])
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 _md_cell(cand.raw_hash[:12]),
                 _md_cell(cand.title or ""),
                 _md_cell(cand.issuer or ""),
                 _md_cell(cand.jurisdiction or ""),
+                # Год отдельной колонкой: он есть там, где полной даты нет (oecd), и
+                # именно он сравнивается с планкой `frontier_year` при суждении.
+                _md_cell(str(cand.doc_year) if cand.doc_year else ""),
                 _md_cell(cand.doc_date.isoformat() if cand.doc_date else ""),
                 # непустое значение = редакция существующей записи корпуса, не дубль
                 _md_cell(cand.supersedes or ""),
