@@ -227,6 +227,25 @@ class TitleProvenance(str, Enum):
     derived = "derived"    # реконструкция из позиционного артефакта — требует явного title при admit
 
 
+class UrlProvenance(str, Enum):
+    """Достоверность ``source_url`` кандидата (spec triage-intake-hardening §6).
+
+    Тот же механизм и то же правило, что у ``TitleProvenance``: код ВЕТВИТСЯ по значению
+    (``suspect`` обязывает admit-решение задать ``source_url`` явно), отсутствие поля —
+    «неизвестно», требования не поднимает.
+
+    Живая мотивация: в экспорте OECD.AI одно значение ``website`` принадлежит нескольким
+    записям с РАЗНЫМИ заголовками (49 URL на 104 записи снапшота) — испанская стратегия
+    несёт ссылку на норвежский Helsedirektoratet, немецкий «AI Action Plan» — на
+    французский La French Tech. Опасность именно в правдоподобии: URL настоящий, рабочий
+    и тематически смежный, а заголовок/издатель/юрисдикция ВЕРНЫЕ, поэтому карточка
+    проходит любую проверку формы — а добыча молча скачает документ другой страны.
+    """
+
+    stated = "stated"      # источник назвал URL именно этого документа
+    suspect = "suspect"    # значение делят записи с разными заголовками — владельца не определить
+
+
 class RelationType(str, Enum):
     """Тип типизированного ребра графа документ->документ."""
 
@@ -455,6 +474,9 @@ class CandidateRecord(BaseModel):
     doc_date: _dt.date | None = None
     language: str | None = None
     source_url: str | None = Field(default=None, pattern=r"^https?://")
+    # Достоверность source_url (spec triage-intake-hardening §6). ``None`` у легаси-записей
+    # = «неизвестно», требования явного source_url при admit не поднимает.
+    url_provenance: UrlProvenance | None = None
     rights: Rights | None = None  # best-effort от коннектора; финализирует триаж
     sensitivity: Sensitivity | None = None  # best-effort; несётся в acquisition-гейт
     # passthrough-обогащение источника (Optional; None -> не пишется в YAML вовсе)

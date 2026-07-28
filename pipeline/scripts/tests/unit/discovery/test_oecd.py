@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 import yaml
 
+from core import schema
 from discovery.connectors import oecd
 
 _BASE_CONFIG = oecd.OecdConfig(
@@ -651,3 +652,94 @@ def test_discover_oecd_shape_gate_failure_propagates(tmp_path: Path) -> None:
             None, config=_BASE_CONFIG, fetch=lambda page_num, **_: bad_page, sleep=lambda s: None,
             snapshot_path=tmp_path / "snap.json",
         )
+
+
+# --- url_provenance: недостоверный website (spec triage-intake-hardening §6) ---
+
+
+def test_ambiguous_websites_flags_value_shared_by_different_titles() -> None:
+    """Живой дефект экспорта OECD.AI: одно значение website у записей с РАЗНЫМИ
+    заголовками (испанская стратегия несёт ссылку на норвежский Helsedirektoratet)."""
+    shared = "https://www.helsedirektoratet.no/rapporter/joint-ai-plan"
+    records = [
+        _base_record(id=2427, englishName="Joint AI plan for health services", website=shared),
+        _base_record(id=2431, englishName="AI Strategy for the National Health System", website=shared),
+    ]
+    assert oecd.ambiguous_websites(records) == {shared}
+
+
+def test_ambiguous_websites_ignores_duplicate_records_of_same_initiative() -> None:
+    """Одна инициатива, заведённая дважды (канадский Voluntary Code, G7 ×2) — общий
+    URL законен; порочить группу по совпадающим заголовкам нельзя."""
+    shared = "https://ised-isde.canada.ca/voluntary-code"
+    records = [
+        _base_record(id=419, englishName="Voluntary Code of Conduct", website=shared),
+        _base_record(id=2435, englishName="Voluntary  Code   of Conduct", website=shared),
+    ]
+    assert oecd.ambiguous_websites(records) == set()
+
+
+def test_ambiguous_websites_ignores_unique_and_invalid_values() -> None:
+    records = [
+        _base_record(id=1, englishName="A", website="https://a.example/x"),
+        _base_record(id=2, englishName="B", website="https://b.example/y"),
+        _base_record(id=3, englishName="C", website=None),
+    ]
+    assert oecd.ambiguous_websites(records) == set()
+
+
+def test_map_record_marks_url_suspect_when_website_ambiguous() -> None:
+    rec = _base_record()
+    cand = oecd._map_record(rec, ambiguous_sites={rec["website"]})
+    assert cand is not None
+    assert cand.url_provenance is schema.UrlProvenance.suspect
+
+
+def test_map_record_marks_url_stated_by_default() -> None:
+    cand = oecd._map_record(_base_record())
+    assert cand is not None
+    assert cand.url_provenance is schema.UrlProvenance.stated
+
+
+def test_discover_oecd_counts_url_suspect_in_diagnostics(tmp_path: Path) -> None:
+    """Не отсев: кандидат допущен (заголовок/юрисдикция верны), но адрес требует
+    проверки куратором — счётчик обязан это показать, а не промолчать."""
+    shared = "https://shared.example/doc"
+    page = _page(
+        [
+            _base_record(id=1, englishName="First Initiative", website=shared, category="Cat A"),
+            _base_record(
+                id=2, englishName="Second Unrelated Initiative", website=shared, category="Cat A",
+            ),
+        ],
+        current=1, last=1, total=2,
+    )
+    result = oecd.discover_oecd(
+        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
+    )
+    assert result.diagnostics["found"] == 2
+    assert result.diagnostics["url_suspect"] == 2  # группа целиком, владельца не определить
+    assert all(c.url_provenance is schema.UrlProvenance.suspect for c in result.candidates)
+
+
+def test_ambiguous_websites_computed_before_scope_filter(tmp_path: Path) -> None:
+    """Запись ВНЕ нашей области видимости всё равно доказывает, что значение спорное —
+    иначе фильтр области прятал бы улику и кандидат уходил бы с меткой stated."""
+    shared = "https://shared.example/doc"
+    page = _page(
+        [
+            _base_record(id=1, englishName="In Scope Initiative", website=shared, category="Cat A"),
+            _base_record(
+                id=2, englishName="Out Of Scope Initiative", website=shared,
+                category="Some Unconfigured Category",
+            ),
+        ],
+        current=1, last=1, total=2,
+    )
+    result = oecd.discover_oecd(
+        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
+    )
+    assert result.diagnostics["skipped_out_of_scope"] == 1
+    assert [c.url_provenance for c in result.candidates] == [schema.UrlProvenance.suspect]

@@ -242,12 +242,16 @@ _WORKSHEET_HEADER = """\
   колонка `missing` таблицы ниже показывает, каких из четырёх условно-обязательных полей
   (`title`/`issuer`/`language`/`source_url`) у кандидата нет — задайте недостающее ключом
   того же имени в решении; отсутствие И у кандидата, И в решении — отказ с именем поля.
-- `missing: title` бывает и при НЕПУСТОМ заголовке в таблице: у snowball-кандидатов из
-  URL-каналов заголовок реконструирован из позиционного артефакта (текст, вырезанный
-  геометрией прямоугольника ссылки, или целая строка doc.md), а не назван источником —
-  такие помечены `title_provenance: derived` и требуют настоящего заголовка ключом
-  `title:`. Взять его неоткуда, кроме WebSearch по документу, — который для батч-каналов
-  и так обязателен (политика triage-channel-policy).
+- `missing` показывает поле и при НЕПУСТОМ значении в таблице — когда значению нельзя
+  верить по провенансу. Два таких случая: (а) `title_provenance: derived` — заголовок
+  snowball-кандидата из URL-каналов реконструирован из позиционного артефакта (текст,
+  вырезанный геометрией прямоугольника ссылки, или целая строка doc.md), а не назван
+  источником; (б) `url_provenance: suspect` — OECD отдал ОДИН адрес нескольким разным
+  документам, чей он на самом деле, из данных не выводится (заголовок и юрисдикция при
+  этом верны — ошибочен только адрес, и добыча по нему скачает чужой документ).
+  Оба требуют явного ключа (`title:`/`source_url:`); взять правильное значение неоткуда,
+  кроме WebSearch по документу, — который для батч-каналов и так обязателен (политика
+  triage-channel-policy).
 - Дефолты (сводка apply напечатает, во что развернулись; RAG/фасеты видят полные значения):
   `authority` — из doc_type: legislation→binding_law, regulation→regulation,
   report/academic_paper→report, guidance/framework/national_strategy→soft_law,
@@ -482,17 +486,21 @@ def _missing_conditional_fields(
     решение, не заданные override'ом в нём). ``decision=None`` — аннотация worksheet ДО
     того, как решение написано (проверяется только кандидат).
 
-    ``title_provenance: derived`` (spec triage-intake-hardening §3) приравнивается к
-    ОТСУТСТВИЮ заголовка: значение есть, но это реконструкция из позиционного артефакта,
-    а не заголовок — допускать её в реестр (где она станет меткой узла графа) нельзя.
-    ``None``-провенанс у легаси-записей требования не поднимает.
+    **Провенанс приравнивается к отсутствию** — одно правило на оба поля (spec
+    triage-intake-hardening §3/§6): ``title_provenance: derived`` (реконструкция из
+    позиционного артефакта, а не заголовок — в реестре станет меткой узла графа) и
+    ``url_provenance: suspect`` (значение ``website`` делят записи OECD с разными
+    заголовками — добыча по нему скачает ЧУЖОЙ документ). Значение есть, но верить ему
+    нельзя, поэтому решение обязано задать поле явно. ``None``-провенанс у легаси-записей
+    требования не поднимает.
     """
+    unusable_provenance = {
+        "title": cand.title_provenance is schema.TitleProvenance.derived,
+        "source_url": cand.url_provenance is schema.UrlProvenance.suspect,
+    }
     missing = []
     for name in _CONDITIONAL_ADMIT_FIELDS:
-        unusable = getattr(cand, name) is None or (
-            name == "title" and cand.title_provenance is schema.TitleProvenance.derived
-        )
-        if not unusable:
+        if getattr(cand, name) is not None and not unusable_provenance.get(name, False):
             continue
         if decision is not None and decision.get(name) is not None:
             continue
@@ -607,14 +615,20 @@ def _build_admit_record(
     missing_conditional = _missing_conditional_fields(cand, decision)
     if missing_conditional:
         field_name = missing_conditional[0]
-        # `title` может физически присутствовать, но быть непригодным (derived —
-        # реконструкция из позиционного артефакта): «у кандидата нет title» при
-        # видимом в worksheet заголовке читалось бы как баг, а не как требование.
+        # Поле может физически ПРИСУТСТВОВАТЬ, но быть непригодным по провенансу:
+        # «у кандидата нет X» при видимом в worksheet значении читалось бы как баг,
+        # а не как требование — поэтому причина называется отдельно.
         if field_name == "title" and cand.title is not None:
             raise ValueError(
                 "admit: `title` кандидата — реконструкция из позиционного артефакта "
                 f"(title_provenance: derived), а не заголовок: {cand.title!r}. "
                 "Задайте настоящий заголовок ключом `title:` в решении"
+            )
+        if field_name == "source_url" and cand.source_url is not None:
+            raise ValueError(
+                "admit: `source_url` кандидата недостоверен (url_provenance: suspect) — "
+                f"источник отдал этот адрес нескольким разным документам: {cand.source_url!r}. "
+                "Проверьте адрес документа и задайте его ключом `source_url:` в решении"
             )
         raise ValueError(
             f"admit: у кандидата нет `{field_name}`, задайте его ключом `{field_name}:` в решении"

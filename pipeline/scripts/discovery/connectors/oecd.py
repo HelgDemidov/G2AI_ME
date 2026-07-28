@@ -208,6 +208,38 @@ def _valid_url(url: str | None) -> bool:
     return url.startswith("http://") or url.startswith("https://")
 
 
+def _record_title(record: dict[str, Any]) -> str:
+    return str(record.get("englishName") or record.get("originalName") or "").strip()
+
+
+def ambiguous_websites(records: list[dict[str, Any]]) -> set[str]:
+    """Значения ``website``, которые делят записи с РАЗНЫМИ заголовками (спек
+    triage-intake-hardening §6) — для них владельца из данных определить НЕЧЕМ.
+
+    Дефект в экспорте OECD.AI, не в нашем коде: 49 значений на 104 записи снапшота
+    (замер 2026-07-28). Похоже на протяжку значения в их конвейере (id соседние), но
+    **направление непостоянно** — `kb.se` утёк от «KB Lab» и вверх, и вниз по id,
+    поэтому эвристика «владелец — меньший id» ЛОЖНА (проверено: она назначала владельцем
+    kb.se финский «Tampere Pulse»). Единственный надёжный вывод — «этому значению нельзя
+    верить для ВСЕЙ группы», поэтому помечается вся группа, а не «лишние» в ней.
+
+    Совпадение заголовков (одна инициатива, заведённая дважды — живой случай: канадский
+    Voluntary Code, фламандский AI Action Plan, G7 ×2) группу НЕ порочит: там общий URL
+    законен. Сравнение по ``dedup.normalized_title`` — та же нормализация, что у
+    стратегии 2 дедупа, чтобы «AI Action Plan» и «AI  Action  Plan» не разошлись.
+    """
+    by_site: dict[str, set[str]] = {}
+    for record in records:
+        website = record.get("website")
+        if not _valid_url(website):
+            continue
+        title = _record_title(record)
+        if not title:
+            continue
+        by_site.setdefault(str(website), set()).add(dedup.normalized_title(title))
+    return {site for site, titles in by_site.items() if len(titles) > 1}
+
+
 def _source_url(record: dict[str, Any]) -> str | None:
     """``website``, иначе первый валидный ``relevantUrls[0]`` (спек §3). ``relevantFiles``
     (OECD-hosted PDF) сознательно НЕ фолбэк — rehost, не официальный первоисточник
@@ -224,9 +256,15 @@ def _source_url(record: dict[str, Any]) -> str | None:
 # --- §3: маппинг записи -> CandidateRecord (Faker/PII-барьеры, §1) ---
 
 
-def _map_record(record: dict[str, Any]) -> schema.CandidateRecord | None:
+def _map_record(
+    record: dict[str, Any], *, ambiguous_sites: frozenset[str] | set[str] = frozenset()
+) -> schema.CandidateRecord | None:
     """Одна запись ``data[]`` -> ``CandidateRecord`` (маппинг §3). ``None`` — пропуск
     (диагностика у вызывающей стороны), не исключение — data-quality отсев, не relevance.
+
+    ``ambiguous_sites`` (спек triage-intake-hardening §6) — значения ``website``, которым
+    нельзя верить (см. ``ambiguous_websites``); считается вызывающей стороной ОДИН раз по
+    полному списку записей, потому что свойство групповое и по одной записи не выводится.
 
     **Faker-барьер (§1):** из ``gaiinCountry``/``intergovernmentalOrganisation`` читается
     ТОЛЬКО ``.name`` — оба объекта несут порченные Faker.js-поля (демография countries;
@@ -301,6 +339,11 @@ def _map_record(record: dict[str, Any]) -> schema.CandidateRecord | None:
         raw_hash=raw_hash,
         normalized_url=dedup.normalize_url(source_url),
         native_format_hint=dedup.format_hint_from_url(source_url),
+        url_provenance=(
+            schema.UrlProvenance.suspect
+            if record.get("website") in ambiguous_sites
+            else schema.UrlProvenance.stated
+        ),
     )
 
 
@@ -333,12 +376,16 @@ def discover_oecd(
     # дублированием той же логики, что уже внутри _map_record, и рисковало бы разойтись
     # с ней при будущей правке.
     skipped_unmappable = 0
+    # Свойство ГРУППОВОЕ (значение website делят записи с разными заголовками), поэтому
+    # считается один раз по ПОЛНОМУ списку — до фильтра области видимости: запись вне
+    # нашей области всё равно доказывает, что значение спорное.
+    ambiguous_sites = ambiguous_websites(records)
 
     for record in records:
         if not in_scope(record, cfg):
             skipped_out_of_scope += 1
             continue
-        cand = _map_record(record)
+        cand = _map_record(record, ambiguous_sites=ambiguous_sites)
         if cand is None:
             skipped_unmappable += 1
             continue
@@ -355,6 +402,11 @@ def discover_oecd(
         "fresh": len(fresh),
         "skipped_out_of_scope": skipped_out_of_scope,
         "skipped_unmappable": skipped_unmappable,
+        # Не отсев: кандидат допущен, но его URL требует проверки куратором при admit
+        # (заголовок/издатель/юрисдикция у него ВЕРНЫЕ — теряется только адрес).
+        "url_suspect": sum(
+            1 for c in candidates if c.url_provenance is schema.UrlProvenance.suspect
+        ),
     }
     return DiscoverResult(candidates=fresh, cursor=new_cursor, diagnostics=diagnostics)
 
