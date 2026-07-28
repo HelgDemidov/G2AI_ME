@@ -475,6 +475,35 @@ def test_map_group_field_mapping() -> None:
     assert cand.native_format_hint == schema.SourceFormat.html
 
 
+def test_map_group_issuer_is_order_independent() -> None:
+    """CELLAR не гарантирует порядок строк ответа, а авторы приходят ОТДЕЛЬНЫМИ строками и
+    склеиваются в одну строку ``issuer``, которая входит в ``raw_hash``.
+
+    Живой замер 2026-07-28: два запроса подряд давали разный ``issuer`` и разный
+    ``raw_hash`` у 7 многоавторских актов из 307. С курсором дефект был невидим (отсев шёл
+    по стабильному CELEX); без курсора он проявился как вечно меняющийся шард — прогон
+    переставал быть no-op.
+    """
+    forward = _sparql_json(
+        [
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="Committee on Culture"),
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="European Parliament"),
+        ]
+    )
+    reverse = _sparql_json(
+        [
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="European Parliament"),
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="Committee on Culture"),
+        ]
+    )
+
+    a, _ = eurlex.map_rows_to_candidates(eurlex.parse_bindings(forward), iso_lang="en")
+    b, _ = eurlex.map_rows_to_candidates(eurlex.parse_bindings(reverse), iso_lang="en")
+
+    assert a[0].issuer == b[0].issuer == "Committee on Culture / European Parliament"
+    assert a[0].raw_hash == b[0].raw_hash
+
+
 def test_map_group_missing_date_gives_none() -> None:
     rows = eurlex.parse_bindings(_sparql_json([_row("32024R1689", title="AI Act", author="EP")]))
     candidates, _ = eurlex.map_rows_to_candidates(rows)

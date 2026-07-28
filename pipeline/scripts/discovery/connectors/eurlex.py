@@ -302,8 +302,12 @@ def _map_group(
         return None
 
     source_url = _build_source_url(celex, iso_lang)
+    # sorted — как и concept_names ниже: CELLAR не гарантирует порядок строк ответа, а
+    # авторы (комитеты) приходят отдельными строками и склеиваются в ОДНУ строку issuer,
+    # которая входит в raw_hash. Без сортировки два запроса подряд дают у многоавторских
+    # актов разный issuer и разный raw_hash (замер 2026-07-28: 7 из 307 живьём).
     authors: list[str] = entry.get("authors") or []
-    issuer = " / ".join(authors) if authors else None
+    issuer = " / ".join(sorted(authors)) if authors else None
     doc_date = _decode_date(entry.get("date"))
     concepts: set[str] = entry.get("concepts") or set()
     concept_names = sorted(concept_label(c) for c in concepts)
