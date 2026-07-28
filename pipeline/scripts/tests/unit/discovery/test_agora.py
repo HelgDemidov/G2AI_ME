@@ -93,7 +93,7 @@ def test_resolve_min_year_null_reads_frontier_year() -> None:
     assert agora.resolve_min_year(config) == agora.frontier_year()
 
 
-# --- _concept_recid / cursor_from_metadata / download_url_from_metadata ---
+# --- _concept_recid / version_from_metadata / download_url_from_metadata ---
 
 
 def test_concept_recid_extracts_from_doi() -> None:
@@ -121,18 +121,8 @@ def _fake_zenodo_record(**overrides: object) -> dict[str, object]:
     return record
 
 
-def test_cursor_from_metadata_extracts_version_id_md5() -> None:
-    cursor = agora.cursor_from_metadata(_fake_zenodo_record())
-    assert cursor == {
-        "zenodo_version": "1.31.0",
-        "record_id": 21390882,
-        "md5": "md5:7a284f8b33f92f282d6e62e829c331a5",
-    }
-
-
-def test_cursor_from_metadata_no_files_gives_none_md5() -> None:
-    cursor = agora.cursor_from_metadata(_fake_zenodo_record(files=[]))
-    assert cursor["md5"] is None
+def test_version_from_metadata_extracts_dump_version() -> None:
+    assert agora.version_from_metadata(_fake_zenodo_record()) == "1.31.0"
 
 
 def test_download_url_from_metadata_extracts_content_link() -> None:
@@ -457,31 +447,7 @@ def _fake_config(**overrides: object) -> agora.AgoraConfig:
     return agora.AgoraConfig(**base)  # type: ignore[arg-type]
 
 
-def test_discover_agora_unchanged_version_is_noop(tmp_path: Path) -> None:
-    cursor = {"zenodo_version": "1.31.0", "record_id": 21390882, "md5": "abc"}
-    calls: list[str] = []
-
-    def fake_fetch(doi: str) -> dict[str, object]:
-        return _fake_zenodo_record()
-
-    def fake_download(url: str, dest: Path) -> None:
-        calls.append(url)
-
-    result = agora.discover_agora(
-        cursor,
-        config=_fake_config(),
-        fetch_metadata=fake_fetch,
-        download=fake_download,
-        cache_dir=tmp_path / "cache",
-        db_path=tmp_path / "registry.duckdb",
-    )
-    assert result.candidates == []
-    assert result.cursor == cursor
-    assert result.diagnostics["status"] == "unchanged"
-    assert calls == []  # fetch не тронут — сеть не участвует на неизменённой версии
-
-
-def test_discover_agora_new_version_downloads_ingests_and_maps(tmp_path: Path) -> None:
+def test_discover_agora_downloads_ingests_and_maps(tmp_path: Path) -> None:
     downloaded: list[Path] = []
 
     def fake_fetch(doi: str) -> dict[str, object]:
@@ -493,7 +459,6 @@ def test_discover_agora_new_version_downloads_ingests_and_maps(tmp_path: Path) -
         downloaded.append(dest)
 
     result = agora.discover_agora(
-        None,
         config=_fake_config(),
         fetch_metadata=fake_fetch,
         download=fake_download,
@@ -501,8 +466,7 @@ def test_discover_agora_new_version_downloads_ingests_and_maps(tmp_path: Path) -
         db_path=tmp_path / "registry.duckdb",
     )
     assert len(downloaded) == 1
-    assert result.cursor["zenodo_version"] == "1.31.0"
-    assert result.diagnostics["status"] == "fetched"
+    assert result.diagnostics["dump_version"] == "1.31.0"
     assert len(result.candidates) == 1  # фикстура: 1 документ, US, matches "agent"/"autonomous"
 
 
@@ -520,18 +484,64 @@ def test_discover_agora_caches_zip_does_not_redownload_same_version(tmp_path: Pa
     cache_dir = tmp_path / "cache"
     db_path = tmp_path / "registry.duckdb"
     agora.discover_agora(
-        None, config=_fake_config(), fetch_metadata=fake_fetch, download=fake_download,
+        config=_fake_config(), fetch_metadata=fake_fetch, download=fake_download,
         cache_dir=cache_dir, db_path=db_path,
     )
-    # курсор из ПРЕДЫДУЩЕГО прогона с ТОЙ ЖЕ версией, но zip уже лежит в кэше —
-    # discover_agora не должен звать download второй раз (версия сравнивается ДО кэша,
-    # но раз версия "изменилась" относительно cursor=None, качаем; проверяем, что при
-    # повторном вызове с cursor=None и уже кэшированным zip download не дублируется)
+    # Скачивание гейтит НАЛИЧИЕ zip в кэше (а не курсор — его больше нет): второй
+    # прогон находит архив на диске и в сеть не идёт.
     agora.discover_agora(
-        None, config=_fake_config(), fetch_metadata=fake_fetch, download=fake_download,
+        config=_fake_config(), fetch_metadata=fake_fetch, download=fake_download,
         cache_dir=cache_dir, db_path=db_path,
     )
     assert len(calls) == 1  # второй вызов нашёл zip в кэше и не скачивал повторно
+
+
+# --- bronze_has_version: «дамп уже проглочен?» спрашивается у КЭША, не у курсора ---
+
+
+def test_bronze_has_version_no_db_is_false(tmp_path: Path) -> None:
+    """Свежая машина: БД ещё нет — честное «нет», а не отказ."""
+    assert agora.bronze_has_version("1.31.0", tmp_path / "absent.duckdb") is False
+
+
+def test_bronze_has_version_db_without_table_is_false(tmp_path: Path) -> None:
+    """БД есть (её создал другой коннектор архетипа), таблицы agora ещё нет."""
+    db_path = tmp_path / "registry.duckdb"
+    conn = registry_store.connect(db_path)
+    conn.close()
+    assert agora.bronze_has_version("1.31.0", db_path) is False
+
+
+def test_bronze_has_version_true_after_ingest_and_false_for_other_version(tmp_path: Path) -> None:
+    zip_path = tmp_path / "agora-1.31.0.zip"
+    _build_fixture_zip(zip_path)
+    db_path = tmp_path / "registry.duckdb"
+    agora.ingest_dump(zip_path, source_version="1.31.0", db_path=db_path)
+
+    assert agora.bronze_has_version("1.31.0", db_path) is True
+    assert agora.bronze_has_version("1.32.0", db_path) is False
+
+
+def test_discover_agora_skips_ingest_when_bronze_already_has_version(tmp_path: Path) -> None:
+    """Замена version-гейта курсора: повторный прогон отдаёт ПОЛНЫЙ вид дампа (кандидаты
+    те же), но не платит за ingest второй раз."""
+    def fake_fetch(doi: str) -> dict[str, object]:
+        return _fake_zenodo_record(metadata={"version": "1.31.0"})
+
+    def fake_download(url: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _build_fixture_zip(dest)
+
+    call = dict(
+        config=_fake_config(), fetch_metadata=fake_fetch, download=fake_download,
+        cache_dir=tmp_path / "cache", db_path=tmp_path / "registry.duckdb",
+    )
+    first = agora.discover_agora(**call)  # type: ignore[arg-type]
+    second = agora.discover_agora(**call)  # type: ignore[arg-type]
+
+    assert first.diagnostics["ingest_skipped"] is False
+    assert second.diagnostics["ingest_skipped"] is True
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
 
 
 def test_agora_connector_implements_protocol() -> None:

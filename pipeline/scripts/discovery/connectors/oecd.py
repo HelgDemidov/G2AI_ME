@@ -2,7 +2,7 @@
 
 Spec `docs/pipeline/discovery/tech_specs/discovery-oecd/spec.md`. Четвёртый экземпляр
 архетипа `registry`, ближайший родственник `aiforgood.py` по форме (живой paginated
-JSON, seen-id-курсор, без DuckDB) — плюс два свойства, специфичных этому источнику:
+JSON, без DuckDB) — плюс два свойства, специфичных этому источнику:
 недокументированный backend (`api.oecdai.org`, найден в HTML фронтенда, не объявлен
 официально) требует shape-гейта честной деградации (§3), а сырые данные несут Faker.js-
 порченную демографию и PII редакторов OECD, которые НИКОГДА не должны попасть в
@@ -28,7 +28,7 @@ import yaml
 from core import fsio, schema
 from core.env import REPO_ROOT
 from discovery import dedup, registry
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_oecd.yaml"
 CACHE_DIR = REPO_ROOT / "pipeline" / "discovery_cache" / "oecd"
@@ -166,21 +166,6 @@ def save_snapshot(records: list[dict[str, Any]], *, path: Path = SNAPSHOT_PATH) 
     Пишется и при ``--dry-run`` (кэш-артефакт, не store — прецедент snowball
     ``.citations.yaml``). НЕСЁТ PII редакторов OECD (§1) — gitignored, наружу не версионируется."""
     fsio.atomic_write_text(path, json.dumps(records, ensure_ascii=False, indent=2))
-
-
-# --- §3: курсор — множество виденных native_id (как seen-CELEX у eurlex/aiforgood) ---
-
-
-def diff_cursor(
-    all_ids: list[str], cursor: ConnectorCursor | None
-) -> tuple[set[str], ConnectorCursor]:
-    """Новые (не виденные) ``id`` + новый курсор = объединение старых и текущих (спек §3).
-    Множество СТРОГО растёт — правка/удаление записи в живом индексе не выбрасывает её id
-    из seen (тот же принцип, что ``eurlex.diff_cursor``/``aiforgood.diff_cursor``)."""
-    seen = set((cursor or {}).get("seen_ids") or [])
-    fresh_ids = {i for i in all_ids if i not in seen}
-    new_seen = sorted(seen | set(all_ids))
-    return fresh_ids, {"seen_ids": new_seen}
 
 
 # --- §2/§3: фильтр объёма — гибрид (полные policy-категории + узкая проба из "projects") ---
@@ -352,7 +337,6 @@ def _map_record(
 
 
 def discover_oecd(
-    cursor: ConnectorCursor | None,
     *,
     config: OecdConfig | None = None,
     fetch: Callable[..., dict[str, Any]] = fetch_json,
@@ -360,7 +344,8 @@ def discover_oecd(
     snapshot_path: Path = SNAPSHOT_PATH,
 ) -> DiscoverResult:
     """``Connector.discover()`` для oecd (спек §3): полный обход -> снапшот сырья ->
-    фильтр §2 -> маппинг -> отсев по seen-id-курсору.
+    фильтр §2 -> маппинг. Отдаёт ПОЛНЫЙ текущий вид индекса; «что здесь новое» решает
+    кросс-коннекторный ``dedup`` оркестратора.
 
     ``fetch``/``sleep`` инжектируем — тесты подменяют фейками, сеть/реальные паузы в CI
     не участвуют. Снапшот пишется ВСЕГДА (даже при ``--dry-run`` у вызывающего CLI) —
@@ -392,15 +377,8 @@ def discover_oecd(
             continue
         candidates.append(cand)
 
-    all_ids = [c.native_id for c in candidates if c.native_id]
-    fresh_ids, new_cursor = diff_cursor(all_ids, cursor)
-    fresh = [c for c in candidates if c.native_id in fresh_ids]
-
-    status_label = "no_new" if cursor is not None and not fresh else "fetched"
     diagnostics = {
-        "status": status_label,
         "found": len(candidates),
-        "fresh": len(fresh),
         "skipped_out_of_scope": skipped_out_of_scope,
         "skipped_unmappable": skipped_unmappable,
         # Не отсев: кандидат допущен, но его URL требует проверки куратором при admit
@@ -409,7 +387,7 @@ def discover_oecd(
             1 for c in candidates if c.url_provenance is schema.UrlProvenance.suspect
         ),
     }
-    return DiscoverResult(candidates=fresh, cursor=new_cursor, diagnostics=diagnostics)
+    return DiscoverResult(candidates=candidates, diagnostics=diagnostics)
 
 
 @dataclass
@@ -422,8 +400,8 @@ class OecdConnector:
     kind: schema.ConnectorKind = schema.ConnectorKind.registry
     enabled: bool = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return discover_oecd(cursor)
+    def discover(self) -> DiscoverResult:
+        return discover_oecd()
 
 
 # Регистрация при импорте (чартер §4.3 «манифест», спек §3): `enabled` — из конфига,

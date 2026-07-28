@@ -2,8 +2,8 @@
 
 Зеркалит `run_pipeline.process_docs`: отказ одного коннектора не рвёт прогон, а
 логируется в сводку. Реконсиляционный инвариант: повторный `discover()` по
-неизменённому upstream-состоянию (курсоры + dedup против уже персистнутых
-кандидатов) — no-op, ноль новых `fresh`.
+неизменённому upstream-состоянию — no-op, ноль новых `fresh`. Держит его один
+`dedup` против уже персистнутых кандидатов (spec drop-cursors-and-decision-overlay §1).
 """
 from __future__ import annotations
 
@@ -69,7 +69,6 @@ def discover(
     Без параметра (``None``, дефолт) поведение НЕ меняется — обычный путь через реестр.
     """
     existing = store.load(root)
-    cursors = store.load_cursors(root)
 
     summaries: list[ConnectorRunSummary] = []
     fresh_this_run: list[schema.CandidateRecord] = []
@@ -77,26 +76,27 @@ def discover(
     connectors = connectors_override if connectors_override is not None else registry.enabled_connectors(only)
     for connector in connectors:
         try:
-            result = connector.discover(cursors.get(connector.id))
+            result = connector.discover()
         except Exception as exc:  # noqa: BLE001 — изоляция отказов, зеркало run_pipeline
             summaries.append(ConnectorRunSummary(connector_id=connector.id, error=str(exc)))
             continue
 
         outcome = dedup(result.candidates, existing + fresh_this_run)
         fresh_this_run.extend(outcome.fresh)
-        cursors[connector.id] = result.cursor
+        # `status` считается ЗДЕСЬ, один раз, из исхода dedup — раньше каждый коннектор
+        # выводил его сам из своего курсора, пятью реализациями и с расходящейся
+        # семантикой. «Новое» есть свойство корпуса кандидатов, а не источника.
         summaries.append(
             ConnectorRunSummary(
                 connector_id=connector.id,
                 found=len(result.candidates),
                 fresh=len(outcome.fresh),
                 merged=outcome.absorbed,
-                diagnostics=result.diagnostics,
+                diagnostics={**result.diagnostics, "status": "fetched" if outcome.fresh else "no_new"},
             )
         )
 
     if not dry_run:
         store.save(existing + fresh_this_run, root)
-        store.save_cursors(cursors, root)
 
     return DiscoverySummary(connectors=summaries, dry_run=dry_run)

@@ -22,6 +22,7 @@ import yaml
 
 from core import schema
 from discovery.connectors import eurlex
+from discovery.dedup import dedup
 
 # --- load_config ---
 
@@ -152,37 +153,6 @@ def test_fetch_sparql_network_errors_are_retried(monkeypatch: Any) -> None:
     out = eurlex.fetch_sparql("SELECT * WHERE {}", endpoint="http://example.org/sparql", timeout=60.0)
     assert out["head"]["vars"] == ["celex"]
     assert calls["n"] == 2
-
-
-# --- diff_cursor ---
-
-
-def test_diff_cursor_first_run_all_fresh_all_seen() -> None:
-    fresh, cursor = eurlex.diff_cursor(["32024R1689", "32025R2653"], None)
-    assert fresh == {"32024R1689", "32025R2653"}
-    assert cursor == {"seen_celex": ["32024R1689", "32025R2653"]}
-
-
-def test_diff_cursor_repeat_run_same_ids_no_new_fresh() -> None:
-    cursor: dict[str, Any] = {"seen_celex": ["32024R1689", "32025R2653"]}
-    fresh, new_cursor = eurlex.diff_cursor(["32024R1689", "32025R2653"], cursor)
-    assert fresh == set()
-    assert new_cursor == cursor
-
-
-def test_diff_cursor_new_id_added_only_new_one_fresh() -> None:
-    cursor: dict[str, Any] = {"seen_celex": ["32024R1689"]}
-    fresh, new_cursor = eurlex.diff_cursor(["32024R1689", "32026R0150"], cursor)
-    assert fresh == {"32026R0150"}
-    assert new_cursor == {"seen_celex": ["32024R1689", "32026R0150"]}
-
-
-def test_diff_cursor_monotonic_never_shrinks_when_upstream_result_shrinks() -> None:
-    cursor: dict[str, Any] = {"seen_celex": ["32024R1689", "32025R2653"]}
-    # апстрим "потерял" 32025R2653 в текущем прогоне — seen не должен его выбросить (§Вне скоупа)
-    fresh, new_cursor = eurlex.diff_cursor(["32024R1689"], cursor)
-    assert fresh == set()
-    assert new_cursor["seen_celex"] == ["32024R1689", "32025R2653"]
 
 
 # --- синтетические SPARQL-JSON фикстуры (форма — как реально отдаёт CELLAR) ---
@@ -505,6 +475,35 @@ def test_map_group_field_mapping() -> None:
     assert cand.native_format_hint == schema.SourceFormat.html
 
 
+def test_map_group_issuer_is_order_independent() -> None:
+    """CELLAR не гарантирует порядок строк ответа, а авторы приходят ОТДЕЛЬНЫМИ строками и
+    склеиваются в одну строку ``issuer``, которая входит в ``raw_hash``.
+
+    Живой замер 2026-07-28: два запроса подряд давали разный ``issuer`` и разный
+    ``raw_hash`` у 7 многоавторских актов из 307. С курсором дефект был невидим (отсев шёл
+    по стабильному CELEX); без курсора он проявился как вечно меняющийся шард — прогон
+    переставал быть no-op.
+    """
+    forward = _sparql_json(
+        [
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="Committee on Culture"),
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="European Parliament"),
+        ]
+    )
+    reverse = _sparql_json(
+        [
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="European Parliament"),
+            _row("52024AP0138", date="2024-04-24", title="Resolution", author="Committee on Culture"),
+        ]
+    )
+
+    a, _ = eurlex.map_rows_to_candidates(eurlex.parse_bindings(forward), iso_lang="en")
+    b, _ = eurlex.map_rows_to_candidates(eurlex.parse_bindings(reverse), iso_lang="en")
+
+    assert a[0].issuer == b[0].issuer == "Committee on Culture / European Parliament"
+    assert a[0].raw_hash == b[0].raw_hash
+
+
 def test_map_group_missing_date_gives_none() -> None:
     rows = eurlex.parse_bindings(_sparql_json([_row("32024R1689", title="AI Act", author="EP")]))
     candidates, _ = eurlex.map_rows_to_candidates(rows)
@@ -565,18 +564,20 @@ def test_candidate_promotable_without_language_override() -> None:
     candidates, _ = eurlex.map_rows_to_candidates(rows)
     record = schema.promote_candidate(
         candidates[0],
-        id="eu-ai-act-test",
-        entity_id="eu",
-        track=schema.Track.intl_xperience,
-        issuer_type=schema.IssuerType.igo,
-        geo_scope=schema.GeoScope.regional,
-        doc_type="legislation",
-        authority="binding_law",
-        admission=schema.Admission(
+        {
+            "id": "eu-ai-act-test",
+            "entity_id": "eu",
+            "track": schema.Track.intl_xperience,
+            "issuer_type": schema.IssuerType.igo,
+            "geo_scope": schema.GeoScope.regional,
+            "doc_type": "legislation",
+            "authority": "binding_law",
+            "admission": schema.Admission(
             axis="digital_sovereignty",
             rationale="test",
         ),
-        source_format=schema.SourceFormat.html,
+            "source_format": schema.SourceFormat.html,
+        },
     )
     assert record.language == "en"
 
@@ -598,13 +599,12 @@ def test_discover_eurlex_first_run_all_fresh() -> None:
     def fake_fetch(query: str, *, endpoint: str, timeout: float) -> dict[str, Any]:
         return sparql_json
 
-    result = eurlex.discover_eurlex(None, config=_fake_config(), fetch=fake_fetch)
+    result = eurlex.discover_eurlex(config=_fake_config(), fetch=fake_fetch)
     assert {c.native_id for c in result.candidates} == {"32024R1689", "32025R2653"}
-    assert result.cursor == {"seen_celex": ["32024R1689", "32025R2653"]}
-    assert result.diagnostics["status"] == "fetched"
 
 
-def test_discover_eurlex_repeat_run_same_result_is_no_new() -> None:
+def test_discover_eurlex_repeat_run_returns_same_full_view() -> None:
+    """Коннектор — чистая функция от ИСТОЧНИКА: повторный прогон отдаёт ТО ЖЕ."""
     sparql_json = _sparql_json(
         [_row("32024R1689", date="2024-06-13", title="AI Act", author="European Parliament")]
     )
@@ -612,14 +612,13 @@ def test_discover_eurlex_repeat_run_same_result_is_no_new() -> None:
     def fake_fetch(query: str, *, endpoint: str, timeout: float) -> dict[str, Any]:
         return sparql_json
 
-    first = eurlex.discover_eurlex(None, config=_fake_config(), fetch=fake_fetch)
-    second = eurlex.discover_eurlex(first.cursor, config=_fake_config(), fetch=fake_fetch)
-    assert second.candidates == []
-    assert second.diagnostics["status"] == "no_new"
-    assert second.cursor == first.cursor
+    first = eurlex.discover_eurlex(config=_fake_config(), fetch=fake_fetch)
+    second = eurlex.discover_eurlex(config=_fake_config(), fetch=fake_fetch)
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
 
 
-def test_discover_eurlex_new_celex_appears_only_it_is_fresh() -> None:
+def test_discover_eurlex_growth_gives_exactly_one_fresh_through_dedup() -> None:
+    """Прямая замена ``test_diff_cursor_*``: новизну решает ``dedup``, не seen-CELEX."""
     first_json = _sparql_json(
         [_row("32024R1689", date="2024-06-13", title="AI Act", author="EP")]
     )
@@ -635,10 +634,13 @@ def test_discover_eurlex_new_celex_appears_only_it_is_fresh() -> None:
         calls["n"] += 1
         return first_json if calls["n"] == 1 else second_json
 
-    first = eurlex.discover_eurlex(None, config=_fake_config(), fetch=fake_fetch)
-    second = eurlex.discover_eurlex(first.cursor, config=_fake_config(), fetch=fake_fetch)
-    assert [c.native_id for c in second.candidates] == ["32026R0150"]
-    assert second.diagnostics["status"] == "fetched"
+    first = eurlex.discover_eurlex(config=_fake_config(), fetch=fake_fetch)
+    second = eurlex.discover_eurlex(config=_fake_config(), fetch=fake_fetch)
+
+    assert len(second.candidates) == 2  # коннектор отдал ПОЛНЫЙ вид
+    outcome = dedup(second.candidates, first.candidates)
+    assert [c.native_id for c in outcome.fresh] == ["32026R0150"]
+    assert outcome.absorbed == 1
 
 
 def test_discover_eurlex_non_default_expression_language_propagates_end_to_end() -> None:
@@ -654,7 +656,7 @@ def test_discover_eurlex_non_default_expression_language_propagates_end_to_end()
         return sparql_json
 
     result = eurlex.discover_eurlex(
-        None, config=_fake_config(expression_language="EST"), fetch=fake_fetch
+        config=_fake_config(expression_language="EST"), fetch=fake_fetch
     )
     cand = result.candidates[0]
     assert cand.language == "et"
@@ -672,7 +674,7 @@ def test_discover_eurlex_unknown_expression_language_fails_before_network_call()
         return _sparql_json([])
 
     with pytest.raises(ValueError, match="expression_language"):
-        eurlex.discover_eurlex(None, config=_fake_config(expression_language="XXX"), fetch=fake_fetch)
+        eurlex.discover_eurlex(config=_fake_config(expression_language="XXX"), fetch=fake_fetch)
     assert calls == []  # сеть не тронута
 
 

@@ -21,6 +21,7 @@ import yaml
 
 from core import schema
 from discovery.connectors import oecd
+from discovery.dedup import dedup
 
 _BASE_CONFIG = oecd.OecdConfig(
     enabled=True,
@@ -329,33 +330,6 @@ def test_save_snapshot_no_staging_leftover(tmp_path: Path) -> None:
     assert list(path.parent.glob(".*.part")) == []
 
 
-# --- diff_cursor: seen-id, монотонный (зеркало test_aiforgood.py) ---
-
-
-def test_diff_cursor_first_run_all_fresh_all_seen() -> None:
-    fresh, cursor = oecd.diff_cursor(["a", "b"], None)
-    assert fresh == {"a", "b"}
-    assert cursor == {"seen_ids": ["a", "b"]}
-
-
-def test_diff_cursor_repeat_run_same_ids_no_new_fresh() -> None:
-    fresh, cursor = oecd.diff_cursor(["a", "b"], {"seen_ids": ["a", "b"]})
-    assert fresh == set()
-    assert cursor == {"seen_ids": ["a", "b"]}
-
-
-def test_diff_cursor_new_id_added_only_new_one_fresh() -> None:
-    fresh, cursor = oecd.diff_cursor(["a", "b", "c"], {"seen_ids": ["a", "b"]})
-    assert fresh == {"c"}
-    assert cursor == {"seen_ids": ["a", "b", "c"]}
-
-
-def test_diff_cursor_monotonic_never_shrinks_when_upstream_result_shrinks() -> None:
-    fresh, cursor = oecd.diff_cursor(["a"], {"seen_ids": ["a", "b"]})
-    assert fresh == set()
-    assert cursor == {"seen_ids": ["a", "b"]}
-
-
 # --- in_scope: гибридный фильтр §2 ---
 
 
@@ -567,43 +541,60 @@ def test_discover_oecd_first_run_all_fresh(tmp_path: Path) -> None:
     rec = _base_record(category="Cat A")
     page = _page([rec], current=1, last=1, total=1)
     result = oecd.discover_oecd(
-        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
         snapshot_path=tmp_path / "snap.json",
     )
-    assert result.diagnostics["status"] == "fetched"
     assert len(result.candidates) == 1
-    assert result.cursor == {"seen_ids": ["2526"]}
 
 
-def test_discover_oecd_repeat_run_same_result_is_no_new(tmp_path: Path) -> None:
+def test_discover_oecd_repeat_run_returns_same_full_view(tmp_path: Path) -> None:
+    """Коннектор — чистая функция от ИСТОЧНИКА: повторный прогон отдаёт ТО ЖЕ, ничего не
+    подавляя. Прежний seen-id-курсор стоял ПОСЛЕ полной загрузки — не экономил ни одного
+    запроса, зато закрывал единственный канал обогащения очереди."""
     rec = _base_record(category="Cat A")
     page = _page([rec], current=1, last=1, total=1)
-    result = oecd.discover_oecd(
-        {"seen_ids": ["2526"]}, config=_BASE_CONFIG, fetch=lambda page_num, **_: page,
-        sleep=lambda s: None, snapshot_path=tmp_path / "snap.json",
+    call = dict(
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
     )
-    assert result.diagnostics["status"] == "no_new"
-    assert result.candidates == []
-    assert result.cursor == {"seen_ids": ["2526"]}
+
+    first = oecd.discover_oecd(**call)  # type: ignore[arg-type]
+    second = oecd.discover_oecd(**call)  # type: ignore[arg-type]
+
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
 
 
-def test_discover_oecd_new_id_appears_only_it_is_fresh(tmp_path: Path) -> None:
+def test_discover_oecd_growth_gives_exactly_one_fresh_through_dedup(tmp_path: Path) -> None:
+    """Прямая замена ``test_diff_cursor_*``: «что здесь новое» решает ``dedup`` против уже
+    персистнутого пула, а не собственное id-пространство источника."""
     rec1 = _base_record(id=1, category="Cat A")
-    rec2 = _base_record(id=2, category="Cat A")
-    page = _page([rec1, rec2], current=1, last=1, total=2)
-    result = oecd.discover_oecd(
-        {"seen_ids": ["1"]}, config=_BASE_CONFIG, fetch=lambda page_num, **_: page,
-        sleep=lambda s: None, snapshot_path=tmp_path / "snap.json",
+    rec2 = _base_record(
+        id=2, category="Cat A",
+        englishName="Second Initiative", website="https://gov.example/second",
     )
-    assert [c.native_id for c in result.candidates] == ["2"]
-    assert result.cursor == {"seen_ids": ["1", "2"]}
+    one = _page([rec1], current=1, last=1, total=1)
+    two = _page([rec1, rec2], current=1, last=1, total=2)
+
+    before = oecd.discover_oecd(
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: one, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
+    )
+    after = oecd.discover_oecd(
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: two, sleep=lambda s: None,
+        snapshot_path=tmp_path / "snap.json",
+    )
+
+    assert len(after.candidates) == 2  # коннектор отдал ПОЛНЫЙ вид
+    outcome = dedup(after.candidates, before.candidates)
+    assert [c.native_id for c in outcome.fresh] == ["2"]
+    assert outcome.absorbed == 1
 
 
 def test_discover_oecd_out_of_scope_record_skipped_with_diagnostic(tmp_path: Path) -> None:
     rec = _base_record(category="Some Unconfigured Category")
     page = _page([rec], current=1, last=1, total=1)
     result = oecd.discover_oecd(
-        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
         snapshot_path=tmp_path / "snap.json",
     )
     assert result.diagnostics["skipped_out_of_scope"] == 1
@@ -614,7 +605,7 @@ def test_discover_oecd_unmappable_record_skipped_with_diagnostic(tmp_path: Path)
     rec = _base_record(category="Cat A", website=None, relevantUrls=[])
     page = _page([rec], current=1, last=1, total=1)
     result = oecd.discover_oecd(
-        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
         snapshot_path=tmp_path / "snap.json",
     )
     assert result.diagnostics["skipped_unmappable"] == 1
@@ -626,7 +617,7 @@ def test_discover_oecd_writes_snapshot_of_raw_records(tmp_path: Path) -> None:
     page = _page([rec], current=1, last=1, total=1)
     snapshot_path = tmp_path / "snap.json"
     oecd.discover_oecd(
-        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
         snapshot_path=snapshot_path,
     )
     saved = json.loads(snapshot_path.read_text(encoding="utf-8"))
@@ -639,7 +630,7 @@ def test_discover_oecd_snapshot_written_even_when_nothing_in_scope(tmp_path: Pat
     page = _page([rec], current=1, last=1, total=1)
     snapshot_path = tmp_path / "snap.json"
     oecd.discover_oecd(
-        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
         snapshot_path=snapshot_path,
     )
     assert json.loads(snapshot_path.read_text(encoding="utf-8")) == [rec]
@@ -651,7 +642,7 @@ def test_discover_oecd_shape_gate_failure_propagates(tmp_path: Path) -> None:
     bad_page = {"data": [], "currentPage": 1, "lastPage": 1, "total": 0}
     with pytest.raises(RuntimeError, match="backend изменил форму"):
         oecd.discover_oecd(
-            None, config=_BASE_CONFIG, fetch=lambda page_num, **_: bad_page, sleep=lambda s: None,
+            config=_BASE_CONFIG, fetch=lambda page_num, **_: bad_page, sleep=lambda s: None,
             snapshot_path=tmp_path / "snap.json",
         )
 
@@ -728,7 +719,7 @@ def test_discover_oecd_counts_url_suspect_in_diagnostics(tmp_path: Path) -> None
         current=1, last=1, total=2,
     )
     result = oecd.discover_oecd(
-        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
         snapshot_path=tmp_path / "snap.json",
     )
     assert result.diagnostics["found"] == 2
@@ -751,7 +742,7 @@ def test_ambiguous_websites_computed_before_scope_filter(tmp_path: Path) -> None
         current=1, last=1, total=2,
     )
     result = oecd.discover_oecd(
-        None, config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
+        config=_BASE_CONFIG, fetch=lambda page_num, **_: page, sleep=lambda s: None,
         snapshot_path=tmp_path / "snap.json",
     )
     assert result.diagnostics["skipped_out_of_scope"] == 1

@@ -4,7 +4,7 @@ Spec `docs/pipeline/discovery/tech_specs/aiforgood-standards/spec.md`. Трет�
 архетипа `registry`: живой paginated JSON поверх WordPress `admin-ajax.php` — ближе по
 форме к `eurlex.py` (живой источник, без DuckDB), но требует пагинации (в отличие от
 EUR-Lex, где вся выборка приходит одним SPARQL-запросом) — ближе к `agora.py` по объёму
-курсорной работы, без bulk-дампа/файлового кэша. Регистрируется в ядре при импорте
+стадии отсева, без bulk-дампа/файлового кэша. Регистрируется в ядре при импорте
 (см. ``discovery/connectors/__init__.py``).
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ import yaml
 from core import schema
 from core.env import REPO_ROOT
 from discovery import dedup, registry
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_aiforgood.yaml"
 STANDARDS_BODIES_PATH = REPO_ROOT / "pipeline" / "vocab" / "vocab_standards_bodies.yaml"
@@ -192,21 +192,6 @@ def paginate_group(
     return records
 
 
-# --- §4: курсор — множество виденных id_value (как seen-CELEX у eurlex) ---
-
-
-def diff_cursor(
-    all_ids: list[str], cursor: ConnectorCursor | None
-) -> tuple[set[str], ConnectorCursor]:
-    """Новые (не виденные) ``id_value`` + новый курсор = объединение старых и текущих
-    (спек §4). Множество СТРОГО растёт — правка/исчезновение записи в живом индексе не
-    выбрасывает её id из seen (тот же принцип, что ``eurlex.diff_cursor``)."""
-    seen = set((cursor or {}).get("seen_ids") or [])
-    fresh_ids = {i for i in all_ids if i not in seen}
-    new_seen = sorted(seen | set(all_ids))
-    return fresh_ids, {"seen_ids": new_seen}
-
-
 # --- §3: справочник организаций (issuer-лукап; аналог build_graph.load_jurisdictions) ---
 
 
@@ -297,7 +282,6 @@ def _map_record(
 
 
 def discover_aiforgood(
-    cursor: ConnectorCursor | None,
     *,
     config: AiforgoodConfig | None = None,
     fetch: Callable[..., dict[str, Any]] = fetch_json,
@@ -306,7 +290,8 @@ def discover_aiforgood(
 ) -> DiscoverResult:
     """``Connector.discover()`` для aiforgood (спек §4): обойти группы (кроме
     ``exclude_groups`` и неизвестных — не в ``GROUP_ID_TO_ENTITY``) -> пагинировать ->
-    отфильтровать черновики -> замаппить -> отфильтровать по seen-id-курсору.
+    отфильтровать черновики -> замаппить. Отдаёт ПОЛНЫЙ текущий вид индекса; «что здесь
+    новое» решает кросс-коннекторный ``dedup`` оркестратора.
 
     ``fetch``/``sleep`` инжектируем — тесты подменяют фейками, сеть/реальные паузы в CI
     не участвуют. ``bodies`` — справочник §3 (по умолчанию читается с диска).
@@ -343,21 +328,14 @@ def discover_aiforgood(
                 continue
             candidates.append(cand)
 
-    all_ids = [c.native_id for c in candidates if c.native_id]
-    fresh_ids, new_cursor = diff_cursor(all_ids, cursor)
-    fresh = [c for c in candidates if c.native_id in fresh_ids]
-
-    status_label = "no_new" if cursor is not None and not fresh else "fetched"
     diagnostics = {
-        "status": status_label,
         "found": len(candidates),
-        "fresh": len(fresh),
         "excluded_groups": excluded_group_count,
         "skipped_unknown_group": skipped_unknown_group,
         "skipped_draft": skipped_draft,
         "skipped_no_title_or_url": skipped_no_title_or_url,
     }
-    return DiscoverResult(candidates=fresh, cursor=new_cursor, diagnostics=diagnostics)
+    return DiscoverResult(candidates=candidates, diagnostics=diagnostics)
 
 
 @dataclass
@@ -370,8 +348,8 @@ class AiforgoodConnector:
     kind: schema.ConnectorKind = schema.ConnectorKind.registry
     enabled: bool = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return discover_aiforgood(cursor)
+    def discover(self) -> DiscoverResult:
+        return discover_aiforgood()
 
 
 # Регистрация при импорте (чартер §4.3 «манифест», спек §4): `enabled` — из конфига,

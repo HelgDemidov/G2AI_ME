@@ -23,6 +23,7 @@ import yaml
 
 from core import schema
 from discovery.connectors import aiforgood
+from discovery.dedup import dedup
 
 # --- load_config ---
 
@@ -322,33 +323,6 @@ def test_get_standards_page_passes_group_and_index() -> None:
     assert captured == {"action": "get_standards", "topic": "tx518", "group": "gx0", "index": "10"}
 
 
-# --- diff_cursor (зеркало test_eurlex.py) ---
-
-
-def test_diff_cursor_first_run_all_fresh_all_seen() -> None:
-    fresh, cursor = aiforgood.diff_cursor(["a", "b"], None)
-    assert fresh == {"a", "b"}
-    assert cursor == {"seen_ids": ["a", "b"]}
-
-
-def test_diff_cursor_repeat_run_same_ids_no_new_fresh() -> None:
-    fresh, cursor = aiforgood.diff_cursor(["a", "b"], {"seen_ids": ["a", "b"]})
-    assert fresh == set()
-    assert cursor == {"seen_ids": ["a", "b"]}
-
-
-def test_diff_cursor_new_id_added_only_new_one_fresh() -> None:
-    fresh, cursor = aiforgood.diff_cursor(["a", "b", "c"], {"seen_ids": ["a", "b"]})
-    assert fresh == {"c"}
-    assert cursor == {"seen_ids": ["a", "b", "c"]}
-
-
-def test_diff_cursor_monotonic_never_shrinks_when_upstream_result_shrinks() -> None:
-    fresh, cursor = aiforgood.diff_cursor(["a"], {"seen_ids": ["a", "b"]})
-    assert fresh == set()
-    assert cursor == {"seen_ids": ["a", "b"]}
-
-
 # --- load_standards_bodies (справочник §3) — регресс-гвард против рассинхрона ---
 
 
@@ -465,18 +439,20 @@ def test_candidate_requires_language_override_like_agora() -> None:
     assert cand is not None
     record = schema.promote_candidate(
         cand,
-        id="itu-t-e475-test",
-        entity_id="itu-t",
-        track=schema.Track.tech_standards,
-        issuer_type=schema.IssuerType.standards_body,
-        geo_scope=schema.GeoScope.international,
-        doc_type="technical_standard",
-        authority="voluntary_standard",
-        admission=schema.Admission(
+        {
+            "id": "itu-t-e475-test",
+            "entity_id": "itu-t",
+            "track": schema.Track.tech_standards,
+            "issuer_type": schema.IssuerType.standards_body,
+            "geo_scope": schema.GeoScope.international,
+            "doc_type": "technical_standard",
+            "authority": "voluntary_standard",
+            "admission": schema.Admission(
             axis="digital_sovereignty",
             rationale="test",
         ),
-        language="en",
+            "language": "en",
+        },
     )
     assert record.language == "en"
 
@@ -510,7 +486,7 @@ def test_discover_aiforgood_excludes_paid_catalog_groups_never_fetched() -> None
         return {"standards": [_standard("1")], "totalCount": 1, "facets": []}
 
     result = aiforgood.discover_aiforgood(
-        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+        config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
     )
     assert result.diagnostics["excluded_groups"] == 1
     assert all(c.native_tags for c in result.candidates)
@@ -527,7 +503,7 @@ def test_discover_aiforgood_unknown_group_skipped_with_diagnostic() -> None:
         raise AssertionError("unknown group must not be paginated")
 
     result = aiforgood.discover_aiforgood(
-        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+        config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
     )
     assert result.diagnostics["skipped_unknown_group"] == 1
     assert result.candidates == []
@@ -547,7 +523,7 @@ def test_discover_aiforgood_draft_status_skipped() -> None:
         }
 
     result = aiforgood.discover_aiforgood(
-        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+        config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
     )
     assert result.diagnostics["skipped_draft"] == 1
     assert [c.native_id for c in result.candidates] == ["2"]
@@ -560,43 +536,49 @@ def test_discover_aiforgood_first_run_all_fresh() -> None:
         return {"standards": [_standard("1")], "totalCount": 1, "facets": []}
 
     result = aiforgood.discover_aiforgood(
-        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+        config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
     )
-    assert result.diagnostics["status"] == "fetched"
     assert len(result.candidates) == 1
-    assert result.cursor == {"seen_ids": ["1"]}
 
 
-def test_discover_aiforgood_repeat_run_same_result_is_no_new() -> None:
+def test_discover_aiforgood_repeat_run_returns_same_full_view() -> None:
+    """Коннектор — чистая функция от ИСТОЧНИКА: повторный прогон отдаёт ТО ЖЕ."""
     def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
         if params["action"] == "get_groups":
             return _groups_payload(("gx0", 1))
         return {"standards": [_standard("1")], "totalCount": 1, "facets": []}
 
-    result = aiforgood.discover_aiforgood(
-        {"seen_ids": ["1"]}, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None,
-        bodies=_bodies(),
-    )
-    assert result.diagnostics["status"] == "no_new"
-    assert result.candidates == []
+    call = dict(config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None,
+                bodies=_bodies())
+    first = aiforgood.discover_aiforgood(**call)  # type: ignore[arg-type]
+    second = aiforgood.discover_aiforgood(**call)  # type: ignore[arg-type]
+
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
 
 
-def test_discover_aiforgood_new_id_appears_only_it_is_fresh() -> None:
-    def fake_fetch(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+def test_discover_aiforgood_growth_gives_exactly_one_fresh_through_dedup() -> None:
+    """Прямая замена ``test_diff_cursor_*``: новизну решает ``dedup``, не seen-id."""
+    def fetch_one(params: dict[str, str], **kw: Any) -> dict[str, Any]:
+        if params["action"] == "get_groups":
+            return _groups_payload(("gx0", 1))
+        return {"standards": [_standard("1")], "totalCount": 1, "facets": []}
+
+    def fetch_two(params: dict[str, str], **kw: Any) -> dict[str, Any]:
         if params["action"] == "get_groups":
             return _groups_payload(("gx0", 2))
-        return {
-            "standards": [_standard("1"), _standard("2")],
-            "totalCount": 2,
-            "facets": [],
-        }
+        return {"standards": [_standard("1"), _standard("2")], "totalCount": 2, "facets": []}
 
-    result = aiforgood.discover_aiforgood(
-        {"seen_ids": ["1"]}, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None,
-        bodies=_bodies(),
+    before = aiforgood.discover_aiforgood(
+        config=aiforgood.load_config(), fetch=fetch_one, sleep=lambda s: None, bodies=_bodies()
     )
-    assert [c.native_id for c in result.candidates] == ["2"]
-    assert result.cursor == {"seen_ids": ["1", "2"]}
+    after = aiforgood.discover_aiforgood(
+        config=aiforgood.load_config(), fetch=fetch_two, sleep=lambda s: None, bodies=_bodies()
+    )
+
+    assert len(after.candidates) == 2  # коннектор отдал ПОЛНЫЙ вид
+    outcome = dedup(after.candidates, before.candidates)
+    assert [c.native_id for c in outcome.fresh] == ["2"]
+    assert outcome.absorbed == 1
 
 
 def test_discover_aiforgood_invalid_url_skipped_not_crashing_batch() -> None:
@@ -610,7 +592,7 @@ def test_discover_aiforgood_invalid_url_skipped_not_crashing_batch() -> None:
         }
 
     result = aiforgood.discover_aiforgood(
-        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+        config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
     )
     assert result.diagnostics["skipped_no_title_or_url"] == 1
     assert [c.native_id for c in result.candidates] == ["2"]
@@ -626,7 +608,7 @@ def test_aiforgood_connector_uses_configured_topic_and_multiple_orgs() -> None:
         return {"standards": [_standard(f"{group}-1")], "totalCount": 1, "facets": []}
 
     result = aiforgood.discover_aiforgood(
-        None, config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
+        config=aiforgood.load_config(), fetch=fake_fetch, sleep=lambda s: None, bodies=_bodies()
     )
     issuers = {c.native_id: c.issuer for c in result.candidates}
     assert issuers == {"gx0-1": "ITU-T", "gx1043-1": "ETSI"}

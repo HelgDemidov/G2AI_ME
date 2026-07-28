@@ -10,7 +10,7 @@ Spec `docs/pipeline/discovery/tech_specs/discovery-snowball/spec.md`. Пятый
 Коммит 2 — экстрактор PDF-аннотаций (§2.1/§2.4): группировка/склейка по ``uri``,
 crop anchor-текста, санитизация URL, отсев самоссылок/уже-в-корпусе.
 Коммит 3 — экстракторы href raw.html и напечатанных URL doc.md (§2.2/§2.3).
-Коммит 4 — маппинг в CandidateRecord, pre-signal, курсор/fingerprint,
+Коммит 4 — маппинг в CandidateRecord, pre-signal, fingerprint,
 регистрация коннектора в ядре (§3/§4).
 Коммит 5 — CLI-подкоманда `snowball` + `orchestrate.connectors_override` (§3).
 Коммит 6 — LLM-стадия текстовых цитат без URL, opt-in `emit.text_citations` (§5).
@@ -37,11 +37,15 @@ from lxml import html as lxml_html
 from core import fsio, openrouter, pdfmeta, schema
 from core.env import REPO_ROOT
 from discovery import registry, store
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 from discovery.dedup import format_hint_from_url, normalize_url
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_snowball.yaml"
 CONNECTOR_ID = "snowball"
+CACHE_DIR = REPO_ROOT / "pipeline" / "discovery_cache" / CONNECTOR_ID
+"""Кэш СЫРЬЯ коннектора (spec drop-cursors-and-decision-overlay §2) — house-style: рядом
+с zip+bronze у agora и снапшотом у oecd, а НЕ в ``sources/``, который остаётся только
+курируемым+операционным (и гейт герметичности тестов не получает новой дыры)."""
 LEADS_FILENAME = "snowball_leads.yaml"
 """Имя файла лидов ВНУТРИ ``sources/.state/`` (каталог принадлежит ``discovery/store.py``:
 писатель владеет своим именем файла, раскладку знает store — см. ``store.state_dir``)."""
@@ -452,7 +456,7 @@ def map_link(
     )
 
 
-# --- §4: курсор — fingerprint по документу (sha256 raw + sha256 doc.md) ---
+# --- §4: fingerprint документа (sha256 raw + sha256 doc.md) ---
 
 
 def document_fingerprint(rec: schema.SourceRecord, root: Path) -> str:
@@ -470,6 +474,106 @@ def document_fingerprint(rec: schema.SourceRecord, root: Path) -> str:
     if md_path.exists():
         md_sha = hashlib.sha256(md_path.read_bytes()).hexdigest()
     return hashlib.sha256(f"{raw_sha}|{md_sha}".encode("utf-8")).hexdigest()
+
+
+# --- §2 bis: кэш СЫРЬЯ (spec drop-cursors-and-decision-overlay §2) ---
+#
+# Кэшируется ДОБЫЧА, никогда — маппинг. Разница с прежним курсором принципиальна: курсор
+# подавлял ВЫДАЧУ (документ пропускался целиком, и обогащение до очереди не доезжало),
+# кэш подавляет только повторную РАБОТУ и возвращает результат — выдача остаётся полной.
+# Правка ``map_link`` доезжает до всей очереди следующим прогоном на ТЁПЛОМ кэше, без
+# бампа версий и миграций; это же снимает нужду в ``Connector.version``, который был бы
+# обязателен при кэшировании результата.
+
+
+_KIND_TO_EXTRACTOR = {
+    "pdf": "pdf_annotations",
+    "html": "html_hrefs",
+    "md": "printed_urls",
+    "citation": "text_citations",
+}
+
+
+def raw_cache_path(doc_id: str, cache_dir: Path | None = None) -> Path:
+    """``cache_dir=None`` -> модульный ``CACHE_DIR``, читаемый В МОМЕНТ ВЫЗОВА.
+
+    Не дефолт-значением параметра: то связывается при определении функции, и
+    monkeypatch модульной константы в тесте на него уже не влияет — тест молча писал бы
+    в боевой кэш (класс инцидента `--db` 2026-07-21, сторожится гейтом герметичности).
+    """
+    return (cache_dir or CACHE_DIR) / f"{doc_id}.yaml"
+
+
+def _emit_signature(emit: EmitConfig) -> dict[str, bool]:
+    """Какие каналы добычи были включены, когда сырьё извлекали.
+
+    Входит в ключ кэша НАРАВНЕ с fingerprint: ``emit`` управляет именно ДОБЫЧЕЙ, а не
+    маппингом, поэтому переключение канала обязано инвалидировать сырьё. Без этого
+    прогон с выключенным каналом записал бы обеднённый набор ссылок, а следующий прогон
+    с включённым тихо отдал бы его же (поймано тестом ``emit``-тумблера).
+    """
+    return {
+        "pdf_annotations": emit.pdf_annotations,
+        "html_hrefs": emit.html_hrefs,
+        "printed_urls": emit.printed_urls,
+        "text_citations": emit.text_citations,
+    }
+
+
+def load_raw_links(
+    doc_id: str, fingerprint: str, emit: EmitConfig, cache_dir: Path | None = None
+) -> list[tuple[RawLink, str]] | None:
+    """Сырьё документа из кэша или ``None`` — нет файла, документ изменился либо изменился
+    набор включённых каналов добычи.
+
+    ``document_fingerprint`` (sha raw + sha doc.md) меняется сам при передобыче или
+    переконвертации документа — отдельной бухгалтерии не нужно.
+    """
+    path = raw_cache_path(doc_id, cache_dir)
+    if not path.exists():
+        return None
+    data: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if data.get("fingerprint") != fingerprint or data.get("emit") != _emit_signature(emit):
+        return None
+    return [
+        (
+            RawLink(
+                url=entry["url"],
+                anchor=entry["anchor"],
+                page_number=entry.get("page_number"),
+                ocr_text_url=bool(entry.get("ocr_text_url")),
+            ),
+            entry["kind"],
+        )
+        for entry in data.get("links") or []
+    ]
+
+
+def save_raw_links(
+    doc_id: str,
+    fingerprint: str,
+    emit: EmitConfig,
+    links: list[tuple[RawLink, str]],
+    cache_dir: Path | None = None,
+) -> None:
+    payload = {
+        "fingerprint": fingerprint,
+        "emit": _emit_signature(emit),
+        "links": [
+            {
+                "url": link.url,
+                "anchor": link.anchor,
+                "page_number": link.page_number,
+                "ocr_text_url": link.ocr_text_url,
+                "kind": kind,
+            }
+            for link, kind in links
+        ],
+    }
+    fsio.atomic_write_text(
+        raw_cache_path(doc_id, cache_dir),
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+    )
 
 
 # --- §5: LLM-стадия текстовых цитат без URL (opt-in `emit.text_citations`) ---
@@ -758,9 +862,7 @@ def leads_path(root: Path) -> Path:
 def save_leads(leads: list[dict[str, Any]], root: Path) -> None:
     """Записать ``sources/.snowball_leads.yaml`` (спек §5) — ПЕРЕЗАПИСЫВАЕТСЯ целиком
     каждым прогоном с ``--with-citations`` (не аппендится): лиды — сырьё СЛЕДУЮЩЕЙ
-    directed-search мини-кампании, не постоянное состояние; известное ограничение —
-    лиды документа, не пере-майненного в этом прогоне (курсор его пропустил), в
-    файл не попадают, пока документ не изменится или курсор не будет сброшен.
+    directed-search мини-кампании, не постоянное состояние.
     Путь — ``leads_path`` (каталог операционного состояния корпуса, ``store.state_dir``).
 
     Каждый лид дампится отдельно, записи разделяются пустой строкой — тот же приём
@@ -785,36 +887,38 @@ def _default_call_model(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def discover_snowball(
-    cursor: ConnectorCursor | None,
     *,
     config: SnowballConfig | None = None,
     root: Path = schema.DEFAULT_SOURCES,
     records: list[schema.SourceRecord] | None = None,
     call_model: Callable[[dict[str, Any]], dict[str, Any]] = _default_call_model,
+    cache_dir: Path | None = None,
 ) -> DiscoverResult:
     """``Connector.discover()`` для snowball (спек §4): отфильтровать документы (§3) ->
-    для каждого НЕизменившегося (по курсору) — скип; иначе прогнать включённые
-    экстракторы (§2, + §5 LLM-стадия цитат, если ``emit.text_citations`` и документ не
-    ``confidential``) -> отсеять самоссылки/уже-в-корпусе/url_filter -> замаппить ->
-    обновить курсор. Ширина прогона задаётся ДОКУМЕНТАМИ (``source_filter``/CLI
-    ``--doc``/``--track``), а не потолком числа находок.
+    прогнать включённые экстракторы (§2, + §5 LLM-стадия цитат, если ``emit.text_citations``
+    и документ не ``confidential``) -> отсеять самоссылки/уже-в-корпусе/url_filter ->
+    замаппить. Отдаёт ПОЛНЫЙ текущий вид корпуса; «что здесь новое» решает
+    кросс-коннекторный ``dedup`` оркестратора. Ширина прогона задаётся ДОКУМЕНТАМИ
+    (``source_filter``/CLI ``--doc``/``--track``), а не потолком числа находок.
+
+    Добыча сырья кэшируется по ``document_fingerprint`` (см. ``load_raw_links``); маппинг
+    гоняется заново ВСЕГДА, поэтому его правка доезжает до очереди на тёплом кэше.
 
     ``records`` — инжектируемый список документов корпуса (тесты подставляют фикстуры;
     по умолчанию читается с диска, как у остальных потребителей ``schema.load_records``).
-    ``call_model`` — инжектируемый транспорт §5 (тесты подставляют фейк).
+    ``call_model`` — инжектируемый транспорт §5 (тесты подставляют фейк). ``cache_dir``
+    тесты обязаны задавать явно — боевой кэш под гейтом герметичности.
     """
     cfg = config or load_config()
     all_records = records if records is not None else schema.load_records(root)
     filtered = apply_source_filter(all_records, cfg.source_filter)
     vocab_terms = _load_vocab_terms()
 
-    mined_before = dict((cursor or {}).get("mined") or {})
-    mined_after = dict(mined_before)
-
     candidates: list[schema.CandidateRecord] = []
     all_leads: list[CitationLead] = []
     docs_scanned = 0
-    docs_skipped_cursor = 0
+    cache_hits = 0
+    cache_misses = 0
     filtered_self_or_corpus = 0
     filtered_by_url_filter = 0
     per_extractor = {"pdf_annotations": 0, "html_hrefs": 0, "printed_urls": 0, "text_citations": 0}
@@ -825,37 +929,40 @@ def discover_snowball(
         if raw_path is None or not md_path.exists():
             continue  # документ ещё не добыт/не сконвертирован — просто нечего майнить
 
-        fingerprint = document_fingerprint(rec, root)
-        if mined_before.get(rec.id) == fingerprint:
-            docs_skipped_cursor += 1
-            continue
         docs_scanned += 1
 
-        raw_links: list[tuple[RawLink, str]] = []
-        if cfg.emit.pdf_annotations and raw_path.suffix == ".pdf":
-            found = extract_pdf_annotation_links(raw_path)
-            per_extractor["pdf_annotations"] += len(found)
-            raw_links.extend((link, "pdf") for link in found)
-        if cfg.emit.html_hrefs and raw_path.suffix == ".html":
-            found = extract_html_href_links(raw_path, source_url=rec.source_url)
-            per_extractor["html_hrefs"] += len(found)
-            raw_links.extend((link, "html") for link in found)
-        if cfg.emit.printed_urls:
-            ocr_flag = raw_path.suffix == ".pdf" and pdfmeta.was_ocr_normalized(raw_path)
-            found = extract_printed_urls(md_path, ocr_normalized=ocr_flag)
-            per_extractor["printed_urls"] += len(found)
-            raw_links.extend((link, "md") for link in found)
-        if cfg.emit.text_citations and schema.external_disclosure_allowed(rec.sensitivity):
-            cite_links, cite_leads = extract_text_citations(
-                md_path,
-                doc_id=rec.id,
-                model=cfg.citations_model,
-                call_model=call_model,
-                fallback_model=cfg.citations_model_fallback,
-            )
-            per_extractor["text_citations"] += len(cite_links)
-            raw_links.extend((link, "citation") for link in cite_links)
-            all_leads.extend(cite_leads)
+        fingerprint = document_fingerprint(rec, root)
+        cached = load_raw_links(rec.id, fingerprint, cfg.emit, cache_dir)
+        if cached is not None:
+            cache_hits += 1
+            raw_links = cached
+        else:
+            cache_misses += 1
+            raw_links = []
+            if cfg.emit.pdf_annotations and raw_path.suffix == ".pdf":
+                found = extract_pdf_annotation_links(raw_path)
+                raw_links.extend((link, "pdf") for link in found)
+            if cfg.emit.html_hrefs and raw_path.suffix == ".html":
+                found = extract_html_href_links(raw_path, source_url=rec.source_url)
+                raw_links.extend((link, "html") for link in found)
+            if cfg.emit.printed_urls:
+                ocr_flag = raw_path.suffix == ".pdf" and pdfmeta.was_ocr_normalized(raw_path)
+                found = extract_printed_urls(md_path, ocr_normalized=ocr_flag)
+                raw_links.extend((link, "md") for link in found)
+            if cfg.emit.text_citations and schema.external_disclosure_allowed(rec.sensitivity):
+                cite_links, cite_leads = extract_text_citations(
+                    md_path,
+                    doc_id=rec.id,
+                    model=cfg.citations_model,
+                    call_model=call_model,
+                    fallback_model=cfg.citations_model_fallback,
+                )
+                raw_links.extend((link, "citation") for link in cite_links)
+                all_leads.extend(cite_leads)
+            save_raw_links(rec.id, fingerprint, cfg.emit, raw_links, cache_dir)
+
+        for _link, kind in raw_links:
+            per_extractor[_KIND_TO_EXTRACTOR[kind]] += 1
 
         doc_candidates: list[schema.CandidateRecord] = []
         for link, kind in raw_links:
@@ -871,15 +978,12 @@ def discover_snowball(
             )
 
         candidates.extend(doc_candidates)
-        mined_after[rec.id] = fingerprint
 
-    status = "no_new" if cursor is not None and not candidates else "fetched"
     diagnostics: dict[str, Any] = {
-        "status": status,
         "docs_scanned": docs_scanned,
-        "docs_skipped_cursor": docs_skipped_cursor,
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
         "found": sum(per_extractor.values()),
-        "fresh": len(candidates),
         "filtered_self_or_corpus": filtered_self_or_corpus,
         "filtered_by_url_filter": filtered_by_url_filter,
         "per_extractor": dict(per_extractor),
@@ -891,7 +995,7 @@ def discover_snowball(
             for lead in all_leads
         ],
     }
-    return DiscoverResult(candidates=candidates, cursor={"mined": mined_after}, diagnostics=diagnostics)
+    return DiscoverResult(candidates=candidates, diagnostics=diagnostics)
 
 
 @dataclass
@@ -911,8 +1015,8 @@ class SnowballConnector:
     # передаёт его явно) — иначе коннектор молча сканирует боевой sources/ вместо тестового/
     # переданного корня (живой дефект, пойманный test_discover_cli.py при написании коммита 5).
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return discover_snowball(cursor, config=self.config, root=self.root)
+    def discover(self) -> DiscoverResult:
+        return discover_snowball(config=self.config, root=self.root)
 
 
 # Регистрация при импорте (чартер §4.3 «манифест», спек §1): `enabled` — из конфига,

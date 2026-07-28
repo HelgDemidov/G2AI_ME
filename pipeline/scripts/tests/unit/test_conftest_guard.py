@@ -14,16 +14,15 @@ from tests.unit import conftest as guard_conftest
 
 
 def test_corpus_state_dir_is_guarded() -> None:
-    """Операционное состояние корпуса (курсоры, лиды snowball, будущие dangling-цитаты
-    graph-v2) сторожится КАТАЛОГОМ ``sources/.state/``, а не перечислением файлов: раньше
-    каждый новый операционный артефакт требовал правки списка guard'а (класс ловушки —
+    """Операционное состояние корпуса (лиды snowball, dangling-цитаты graph-v2)
+    сторожится КАТАЛОГОМ ``sources/.state/``, а не перечислением файлов: раньше каждый
+    новый операционный артефакт требовал правки списка guard'а (класс ловушки —
     main()-путь без явного ``--root``), теперь класс закрыт целиком."""
     from core import schema
     from discovery import store
     from discovery.connectors import snowball
 
     assert store.STATE_DIR in guard_conftest._GUARDED_REAL_DIRS
-    assert store.CURSORS_PATH.parent == store.STATE_DIR
     assert snowball.leads_path(schema.DEFAULT_SOURCES).parent == store.STATE_DIR
 
 

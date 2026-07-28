@@ -495,7 +495,7 @@ def test_confidential_document_skips_llm_stage_entirely(tmp_path: Path) -> None:
         citations_model="test/model",
         citations_model_fallback=None,
     )
-    result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec], call_model=boom)
+    result = discover_snowball(config=cfg, root=tmp_path, records=[rec], call_model=boom, cache_dir=tmp_path / "snowball_cache")
     assert result.diagnostics["per_extractor"]["text_citations"] == 0
     assert result.diagnostics["leads"] == []
 
@@ -520,7 +520,7 @@ def test_normal_document_llm_stage_runs_when_emitted(tmp_path: Path) -> None:
         citations_model="test/model",
         citations_model_fallback=None,
     )
-    result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec], call_model=fake)
+    result = discover_snowball(config=cfg, root=tmp_path, records=[rec], call_model=fake, cache_dir=tmp_path / "snowball_cache")
     urls = {c.source_url for c in result.candidates}
     assert "https://gov.example/strategy.pdf" in urls
     assert fake.calls == 1
@@ -677,7 +677,7 @@ def test_discover_snowball_mines_html_document_end_to_end(tmp_path: Path) -> Non
         citations_model="test/model",
         citations_model_fallback=None,
     )
-    result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec])
+    result = discover_snowball(config=cfg, root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     urls = {c.source_url for c in result.candidates}
     assert "https://example.org/found-via-html" in urls
     assert result.diagnostics["per_extractor"]["html_hrefs"] == 1

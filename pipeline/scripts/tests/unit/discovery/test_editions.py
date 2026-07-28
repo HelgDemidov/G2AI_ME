@@ -192,22 +192,22 @@ def test_inject_without_supersedes_does_not_read_registry(tmp_path: Path, monkey
 # --- promote: авто-ребро supersedes ---------------------------------------------------
 
 
-def _promote(cand: schema.CandidateRecord, **kwargs: object) -> schema.SourceRecord:
-    return schema.promote_candidate(
-        cand,
-        id="me-registration-law-2027",
-        entity_id="me",
-        track=schema.Track.target_entity,
-        issuer_type=schema.IssuerType.government,
-        geo_scope=schema.GeoScope.national,
-        doc_type="legislation",
-        authority="binding_law",
-        admission=schema.Admission(
+def _promote(cand: schema.CandidateRecord, **overrides: object) -> schema.SourceRecord:
+    curated: dict[str, object] = {
+        "id": "me-registration-law-2027",
+        "entity_id": "me",
+        "track": schema.Track.target_entity,
+        "issuer_type": schema.IssuerType.government,
+        "geo_scope": schema.GeoScope.national,
+        "doc_type": "legislation",
+        "authority": "binding_law",
+        "admission": schema.Admission(
             axis="digital_sovereignty",
             rationale="new edition of a corpus record",
         ),
-        **kwargs,  # type: ignore[arg-type]
-    )
+    }
+    curated.update(overrides)
+    return schema.promote_candidate(cand, curated)
 
 
 def test_promote_materializes_supersedes_edge() -> None:

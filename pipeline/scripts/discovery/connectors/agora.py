@@ -1,7 +1,7 @@
 """discovery/connectors/agora.py — ETO AGORA (Zenodo bulk) registry-коннектор.
 
 Spec `docs/pipeline/discovery/tech_specs/discovery-agora/spec.md`. Первый реальный
-экземпляр архетипа `registry`: fetch (Zenodo API, версионный курсор, zip-кэш,
+экземпляр архетипа `registry`: fetch (Zenodo API, zip-кэш,
 DuckDB-ingestion — этот слой) + SQL-фильтр (все не-US + US-проба по узкой оси
 agentic_g2ai) и маппинг в CandidateRecord — следующий слой того же модуля.
 Регистрируется в ядре при импорте (см. ``discovery/connectors/__init__.py``).
@@ -25,7 +25,7 @@ import yaml
 from core import schema
 from core.env import REPO_ROOT
 from discovery import dedup, registry, registry_store
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_agora.yaml"
 TRIAGE_CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "triage.yaml"
@@ -96,11 +96,10 @@ def fetch_latest_metadata(doi: str, *, timeout: float = 30.0) -> dict[str, Any]:
         return json.loads(resp.read())  # type: ignore[no-any-return]
 
 
-def cursor_from_metadata(record: dict[str, Any]) -> ConnectorCursor:
-    """Zenodo record JSON -> непрозрачный курсор коннектора (спек §3): версия/id/md5 файла."""
-    files = record.get("files") or []
-    md5 = files[0]["checksum"] if files else None
-    return {"zenodo_version": record["metadata"]["version"], "record_id": record["id"], "md5": md5}
+def version_from_metadata(record: dict[str, Any]) -> str:
+    """Zenodo record JSON -> версия дампа. Из прежнего курсора нужна ровно она: id записи
+    и md5 файла не читал ни один потребитель, а версия — ключ и кэша zip, и bronze-слоя."""
+    return str(record["metadata"]["version"])
 
 
 def download_url_from_metadata(record: dict[str, Any]) -> str:
@@ -157,6 +156,34 @@ def ingest_dump(
             )
         finally:
             conn.close()
+
+
+def bronze_has_version(version: str, db_path: Path = registry_store.DEFAULT_DB_PATH) -> bool:
+    """Проглочен ли дамп этой версии в bronze-слой (spec drop-cursors-and-decision-overlay §2).
+
+    Вопрос задаётся ТАБЛИЦЕ, которая и так несёт ``_source_version`` на каждой строке;
+    прежний курсор хранил вторую копию того, что кэш знает сам. Отсутствие БД или самой
+    таблицы — честное «нет», а не отказ: первый прогон на свежей машине обязан проглотить
+    дамп, а не упасть. Существование таблицы проверяется явным запросом к
+    ``information_schema``, не перехватом ошибки — иначе гейт глотал бы и настоящие сбои
+    DuckDB, тихо переходя к повторному ingest.
+    """
+    if not db_path.exists():
+        return False
+    conn = registry_store.connect(db_path)
+    try:
+        table_exists = conn.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'agora' AND table_name = 'documents_raw'"
+        ).fetchone()
+        if table_exists is None:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM agora.documents_raw WHERE _source_version = ? LIMIT 1", [version]
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
 
 
 # --- §4: гибрид-фильтр (все не-US + US-проба по узкой оси agentic_g2ai) ---
@@ -323,7 +350,6 @@ def select_and_map_candidates(
 
 
 def discover_agora(
-    cursor: ConnectorCursor | None,
     *,
     config: AgoraConfig | None = None,
     fetch_metadata: Callable[[str], dict[str, Any]] = fetch_latest_metadata,
@@ -331,20 +357,20 @@ def discover_agora(
     cache_dir: Path = CACHE_DIR,
     db_path: Path = registry_store.DEFAULT_DB_PATH,
 ) -> DiscoverResult:
-    """``Connector.discover()`` для AGORA (спек §3): version-гейт -> fetch+cache+ingest ->
-    SQL-фильтр -> маппинг. ``fetch_metadata``/``download`` инжектируемы — тесты подменяют
+    """``Connector.discover()`` для AGORA (спек §3): fetch+cache+ingest -> SQL-фильтр ->
+    маппинг. Отдаёт ПОЛНЫЙ текущий вид дампа; «что здесь новое» решает кросс-коннекторный
+    ``dedup`` оркестратора. ``fetch_metadata``/``download`` инжектируемы — тесты подменяют
     их фейками, сеть в CI не участвует."""
     cfg = config or load_config()
     record = fetch_metadata(cfg.zenodo_doi)
-    new_cursor = cursor_from_metadata(record)
+    version = version_from_metadata(record)
 
-    if cursor is not None and cursor.get("zenodo_version") == new_cursor["zenodo_version"]:
-        return DiscoverResult(candidates=[], cursor=cursor, diagnostics={"status": "unchanged"})
-
-    zip_path = cache_dir / f"agora-{new_cursor['zenodo_version']}.zip"
+    zip_path = cache_dir / f"agora-{version}.zip"
     if not zip_path.exists():
         download(download_url_from_metadata(record), zip_path)
-    ingest_dump(zip_path, source_version=str(new_cursor["zenodo_version"]), db_path=db_path)
+    ingest_skipped = bronze_has_version(version, db_path)
+    if not ingest_skipped:
+        ingest_dump(zip_path, source_version=version, db_path=db_path)
 
     conn = registry_store.connect(db_path)
     try:
@@ -355,8 +381,13 @@ def discover_agora(
     finally:
         conn.close()
 
-    diagnostics = {"status": "fetched", "found": len(candidates), "skipped_invalid_url": skipped}
-    return DiscoverResult(candidates=candidates, cursor=new_cursor, diagnostics=diagnostics)
+    diagnostics = {
+        "found": len(candidates),
+        "skipped_invalid_url": skipped,
+        "dump_version": version,
+        "ingest_skipped": ingest_skipped,
+    }
+    return DiscoverResult(candidates=candidates, diagnostics=diagnostics)
 
 
 @dataclass
@@ -371,8 +402,8 @@ class AgoraConnector:
     kind: schema.ConnectorKind = schema.ConnectorKind.registry
     enabled: bool = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return discover_agora(cursor)
+    def discover(self) -> DiscoverResult:
+        return discover_agora()
 
 
 # Регистрация при импорте (чартер §4.3 «манифест», спек §6): `enabled` — из конфига,

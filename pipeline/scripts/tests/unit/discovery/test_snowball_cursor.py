@@ -1,11 +1,13 @@
-"""Тесты discovery/connectors/snowball.py — discover_snowball() целиком: курсор/fingerprint-
-скип, реконсиляционный no-op, диагностика (spec discovery-snowball
-§3/§4, коммит 4)."""
+"""Тесты discovery/connectors/snowball.py — discover_snowball() целиком: полная выдача,
+кэш сырья, фильтры источника/URL, диагностика (spec discovery-snowball §3/§4)."""
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from core import schema
+from discovery.connectors import snowball
 from discovery.connectors.snowball import (
     EmitConfig,
     SnowballConfig,
@@ -52,46 +54,28 @@ def test_document_without_raw_or_doc_md_is_skipped_not_errored(tmp_path: Path) -
     data = valid_record() | {"id": "no-raw-doc", "entity_id": "me", "track": "target-entity"}
     write_doc(tmp_path, data)  # только meta.yaml — ни raw, ни doc.md
     rec = schema.SourceRecord.model_validate(data)
-    result = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
+    result = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     assert result.candidates == []
     assert result.diagnostics["docs_scanned"] == 0
 
 
-def test_first_run_mines_document_and_records_fingerprint(tmp_path: Path) -> None:
+def test_first_run_mines_document(tmp_path: Path) -> None:
     rec = _seed_doc(tmp_path, doc_id="first-run-doc", raw_sha="a" * 64, links=[("https://example.org/a", "Doc A")])
-    result = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
+    result = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     assert len(result.candidates) == 1
     assert result.candidates[0].source_url == "https://example.org/a"
-    assert rec.id in result.cursor["mined"]
     assert result.diagnostics["docs_scanned"] == 1
-    assert result.diagnostics["docs_skipped_cursor"] == 0
 
 
-def test_second_run_unchanged_corpus_is_noop(tmp_path: Path) -> None:
+def test_second_run_returns_same_full_view(tmp_path: Path) -> None:
+    """Коннектор — чистая функция от ИСТОЧНИКА (здесь источник = собственный корпус):
+    повторный прогон отдаёт ТО ЖЕ, документ не «пропускается». Инвариант «повторный
+    прогон — no-op» держит ``dedup`` оркестратора, и это проверено в test_orchestrate."""
     rec = _seed_doc(tmp_path, doc_id="noop-doc", raw_sha="a" * 64, links=[("https://example.org/b", "Doc B")])
-    first = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
-    second = discover_snowball(first.cursor, config=_config(), root=tmp_path, records=[rec])
-    assert second.candidates == []
-    assert second.cursor == first.cursor
-    assert second.diagnostics["docs_skipped_cursor"] == 1
-    assert second.diagnostics["docs_scanned"] == 0
-
-
-def test_changed_doc_md_triggers_remine(tmp_path: Path) -> None:
-    data = valid_record() | {"id": "remine-doc", "entity_id": "me", "track": "target-entity"}
-    rec = schema.SourceRecord.model_validate(data)
-    raw_bytes = _pdf_with_link("https://example.org/c", "Doc C")
-    write_doc(tmp_path, data, raw=raw_bytes, md="version one", state={"sha256": "a" * 64})
-    first = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
-    assert len(first.candidates) == 1
-
-    write_doc(tmp_path, data, raw=raw_bytes, md="version TWO, changed", state={"sha256": "a" * 64})
-    second = discover_snowball(first.cursor, config=_config(), root=tmp_path, records=[rec])
-    # doc.md изменился -> fingerprint изменился -> пере-майнинг (та же ссылка снова найдена,
-    # но она уже персистнута кросс-коннекторным dedup'ом на уровне оркестратора — здесь
-    # discover_snowball() эмитит её заново, это ожидаемо для чистой функции коннектора)
+    first = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
+    second = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
     assert second.diagnostics["docs_scanned"] == 1
-    assert second.diagnostics["docs_skipped_cursor"] == 0
 
 
 def test_self_link_and_corpus_link_are_excluded_end_to_end(tmp_path: Path) -> None:
@@ -115,9 +99,7 @@ def test_self_link_and_corpus_link_are_excluded_end_to_end(tmp_path: Path) -> No
     )
     write_doc(tmp_path, self_data, raw=raw_bytes, md="no urls in md", state={"sha256": "a" * 64})
 
-    result = discover_snowball(
-        None, config=_config(), root=tmp_path, records=[self_rec, other_rec]
-    )
+    result = discover_snowball(config=_config(), root=tmp_path, records=[self_rec, other_rec], cache_dir=tmp_path / "snowball_cache")
     urls = {c.source_url for c in result.candidates}
     assert urls == {"https://example.org/genuinely-new"}
     assert result.diagnostics["filtered_self_or_corpus"] == 2
@@ -139,7 +121,7 @@ def test_url_filter_excludes_matching_domain_end_to_end(tmp_path: Path) -> None:
         citations_model=cfg.citations_model,
         citations_model_fallback=cfg.citations_model_fallback,
     )
-    result = discover_snowball(None, config=cfg, root=tmp_path, records=[rec])
+    result = discover_snowball(config=cfg, root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     urls = {c.source_url for c in result.candidates}
     assert urls == {"https://gov.example.org/law"}
     assert result.diagnostics["filtered_by_url_filter"] == 1
@@ -164,8 +146,105 @@ def test_emit_toggle_disables_printed_urls_extractor(tmp_path: Path) -> None:
         citations_model="test/model",
         citations_model_fallback=None,
     )
-    result_off = discover_snowball(None, config=cfg_off, root=tmp_path, records=[rec])
+    result_off = discover_snowball(config=cfg_off, root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     assert result_off.candidates == []
 
-    result_on = discover_snowball(None, config=_config(), root=tmp_path, records=[rec])
+    result_on = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     assert len(result_on.candidates) == 1
+
+
+# --- кэш СЫРЬЯ вместо курсора (spec drop-cursors-and-decision-overlay §2) ---
+
+
+def test_cold_run_extracts_and_writes_cache(tmp_path: Path) -> None:
+    rec = _seed_doc(tmp_path, doc_id="cold-doc", raw_sha="a" * 64, links=[("https://example.org/a", "Doc A")])
+    cache_dir = tmp_path / "snowball_cache"
+
+    result = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=cache_dir)
+
+    assert result.diagnostics["cache_misses"] == 1
+    assert result.diagnostics["cache_hits"] == 0
+    assert snowball.raw_cache_path(rec.id, cache_dir).exists()
+
+
+def test_warm_run_returns_same_output_without_extracting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ключевое отличие кэша от курсора: подавляется РАБОТА, не выдача. Тёплый прогон
+    отдаёт ТО ЖЕ, а не пустоту, — поэтому обогащение очереди продолжает течь."""
+    rec = _seed_doc(tmp_path, doc_id="warm-doc", raw_sha="a" * 64, links=[("https://example.org/b", "Doc B")])
+    cache_dir = tmp_path / "snowball_cache"
+    first = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=cache_dir)
+
+    def boom(*a: object, **kw: object) -> list[snowball.RawLink]:
+        raise AssertionError("тёплый кэш не должен извлекать сырьё заново")
+
+    monkeypatch.setattr(snowball, "extract_pdf_annotation_links", boom)
+    monkeypatch.setattr(snowball, "extract_printed_urls", boom)
+    second = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=cache_dir)
+
+    assert second.diagnostics["cache_hits"] == 1
+    assert [c.raw_hash for c in second.candidates] == [c.raw_hash for c in first.candidates]
+
+
+def test_changed_doc_md_invalidates_only_its_own_cache_entry(tmp_path: Path) -> None:
+    data = valid_record() | {"id": "invalidate-doc", "entity_id": "me", "track": "target-entity"}
+    rec = schema.SourceRecord.model_validate(data)
+    other = _seed_doc(tmp_path, doc_id="untouched-doc", raw_sha="b" * 64, links=[("https://example.org/x", "X")])
+    raw_bytes = _pdf_with_link("https://example.org/c", "Doc C")
+    write_doc(tmp_path, data, raw=raw_bytes, md="version one", state={"sha256": "a" * 64})
+    cache_dir = tmp_path / "snowball_cache"
+    discover_snowball(config=_config(), root=tmp_path, records=[rec, other], cache_dir=cache_dir)
+
+    write_doc(tmp_path, data, raw=raw_bytes, md="version TWO, changed", state={"sha256": "a" * 64})
+    second = discover_snowball(config=_config(), root=tmp_path, records=[rec, other], cache_dir=cache_dir)
+
+    assert second.diagnostics["cache_misses"] == 1  # только изменившийся
+    assert second.diagnostics["cache_hits"] == 1
+
+
+def test_mapping_change_reaches_queue_on_warm_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Кэшируется ДОБЫЧА, никогда маппинг: правка ``map_link`` доезжает до всей очереди
+    следующим прогоном на тёплом кэше, без бампа версий и миграций. Это же снимает нужду
+    в ``Connector.version``, обязательном при кэшировании результата."""
+    rec = _seed_doc(tmp_path, doc_id="mapping-doc", raw_sha="a" * 64, links=[("https://example.org/m", "Doc M")])
+    cache_dir = tmp_path / "snowball_cache"
+    discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=cache_dir)
+
+    real_map = snowball.map_link
+
+    def patched_map(link: snowball.RawLink, **kw: object) -> schema.CandidateRecord:
+        cand = real_map(link, **kw)  # type: ignore[arg-type]
+        cand.native_tags = [*(cand.native_tags or []), "new-mapping-field"]
+        return cand
+
+    monkeypatch.setattr(snowball, "map_link", patched_map)
+    second = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=cache_dir)
+
+    assert second.diagnostics["cache_hits"] == 1  # сырьё из кэша...
+    assert "new-mapping-field" in (second.candidates[0].native_tags or [])  # ...маппинг свежий
+
+
+def test_emit_toggle_invalidates_cache(tmp_path: Path) -> None:
+    """``emit`` управляет ДОБЫЧЕЙ, поэтому входит в ключ кэша наравне с fingerprint: иначе
+    прогон с выключенным каналом записал бы обеднённое сырьё, а следующий с включённым
+    тихо отдал бы его же."""
+    rec = _seed_doc(tmp_path, doc_id="emit-doc", raw_sha="a" * 64, links=[("https://example.org/e", "Doc E")])
+    cache_dir = tmp_path / "snowball_cache"
+    cfg_off = SnowballConfig(
+        enabled=True,
+        source_filter=_PERMISSIVE_FILTER,
+        url_filter=_PERMISSIVE_URL_FILTER,
+        emit=EmitConfig(pdf_annotations=False, html_hrefs=True, printed_urls=True, text_citations=False),
+        citations_model="test/model",
+        citations_model_fallback=None,
+    )
+
+    off = discover_snowball(config=cfg_off, root=tmp_path, records=[rec], cache_dir=cache_dir)
+    on = discover_snowball(config=_config(), root=tmp_path, records=[rec], cache_dir=cache_dir)
+
+    assert off.candidates == []
+    assert on.diagnostics["cache_misses"] == 1  # смена канала — не попадание в кэш
+    assert len(on.candidates) == 1

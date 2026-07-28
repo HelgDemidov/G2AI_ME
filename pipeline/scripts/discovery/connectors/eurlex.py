@@ -2,8 +2,8 @@
 
 Spec `docs/pipeline/discovery/tech_specs/discovery-eurlex/spec.md`. Второй экземпляр
 архетипа `registry` после AGORA — и первый, где источник живой запрашиваемый индекс
-(SPARQL), а не одноразовый bulk-дамп: без DuckDB/registry_store (§2 спека), курсор —
-множество виденных CELEX, а не version-гейт (§4). Регистрируется в ядре при импорте
+(SPARQL), а не одноразовый bulk-дамп: без DuckDB/registry_store (§2 спека).
+Регистрируется в ядре при импорте
 (см. ``discovery/connectors/__init__.py``).
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ import yaml
 from core import schema
 from core.env import REPO_ROOT
 from discovery import registry
-from discovery.base import ConnectorCursor, DiscoverResult
+from discovery.base import DiscoverResult
 
 CONFIG_PATH = REPO_ROOT / "pipeline" / "config" / "discovery_eurlex.yaml"
 CONNECTOR_ID = "eurlex"
@@ -89,24 +89,6 @@ def fetch_sparql(query: str, *, endpoint: str, timeout: float) -> dict[str, Any]
         print(f"попытка {attempt}/{total_attempts} через {delay:.0f}s: {reason}", file=sys.stderr)
         time.sleep(delay)
     raise RuntimeError(f"EUR-Lex SPARQL: исчерпаны попытки ({total_attempts}) — {reason}")
-
-
-# --- §4: курсор — множество виденных CELEX (не version-гейт, как у AGORA) ---
-
-
-def diff_cursor(
-    all_ids: list[str], cursor: ConnectorCursor | None
-) -> tuple[set[str], ConnectorCursor]:
-    """Новые (не виденные) id + новый курсор = объединение старых и текущих (спек §4).
-
-    Работает на голых CELEX-строках, не на ``CandidateRecord`` — идемпотентность курсора
-    не зависит от формы маппинга. Множество СТРОГО растёт (никогда не уменьшается) —
-    правка/исчезновение работы в живом индексе не выбрасывает её CELEX из seen (§Вне скоупа).
-    """
-    seen = set((cursor or {}).get("seen_celex") or [])
-    fresh_ids = {i for i in all_ids if i not in seen}
-    new_seen = sorted(seen | set(all_ids))
-    return fresh_ids, {"seen_celex": new_seen}
 
 
 # --- производный язык: единый источник — expression_language конфига ---
@@ -320,8 +302,12 @@ def _map_group(
         return None
 
     source_url = _build_source_url(celex, iso_lang)
+    # sorted — как и concept_names ниже: CELLAR не гарантирует порядок строк ответа, а
+    # авторы (комитеты) приходят отдельными строками и склеиваются в ОДНУ строку issuer,
+    # которая входит в raw_hash. Без сортировки два запроса подряд дают у многоавторских
+    # актов разный issuer и разный raw_hash (замер 2026-07-28: 7 из 307 живьём).
     authors: list[str] = entry.get("authors") or []
-    issuer = " / ".join(authors) if authors else None
+    issuer = " / ".join(sorted(authors)) if authors else None
     doc_date = _decode_date(entry.get("date"))
     concepts: set[str] = entry.get("concepts") or set()
     concept_names = sorted(concept_label(c) for c in concepts)
@@ -386,13 +372,13 @@ def map_rows_to_candidates(
 
 
 def discover_eurlex(
-    cursor: ConnectorCursor | None,
     *,
     config: EurlexConfig | None = None,
     fetch: Callable[..., dict[str, Any]] = fetch_sparql,
 ) -> DiscoverResult:
     """``Connector.discover()`` для EUR-Lex (спек §3/§4): построить запрос -> выполнить
-    -> распарсить -> сгруппировать+замаппить -> отфильтровать по seen-CELEX-курсору.
+    -> распарсить -> сгруппировать+замаппить. Отдаёт ПОЛНЫЙ текущий вид индекса; «что
+    здесь новое» решает кросс-коннекторный ``dedup`` оркестратора.
     ``fetch`` инжектируем — тесты подменяют фейком, сеть в CI не участвует."""
     cfg = config or load_config()
     iso_lang = resolve_iso_language(cfg.expression_language)
@@ -401,18 +387,11 @@ def discover_eurlex(
     rows = parse_bindings(sparql_json)
     candidates, skipped = map_rows_to_candidates(rows, iso_lang=iso_lang)
 
-    all_ids = [c.native_id for c in candidates if c.native_id]
-    fresh_ids, new_cursor = diff_cursor(all_ids, cursor)
-    fresh = [c for c in candidates if c.native_id in fresh_ids]
-
-    status = "no_new" if cursor is not None and not fresh else "fetched"
     diagnostics = {
-        "status": status,
         "found": len(candidates),
-        "fresh": len(fresh),
         "skipped_no_title": skipped,
     }
-    return DiscoverResult(candidates=fresh, cursor=new_cursor, diagnostics=diagnostics)
+    return DiscoverResult(candidates=candidates, diagnostics=diagnostics)
 
 
 @dataclass
@@ -425,8 +404,8 @@ class EurlexConnector:
     kind: schema.ConnectorKind = schema.ConnectorKind.registry
     enabled: bool = True
 
-    def discover(self, cursor: ConnectorCursor | None) -> DiscoverResult:
-        return discover_eurlex(cursor)
+    def discover(self) -> DiscoverResult:
+        return discover_eurlex()
 
 
 # Регистрация при импорте (чартер §4.3 «манифест», спек §6): `enabled` — из конфига,
