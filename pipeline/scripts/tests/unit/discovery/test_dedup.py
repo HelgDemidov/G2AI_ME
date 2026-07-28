@@ -2,10 +2,18 @@
 (spec discovery-core §3)."""
 from __future__ import annotations
 
+import ast
 import datetime as dt
 
 from core import schema
-from discovery.dedup import dedup, format_hint_from_url, normalize_url, normalized_title
+from core.env import REPO_ROOT
+from discovery.dedup import (
+    _MERGE_EXEMPT,
+    dedup,
+    format_hint_from_url,
+    normalize_url,
+    normalized_title,
+)
 
 
 def _candidate(**overrides: object) -> schema.CandidateRecord:
@@ -165,7 +173,7 @@ def test_dedup_rejected_existing_not_resurrected() -> None:
     assert rejected.rejected_reason == "вне обеих осей"  # неприкосновенно
 
 
-def test_dedup_never_overwrites_existing_fields() -> None:
+def test_dedup_foreign_source_never_overwrites_existing_fields() -> None:
     existing_cand = _candidate(raw_hash="ha", title="Original Title", issuer="Gov")
     dup = _candidate(
         connector_id="search:test",
@@ -382,3 +390,147 @@ def test_source_identity_is_not_a_fallback_for_missed_url() -> None:
 
     assert outcome.fresh == [second_link]
     assert second_link.source_url == "https://b.example/two.pdf"
+
+
+# --- слияние по отношению источников (spec candidate-identity-hardening §3) ---
+
+
+def test_merge_own_source_updates_what_it_produced() -> None:
+    """Переобнаружение своим источником авторитетнее прежнего снимка: обновляется всё,
+    что источник произвёл, включая ПОНИЖЕНИЕ доверия к адресу."""
+    existing_cand = _candidate(
+        connector_id="oecd", raw_hash="ha", native_id="42",
+        title="Draft strategy", issuer="Gov", doc_date=dt.date(2026, 1, 1),
+        source_url="https://oecd.example/doc", url_provenance="stated",
+        native_summary="old abstract",
+    )
+    refreshed = _candidate(
+        connector_id="oecd", raw_hash="hb", native_id="42",
+        title="Draft strategy", issuer="Gov", doc_date=dt.date(2026, 1, 1),
+        source_url="https://oecd.example/doc", url_provenance="suspect",
+        native_summary="new abstract",
+    )
+
+    dedup([refreshed], existing=[existing_cand])
+
+    assert existing_cand.native_summary == "new abstract"
+    assert existing_cand.url_provenance is schema.UrlProvenance.suspect
+
+
+def test_merge_foreign_source_fills_empty_only() -> None:
+    existing_cand = _candidate(
+        connector_id="oecd", raw_hash="ha",
+        title="Doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
+        native_summary="own abstract", language=None,
+    )
+    other = _candidate(
+        connector_id="agora", raw_hash="hb",
+        title="doc", issuer="Gov", doc_date=dt.date(2026, 1, 1),
+        native_summary="foreign abstract", language="en",
+    )
+
+    dedup([other], existing=[existing_cand])
+
+    assert existing_cand.native_summary == "own abstract"  # заполненное не переписывается
+    assert existing_cand.language == "en"  # пустое заполняется
+    assert existing_cand.merged_connector_ids == ["agora"]  # type: ignore[attr-defined]
+
+
+def test_merge_own_source_does_not_erase_field_it_stopped_producing() -> None:
+    """``None`` у дубля означает «источник этого не сказал», а не «значения нет»."""
+    existing_cand = _candidate(
+        connector_id="oecd", raw_hash="ha", native_id="42", matched_query="ai strategy"
+    )
+    quiet = _candidate(connector_id="oecd", raw_hash="hb", native_id="42")
+
+    dedup([quiet], existing=[existing_cand])
+
+    assert existing_cand.matched_query == "ai strategy"
+
+
+def test_merge_never_carries_curated_state_from_dup() -> None:
+    """``_MERGE_EXEMPT``: без него дубль с ``rejected_reason`` пометил бы поглотителя
+    отклонённым (найдено property-тестом). В проде такой вход сегодня невозможен —
+    правило обязано держаться и на входе, который так не выглядит."""
+    existing_cand = _candidate(connector_id="oecd", raw_hash="ha", native_id="42")
+    poisoned = _candidate(
+        connector_id="oecd", raw_hash="hb", native_id="42",
+        rejected_reason="вне обеих осей", rejected_kind="unacquirable",
+        admitted_as="me-other-doc-2026", probe_finding="blocked: WAF",
+    )
+
+    dedup([poisoned], existing=[existing_cand])
+
+    assert existing_cand.rejected_reason is None
+    assert existing_cand.rejected_kind is None
+    assert existing_cand.admitted_as is None
+    assert existing_cand.probe_finding is None
+    assert existing_cand.raw_hash == "ha"  # идентичность записи тоже неприкосновенна
+
+
+def test_merge_own_source_move_keeps_previous_address() -> None:
+    """Свой источник перенёс документ: новый адрес становится основным, прежний уходит
+    в ``alternate_source_urls`` — вытесняемый адрес не теряется ни в одном направлении."""
+    existing_cand = _candidate(
+        connector_id="oecd", raw_hash="ha", native_id="42",
+        title="Doc", issuer="Gov", source_url="https://old.example/doc",
+    )
+    moved = _candidate(
+        connector_id="oecd", raw_hash="hb", native_id="42",
+        title="Doc", issuer="Gov", source_url="https://new.example/doc",
+    )
+
+    dedup([moved], existing=[existing_cand])
+
+    assert existing_cand.source_url == "https://new.example/doc"
+    assert existing_cand.alternate_source_urls == ["https://old.example/doc"]  # type: ignore[attr-defined]
+
+
+def test_merge_filling_empty_url_is_not_an_alternate() -> None:
+    """Поглотитель без адреса: поле просто заполняется, вытеснять нечего."""
+    existing_cand = _candidate(
+        connector_id="oecd", raw_hash="ha", title="Doc", issuer="Gov", source_url=None
+    )
+    with_url = _candidate(
+        connector_id="agora", raw_hash="hb", title="doc", issuer="Gov",
+        source_url="https://found.example/doc",
+    )
+
+    dedup([with_url], existing=[existing_cand])
+
+    assert existing_cand.source_url == "https://found.example/doc"
+    assert getattr(existing_cand, "alternate_source_urls", None) is None
+
+
+def test_dedup_exempt_matches_unproduced_fields() -> None:
+    """AST-гейт: поле ``CandidateRecord``, которого не выставляет НИ ОДИН производитель
+    кандидатов, ОБЯЗАНО быть в ``_MERGE_EXEMPT``.
+
+    Иначе слияние протащило бы курируемое/машинное состояние из дубля в поглотителя, и
+    заметить это можно было бы только на боевых данных. Список — то, чего этот слой в
+    остальном избегает (природа поля из типа не выводится), поэтому его состав проверяется
+    гейтом, а не дисциплиной."""
+    sources = [REPO_ROOT / "pipeline" / "scripts" / "discovery" / "manual.py"]
+    connectors_dir = REPO_ROOT / "pipeline" / "scripts" / "discovery" / "connectors"
+    sources += sorted(p for p in connectors_dir.glob("*.py") if p.name != "__init__.py")
+
+    produced: set[str] = set()
+    for path in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name == "CandidateRecord":
+                produced.update(kw.arg for kw in node.keywords if kw.arg)
+            elif name == "model_validate" and node.args and isinstance(node.args[0], ast.Dict):
+                for key in node.args[0].keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        produced.add(key.value)
+
+    assert "title" in produced and "source_url" in produced  # AST-сборка вообще сработала
+    unproduced = set(schema.CandidateRecord.model_fields) - produced
+    assert unproduced <= set(_MERGE_EXEMPT), (
+        f"поля без производителя, не защищённые _MERGE_EXEMPT: {sorted(unproduced - set(_MERGE_EXEMPT))}"
+    )

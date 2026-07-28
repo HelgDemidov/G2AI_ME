@@ -130,8 +130,14 @@ def test_inject_mirror_absorbed_by_strategy_two_reports_real_absorber_and_reason
     поглощён стратегией 2 (issuer+title+date), а НЕ по URL-паре — старый код искал
     поглотителя ТОЛЬКО по ``(normalized_url, supersedes)``, находил ``None`` и
     возвращал СВЕЖЕГО кандидата; куратор видел «уже есть» без причины отказа, даже
-    не узнавая, что попал в отклонённого. URL зеркала при этом должен осесть в
-    ``alternate_source_urls`` поглотителя (Г4 — не теряться нигде)."""
+    не узнавая, что попал в отклонённого.
+
+    Оба inject идут КАНАЛОМ ``manual``, то есть «свой источник» (spec candidate-identity-
+    hardening §3): куратор только что назвал рабочее зеркало, оно и становится адресом
+    кандидата, а заблокированный первоисточник уходит в ``alternate_source_urls`` — не
+    теряется нигде (Г4). Побочно это чинит недобываемого по-настоящему: популяция (c)
+    recheck пробует ``source_url``, и теперь она пробует живой адрес, а не тот, о который
+    уже разбилась лестница."""
     manual.inject(
         url="https://blocked.gov/law.pdf", title="Registration Law",
         issuer="Ministry", language="en", date=dt.date(2026, 1, 1), root=tmp_path,
@@ -150,7 +156,9 @@ def test_inject_mirror_absorbed_by_strategy_two_reports_real_absorber_and_reason
     assert mirror_cand.rejected_reason == "WAF blocks every rung"  # реальный поглотитель, не свежий
     assert mirror_cand.raw_hash == all_cands[0].raw_hash
     absorber = store.load(tmp_path)[0]
-    assert absorber.alternate_source_urls == ["https://mirror.example.org/law.pdf"]  # type: ignore[attr-defined]
+    assert absorber.source_url == "https://mirror.example.org/law.pdf"
+    assert absorber.alternate_source_urls == ["https://blocked.gov/law.pdf"]  # type: ignore[attr-defined]
+    assert absorber.rejected_kind is schema.RejectionKind.unacquirable  # отказ не тронут
 
 
 # --- pending_candidates / render_worksheet (spec §3) ---

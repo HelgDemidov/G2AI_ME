@@ -172,32 +172,62 @@ class _PoolIndex:
         return None
 
 
-def _merge_provenance(existing: CandidateRecord, dup: CandidateRecord) -> None:
-    """Дописать provenance поглощённого дубля в existing — НИКОГДА не перезаписывая его поля.
+_MERGE_EXEMPT = (
+    # идентичность самой записи-кандидата — переносить её значит подменить запись
+    "raw_hash",
+    "retrieved_at",
+    "connector_id",
+    # курируемое/машинное состояние, которого не выставляет НИ ОДИН производитель
+    # кандидатов; сторожится AST-гейтом test_dedup_exempt_matches_unproduced_fields
+    "admitted_as",
+    "rejected_reason",
+    "rejected_kind",
+    "probe_checked",
+    "probe_finding",
+)
 
-    ``alternate_source_urls`` (spec discovery-acquire-seam-hardening §5, Г4): если
-    URL дубля расходится (после нормализации) с URL поглотителя, он копится в
-    extra-поле-списке поглотителя (``extra="allow"`` уже позволяет; дедуп внутри
-    списка). Стратегия 2 (issuer+title+date) МОЖЕТ поглотить
-    кандидата с другим URL — живой сценарий: зеркало WAF-заблокированного
-    первоисточника (тот же документ, официальный alt-хост/национальный портал). До
-    этого спека такой URL терялся НИГДЕ — тупик ровно на популяции (c), ради
-    которой ``rejected_kind: unacquirable`` существует."""
+
+def _merge_provenance(existing: CandidateRecord, dup: CandidateRecord) -> None:
+    """Донести до поглотителя то, что источник узнал о документе заново.
+
+    Правило — про ОТНОШЕНИЕ источников, а не про перечень полей (его не приходится
+    править при добавлении поля в схему):
+
+    * свой источник (``connector_id`` совпал) ОБНОВЛЯЕТ произведённое им — переобнаружение
+      реестром авторитетнее прежнего снимка, включая понижение доверия
+      (``url_provenance: stated -> suspect``);
+    * чужой источник ЗАПОЛНЯЕТ только пустое;
+    * ``_MERGE_EXEMPT`` неприкосновенно в обоих случаях.
+
+    ``alternate_source_urls`` (spec discovery-acquire-seam-hardening §5, Г4): расходящийся
+    адрес копится в extra-поле-списке поглотителя (``extra="allow"`` уже позволяет; дедуп
+    внутри списка) — иначе зеркало WAF-заблокированного первоисточника терялось бы нигде,
+    тупик ровно на популяции (c), ради которой ``rejected_kind: unacquirable`` существует.
+    Копится ВЫТЕСНЯЕМЫЙ адрес: у чужого источника это его собственный (у поглотителя свой
+    остаётся), у своего — прежний адрес поглотителя, который сейчас будет переписан.
+    """
     merged: list[str] = list(getattr(existing, "merged_connector_ids", None) or [])
-    if dup.connector_id != existing.connector_id and dup.connector_id not in merged:
+    same_source = dup.connector_id == existing.connector_id
+    if not same_source and dup.connector_id not in merged:
         merged.append(dup.connector_id)
         existing.merged_connector_ids = merged  # type: ignore[attr-defined]  # extra="allow"
 
-    if dup.source_url:
-        dup_normalized = normalize_url(dup.source_url)
-        existing_normalized = (
-            normalize_url(existing.source_url) if existing.source_url else None
-        )
-        if dup_normalized != existing_normalized:
+    if dup.source_url and existing.source_url:
+        if normalize_url(dup.source_url) != normalize_url(existing.source_url):
+            displaced = existing.source_url if same_source else dup.source_url
             alternates: list[str] = list(getattr(existing, "alternate_source_urls", None) or [])
-            if dup.source_url not in alternates:
-                alternates.append(dup.source_url)
+            if displaced not in alternates:
+                alternates.append(displaced)
                 existing.alternate_source_urls = alternates  # type: ignore[attr-defined]  # extra="allow"
+
+    for name in type(dup).model_fields:
+        if name in _MERGE_EXEMPT:
+            continue
+        value = getattr(dup, name, None)
+        if value is None:
+            continue
+        if same_source or getattr(existing, name, None) is None:
+            setattr(existing, name, value)
 
 
 @dataclass(frozen=True)
