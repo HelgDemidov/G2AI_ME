@@ -88,25 +88,8 @@ class SnowballConfig:
     source_filter: SourceFilter
     url_filter: UrlFilter
     emit: EmitConfig
-    max_candidates: int | None
     citations_model: str
     citations_model_fallback: str | None
-
-
-def _validate_max_candidates(value: Any) -> int | None:
-    """Sanity-чек `max_candidates` (спек §3): ``None`` — без капа; иначе целое >= 0.
-
-    Отклоняет отрицательные/нецелые/строковые значения ДО старта майнинга (fail-fast
-    в конфиге, не на середине прогона) — ``bool`` явно исключён (``isinstance(True, int)``
-    истинно в Python, но булево значение здесь не осмысленно как кап).
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"max_candidates: ожидалось целое >= 0 или null, получено {value!r}")
-    if value < 0:
-        raise ValueError(f"max_candidates: ожидалось целое >= 0, получено {value!r}")
-    return value
 
 
 def _tuple_of_str(raw: dict[str, Any], key: str) -> tuple[str, ...]:
@@ -138,7 +121,6 @@ def load_config(path: Path = CONFIG_PATH) -> SnowballConfig:
             printed_urls=bool(emit_raw.get("printed_urls", True)),
             text_citations=bool(emit_raw.get("text_citations", False)),
         ),
-        max_candidates=_validate_max_candidates(raw.get("max_candidates")),
         citations_model=str(raw["citations_model"]),
         citations_model_fallback=(
             str(raw["citations_model_fallback"]) if raw.get("citations_model_fallback") else None
@@ -466,7 +448,6 @@ def map_link(
         connector_id=CONNECTOR_ID,
         retrieved_at=dt.date.today(),
         raw_hash=raw_hash,
-        normalized_url=normalized,
         native_format_hint=format_hint_from_url(link.url),
     )
 
@@ -694,7 +675,7 @@ def extract_text_citations(
 ) -> tuple[list[RawLink], list[CitationLead]]:
     """LLM-стадия текстовых цитат без URL (спек §5, opt-in). Возвращает
     ``(URL-несущие находки как RawLink, лиды без URL)`` — URL-находки идут ДАЛЬШЕ по
-    общему пути §4 (self-link/url_filter/max_candidates/маппинг), не спецкейсятся.
+    общему пути §4 (self-link/url_filter/маппинг), не спецкейсятся.
 
     ``call_model`` — инжектируемый транспорт (тесты подставляют фейк; продакшен —
     partial вокруг ``core.openrouter.chat_request`` с живым ``OPENROUTER_API_KEY``,
@@ -815,9 +796,8 @@ def discover_snowball(
     для каждого НЕизменившегося (по курсору) — скип; иначе прогнать включённые
     экстракторы (§2, + §5 LLM-стадия цитат, если ``emit.text_citations`` и документ не
     ``confidential``) -> отсеять самоссылки/уже-в-корпусе/url_filter -> замаппить ->
-    применить ``max_candidates`` (если задан) -> обновить курсор ТОЛЬКО для документов,
-    чьи находки не были урезаны капом (спек §3: недомайненный хвост добирается
-    следующим прогоном).
+    обновить курсор. Ширина прогона задаётся ДОКУМЕНТАМИ (``source_filter``/CLI
+    ``--doc``/``--track``), а не потолком числа находок.
 
     ``records`` — инжектируемый список документов корпуса (тесты подставляют фикстуры;
     по умолчанию читается с диска, как у остальных потребителей ``schema.load_records``).
@@ -835,12 +815,9 @@ def discover_snowball(
     all_leads: list[CitationLead] = []
     docs_scanned = 0
     docs_skipped_cursor = 0
-    truncated_docs = 0
-    truncated_candidates = 0
     filtered_self_or_corpus = 0
     filtered_by_url_filter = 0
     per_extractor = {"pdf_annotations": 0, "html_hrefs": 0, "printed_urls": 0, "text_citations": 0}
-    cap_remaining = cfg.max_candidates
 
     for rec in filtered:
         raw_path = schema.raw_file(rec, root)
@@ -893,24 +870,8 @@ def discover_snowball(
                 map_link(link, source_record=rec, location_kind=kind, vocab_terms=vocab_terms)
             )
 
-        doc_truncated = False
-        if cap_remaining is not None and len(doc_candidates) > cap_remaining:
-            truncated_candidates += len(doc_candidates) - cap_remaining
-            doc_candidates = doc_candidates[:cap_remaining]
-            doc_truncated = True
-            cap_remaining = 0
-        elif cap_remaining is not None:
-            cap_remaining -= len(doc_candidates)
-
         candidates.extend(doc_candidates)
-
-        if doc_truncated:
-            truncated_docs += 1  # НЕ обновляем mined_after[rec.id] — хвост добирает следующий прогон
-        else:
-            mined_after[rec.id] = fingerprint
-
-        if cap_remaining is not None and cap_remaining <= 0:
-            break  # остальные документы этот прогон не трогает вовсе (курсор их не помнит)
+        mined_after[rec.id] = fingerprint
 
     status = "no_new" if cursor is not None and not candidates else "fetched"
     diagnostics: dict[str, Any] = {
@@ -922,8 +883,6 @@ def discover_snowball(
         "filtered_self_or_corpus": filtered_self_or_corpus,
         "filtered_by_url_filter": filtered_by_url_filter,
         "per_extractor": dict(per_extractor),
-        "truncated_docs": truncated_docs,
-        "truncated_candidates": truncated_candidates,
         # §5: лиды (цитаты без URL) — сериализуемые dict, не dataclass (диагностика
         # должна пройти через ConnectorRunSummary как plain data, см. orchestrate.py).
         "leads": [

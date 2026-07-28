@@ -249,12 +249,12 @@ def test_promote_without_supersedes_keeps_relations_untouched() -> None:
     assert rec.relations == []
 
 
-# --- pending/worksheet: реконсиляция по паре (url, supersedes) ------------------------
+# --- pending/worksheet: реконсиляция по штампу допуска --------------------------------
 
 
 def test_edition_stays_pending_while_only_predecessor_is_registered(tmp_path: Path) -> None:
-    """Ядро фикса: совпадение URL с ПРЕДШЕСТВЕННИКОМ не гасит редакцию — иначе она
-    никогда не попала бы в worksheet и штатный триаж редакций был бы невозможен."""
+    """Ядро фикса: промоушен ПРЕДШЕСТВЕННИКА не гасит редакцию — иначе она никогда не
+    попала бы в worksheet и штатный триаж редакций был бы невозможен."""
     predecessor = _predecessor(tmp_path)
     edition = _candidate(supersedes=predecessor.id)
 
@@ -262,23 +262,13 @@ def test_edition_stays_pending_while_only_predecessor_is_registered(tmp_path: Pa
 
 
 def test_edition_gasnet_after_its_own_promotion(tmp_path: Path) -> None:
-    """Редакция перестаёт быть ждущей, когда промоутнута ОНА САМА (её ребро в реестре)."""
+    """Редакция перестаёт быть ждущей, когда промоутнута ОНА САМА — по СВОЕМУ штампу,
+    а не по URL, общему с предшественником (spec candidate-identity-hardening §1)."""
     predecessor = _predecessor(tmp_path)
-    edition = _candidate(supersedes=predecessor.id)
-    promoted_edition = _promote(edition)
+    promoted_edition = _promote(_candidate(supersedes=predecessor.id))
+    edition = _candidate(supersedes=predecessor.id, admitted_as=promoted_edition.id)
 
-    pending = manual.pending_candidates([edition], [predecessor, promoted_edition])
-
-    assert pending == []
-
-
-def test_plain_rediscovery_of_registered_url_is_not_pending(tmp_path: Path) -> None:
-    """Обычное пере-обнаружение того же URL (без supersedes) по-прежнему гасится —
-    регрессия исходного поведения реконсиляции."""
-    predecessor = _predecessor(tmp_path)
-    plain = _candidate()
-
-    assert manual.pending_candidates([plain], [predecessor]) == []
+    assert manual.pending_candidates([edition], [predecessor, promoted_edition]) == []
 
 
 def test_edition_of_other_predecessor_stays_pending(tmp_path: Path) -> None:

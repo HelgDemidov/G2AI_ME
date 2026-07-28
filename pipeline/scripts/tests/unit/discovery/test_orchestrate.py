@@ -18,7 +18,7 @@ def _candidate(connector_id: str, ref: str, **overrides: object) -> schema.Candi
         "connector_id": connector_id,
         "retrieved_at": dt.date(2026, 7, 21),
         "raw_hash": ref,
-        "normalized_url": f"https://example.gov/{ref}",
+        "source_url": f"https://example.gov/{ref}",
     }
     fields.update(overrides)
     return schema.CandidateRecord.model_validate(fields)

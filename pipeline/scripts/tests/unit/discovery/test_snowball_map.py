@@ -38,7 +38,6 @@ def test_map_link_pdf_fields() -> None:
     assert "domain: ai.gov.eg" in cand.native_tags
     assert f"source: {_source_record().id}" in cand.native_tags
     assert cand.connector_id == "snowball"
-    assert cand.normalized_url is not None
 
 
 def test_map_link_html_and_md_native_id_forms() -> None:

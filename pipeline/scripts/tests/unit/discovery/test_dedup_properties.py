@@ -1,9 +1,9 @@
 """Property-тесты индексного dedup против независимого наивного оракула
 (spec discovery-candidates-sharding §4; hypothesis — общепроектный стандарт для такого класса).
 
-Прод-реализация схлопнула три линейных скана в три dict-индекса. Эквивалентность
-КАНОНИЧЕСКОЙ семантике (строгий приоритет стратегий url -> key -> hash над единым пулом)
-доказывается сравнением с оракулом, живущим В ЭТОМ файле: наивные линейные сканы,
+Прод-реализация схлопнула линейные сканы в dict-индексы. Эквивалентность КАНОНИЧЕСКОЙ
+семантике (строгий приоритет стратегий url -> key -> идентичность в источнике над единым
+пулом) доказывается сравнением с оракулом, живущим В ЭТОМ файле: наивные линейные сканы,
 написанные независимо от прод-кода. Обёртка над самими индексами оракулом быть не может —
 сравнение выродилось бы в тавтологию.
 """
@@ -15,7 +15,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from core import schema
-from discovery.dedup import dedup, normalized_title
+from discovery.dedup import dedup, normalize_url, normalized_title
 
 # --- независимый наивный оракул -------------------------------------------------------
 
@@ -26,18 +26,39 @@ def _oracle_key(cand: schema.CandidateRecord) -> tuple[str, str, str] | None:
     return (cand.issuer, normalized_title(cand.title), str(cand.doc_date))
 
 
+def _oracle_url(cand: schema.CandidateRecord) -> str | None:
+    if cand.url_provenance is schema.UrlProvenance.suspect:
+        return None
+    return normalize_url(cand.source_url) if cand.source_url else None
+
+
+def _oracle_keyless(cand: schema.CandidateRecord) -> bool:
+    return _oracle_url(cand) is None and _oracle_key(cand) is None
+
+
+def _oracle_source(cand: schema.CandidateRecord) -> tuple[str, str, str | None]:
+    return (cand.connector_id, cand.native_id or cand.raw_hash, cand.supersedes)
+
+
 def _oracle_find(
     cand: schema.CandidateRecord, pool: list[schema.CandidateRecord]
 ) -> schema.CandidateRecord | None:
     """Линейные сканы по ЕДИНОМУ пулу в порядке приоритета стратегий."""
-    if cand.normalized_url:
+    url = _oracle_url(cand)
+    if url:
         for other in pool:
-            if other.normalized_url == cand.normalized_url:
+            if _oracle_url(other) == url:
                 return other
     key = _oracle_key(cand)
     if key is not None:
         for other in pool:
             if _oracle_key(other) == key:
+                return other
+    # стратегия 3 — только между бесключевыми, не как фолбэк промаха первых двух
+    if _oracle_keyless(cand):
+        ident = _oracle_source(cand)
+        for other in pool:
+            if _oracle_keyless(other) and _oracle_source(other) == ident:
                 return other
     return None
 
@@ -66,11 +87,15 @@ def _oracle_dedup(
 
 # Крошечные алфавиты — намеренно: цель не «реалистичные данные», а густые коллизии по
 # каждой из трёх стратегий и по нескольким сразу (кросс-стратегийный угол §4).
-_URLS = st.sampled_from([None, "https://a.gov/1", "https://a.gov/2"])
+_URLS = st.sampled_from([None, "https://a.gov/1", "https://A.gov/1/", "https://a.gov/2"])
+_URL_PROVENANCE = st.sampled_from(
+    [None, schema.UrlProvenance.stated, schema.UrlProvenance.suspect]
+)
 _TITLES = st.sampled_from([None, "Doc One", "doc  one!", "Doc Two"])
 _ISSUERS = st.sampled_from([None, "MinDigital", "MinFin"])
 _DATES = st.sampled_from([None, dt.date(2026, 1, 1), dt.date(2026, 2, 2)])
 _CONNECTORS = st.sampled_from(["manual", "agora", "search:wb"])
+_NATIVE_IDS = st.sampled_from([None, "n1", "n2"])
 _REJECTED = st.sampled_from([None, "вне обеих осей"])
 
 
@@ -84,7 +109,9 @@ def _candidate(draw: st.DrawFn, raw_hash: str) -> schema.CandidateRecord:
             "title": draw(_TITLES),
             "issuer": draw(_ISSUERS),
             "doc_date": draw(_DATES),
-            "normalized_url": draw(_URLS),
+            "source_url": draw(_URLS),
+            "url_provenance": draw(_URL_PROVENANCE),
+            "native_id": draw(_NATIVE_IDS),
             "rejected_reason": draw(_REJECTED),
         }
     )
@@ -106,18 +133,6 @@ def _clone(records: list[schema.CandidateRecord]) -> list[schema.CandidateRecord
 
 def _provenance(records: list[schema.CandidateRecord]) -> list[list[str] | None]:
     return [getattr(r, "merged_connector_ids", None) for r in records]
-
-
-def _has_dedup_key(cand: schema.CandidateRecord) -> bool:
-    """Несёт ли кандидат хоть ОДИН из ключей сравнения.
-
-    Кандидат без обоих (ни URL, ни пары issuer+title) не имеет идентичности для dedup
-    и потому не дедуплицируется вовсе — свойство ИСХОДНОГО дизайна (прежний линейный
-    ``_find_match`` возвращал None так же), а не следствие индексации. Пинится тестом
-    в ``test_dedup.py``. Третья стратегия (``content_hash``) снята вместе с полем —
-    писателя у неё не было ни одного (spec triage-intake-hardening §4).
-    """
-    return bool(cand.normalized_url or (cand.title and cand.issuer))
 
 
 @given(pools=_pools())
@@ -172,11 +187,12 @@ def test_dedup_is_idempotent_against_persisted_pool(
     pools: tuple[list[schema.CandidateRecord], list[schema.CandidateRecord]],
 ) -> None:
     """Реконсиляционный инвариант discovery: повторный прогон по уже персистнутому
-    результату поглощает всё, что несёт хоть один ключ сравнения.
+    результату поглощает ВСЁ, без исключений.
 
-    Единственное исключение — кандидат вообще БЕЗ ключей (см. ``_has_dedup_key``): у него
-    нет идентичности, поэтому он честно приходит «свежим» снова. Тест пинит и это (точным
-    равенством, не фильтрацией входа) — свойство видимо, а не замаскировано.
+    Раньше исключением был кандидат без обоих ключей (ни достоверного URL, ни пары
+    issuer+title): идентичности у него не было, и он честно приходил «свежим» каждый
+    прогон. Идентичность записи в источнике (стратегия 3) закрывает этот класс —
+    §23 бэклога.
     """
     existing, new = pools
     prod_existing, prod_new = _clone(existing), _clone(new)
@@ -187,6 +203,5 @@ def test_dedup_is_idempotent_against_persisted_pool(
 
     again = dedup(_clone(fresh), persisted)
 
-    keyless = [c.raw_hash for c in fresh if not _has_dedup_key(c)]
-    assert [c.raw_hash for c in again.fresh] == keyless
-    assert again.absorbed == len(fresh) - len(keyless)
+    assert again.fresh == []
+    assert again.absorbed == len(fresh)

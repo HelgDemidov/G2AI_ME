@@ -411,7 +411,7 @@ def test_hybrid_filter_invalid_source_url_skipped_not_crashed(tmp_path: Path) ->
     assert [c.native_id for c in candidates] == ["2"]
 
 
-def test_hybrid_filter_normalized_url_and_raw_hash_set(tmp_path: Path) -> None:
+def test_hybrid_filter_source_url_and_raw_hash_set(tmp_path: Path) -> None:
     db_path = _build_filter_test_db(
         tmp_path,
         doc_rows=[_doc_row(1, authority="China A", url="https://Ex.org/D/", activity_date="2020-01-01")],
@@ -423,7 +423,7 @@ def test_hybrid_filter_normalized_url_and_raw_hash_set(tmp_path: Path) -> None:
     )
     conn.close()
     cand = candidates[0]
-    assert cand.normalized_url == "https://ex.org/D"  # normalize_url lower-кейсит host, не path
+    assert cand.source_url == "https://Ex.org/D/"  # адрес источника verbatim, ключ считает dedup
     assert len(cand.raw_hash) == 64
 
 

@@ -130,8 +130,14 @@ def test_inject_mirror_absorbed_by_strategy_two_reports_real_absorber_and_reason
     поглощён стратегией 2 (issuer+title+date), а НЕ по URL-паре — старый код искал
     поглотителя ТОЛЬКО по ``(normalized_url, supersedes)``, находил ``None`` и
     возвращал СВЕЖЕГО кандидата; куратор видел «уже есть» без причины отказа, даже
-    не узнавая, что попал в отклонённого. URL зеркала при этом должен осесть в
-    ``alternate_source_urls`` поглотителя (Г4 — не теряться нигде)."""
+    не узнавая, что попал в отклонённого.
+
+    Оба inject идут КАНАЛОМ ``manual``, то есть «свой источник» (spec candidate-identity-
+    hardening §3): куратор только что назвал рабочее зеркало, оно и становится адресом
+    кандидата, а заблокированный первоисточник уходит в ``alternate_source_urls`` — не
+    теряется нигде (Г4). Побочно это чинит недобываемого по-настоящему: популяция (c)
+    recheck пробует ``source_url``, и теперь она пробует живой адрес, а не тот, о который
+    уже разбилась лестница."""
     manual.inject(
         url="https://blocked.gov/law.pdf", title="Registration Law",
         issuer="Ministry", language="en", date=dt.date(2026, 1, 1), root=tmp_path,
@@ -150,7 +156,9 @@ def test_inject_mirror_absorbed_by_strategy_two_reports_real_absorber_and_reason
     assert mirror_cand.rejected_reason == "WAF blocks every rung"  # реальный поглотитель, не свежий
     assert mirror_cand.raw_hash == all_cands[0].raw_hash
     absorber = store.load(tmp_path)[0]
-    assert absorber.alternate_source_urls == ["https://mirror.example.org/law.pdf"]  # type: ignore[attr-defined]
+    assert absorber.source_url == "https://mirror.example.org/law.pdf"
+    assert absorber.alternate_source_urls == ["https://blocked.gov/law.pdf"]  # type: ignore[attr-defined]
+    assert absorber.rejected_kind is schema.RejectionKind.unacquirable  # отказ не тронут
 
 
 # --- pending_candidates / render_worksheet (spec §3) ---
@@ -180,43 +188,47 @@ def test_pending_candidates_excludes_rejected() -> None:
     assert manual.pending_candidates([cand], []) == []
 
 
-def test_pending_candidates_excludes_already_registered_by_url() -> None:
-    cand = _candidate(
-        normalized_url="https://gov.example.org/a.pdf",
-        source_url="https://gov.example.org/a.pdf",
-    )
-    rec_data = valid_record()
-    rec_data["source_url"] = "https://gov.example.org/a.pdf"
-    rec = schema.SourceRecord.model_validate(rec_data)
+def _record(**overrides: object) -> schema.SourceRecord:
+    data = valid_record()
+    data.update(overrides)
+    return schema.SourceRecord.model_validate(data)
+
+
+def test_pending_candidates_excludes_admitted_by_doc_id() -> None:
+    rec = _record()
+    cand = _candidate(admitted_as=rec.id)
     assert manual.pending_candidates([cand], [rec]) == []
 
 
-def test_pending_candidates_normalizes_url_before_comparing() -> None:
-    cand = _candidate(source_url="http://gov.example.org/a.pdf/", normalized_url=None)
-    rec_data = valid_record()
-    rec_data["source_url"] = "https://gov.example.org/a.pdf"  # https, без trailing slash
-    rec = schema.SourceRecord.model_validate(rec_data)
-    assert manual.pending_candidates([cand], [rec]) == []
+def test_pending_candidates_url_match_alone_does_not_hide() -> None:
+    """spec candidate-identity-hardening §1: реконсиляция идёт ПО ШТАМПУ, не по адресу.
+
+    Осознанная смена семантики: раньше кандидат гасился совпадением ``source_url`` с
+    любой записью реестра. Теперь совпадение адреса само по себе ничего не значит —
+    гасит только собственный промоушен. Замер на боевом store: расхождение затрагивало
+    ровно 6 кандидатов, и все шесть были теми самыми промоутнутыми (§5 спека штампует
+    их разово).
+    """
+    rec = _record(source_url="https://gov.example.org/a.pdf")
+    cand = _candidate(source_url="https://gov.example.org/a.pdf")
+    assert manual.pending_candidates([cand], [rec]) == [cand]
 
 
-def test_pending_candidates_without_url_stays_pending() -> None:
-    """Безопасный дефолт: чего не можем уверенно сопоставить с реестром по URL — не
-    прячем от куратора."""
-    cand = _candidate(source_url=None, normalized_url=None)
+def test_pending_candidates_stale_stamp_returns_candidate() -> None:
+    """Самовосстановление: удалили папку документа (документированный путь исправления
+    ошибки допуска) -> id исчез из реестра -> кандидат вернулся в очередь."""
+    cand = _candidate(admitted_as="me-deleted-doc-2026")
     assert manual.pending_candidates([cand], []) == [cand]
 
 
-def test_registered_pairs_public_and_includes_supersedes_edge() -> None:
-    """spec discovery-acquire-seam-hardening §4: ``registered_pairs`` — публичное имя
-    (было ``_registered_pairs``), общий примитив реконсиляции обеих очередей слоя
-    кандидатов (``pending_candidates`` и ``unacquirable_candidates``)."""
-    rec_data = valid_record()
-    rec_data["source_url"] = "https://gov.example.org/a.pdf"
-    rec_data["relations"] = [{"type": "supersedes", "target": "me-old-law-2024"}]
-    rec = schema.SourceRecord.model_validate(rec_data)
-    pairs = manual.registered_pairs([rec])
-    assert ("https://gov.example.org/a.pdf", None) in pairs
-    assert ("https://gov.example.org/a.pdf", "me-old-law-2024") in pairs
+def test_admitted_ids_is_shared_reconciliation_primitive() -> None:
+    """``admitted_ids`` — публичный примитив, общий для ОБЕИХ очередей слоя: расхождения
+    двух копий реконсиляции (класс дефекта, чиненный PR #54) физически негде завести."""
+    rec = _record()
+    assert manual.admitted_ids([rec]) == {rec.id}
+    admitted = _candidate(admitted_as=rec.id, rejected_kind="unacquirable", rejected_reason="WAF")
+    assert manual.pending_candidates([admitted], [rec]) == []
+    assert manual.unacquirable_candidates([admitted], [rec]) == []
 
 
 def test_render_worksheet_includes_header_and_row() -> None:
@@ -486,14 +498,18 @@ def test_apply_admit_creates_meta_yaml_at_correct_path(tmp_path: Path) -> None:
     assert len(records) == 1 and records[0].id == "me-example-strategy-2026"
 
 
-def test_apply_admit_does_not_touch_candidate_in_store(tmp_path: Path) -> None:
+def test_apply_admit_stamps_candidate_with_doc_id(tmp_path: Path) -> None:
+    """Штамп идентичности (spec candidate-identity-hardening §1): единственная мутация
+    кандидата при admit — ``admitted_as``, и именно она уводит его из очереди."""
     cand = _candidate(raw_hash="b" * 64)
     store.save([cand], tmp_path)
 
     manual.apply_decisions([_admit_decision("b" * 64)], root=tmp_path)
     reloaded = store.load(tmp_path)
     assert len(reloaded) == 1
-    assert reloaded[0].rejected_reason is None  # кандидат — аудит-след, apply его не трогает
+    assert reloaded[0].admitted_as == "me-example-strategy-2026"
+    assert reloaded[0].rejected_reason is None  # отказной след apply не трогает
+    assert manual.pending_candidates(reloaded, schema.load_records(tmp_path)) == []
 
 
 def test_apply_admit_v2_fields_reach_meta_yaml(tmp_path: Path) -> None:
@@ -686,6 +702,7 @@ def test_apply_dry_run_does_not_write(tmp_path: Path) -> None:
     assert schema.load_records(tmp_path) == []
     meta_path = tmp_path / "target-entity" / "me" / "me-example-strategy-2026" / "meta.yaml"
     assert not meta_path.exists()
+    assert store.load(tmp_path)[0].admitted_as is None  # план не штампует
 
 
 def test_apply_dry_run_reject_does_not_write(tmp_path: Path) -> None:
@@ -965,6 +982,12 @@ def test_apply_isolates_existing_meta_conflict(tmp_path: Path) -> None:
     assert len(summary.errors) == 1
     assert "уже существует" in summary.errors[0].detail
     assert len(schema.load_records(tmp_path)) == 1  # исходная запись не перезаписана
+    # штамп ставится ТОЛЬКО после реально записанной meta.yaml: отказавший кандидат
+    # остаётся ждущим, а не помечается допущенным в никуда
+    assert {c.raw_hash[:1]: c.admitted_as for c in store.load(tmp_path)} == {
+        "b": "me-example-strategy-2026",
+        "c": None,
+    }
 
 
 def test_render_worksheet_header_documents_hidden_fields() -> None:

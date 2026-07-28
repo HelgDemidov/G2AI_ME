@@ -75,7 +75,6 @@ def test_load_config_reads_real_tracked_config() -> None:
     assert config.emit.html_hrefs is True
     assert config.emit.printed_urls is True
     assert config.emit.text_citations is False
-    assert config.max_candidates is None
     assert config.citations_model == "minimax/minimax-m3"
     assert config.citations_model_fallback == "google/gemini-3-flash-preview"
 
@@ -109,7 +108,6 @@ def test_load_config_custom_path_full(tmp_path: Path) -> None:
                 "printed_urls": False,
                 "text_citations": True,
             },
-            "max_candidates": 50,
             "citations_model": "test/model",
             "citations_model_fallback": "test/fallback-model",
         },
@@ -121,13 +119,12 @@ def test_load_config_custom_path_full(tmp_path: Path) -> None:
     assert config.url_filter.exclude_domains == ("example.com",)
     assert config.emit.pdf_annotations is False
     assert config.emit.text_citations is True
-    assert config.max_candidates == 50
     assert config.citations_model == "test/model"
     assert config.citations_model_fallback == "test/fallback-model"
 
 
 def test_load_config_missing_nested_sections_default_to_permissive(tmp_path: Path) -> None:
-    """Отсутствующие ``source_filter``/``url_filter``/``emit``/``max_candidates`` -> дефолты
+    """Отсутствующие ``source_filter``/``url_filter``/``emit`` -> дефолты
     §3: пустые (разрешающие) фильтры, все emit-тумблеры включены кроме text_citations,
     без капа — консистентно с философией «нет жёстких дефолтов»."""
     path = _write_config(tmp_path, {"enabled": True, "citations_model": "x/y"})
@@ -136,7 +133,6 @@ def test_load_config_missing_nested_sections_default_to_permissive(tmp_path: Pat
     assert config.url_filter.exclude_domains == ()
     assert config.emit.pdf_annotations is True
     assert config.emit.text_citations is False
-    assert config.max_candidates is None
     assert config.citations_model_fallback is None
 
 
@@ -152,24 +148,3 @@ def test_citations_model_fallback_falsy_yaml_value_is_none(tmp_path: Path, raw_v
     assert config.citations_model_fallback is None
 
 
-# --- max_candidates sanity-чек ---
-
-
-@pytest.mark.parametrize(
-    "value",
-    [None, 0, 1, 50, 10_000],
-)
-def test_max_candidates_accepts_none_and_nonnegative_ints(tmp_path: Path, value: int | None) -> None:
-    path = _write_config(tmp_path, {"enabled": True, "citations_model": "x/y", "max_candidates": value})
-    config = snowball.load_config(path)
-    assert config.max_candidates == value
-
-
-@pytest.mark.parametrize(
-    "value",
-    [-1, -100, True, False, "5", 3.5, [1]],
-)
-def test_max_candidates_rejects_invalid_values(tmp_path: Path, value: Any) -> None:
-    path = _write_config(tmp_path, {"enabled": True, "citations_model": "x/y", "max_candidates": value})
-    with pytest.raises(ValueError, match="max_candidates"):
-        snowball.load_config(path)
