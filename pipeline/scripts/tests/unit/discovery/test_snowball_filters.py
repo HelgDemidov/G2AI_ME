@@ -23,7 +23,6 @@ def _base_config() -> snowball.SnowballConfig:
         emit=snowball.EmitConfig(
             pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=False
         ),
-        max_candidates=None,
         citations_model="test/model",
         citations_model_fallback=None,
     )
@@ -35,7 +34,6 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "track": None,
         "exclude_domain": None,
         "with_citations": False,
-        "max_candidates": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -75,34 +73,20 @@ def test_with_citations_flag_enables_text_citations(_patched_load_config: snowba
     assert merged.emit.pdf_annotations is True  # прочие emit-поля не задеты
 
 
-def test_max_candidates_flag_overrides_yaml_value(_patched_load_config: snowball.SnowballConfig) -> None:
-    merged = discover._build_snowball_config_override(_args(max_candidates=25))
-    assert merged.max_candidates == 25
-
-
-def test_max_candidates_flag_zero_is_respected_not_treated_as_falsy(
-    _patched_load_config: snowball.SnowballConfig,
-) -> None:
-    """``0`` — валидное значение капа («эмитировать ничего»), не «флаг не задан»
-    (``args.max_candidates is None`` — правильная проверка, не bool-truthiness)."""
-    merged = discover._build_snowball_config_override(_args(max_candidates=0))
-    assert merged.max_candidates == 0
-
-
 def test_cli_override_does_not_mutate_yaml_on_disk(tmp_path: Path) -> None:
     """CLI-override — эффект на один прогон; файл `discovery_snowball.yaml` на диске
     остаётся байт-в-байт нетронутым (спек §3)."""
     config_path = tmp_path / "discovery_snowball.yaml"
     config_path.write_text(
-        "enabled: true\ncitations_model: test/model\nmax_candidates: null\n", encoding="utf-8"
+        "enabled: true\ncitations_model: test/model\n", encoding="utf-8"
     )
     before = config_path.read_bytes()
 
     import dataclasses
 
     real_load = snowball.load_config
-    merged = dataclasses.replace(real_load(config_path), max_candidates=99)
-    assert merged.max_candidates == 99
+    merged = dataclasses.replace(real_load(config_path), citations_model="other/model")
+    assert merged.citations_model == "other/model"
     assert config_path.read_bytes() == before
 
 
@@ -125,7 +109,6 @@ def test_emit_toggle_disables_pdf_annotations_extractor(tmp_path: Path) -> None:
         emit=snowball.EmitConfig(
             pdf_annotations=False, html_hrefs=True, printed_urls=True, text_citations=False
         ),
-        max_candidates=None,
         citations_model="test/model",
         citations_model_fallback=None,
     )
@@ -158,7 +141,6 @@ def test_emit_toggle_disables_html_hrefs_extractor(tmp_path: Path) -> None:
         emit=snowball.EmitConfig(
             pdf_annotations=True, html_hrefs=False, printed_urls=True, text_citations=False
         ),
-        max_candidates=None,
         citations_model="test/model",
         citations_model_fallback=None,
     )

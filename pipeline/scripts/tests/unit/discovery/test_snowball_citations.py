@@ -492,7 +492,6 @@ def test_confidential_document_skips_llm_stage_entirely(tmp_path: Path) -> None:
         source_filter=sb.SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=()),
         url_filter=sb.UrlFilter(exclude_domains=(), exclude_url_substrings=()),
         emit=sb.EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=True),
-        max_candidates=None,
         citations_model="test/model",
         citations_model_fallback=None,
     )
@@ -518,7 +517,6 @@ def test_normal_document_llm_stage_runs_when_emitted(tmp_path: Path) -> None:
         source_filter=sb.SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=()),
         url_filter=sb.UrlFilter(exclude_domains=(), exclude_url_substrings=()),
         emit=sb.EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=True),
-        max_candidates=None,
         citations_model="test/model",
         citations_model_fallback=None,
     )
@@ -676,7 +674,6 @@ def test_discover_snowball_mines_html_document_end_to_end(tmp_path: Path) -> Non
         source_filter=sb.SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids=()),
         url_filter=sb.UrlFilter(exclude_domains=(), exclude_url_substrings=()),
         emit=sb.EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=False),
-        max_candidates=None,
         citations_model="test/model",
         citations_model_fallback=None,
     )

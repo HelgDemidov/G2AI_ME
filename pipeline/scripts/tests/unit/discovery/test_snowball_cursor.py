@@ -1,5 +1,5 @@
 """Тесты discovery/connectors/snowball.py — discover_snowball() целиком: курсор/fingerprint-
-скип, реконсиляционный no-op, max_candidates урезание, диагностика (spec discovery-snowball
+скип, реконсиляционный no-op, диагностика (spec discovery-snowball
 §3/§4, коммит 4)."""
 from __future__ import annotations
 
@@ -19,13 +19,12 @@ _PERMISSIVE_FILTER = SourceFilter(tracks=(), include_doc_ids=(), exclude_doc_ids
 _PERMISSIVE_URL_FILTER = UrlFilter(exclude_domains=(), exclude_url_substrings=())
 
 
-def _config(*, max_candidates: int | None = None) -> SnowballConfig:
+def _config() -> SnowballConfig:
     return SnowballConfig(
         enabled=True,
         source_filter=_PERMISSIVE_FILTER,
         url_filter=_PERMISSIVE_URL_FILTER,
         emit=EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=True, text_citations=False),
-        max_candidates=max_candidates,
         citations_model="test/model",
         citations_model_fallback=None,
     )
@@ -95,41 +94,6 @@ def test_changed_doc_md_triggers_remine(tmp_path: Path) -> None:
     assert second.diagnostics["docs_skipped_cursor"] == 0
 
 
-def test_max_candidates_truncates_and_document_not_marked_mined(tmp_path: Path) -> None:
-    rec = _seed_doc(
-        tmp_path,
-        doc_id="capped-doc",
-        raw_sha="a" * 64,
-        links=[("https://example.org/one", "Doc One"), ("https://example.org/two", "Doc Two")],
-    )
-    result = discover_snowball(None, config=_config(max_candidates=1), root=tmp_path, records=[rec])
-    assert len(result.candidates) == 1
-    assert result.diagnostics["truncated_docs"] == 1
-    assert result.diagnostics["truncated_candidates"] == 1
-    assert rec.id not in result.cursor["mined"]  # урезанный документ не считается domined
-
-
-def test_max_candidates_not_exceeded_document_marked_mined_normally(tmp_path: Path) -> None:
-    rec = _seed_doc(tmp_path, doc_id="under-cap-doc", raw_sha="a" * 64, links=[("https://example.org/x", "X")])
-    result = discover_snowball(None, config=_config(max_candidates=5), root=tmp_path, records=[rec])
-    assert len(result.candidates) == 1
-    assert result.diagnostics["truncated_docs"] == 0
-    assert rec.id in result.cursor["mined"]
-
-
-def test_max_candidates_zero_emits_nothing_but_untouched_doc_not_truncated(tmp_path: Path) -> None:
-    """Документ БЕЗ находок при max_candidates=0 — не «урезан» (нечего урезать), fingerprint
-    фиксируется нормально; урезание — только когда реально что-то отброшено."""
-    data = valid_record() | {"id": "zero-cap-doc", "entity_id": "me", "track": "target-entity"}
-    rec = schema.SourceRecord.model_validate(data)
-    raw_bytes = build_pdf(lines=[("no links on this page", 50.0, 60.0, 12.0)])
-    write_doc(tmp_path, data, raw=raw_bytes, md="no urls here either", state={"sha256": "a" * 64})
-    result = discover_snowball(None, config=_config(max_candidates=0), root=tmp_path, records=[rec])
-    assert result.candidates == []
-    assert result.diagnostics["truncated_docs"] == 0
-    assert rec.id in result.cursor["mined"]
-
-
 def test_self_link_and_corpus_link_are_excluded_end_to_end(tmp_path: Path) -> None:
     other_data = valid_record() | {
         "id": "other-existing-doc",
@@ -172,7 +136,6 @@ def test_url_filter_excludes_matching_domain_end_to_end(tmp_path: Path) -> None:
         source_filter=cfg.source_filter,
         url_filter=UrlFilter(exclude_domains=("blog.example.com",), exclude_url_substrings=()),
         emit=cfg.emit,
-        max_candidates=cfg.max_candidates,
         citations_model=cfg.citations_model,
         citations_model_fallback=cfg.citations_model_fallback,
     )
@@ -198,7 +161,6 @@ def test_emit_toggle_disables_printed_urls_extractor(tmp_path: Path) -> None:
         source_filter=_PERMISSIVE_FILTER,
         url_filter=_PERMISSIVE_URL_FILTER,
         emit=EmitConfig(pdf_annotations=True, html_hrefs=True, printed_urls=False, text_citations=False),
-        max_candidates=None,
         citations_model="test/model",
         citations_model_fallback=None,
     )

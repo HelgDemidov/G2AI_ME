@@ -172,14 +172,11 @@ def _build_snowball_config_override(args: argparse.Namespace) -> snowball.Snowba
     if args.with_citations:
         emit = dataclasses.replace(emit, text_citations=True)
 
-    max_candidates = base.max_candidates if args.max_candidates is None else args.max_candidates
-
     return dataclasses.replace(
         base,
         source_filter=source_filter,
         url_filter=url_filter,
         emit=emit,
-        max_candidates=max_candidates,
     )
 
 
@@ -299,7 +296,6 @@ def main(argv: list[str] | None = None) -> int:
     p_snowball.add_argument(
         "--with-citations", action="store_true", help="включить LLM-стадию текстовых цитат (§5)"
     )
-    p_snowball.add_argument("--max-candidates", type=int, default=None, metavar="N")
     p_snowball.add_argument("--root", type=Path, default=schema.DEFAULT_SOURCES)
     p_snowball.add_argument("--dry-run", action="store_true", help="сводка без записи store/cursors")
     p_snowball.set_defaults(func=_cmd_snowball)

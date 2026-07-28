@@ -24,9 +24,6 @@ emit:
   printed_urls: true        # §2.3 напечатанные URL в doc.md
   text_citations: false     # §5 LLM-стадия текстовых цитат без URL — opt-in, требует сети
 
-max_candidates: null        # опциональный кап на прогон: null = без капа;
-                             # иначе целое >= 0 (произвольное число, без дискретных порогов)
-
 citations_model: "minimax/minimax-m3"   # §5 основная модель — живой мини-A/B 2026-07-24 на
                                          # реальной секции корпуса (sg-imda, 48 цитат, 100%
                                          # verbatim-гейт, ~8с/вызов, reasoning_tokens=0 в обоих
