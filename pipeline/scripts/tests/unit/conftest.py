@@ -27,6 +27,7 @@ import pytest
 from acquire import acquisition
 from convert import converters
 from discovery import registry_store, store
+from discovery.connectors import snowball
 from index import corpus_index
 
 
@@ -67,11 +68,19 @@ _GUARDED_REAL_ARTIFACTS: tuple[Path, ...] = (
 
 # Боевые КАТАЛОГИ, чей состав тоже неприкосновенен (spec discovery-candidates-sharding §6):
 # для шардированного store недостаточно сторожить один файл — правку шарда на месте И
-# появление/исчезновение шарда ловит только снимок всего каталога. `.state/` (курсоры,
-# лиды snowball, в будущем dangling-цитаты graph-v2) сторожится тем же механизмом с
-# 2026-07-25: раньше это были два отдельных файла в списке выше, и КАЖДЫЙ новый
-# операционный артефакт требовал правки списка — каталог закрывает класс целиком.
-_GUARDED_REAL_DIRS: tuple[Path, ...] = (store.CANDIDATES_DIR, store.STATE_DIR)
+# появление/исчезновение шарда ловит только снимок всего каталога. `.state/` (лиды
+# snowball, dangling-цитаты graph-v2) сторожится тем же механизмом с 2026-07-25: раньше
+# это были два отдельных файла в списке выше, и КАЖДЫЙ новый операционный артефакт
+# требовал правки списка — каталог закрывает класс целиком.
+# `discovery_cache/snowball/` — кэш СЫРЬЯ (spec drop-cursors-and-decision-overlay §2):
+# дефолт `cache_dir=CACHE_DIR` делает тест без явного tmp-пути негерметичным ровно как
+# `--db` в инциденте 2026-07-21, и вдобавок отдаёт ему ТЁПЛЫЙ кэш от предыдущего теста
+# (поймано живьём при прототипировании: LLM-стадия «не вызвалась»).
+_GUARDED_REAL_DIRS: tuple[Path, ...] = (
+    store.CANDIDATES_DIR,
+    store.STATE_DIR,
+    snowball.CACHE_DIR,
+)
 
 
 def _artifact_snapshot() -> list[tuple[str, tuple[int, int] | None]]:

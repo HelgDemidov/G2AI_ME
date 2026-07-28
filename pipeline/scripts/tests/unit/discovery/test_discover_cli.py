@@ -13,6 +13,7 @@ from core import fsio, schema
 from discover import main
 from discovery import registry, store
 from discovery.base import DiscoverResult
+from discovery.connectors import snowball
 
 
 class _StaticConnector:
@@ -39,6 +40,14 @@ class _BoomConnector:
 
     def discover(self) -> DiscoverResult:
         raise RuntimeError("down")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_snowball_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI-путь не принимает ``cache_dir`` параметром, поэтому изоляция делается модульной
+    константой — та читается В МОМЕНТ ВЫЗОВА именно ради этого. Без фикстуры подкоманда
+    `snowball` писала бы в БОЕВОЙ кэш, и гейт герметичности краснеет (справедливо)."""
+    monkeypatch.setattr(snowball, "CACHE_DIR", tmp_path / "snowball_cache")
 
 
 @pytest.fixture(autouse=True)

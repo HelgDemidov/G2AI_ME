@@ -112,7 +112,7 @@ def test_emit_toggle_disables_pdf_annotations_extractor(tmp_path: Path) -> None:
         citations_model="test/model",
         citations_model_fallback=None,
     )
-    result = snowball.discover_snowball(config=cfg_off, root=tmp_path, records=[rec])
+    result = snowball.discover_snowball(config=cfg_off, root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     assert result.candidates == []
     assert result.diagnostics["per_extractor"]["pdf_annotations"] == 0
 
@@ -144,6 +144,6 @@ def test_emit_toggle_disables_html_hrefs_extractor(tmp_path: Path) -> None:
         citations_model="test/model",
         citations_model_fallback=None,
     )
-    result = snowball.discover_snowball(config=cfg_off, root=tmp_path, records=[rec])
+    result = snowball.discover_snowball(config=cfg_off, root=tmp_path, records=[rec], cache_dir=tmp_path / "snowball_cache")
     assert result.candidates == []
     assert result.diagnostics["per_extractor"]["html_hrefs"] == 0
