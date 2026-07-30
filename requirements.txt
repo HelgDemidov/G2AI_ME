@@ -14,4 +14,4 @@ PyYAML==6.0.3         # чтение/запись sources.yaml и словаре
 networkx==3.6.1       # гетерогенный граф знаний (build_graph.py)
 tokenizers==0.23.1    # токенизатор bge-m3 для канонической чанковки (bge_tokenizer.py)
 numpy==2.5.1          # векторные операции (embed.py, vector_store.py)
-onnxruntime==1.27.0   # инференс bge-m3 int8 ONNX, CPU (embed.py)
+onnxruntime==1.28.0   # инференс bge-m3 int8 ONNX, CPU (embed.py)
