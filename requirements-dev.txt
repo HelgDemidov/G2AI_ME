@@ -14,6 +14,6 @@ pytest-cov==7.1.0
 types-PyYAML==6.0.12.20260518
 types-openpyxl==3.1.5.20260724
 reportlab==5.0.0       # синтетические PDF-фикстуры для тестов pdf_to_markdown (генерация на лету, ничего не коммитится)
-types-reportlab==4.5.1.20260712
-hypothesis==6.160.0    # property-based тестирование геометрии pdf_to_markdown (test-coverage-hardening); общепроектный стандарт
+types-reportlab==4.5.1.20260728
+hypothesis==6.163.0    # property-based тестирование геометрии pdf_to_markdown (test-coverage-hardening); общепроектный стандарт
 # mermaidx — теперь runtime-зависимость (requirements.txt), тянется сюда транзитивно через -r requirements.txt выше
