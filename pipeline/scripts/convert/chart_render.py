@@ -19,12 +19,33 @@ runtime-зависимость с 2026-07-22), любой отказ -> отка
 крах конвертации. Гейт публичен (spec convert-knowledge-seam-hardening §8-bis):
 ``figures_vlm`` применяет его к mermaid-фенсам VLM-ответа — тот же класс вывода,
 та же дисциплина (прецедент публикации — ``apply_superseded_gate``)."""
+
 from __future__ import annotations
 
+import logging
 import re
+from functools import lru_cache
 from typing import cast
 
 from convert.chart_data import ChartData
+
+logger = logging.getLogger(__name__)
+
+# mermaidx is an optional per-format extra (refigure [docx]/[xlsx]) — a
+# pdf/html-only install must not require it.
+try:
+    import mermaidx
+except ImportError:
+    mermaidx = None
+
+
+@lru_cache(maxsize=1)
+def _warn_missing_mermaidx() -> None:
+    logger.warning(
+        "mermaidx not installed — chart diagrams disabled, falling back to "
+        "tables only (install refigure[docx]/[xlsx] to enable rendering)"
+    )
+
 
 _STRIP_RE = re.compile(r"[\[\]{}()]")
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9]+")
@@ -91,8 +112,13 @@ def _row_labels(data: ChartData) -> tuple[str, ...]:
 
 
 def _table(data: ChartData) -> str:
-    header = ["Category"] + [s.name or f"Series {i + 1}" for i, s in enumerate(data.series)]
-    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
+    header = ["Category"] + [
+        s.name or f"Series {i + 1}" for i, s in enumerate(data.series)
+    ]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * len(header)) + " |",
+    ]
     for i, label in enumerate(_row_labels(data)):
         row = [label.replace("\n", " ")] + [
             _format_value(s.values[i] if i < len(s.values) else None, data.value_format)
@@ -108,7 +134,10 @@ def _series_shape_ok(data: ChartData) -> bool:
     (пустая ячейка), mermaid просто снимается целиком."""
     if not data.categories:
         return False
-    return all(len(s.values) == len(data.categories) and all(v is not None for v in s.values) for s in data.series)
+    return all(
+        len(s.values) == len(data.categories) and all(v is not None for v in s.values)
+        for s in data.series
+    )
 
 
 def _dense(values: tuple[float | None, ...]) -> tuple[float, ...]:
@@ -144,7 +173,9 @@ def _mermaid_xychart(data: ChartData) -> str | None:
     lines = ["xychart-beta"]
     x_axis = ", ".join(f'"{_sanitize_label(c)}"' for c in data.categories)
     lines.append(f"x-axis [{x_axis}]")
-    y_label = _sanitize_label(data.value_axis_title) if data.value_axis_title else "Value"
+    y_label = (
+        _sanitize_label(data.value_axis_title) if data.value_axis_title else "Value"
+    )
     all_values = [v for s in data.series for v in _dense(s.values)]
     y_min, y_max = min(0.0, min(all_values)), max(all_values)
     if y_min == y_max:
@@ -160,7 +191,10 @@ def _mermaid_xychart(data: ChartData) -> str | None:
 def _mermaid_radar(data: ChartData) -> str | None:
     if not _series_shape_ok(data):
         return None
-    axis = ", ".join(f'{_slug(cat, i)}["{_sanitize_label(cat)}"]' for i, cat in enumerate(data.categories))
+    axis = ", ".join(
+        f'{_slug(cat, i)}["{_sanitize_label(cat)}"]'
+        for i, cat in enumerate(data.categories)
+    )
     lines = [f"axis {axis}"]
     for i, s in enumerate(data.series):
         label = _sanitize_label(s.name) if s.name else f"Series {i + 1}"
@@ -183,8 +217,9 @@ def mermaid_renders(code: str) -> bool:
     различает «грамматически валидно» и «примет реальный рендерер». Любой
     сбой (включая недоступность самой библиотеки) -> False, фейл-safe —
     вызывающая сторона просто теряет mermaid-блок, НЕ конвертацию целиком."""
-    import mermaidx  # ленивый импорт: pdf/html-путь не платит за chart-специфичный вес
-
+    if mermaidx is None:
+        _warn_missing_mermaidx()
+        return False
     try:
         mermaidx.render(code).svg()
         return True
@@ -212,7 +247,9 @@ def render_chart(data: ChartData) -> str | None:
     зовёт caption-фолбэк (честный маркер, см. ``xlsx_charts.render_chart_marker``/
     ``docx_groups._render_group_marker``). Порядок вывода (§3): подпись ->
     mermaid (если есть) -> таблица."""
-    if not data.series or not any(any(v is not None for v in s.values) for s in data.series):
+    if not data.series or not any(
+        any(v is not None for v in s.values) for s in data.series
+    ):
         return None
     parts = [p for p in (_caption(data), _mermaid(data), _table(data)) if p]
     return "\n\n".join(parts)
