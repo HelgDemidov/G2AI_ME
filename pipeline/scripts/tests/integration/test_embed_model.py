@@ -7,14 +7,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from index.bge_tokenizer import TOKENIZER_JSON
-from index.embed import DEFAULT_ONNX, OnnxBgeEmbedder
+from index.bge_tokenizer import MODEL_DIR_ENV, tokenizer_json
+from index.embed import OnnxBgeEmbedder, default_onnx
 
 pytestmark = [
     pytest.mark.model,
     pytest.mark.skipif(
-        not (DEFAULT_ONNX.exists() and TOKENIZER_JSON.exists()),
-        reason="модель bge-m3 не скачана (pipeline/models/bge-m3-onnx-int8/)",
+        not (default_onnx().exists() and tokenizer_json().exists()),
+        reason=f"модель bge-m3 не скачана (задать {MODEL_DIR_ENV} или положить в pipeline/models/)",
     ),
 ]
 

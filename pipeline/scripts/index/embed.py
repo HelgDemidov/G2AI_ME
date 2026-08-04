@@ -24,11 +24,9 @@ from typing import Any, Literal, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from index.bge_tokenizer import EMBED_MAX_TOKENS, MODEL_DIR, TOKENIZER_JSON, load_tokenizer
+from index.bge_tokenizer import EMBED_MAX_TOKENS, load_tokenizer, model_dir
 
 FloatArray = NDArray[np.float32]
-
-DEFAULT_ONNX = MODEL_DIR / "model_int8.onnx"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
 INTRA_OP_THREADS = 4  # физический лимит машины: 2 ядра/4 потока (spec embed-local-swap §3) —
 # лечит документированную оверсабскрипцию (onnxruntime иначе создаёт потоков больше ядер)
@@ -52,6 +50,11 @@ CLOUD_MODEL_TOKEN_LIMITS: dict[str, int] = {
     # несоразмерно (knowledge-hardening §7).
     "google/gemini-embedding-001": 2048,
 }
+
+
+def default_onnx() -> Path:
+    """Path to the int8 ONNX weights inside the resolved model directory (bge_tokenizer)."""
+    return model_dir() / "model_int8.onnx"
 
 
 def l2_normalize(mat: FloatArray) -> FloatArray:
@@ -89,13 +92,15 @@ class OnnxBgeEmbedder:
 
     def __init__(
         self,
-        model_path: Path = DEFAULT_ONNX,
-        tokenizer_path: Path = TOKENIZER_JSON,
+        model_path: Path | None = None,
+        tokenizer_path: Path | None = None,
         max_tokens: int = EMBED_MAX_TOKENS,
         batch_size: int = 16,
     ) -> None:
         import onnxruntime as ort
 
+        # None => resolve through bge_tokenizer.model_dir() (BGE_MODEL_DIR, then repo-local)
+        model_path = model_path if model_path is not None else default_onnx()
         if not model_path.exists():
             raise FileNotFoundError(f"модель не найдена: {model_path} — скачать bge-m3?")
         opts = ort.SessionOptions()
