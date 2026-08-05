@@ -7,7 +7,7 @@
 #   .venv/bin/python pipeline/scripts/validate_sources.py
 -r requirements.txt
 mypy==2.3.0
-ruff==0.15.22
+ruff==0.16.1
 pip-audit==2.10.1      # CVE-аудит зависимостей; шаг job `quality` в CI — раньше стоял только там, локальное окружение расходилось с объявленным
 pytest==9.1.1
 pytest-cov==7.1.0
